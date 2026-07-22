@@ -1,0 +1,3111 @@
+[
+  {
+    "app": "Salesforce",
+    "category": "CRM",
+    "one_liner": "Salesforce is a leading CRM platform offering extensive REST APIs and official MCP servers for AI agents.",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Free Developer Edition supports development and testing; production API access requires a supported paid edition or API add-on."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Hard",
+    "main_blocker": "Production API access requires an existing customer on a supported paid edition or an API access add-on.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://developer.salesforce.com/docs/platform/connect-rest-api/guide/intro_using_oauth.html",
+      "https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/intro_rest_compatible_editions.htm",
+      "https://github.com/salesforcecli/mcp"
+    ],
+    "confidence": 0.8,
+    "verification_status": "Hand-Checked",
+    "slug": "salesforce",
+    "primary_docs_url": "https://developer.salesforce.com/docs/platform/connect-rest-api/guide/intro_using_oauth.html",
+    "rate_limit_note": "API limits are typically based on the Salesforce edition and user licenses.",
+    "last_verified": "2026-07-11"
+  },
+  {
+    "app": "HubSpot",
+    "category": "CRM",
+    "one_liner": "HubSpot provides a comprehensive CRM platform with robust REST APIs and an official MCP server for AI integrations.",
+    "auth_methods": [
+      "OAuth2",
+      "Bearer Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can freely create a developer account to build apps, generate OAuth credentials, or create service keys for API access."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developers.hubspot.com/docs/api-reference/latest/authentication/manage-oauth-tokens",
+      "https://developers.hubspot.com/docs/apps/developer-platform/build-apps/authentication/account-service-keys",
+      "https://developers.hubspot.com/docs/getting-started/account-types",
+      "https://developers.hubspot.com/ai-tools/mcp"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "hubspot",
+    "primary_docs_url": "https://developers.hubspot.com/docs/api-reference/latest/authentication/manage-oauth-tokens",
+    "rate_limit_note": "Service keys and OAuth apps are subject to standard API limits based on the developer platform version.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Pipedrive",
+    "category": "CRM",
+    "one_liner": "Pipedrive is a CRM platform offering a REST API and a native MCP server for integrating sales workflows into AI...",
+    "auth_methods": [
+      "OAuth2",
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up for a free Sandbox account to obtain API tokens and build integrations without manual approval."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developers.pipedrive.com/docs/api/v1",
+      "https://developers.pipedrive.com/docs/api/v1/Oauth",
+      "https://developer.pipedrive.com",
+      "https://www.pipedrive.com/en/newsroom/pipedrive-launches-native-mcp-server-bringing-crm-workflows-directly-into-ai-assistants"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "pipedrive",
+    "primary_docs_url": "https://developers.pipedrive.com/docs/api/v1/Oauth",
+    "rate_limit_note": "Not explicitly detailed in the provided snippets, but standard API token validation applies.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Attio",
+    "category": "CRM",
+    "one_liner": "Attio is an AI-native CRM platform offering a comprehensive REST API and an official hosted MCP server for AI agents.",
+    "auth_methods": [
+      "OAuth2",
+      "API Key",
+      "Basic Auth"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can create apps, configure OAuth 2.0, and generate single-workspace API keys directly from the developer dashboard."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None.",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.attio.com/rest-api/guides/authentication",
+      "https://docs.attio.com/mcp/overview",
+      "https://docs.attio.com/share/the-publication-lifecycle"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "attio",
+    "primary_docs_url": "https://docs.attio.com/rest-api/guides/authentication",
+    "rate_limit_note": "The documentation includes a section on 'Handling rate limits', though specific limits are not detailed in the provided snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Twenty",
+    "category": "CRM",
+    "one_liner": "Twenty is an open-source CRM that provides dynamically generated REST and GraphQL APIs based on workspace schemas.",
+    "auth_methods": [
+      "API Key",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "API keys can be generated directly in the workspace settings, and OAuth clients can be registered dynamically via API without manual dashboard setup."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "None",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None.",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.twenty.com/developers/extend/api",
+      "https://docs.twenty.com/developers/extend/oauth"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "twenty",
+    "primary_docs_url": "https://docs.twenty.com/developers/extend/api",
+    "rate_limit_note": "100 requests per minute, batch size up to 60 records per call.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Podio",
+    "category": "CRM",
+    "one_liner": "Podio is a customizable CRM and work management platform offering a comprehensive REST API and an official MCP server.",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can generate API keys and OAuth credentials directly from their Podio account settings."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None.",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developers.podio.com",
+      "https://developers.podio.com/doc/oauth-authorization",
+      "https://developers.podio.com/authentication/app_auth",
+      "https://docs.sharefile.com/en-us/podio/using-podio/general-features/podio-mcp-server.html"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "podio",
+    "primary_docs_url": "https://developers.podio.com/doc/oauth-authorization",
+    "rate_limit_note": "Sensible rate limits are in place, but developers can request an increase by contacting support.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Zoho CRM",
+    "category": "CRM",
+    "one_liner": "Zoho CRM is a comprehensive customer relationship management platform offering REST APIs and official MCP servers...",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up for a free account or developer environment to access the API and MCP servers."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None.",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://www.zoho.com/crm/developer/docs/api/v8/auth-request.html",
+      "https://www.zoho.com/crm/developer/docs/api/v8/api-limits.html",
+      "https://www.zoho.com/crm/developer/docs/mcp/overview.html"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "zoho-crm",
+    "primary_docs_url": "https://www.zoho.com/crm/developer/docs/api/v8/auth-request.html",
+    "rate_limit_note": "OAuth 2.0 access tokens expire after 60 minutes.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Close",
+    "category": "CRM",
+    "one_liner": "Close is a sales CRM providing a comprehensive REST API and an official MCP server for AI agents.",
+    "auth_methods": [
+      "API Key",
+      "Basic Auth",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Close provides a temporary trial; continued production API and MCP use requires a paid Close subscription."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Moderate",
+    "main_blocker": "Production credentials require an existing paid customer account.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://developer.close.com/api/overview/api-key-authentication",
+      "https://developer.close.com/api/overview/oauth-authentication",
+      "https://developer.close.com/mcp",
+      "https://close.com/pricing"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "close",
+    "primary_docs_url": "https://developer.close.com/api/overview/api-key-authentication",
+    "rate_limit_note": "Rate limits exist and are documented in the API reference, though specific thresholds are not detailed in the fetched snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Copper",
+    "category": "CRM",
+    "one_liner": "Copper provides a comprehensive REST API for integrating with its CRM platform, supporting both OAuth2 and API keys.",
+    "auth_methods": [
+      "OAuth2",
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Copper provides a temporary trial; continued production API use requires a paid Copper subscription."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Moderate",
+    "main_blocker": "Production credentials require an existing paid customer account.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://developer.copper.com/introduction/oauth/index.html",
+      "https://developer.copper.com/introduction/requests.html",
+      "https://www.copper.com/pricing",
+      "https://www.synchub.io/connectors/copper/knowledge-base/mcp"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Hand-Checked",
+    "slug": "copper",
+    "primary_docs_url": "https://developer.copper.com/introduction/oauth/index.html",
+    "rate_limit_note": "Rate limits are enforced and detailed in the API documentation.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "DealCloud",
+    "category": "CRM",
+    "one_liner": "DealCloud provides a comprehensive REST API and an upcoming official MCP server, but access requires an existing...",
+    "auth_methods": [
+      "OAuth2",
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "API keys and OAuth credentials must be generated by an admin within an existing DealCloud environment. There is no self-serve public signup."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Hard",
+    "main_blocker": "Requires an existing paid DealCloud account and admin privileges to generate API credentials; no self-serve public sandbox is available.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://api.docs.dealcloud.com/docs/token",
+      "https://api.docs.dealcloud.com/docs/apikeys",
+      "https://api.docs.dealcloud.com/releases"
+    ],
+    "confidence": 0.8,
+    "verification_status": "Hand-Checked",
+    "slug": "dealcloud",
+    "primary_docs_url": "https://api.docs.dealcloud.com/docs/token",
+    "rate_limit_note": "Rate limits are mentioned in the documentation index, but specific thresholds are not detailed in the fetched snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Zendesk",
+    "category": "Support",
+    "one_liner": "Zendesk provides a comprehensive REST API for managing tickets, users, and customer service workflows.",
+    "auth_methods": [
+      "OAuth2",
+      "API Key",
+      "Basic Auth"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "A paid Zendesk subscription is required for production use, though free trial or sponsored developer accounts are available for testing."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "Yes",
+    "buildability": "Moderate",
+    "main_blocker": "Production access requires an active paid Zendesk account.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://developer.zendesk.com/documentation/api-basics/authentication/creating-and-using-oauth-tokens-with-the-api/",
+      "https://developer.zendesk.com/api-reference/ticketing/oauth/oauth_tokens/",
+      "https://github.com/reminia/zendesk-mcp-server"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Auto",
+    "slug": "zendesk",
+    "primary_docs_url": "https://developer.zendesk.com/api-reference/ticketing/oauth/oauth_tokens/",
+    "rate_limit_note": "Rate limits apply; Zendesk provides documentation on best practices for avoiding rate limiting.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Intercom",
+    "category": "Support",
+    "one_liner": "Intercom provides a comprehensive REST API and an official MCP server for integrating AI agents with customer...",
+    "auth_methods": [
+      "OAuth2",
+      "Personal Access Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up for a free development workspace to test and build apps."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "The official MCP server is currently only supported in US hosted workspaces.",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developers.intercom.com/docs/build-an-integration/learn-more/authentication",
+      "https://developers.intercom.com/docs/guides/mcp",
+      "https://developers.intercom.com"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "intercom",
+    "primary_docs_url": "https://developers.intercom.com/docs/build-an-integration/learn-more/authentication/setting-up-oauth",
+    "rate_limit_note": "Rate limits are not explicitly detailed in the provided snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Freshdesk",
+    "category": "Support",
+    "one_liner": "Freshdesk provides a comprehensive REST API and an official MCP server for managing customer support tickets and...",
+    "auth_methods": [
+      "API Key",
+      "Basic Auth"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Freshdesk Free currently permits zero API calls; production API use requires a paid Growth, Pro, or Enterprise account."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Moderate",
+    "main_blocker": "Production API credentials require an existing paid Freshdesk customer account.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://developers.freshdesk.com/api/",
+      "https://partnersupport.freshworks.com/support/solutions/articles/225439-what-are-the-rate-limits-for-the-api-calls-to-freshdesk-",
+      "https://support.freshdesk.com/support/solutions/articles/50000012670-model-context-protocol-mcp-integration-in-freshdesk-eap-"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "freshdesk",
+    "primary_docs_url": "https://developers.freshdesk.com/api/",
+    "rate_limit_note": "Rate limits are enforced based on the number of API calls per hour, varying by subscription plan.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Front",
+    "category": "Support",
+    "one_liner": "Front provides a Core API and an official MCP server for building custom workflows, messaging channels, and AI...",
+    "auth_methods": [
+      "Bearer Token",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Front API access is included with paid plans; the self-serve trial is temporary and does not satisfy the production-access rubric."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Moderate",
+    "main_blocker": "Production API use requires an existing paid Front customer account.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://dev.frontapp.com/docs/authentication",
+      "https://help.front.com/en/articles/2438",
+      "https://dev.frontapp.com/docs/mcp-server"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "front",
+    "primary_docs_url": "https://dev.frontapp.com/docs/authentication",
+    "rate_limit_note": "Front has two rate limits: global and burst.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Pylon",
+    "category": "Support",
+    "one_liner": "Pylon is an AI-native B2B support platform offering a REST API and an official MCP server for omnichannel workflows.",
+    "auth_methods": [
+      "Bearer Token",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "API tokens can be generated in the Pylon dashboard. A free trial is available to get started, though production use may require a paid plan."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://usepylon.com",
+      "https://docs.usepylon.com/pylon-docs/developer/api/authentication",
+      "https://docs.usepylon.com/pylon-docs/developer/api/api-reference/me",
+      "https://docs.usepylon.com/pylon-docs/integrations/pylon-mcp"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Auto",
+    "slug": "pylon",
+    "primary_docs_url": "https://usepylon.com",
+    "rate_limit_note": "60 requests per minute as documented on the /me endpoint.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "LiveAgent",
+    "category": "Support",
+    "one_liner": "LiveAgent provides a REST API for integrating customer support, ticketing, and live chat functionalities.",
+    "auth_methods": [
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "API keys can be generated directly from the LiveAgent admin dashboard under Configuration > System > API."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://faq.liveagent.com/535002-LiveAgent-API-v1-vs-v3-Authentication-Differences-API-Key-Management-and-Resolving-403-Errors",
+      "https://support.liveagent.com/802463-REST-API",
+      "https://support.liveagent.com/840770-Complete-API-reference",
+      "https://www.flowhunt.io/mcp-servers/liveagent/"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Auto",
+    "slug": "liveagent",
+    "primary_docs_url": "https://faq.liveagent.com/535002-LiveAgent-API-v1-vs-v3-Authentication-Differences-API-Key-Management-and-Resolving-403-Errors",
+    "rate_limit_note": "No specific rate limit information found in the provided documentation.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Plain",
+    "category": "Support",
+    "one_liner": "Plain is an AI-first support infrastructure platform that enables B2B teams to build custom support workflows.",
+    "auth_methods": [
+      "API Key",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Plain provides a seven-day trial; production API and MCP use requires a paid Foundation, Horizon, or Frontier workspace."
+    },
+    "api_type": "GraphQL",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Moderate",
+    "main_blocker": "Production credentials require an existing paid customer account.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://help.plain.com/article/api-quickstart",
+      "https://help.plain.com/article/mcp-server",
+      "https://www.plain.com/pricing"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Hand-Checked",
+    "slug": "plain",
+    "primary_docs_url": "https://help.plain.com/article/api-quickstart",
+    "rate_limit_note": "Rate limits exist but specific details are not provided in the quickstart.",
+    "last_verified": "2026-07-11"
+  },
+  {
+    "app": "Help Scout",
+    "category": "Support",
+    "one_liner": "Help Scout provides a comprehensive REST API for managing support conversations, customers, and knowledge base docs.",
+    "auth_methods": [
+      "OAuth2",
+      "API Key",
+      "Basic Auth"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Help Scout provides a temporary trial; continued production API use requires an active paid Help Scout account."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "Yes",
+    "buildability": "Moderate",
+    "main_blocker": "Production credentials require an existing paid customer account.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://developer.helpscout.com/mailbox-api/overview/authentication/",
+      "https://developer.helpscout.com/docs-api/",
+      "https://docs.helpscout.com/article/596-billing-and-plans-guide",
+      "https://mcpengage.com/helpscout"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "help-scout",
+    "primary_docs_url": "https://developer.helpscout.com/mailbox-api/overview/authentication/",
+    "rate_limit_note": "Rate limiting is enforced and documented in the API overview.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Gorgias",
+    "category": "Support",
+    "one_liner": "Gorgias provides a REST API and an official MCP server for managing e-commerce helpdesk tickets and customer data.",
+    "auth_methods": [
+      "Basic Auth",
+      "API Key",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Gorgias provides a seven-day trial; continued production API and MCP use requires a paid plan."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Moderate",
+    "main_blocker": "Production credentials require an existing paid customer account.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://developers.gorgias.com/reference/authentication",
+      "https://developers.gorgias.com/docs/access-tokens-api-keys",
+      "https://www.gorgias.com/pricing/choose-your-plan",
+      "https://docs.gorgias.com/en-US/connect-your-ai-assistant-to-the-gorgias-mcp-6310546"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "gorgias",
+    "primary_docs_url": "https://developers.gorgias.com/reference/authentication",
+    "rate_limit_note": "Not explicitly detailed in the provided snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Gladly",
+    "category": "Support",
+    "one_liner": "Gladly provides a comprehensive REST API and App Platform for integrating customer service workflows and data.",
+    "auth_methods": [
+      "API Key",
+      "Basic Auth",
+      "Bearer Token",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Requires an existing customer account or partner relationship with Gladly to access the API and generate tokens."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Hard",
+    "main_blocker": "Requires an existing customer account or partner relationship with Gladly to access the API and generate tokens.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://developer.gladly.com/rest/",
+      "https://help.gladly.com/developer-tutorials/docs/quickstart",
+      "https://www.stackone.com/connectors/gladly/mcp/"
+    ],
+    "confidence": 0.85,
+    "verification_status": "Auto",
+    "slug": "gladly",
+    "primary_docs_url": "https://developer.gladly.com/rest/",
+    "rate_limit_note": "The REST API documentation includes sections on Default Rate Limit, Reporting API Rate Limit, and Handling Rate Limit.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Slack",
+    "category": "Comms",
+    "one_liner": "Slack provides a comprehensive REST API and an official MCP server for building apps and AI agents.",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can create apps and obtain credentials directly from the Slack API portal without manual approval for basic development."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.slack.dev/quickstart/",
+      "https://docs.slack.dev/authentication/installing-with-oauth/",
+      "https://docs.slack.dev/ai/slack-mcp-server/"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "slack",
+    "primary_docs_url": "https://docs.slack.dev/quickstart/",
+    "rate_limit_note": "Tiered rate limits apply; for example, Tier 4 allows 100+ requests per minute.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Twilio",
+    "category": "Comms",
+    "one_liner": "Twilio provides a comprehensive communications platform with APIs for messaging, voice, video, and authentication.",
+    "auth_methods": [
+      "API Key",
+      "Basic Auth",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up and generate API keys or access tokens directly from the Twilio Console for production use."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None.",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://www.twilio.com/docs/iam/api-keys",
+      "https://www.twilio.com/docs/iam/oauth-apps/overview",
+      "https://www.twilio.com/docs/iam/credentials/api",
+      "https://www.twilio.com/docs/iam/access-tokens",
+      "https://www.twilio.com/docs/ai/mcp",
+      "https://github.com/twilio-labs/mcp"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "twilio",
+    "primary_docs_url": "https://www.twilio.com/docs/iam/api-keys",
+    "rate_limit_note": "No specific rate limits were detailed in the provided evidence.",
+    "last_verified": "2026-07-11"
+  },
+  {
+    "app": "Zoho Cliq",
+    "category": "Comms",
+    "one_liner": "Zoho Cliq offers a comprehensive REST API and an official MCP server for integrating AI agents and automating team...",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up for free and register applications in the Zoho API console to obtain OAuth 2.0 credentials."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://www.zoho.com/cliq/help/restapi/v3/oauth/",
+      "https://www.zoho.com/cliq/help/platform/zoho-cliq-mcp.html",
+      "https://www.zoho.com/cliq/mcp-server.html",
+      "https://www.zoho.com/mcp/"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "zoho-cliq",
+    "primary_docs_url": "https://www.zoho.com/cliq/help/restapi/v3/oauth/",
+    "rate_limit_note": "Rate limits are not explicitly detailed in the provided evidence.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Lark (Larksuite)",
+    "category": "Comms",
+    "one_liner": "Lark (Larksuite) provides a REST API and an official MCP server for integrating AI agents with its collaboration...",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "App permissions require review and approval before the app can invoke server APIs."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Hard",
+    "main_blocker": "App review and permission approval are required before API access is granted.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://open.larksuite.com/document/server-docs/getting-started/overview-of-app-scopes",
+      "https://open.larksuite.com/document/server-docs/getting-started/api-access-token/app-access-token-development-guide",
+      "https://github.com/larksuite/lark-openapi-mcp",
+      "https://open.larksuite.com/document/uAjLw4CM/ukTMukTMukTM/mcp_integration/mcp_introduction"
+    ],
+    "confidence": 0.85,
+    "verification_status": "Auto",
+    "slug": "lark",
+    "primary_docs_url": "https://github.com/larksuite/lark-openapi-mcp",
+    "rate_limit_note": "Not explicitly detailed in the provided snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Pumble",
+    "category": "Comms",
+    "one_liner": "Pumble provides a REST API and an official MCP server for team communication, messaging, and channel management.",
+    "auth_methods": [
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "API keys can be generated directly within the Pumble workspace by installing the API addon."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://pumble.com/help/integrations/automation-workflow-integrations/api-keys-integration/",
+      "https://pumble.com/help/integrations/automation-workflow-integrations/how-to-use-the-pumble-mcp-server/",
+      "https://cake.com/updates/mcp-server"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "pumble",
+    "primary_docs_url": "https://pumble.com/help/integrations/automation-workflow-integrations/api-keys-integration/",
+    "rate_limit_note": "1000 requests per minute per user.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Discord",
+    "category": "Comms",
+    "one_liner": "Discord provides a comprehensive REST API and WebSocket gateway for building bots, apps, and integrations.",
+    "auth_methods": [
+      "OAuth2",
+      "Bot Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can freely create applications and bots in the Discord Developer Portal to obtain credentials."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.discord.com/developers/topics/oauth2",
+      "https://docs.discord.com/developers/reference",
+      "https://github.com/IQAIcom/mcp-discord"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "discord",
+    "primary_docs_url": "https://docs.discord.com/developers/topics/oauth2",
+    "rate_limit_note": "Rate limits are enforced and documented in the API reference, with specific limits varying by endpoint.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Telegram",
+    "category": "Comms",
+    "one_liner": "Telegram provides a self-serve HTTP-based Bot API and a custom client API for building bots and messaging applications.",
+    "auth_methods": [
+      "Bot Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can freely create bots and obtain Bot Tokens without manual approval."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://core.telegram.org/bots/api",
+      "https://core.telegram.org/bots",
+      "https://github.com/sparfenyuk/mcp-telegram"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Hand-Checked",
+    "slug": "telegram",
+    "primary_docs_url": "https://core.telegram.org/bots/api",
+    "rate_limit_note": "Not explicitly detailed in the fetched evidence.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "WhatsApp Business",
+    "category": "Comms",
+    "one_liner": "The WhatsApp Business Platform provides a Cloud API for sending messages, managing templates, and handling business...",
+    "auth_methods": [
+      "OAuth2",
+      "Bearer Token"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Production access requires Meta business verification, an approved WhatsApp Business account, and App Review."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Hard",
+    "main_blocker": "Requires Meta business verification and App Review before production access is granted.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://developers.facebook.com/documentation/business-messaging/whatsapp/get-started",
+      "https://developers.facebook.com/documentation/business-messaging/whatsapp/embedded-signup/overview",
+      "https://developers.facebook.com/documentation/development/create-an-app/whatsapp-use-case#permissions-and-features",
+      "https://github.com/mattcoatsworth/Whatsapp-MCP-Server"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Hand-Checked",
+    "slug": "whatsapp-business",
+    "primary_docs_url": "https://developers.facebook.com/documentation/business-messaging/whatsapp/get-started",
+    "rate_limit_note": "Cloud API supports up to 1,000 messages per second, subject to conversation-based pricing and tier limits.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Aircall",
+    "category": "Comms",
+    "one_liner": "Aircall provides a comprehensive REST API for managing calls, contacts, and users, supported by community MCP servers.",
+    "auth_methods": [
+      "Basic Auth",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Aircall API access is bundled with paid Aircall plans and therefore requires an existing customer account."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Moderate",
+    "main_blocker": "Production credentials require an existing paid customer account.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://developer.aircall.io/tutorials/basic-authentication/",
+      "https://developer.aircall.io/api-references/",
+      "https://aircall.io/pricing/",
+      "https://lobehub.com/mcp/themobilefirstco-aircall-mcp-server"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "aircall",
+    "primary_docs_url": "https://developer.aircall.io/tutorials/basic-authentication/",
+    "rate_limit_note": "Rate limiting is listed in the API references menu, though specific limits are not detailed in the provided text.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Vonage",
+    "category": "Comms",
+    "one_liner": "Vonage provides a broad suite of communication APIs for voice, video, messaging, and verification, along with...",
+    "auth_methods": [
+      "Basic Auth",
+      "API Key",
+      "Bearer Token",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can create a Vonage account and immediately access API keys and secrets from the dashboard for production use."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developer.vonage.com/en/verify/concepts/authentication",
+      "https://developer.vonage.com/en/getting-started/overview",
+      "https://developer.vonage.com/en/mcp-server/overview"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "vonage",
+    "primary_docs_url": "https://developer.vonage.com/en/verify/concepts/authentication",
+    "rate_limit_note": "No specific rate limit details were found in the provided documentation snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Google Ads",
+    "category": "Ads/Marketing",
+    "one_liner": "The Google Ads API allows developers to programmatically manage and automate Google Ads campaigns and accounts.",
+    "auth_methods": [
+      "OAuth2",
+      "API Key",
+      "Service Account"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Production access requires an approved developer token and an application review to grant appropriate access levels."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Hard",
+    "main_blocker": "Requires an application review and an approved developer token to access production environments.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://developers.google.com/google-ads/api/docs/oauth/overview",
+      "https://developers.google.com/google-ads/api/docs/api-policy/developer-token",
+      "https://developers.google.com/google-ads/api/docs/developer-toolkit/mcp-server"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "google-ads",
+    "primary_docs_url": "https://developers.google.com/google-ads/api/docs/oauth/overview",
+    "rate_limit_note": "Operation limits are determined by the access level granted to the developer token (e.g., Basic Access vs. Standard Access).",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Meta Ads",
+    "category": "Ads/Marketing",
+    "one_liner": "Meta Ads provides a Marketing API for managing campaigns, though production access requires app review and business...",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Production access to the Marketing API requires app review and business verification. Community MCPs exist but require these same gated credentials."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "Yes",
+    "buildability": "Hard",
+    "main_blocker": "Marketing API is behind Meta app review and business verification.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://developers.facebook.com/documentation/ads-commerce/marketing-api/get-started/authorization",
+      "https://www.augmentcode.com/mcp/meta-ads-mcp"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Hand-Checked",
+    "slug": "meta-ads",
+    "primary_docs_url": "https://developers.facebook.com/documentation/ads-commerce/marketing-api/get-started/authorization",
+    "rate_limit_note": "Rate limiting is applied dynamically based on the app and account tier.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "LinkedIn Ads",
+    "category": "Ads/Marketing",
+    "one_liner": "The LinkedIn Ads API enables developers to manage campaigns, target audiences, and track advertising performance.",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Access to the Advertising API requires applying for approval through the LinkedIn Developer Portal, which is evaluated by LinkedIn and not guaranteed."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "Yes",
+    "buildability": "Hard",
+    "main_blocker": "Production access requires manual approval for the Advertising API product from LinkedIn, which can take days and is not guaranteed.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://learn.microsoft.com/en-us/linkedin/shared/authentication/authentication",
+      "https://learn.microsoft.com/en-us/linkedin/marketing/increasing-access?view=li-lms-2026-06",
+      "https://libraries.io/pypi/linkedin-ads-mcp"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Hand-Checked",
+    "slug": "linkedin-ads",
+    "primary_docs_url": "https://learn.microsoft.com/en-us/linkedin/shared/authentication/authentication",
+    "rate_limit_note": "No specific rate limit details were found in the provided documentation.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "GoHighLevel",
+    "category": "Ads/Marketing",
+    "one_liner": "GoHighLevel provides a comprehensive REST API and an official MCP server for CRM, marketing, and automation workflows.",
+    "auth_methods": [
+      "OAuth2",
+      "Bearer Token"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "HighLevel API access is available on paid agency plans after the temporary trial."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Moderate",
+    "main_blocker": "Production credentials require an existing paid customer account.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://marketplace.gohighlevel.com/docs/Authorization/authorization_doc/",
+      "https://marketplace.gohighlevel.com/docs/",
+      "https://www.gohighlevel.com/pricing",
+      "https://marketplace.gohighlevel.com/docs/other/mcp/index.html"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Hand-Checked",
+    "slug": "gohighlevel",
+    "primary_docs_url": "https://marketplace.gohighlevel.com/docs/Authorization/authorization_doc/",
+    "rate_limit_note": "Not explicitly detailed in the provided evidence.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Mailchimp",
+    "category": "Ads/Marketing",
+    "one_liner": "Mailchimp provides comprehensive REST APIs and an official MCP server for managing marketing campaigns and...",
+    "auth_methods": [
+      "OAuth2",
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up for a Mailchimp account to generate API keys or register OAuth 2 applications without manual approval."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://mailchimp.com/developer/marketing/guides/access-user-data-oauth-2/",
+      "https://mailchimp.com/developer/marketing/api/",
+      "https://mailchimp.com/developer/transactional/guides/how-to-use-mailchimps-transactional-messaging-mcp/"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "mailchimp",
+    "primary_docs_url": "https://mailchimp.com/developer/marketing/guides/access-user-data-oauth-2/",
+    "rate_limit_note": "Rate limits are not explicitly detailed in the provided snippets, but standard API limits apply.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Klaviyo",
+    "category": "Ads/Marketing",
+    "one_liner": "Klaviyo provides a comprehensive REST API and an official MCP server for managing marketing data, profiles, and...",
+    "auth_methods": [
+      "OAuth2",
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can create a free test account to obtain API credentials and start building immediately."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None. The API is well-documented, self-serve, and an official MCP server is available.",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developers.klaviyo.com/en/v2026-01-15/reference/api_overview",
+      "https://developers.klaviyo.com/en/docs/klaviyo_mcp_server"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "klaviyo",
+    "primary_docs_url": "https://developers.klaviyo.com/en/v2026-01-15/reference/api_overview",
+    "rate_limit_note": "Rate limits apply and are documented in the 'Rate limits, status codes, and errors' section, though specific limits depend on the endpoint.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "systeme.io",
+    "category": "Ads/Marketing",
+    "one_liner": "Systeme.io provides a REST API and an official MCP server for managing contacts, tags, subscriptions, and newsletters.",
+    "auth_methods": [
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up for a free account and generate API and MCP keys directly from the settings dashboard."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://help.systeme.io/article/2329-how-to-use-systeme-io-public-api",
+      "https://help.systeme.io/article/2323-how-to-create-a-public-api-key-on-systeme-io",
+      "https://help.systeme.io/article/9489-how-to-use-systeme-ios-mcp",
+      "https://systeme.io"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "systeme-io",
+    "primary_docs_url": "https://help.systeme.io/article/2329-how-to-use-systeme-io-public-api",
+    "rate_limit_note": "No specific rate limits are mentioned in the provided documentation.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Pinterest",
+    "category": "Ads/Marketing",
+    "one_liner": "Pinterest provides a REST API for managing pins, boards, ads, and catalogs, with production access requiring a video...",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Trial access is self-serve, but Standard (production) access requires submitting a video demo of the OAuth flow and core actions for manual approval."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Hard",
+    "main_blocker": "Upgrading from Trial to Standard access requires recording and submitting a video demo of the application for vendor approval.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://developers.pinterest.com/docs/getting-started/set-up-authentication-and-authorization/",
+      "https://developers.pinterest.com/docs/key-concepts/access-tiers/",
+      "https://github.com/clugtu/pinterest-mcp"
+    ],
+    "confidence": 0.5,
+    "verification_status": "Hand-Checked",
+    "slug": "pinterest",
+    "primary_docs_url": "https://developers.pinterest.com/docs/getting-started/set-up-authentication-and-authorization/",
+    "rate_limit_note": "Trial access restricts certain POST endpoints; Standard access lifts these restrictions upon approval.",
+    "last_verified": "2026-07-11"
+  },
+  {
+    "app": "Threads (Meta)",
+    "category": "Ads/Marketing",
+    "one_liner": "The Threads API by Meta allows developers to publish content, manage replies, and retrieve insights via a REST API.",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Requires Meta App Review for production access to permissions for users without a role on the app."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Hard",
+    "main_blocker": "Production access requires passing Meta's App Review process to get permissions approved for public users.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://developers.facebook.com/docs/threads/get-started/",
+      "https://developers.facebook.com/docs/threads/get-started/get-access-tokens-and-permissions/",
+      "https://github.com/quinnjr/threads-mcp",
+      "https://lobehub.com/ru/mcp/metathreads-meta-threads-mcp"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Auto",
+    "slug": "threads",
+    "primary_docs_url": "https://developers.facebook.com/docs/threads/get-started/",
+    "rate_limit_note": "Rate limits and publishing quotas apply, though specific limits are not detailed in the provided snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "SendGrid",
+    "category": "Ads/Marketing",
+    "one_liner": "SendGrid provides a cloud-based email delivery service with a robust REST API for transactional and marketing emails.",
+    "auth_methods": [
+      "API Key",
+      "Bearer Token",
+      "Basic Auth"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "New SendGrid accounts receive a time-limited trial; continuing production email API use requires a paid plan."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "Yes",
+    "buildability": "Moderate",
+    "main_blocker": "Production credentials require an existing paid customer account.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://www.twilio.com/docs/sendgrid/api-reference/how-to-use-the-sendgrid-v3-api/authentication",
+      "https://www.twilio.com/docs/sendgrid/for-developers/sending-email/authentication",
+      "https://support.sendgrid.com/hc/en-us/articles/35270136965403-Twilio-SendGrid-Trial-Account-Plan",
+      "https://github.com/Garoth/sendgrid-mcp"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "sendgrid",
+    "primary_docs_url": "https://www.twilio.com/docs/sendgrid/api-reference/how-to-use-the-sendgrid-v3-api/authentication",
+    "rate_limit_note": "Rate limits apply to the API and are detailed in the 'Rate Limits' section of the v3 API documentation.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Shopify",
+    "category": "Commerce",
+    "one_liner": "Shopify provides a comprehensive commerce platform with GraphQL APIs and official MCP support for AI integrations.",
+    "auth_methods": [
+      "OAuth2",
+      "Bearer Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can create a Partner account, scaffold apps, and generate client credentials or Storefront access tokens directly from the Dev Dashboard."
+    },
+    "api_type": "GraphQL",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://shopify.dev/docs/api/usage/authentication",
+      "https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/authorization-code-grant",
+      "https://shopify.dev/docs/apps/launch/distribution",
+      "https://shopify.dev/docs/apps/build/storefront-mcp"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "shopify",
+    "primary_docs_url": "https://shopify.dev/docs/api/usage/authentication",
+    "rate_limit_note": "Apps can have a maximum of 100 active storefront access tokens per shop.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "WooCommerce",
+    "category": "Commerce",
+    "one_liner": "WooCommerce provides a comprehensive REST API and native MCP integration for managing store data and operations.",
+    "auth_methods": [
+      "API Key",
+      "Basic Auth"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "API keys can be generated directly from the WooCommerce admin dashboard by any store owner."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developer.woocommerce.com/docs/apis/rest-api/authentication/",
+      "https://developer.woocommerce.com/docs/features/mcp/"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "woocommerce",
+    "primary_docs_url": "https://developer.woocommerce.com/docs/apis/rest-api/authentication/",
+    "rate_limit_note": "Rate limits depend on the underlying WordPress hosting environment.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "BigCommerce",
+    "category": "Commerce",
+    "one_liner": "BigCommerce provides comprehensive REST and GraphQL APIs, along with an official MCP server, for e-commerce management.",
+    "auth_methods": [
+      "OAuth2",
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "A sandbox can be created for testing, but production API credentials require an active BigCommerce store or partner/customer relationship."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Moderate",
+    "main_blocker": "Production credentials require an active paid store or an existing BigCommerce partner/customer relationship.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://docs.bigcommerce.com/developer/docs/overview/quick-start",
+      "https://docs.bigcommerce.com/developer/docs/overview/api-fundamentals/api-accounts",
+      "https://docs.bigcommerce.com",
+      "https://docs.bigcommerce.com/developer/api-reference/mcp/overview",
+      "https://www.bigcommerce.com/blog/storefront-mcp/"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "bigcommerce",
+    "primary_docs_url": "https://docs.bigcommerce.com/developer/docs/overview/quick-start",
+    "rate_limit_note": "Rate limits apply and are documented in the API Fundamentals section.",
+    "last_verified": "2026-07-11"
+  },
+  {
+    "app": "Salesforce Commerce Cloud",
+    "category": "Commerce",
+    "one_liner": "Salesforce Commerce Cloud provides REST APIs for building headless commerce experiences.",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Requires an enterprise Salesforce Commerce Cloud account and Account Manager access to create API clients."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "None",
+    "composio_toolkit": "No",
+    "buildability": "Hard",
+    "main_blocker": "Requires an existing customer relationship or partner account; enterprise commerce platform sold via sales with no self-serve signup.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://developer.salesforce.com/docs/commerce/commerce-api/guide/authorization.html"
+    ],
+    "confidence": 0.8,
+    "verification_status": "Auto",
+    "slug": "salesforce-commerce-cloud",
+    "primary_docs_url": "https://developer.salesforce.com/docs/commerce/commerce-api/guide/authorization.html",
+    "rate_limit_note": "Not explicitly detailed in the provided snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Magento (Adobe Commerce)",
+    "category": "Commerce",
+    "one_liner": "Adobe Commerce and Magento Open Source provide comprehensive REST and GraphQL APIs for headless commerce integrations.",
+    "auth_methods": [
+      "Bearer Token",
+      "OAuth2",
+      "Other Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Magento Open Source can be downloaded and installed freely to generate API credentials, though Adobe Commerce cloud hosting requires a paid contract."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developer.adobe.com/commerce/webapi/get-started/authentication/",
+      "https://developer.adobe.com/commerce/webapi/get-started/authentication/gs-authentication-oauth",
+      "https://developer.adobe.com/commerce/webapi/rest/authentication/user",
+      "https://lobehub.com/mcp/codexpect-adobe-commerce-mcp"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Hand-Checked",
+    "slug": "magento",
+    "primary_docs_url": "https://developer.adobe.com/commerce/webapi/get-started/authentication/",
+    "rate_limit_note": "Rate limits depend on the specific hosting environment and infrastructure configuration of the Magento instance.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Squarespace",
+    "category": "Commerce",
+    "one_liner": "Squarespace provides REST Commerce APIs to manage merchant site data such as products, orders, inventory, and...",
+    "auth_methods": [
+      "OAuth2",
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "API keys require a Commerce Advanced plan. OAuth client registration requires submitting a form for manual review by Squarespace."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Hard",
+    "main_blocker": "OAuth client registration requires manual review, and generating API keys requires an existing Commerce Advanced paid plan.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://developers.squarespace.com/oauth",
+      "https://developers.squarespace.com/commerce-apis/authentication-and-permissions",
+      "https://github.com/BusyBee3333/squarespace-mcp-2026-complete"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Hand-Checked",
+    "slug": "squarespace",
+    "primary_docs_url": "https://developers.squarespace.com/oauth",
+    "rate_limit_note": "No specific rate limits were found in the provided documentation.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Ecwid",
+    "category": "Commerce",
+    "one_liner": "Ecwid provides a comprehensive REST API for managing store data, products, orders, and customers using OAuth 2.0.",
+    "auth_methods": [
+      "OAuth2",
+      "Personal Access Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up, create a custom app, and immediately obtain public and secret access tokens for their own store."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.ecwid.com/get-started/make-your-first-api-request",
+      "https://docs.ecwid.com/api-reference",
+      "https://viasocket.com/mcp/ecwid-by-lightspeed"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "ecwid",
+    "primary_docs_url": "https://docs.ecwid.com/get-started/make-your-first-api-request",
+    "rate_limit_note": "600 requests per minute per token. Exceeding this returns a 429 error with a Retry-After header.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Gumroad",
+    "category": "Commerce",
+    "one_liner": "Gumroad provides a REST API and community MCP servers for managing products, sales, and offer codes.",
+    "auth_methods": [
+      "OAuth2",
+      "Personal Access Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can create a Gumroad account and generate access tokens or OAuth applications without manual approval."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Community",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://gumroad.com/help/article/280-create-application-api",
+      "https://glama.ai/mcp/servers/@rmarescu/gumroad-mcp"
+    ],
+    "confidence": 0.7,
+    "verification_status": "Auto",
+    "slug": "gumroad",
+    "primary_docs_url": "https://gumroad.com/help/article/280-create-application-api",
+    "rate_limit_note": "Rate limits are not explicitly detailed in the fetched snippets, but standard API limits likely apply.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Amazon Selling Partner",
+    "category": "Commerce",
+    "one_liner": "The Amazon Selling Partner API (SP-API) provides programmatic access to Amazon Seller Central data for orders...",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Requires creating a Solution Provider Portal account, completing identity verification, and submitting a profile for approval."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "None",
+    "composio_toolkit": "No",
+    "buildability": "Hard",
+    "main_blocker": "Developers must complete a gated identity verification and profile approval process before obtaining production credentials.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://developer-docs.amazon.com/sp-api/docs/onboarding-overview",
+      "https://developer-docs.amazon.com/sp-api/lang-en_EN/docs/sp-api-registration-overview",
+      "https://developer-docs.amazon.com/sp-api/lang-US/docs/onboarding-step-8-call-the-sp-api-in-production"
+    ],
+    "confidence": 0.85,
+    "verification_status": "Hand-Checked",
+    "slug": "amazon-selling-partner",
+    "primary_docs_url": "https://developer-docs.amazon.com/sp-api/docs/onboarding-overview",
+    "rate_limit_note": "Rate limits apply and vary by endpoint, such as specific limits for the Catalog Items and Customer Feedback APIs.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "fanbasis",
+    "category": "Commerce",
+    "one_liner": "FanBasis provides a REST API for managing checkout sessions, subscriptions, customers, and payments for digital...",
+    "auth_methods": [
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up on the FanBasis platform and generate an API key for immediate use."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "None",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://apidocs.fan/",
+      "https://fanbasis.com"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Auto",
+    "slug": "fanbasis",
+    "primary_docs_url": "https://developers.kit.com/api-reference/authentication",
+    "rate_limit_note": "Rate limits and pagination are enforced and detailed in the API documentation.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "DataForSEO",
+    "category": "Research/Scraping",
+    "one_liner": "DataForSEO provides a comprehensive suite of APIs and an official MCP server for SEO, SERP, and digital marketing data.",
+    "auth_methods": [
+      "Basic Auth"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can create a free account and immediately access their API login and password from the dashboard."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.dataforseo.com/v3/auth/",
+      "https://dataforseo.com/help-center/how-to-authenticate-with-dataforseo-google-search-serp-api-api-key-setup-and-code-examples",
+      "https://dataforseo.com/update/dataforseo-mcp-server-launch",
+      "https://dataforseo.com/model-context-protocol"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "dataforseo",
+    "primary_docs_url": "https://docs.dataforseo.com/v3/auth/",
+    "rate_limit_note": "Usage is typically billed based on API calls and spending limits rather than strict rate limits, though specific rate limits are not detailed in the provided snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "SE Ranking",
+    "category": "Research/Scraping",
+    "one_liner": "SE Ranking provides a REST API and an official MCP server for programmatic access to SEO data, keyword research, and...",
+    "auth_methods": [
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "API access requires an SE Ranking account and is billed via an API credit system (e.g., $50 for 250K credits)."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "Requires a paid SE Ranking account with API credits to execute queries.",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://seranking.com/api/project/getting-started/",
+      "https://seranking.com/api/data/getting-started/",
+      "https://seranking.com/api/integrations/mcp/",
+      "https://mcp.directory/servers/se-ranking"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Auto",
+    "slug": "se-ranking",
+    "primary_docs_url": "https://seranking.com/api/project/getting-started/",
+    "rate_limit_note": "Rate limits and usage are governed by the API credit system associated with the user's plan.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Ahrefs",
+    "category": "Research/Scraping",
+    "one_liner": "Ahrefs provides a REST API and an official MCP server to access comprehensive SEO, marketing, and search data.",
+    "auth_methods": [
+      "API Key",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Production access to the API and the remote MCP server requires a paid Ahrefs subscription (Lite plan or higher). Free test queries are available without a paid plan."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Moderate",
+    "main_blocker": "Accessing real production data requires an active paid Ahrefs subscription.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://docs.ahrefs.com/en/api/docs/introduction",
+      "https://docs.ahrefs.com/ahrefs-connect/docs/oauth-guide",
+      "https://docs.ahrefs.com/en/mcp/docs/introduction"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "ahrefs",
+    "primary_docs_url": "https://docs.ahrefs.com/en/api/docs/introduction",
+    "rate_limit_note": "API requests consume units based on rows and fields returned (minimum 50 units per request). The MCP server also enforces row and request limits based on the subscription tier.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "MrScraper",
+    "category": "Research/Scraping",
+    "one_liner": "MrScraper provides a REST API and an official MCP server to programmatically run AI-powered web scrapers.",
+    "auth_methods": [
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "API tokens can be generated and scrapers can be activated for API access directly from the user dashboard."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.mrscraper.com/docs/features/activating-api",
+      "https://docs.mrscraper.com/docs/api/authentication"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Auto",
+    "slug": "mrscraper",
+    "primary_docs_url": "https://docs.mrscraper.com/docs/features/activating-api",
+    "rate_limit_note": "No specific rate limits are mentioned in the provided documentation.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Apify",
+    "category": "Research/Scraping",
+    "one_liner": "Apify provides a platform for web scraping and automation, offering a REST API and an official MCP server to run Actors.",
+    "auth_methods": [
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up for an Apify account and immediately generate an API token from the console."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.apify.com/api/v2/getting-started",
+      "https://docs.apify.com/platform/integrations/mcp"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "apify",
+    "primary_docs_url": "https://docs.apify.com/api/v2/getting-started",
+    "rate_limit_note": "Rate limits are not explicitly detailed in the provided snippets, but standard API usage limits apply based on the pricing plan.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Firecrawl",
+    "category": "Research/Scraping",
+    "one_liner": "Firecrawl provides a REST API and official MCP server for AI agents to search, scrape, and interact with web data.",
+    "auth_methods": [
+      "Bearer Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up for free and immediately obtain an API key to start using the service."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.firecrawl.dev/api-reference/v2-introduction",
+      "https://docs.firecrawl.dev/use-cases/developers-mcp",
+      "https://github.com/firecrawl/firecrawl-mcp-server",
+      "https://www.firecrawl.dev/blog/firecrawl-mcp-chatgpt"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "firecrawl",
+    "primary_docs_url": "https://docs.firecrawl.dev/api-reference/introduction",
+    "rate_limit_note": "The documentation mentions 429 response codes for rate limiting, but specific limits are not detailed in the provided snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Bright Data",
+    "category": "Research/Scraping",
+    "one_liner": "Bright Data provides APIs and an official MCP server for web scraping, proxy infrastructure, and dataset extraction.",
+    "auth_methods": [
+      "API Key",
+      "Bearer Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up for a free trial and an API key is automatically generated upon account creation."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.brightdata.com/api-reference/authentication",
+      "https://docs.brightdata.com/api-reference/marketplace-dataset-api/get-dataset-list",
+      "https://brightdata.com/ai/mcp-server",
+      "https://docs.brightdata.com/cn/ai/mcp-server/faqs"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "bright-data",
+    "primary_docs_url": "https://docs.brightdata.com/api-reference/authentication",
+    "rate_limit_note": "The free tier for the MCP server is limited to 5,000 requests per month.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Sherlock",
+    "category": "Research/Scraping",
+    "one_liner": "Sherlock is an open-source CLI tool for hunting social media accounts by username across various social networks.",
+    "auth_methods": [
+      "None / Not Applicable"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Sherlock is a free, open-source CLI tool that does not require API credentials or vendor approval."
+    },
+    "api_type": "None",
+    "api_breadth": "Narrow",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Blocked",
+    "main_blocker": "Sherlock is a local CLI tool, not a hosted API service, meaning there is no cloud API surface to integrate against.",
+    "recommended_next_action": "Blocked",
+    "evidence_urls": [
+      "https://github.com/sherlock-project/sherlock",
+      "https://www.mcp-gallery.jp/mcp/github/burnsedia/sherlock-mcp"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "sherlock",
+    "primary_docs_url": "https://api-docs.zocdoc.com/guides/authentication",
+    "rate_limit_note": "Not applicable as there is no hosted API.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Waterfall.io",
+    "category": "Research/Scraping",
+    "one_liner": "Waterfall.io provides a REST API for B2B contact and company enrichment, prospecting, and email verification.",
+    "auth_methods": [
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Requires booking a call or contacting sales to obtain an API key. Explicit self-serve access documentation is missing, inferred from 'Book a Call' and 'Get API & Sales Support' links."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "None",
+    "composio_toolkit": "No",
+    "buildability": "Moderate",
+    "main_blocker": "No self-serve sign-up; developers must book a call or contact sales to get API credentials.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://docs.waterfall.io/v1/authentication",
+      "https://docs.waterfall.io/v1/introduction",
+      "https://waterfall.io",
+      "https://www.waterfall.io/"
+    ],
+    "confidence": 0.7,
+    "verification_status": "Auto",
+    "slug": "waterfall",
+    "primary_docs_url": "https://waterfall.io",
+    "rate_limit_note": "Rate limit documentation exists but specific limits are not detailed in the provided snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Clay",
+    "category": "Research/Scraping",
+    "one_liner": "Clay provides a developer API and an official MCP server for searching GTM data, running routines, and reading tables.",
+    "auth_methods": [
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can start a free trial, log into Clay, and generate an API key to use the API and MCP server."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None. The API and MCP server are available and documented.",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://clay.com",
+      "https://developers.clay.com",
+      "https://github.com/clay-inc/clay-mcp",
+      "https://community.clay.com/x/support/5cwjpgptccda/authenticating-an-api-key-in-clay-steps-beyond-cur"
+    ],
+    "confidence": 0.8,
+    "verification_status": "Auto",
+    "slug": "clay",
+    "primary_docs_url": "https://university.clay.com/docs/http-api-with-jwt-authentication-integration-overview",
+    "rate_limit_note": "Not explicitly detailed in the provided documentation snippets.",
+    "last_verified": "2026-07-11"
+  },
+  {
+    "app": "GitHub",
+    "category": "DevInfra",
+    "one_liner": "GitHub provides a comprehensive REST and GraphQL API, along with an official MCP server, for managing repositories...",
+    "auth_methods": [
+      "Personal Access Token",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can instantly generate Personal Access Tokens or register GitHub Apps for OAuth2 and installation tokens without manual approval."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.github.com/en/rest/authentication/authenticating-to-the-rest-api",
+      "https://github.com/github/github-mcp-server"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "github",
+    "primary_docs_url": "https://docs.github.com/en/rest/authentication/authenticating-to-the-rest-api",
+    "rate_limit_note": "Rate limits apply to the REST API, with higher limits granted to authenticated requests.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Vercel",
+    "category": "DevInfra",
+    "one_liner": "Vercel provides a REST API and an official MCP server for managing deployments, projects, and infrastructure.",
+    "auth_methods": [
+      "OAuth2",
+      "Personal Access Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can generate Personal Access Tokens directly from their account settings or use OAuth2 for integrations."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://vercel.com/docs/rest-api",
+      "https://vercel.com/docs/sign-in-with-vercel/authorization-server-api",
+      "https://vercel.com/docs/agent-resources/vercel-mcp"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "vercel",
+    "primary_docs_url": "https://vercel.com/docs/rest-api",
+    "rate_limit_note": "Rate limits are not explicitly detailed in the provided snippets, but standard Vercel API limits apply.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Netlify",
+    "category": "DevInfra",
+    "one_liner": "Netlify provides a comprehensive REST API and an official MCP server for managing sites, deploys, and platform...",
+    "auth_methods": [
+      "Personal Access Token",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up for a free account and generate personal access tokens or configure OAuth applications without manual approval."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.netlify.com/api",
+      "https://docs.netlify.com/start/glossary/",
+      "https://developers.netlify.com/sdk/oauth/get-started/",
+      "https://github.com/netlify/netlify-mcp"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "netlify",
+    "primary_docs_url": "https://docs.netlify.com/api",
+    "rate_limit_note": "Rate limiting is enforced on the API; specific limits are detailed in the API documentation's Rate limiting section.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Cloudflare",
+    "category": "DevInfra",
+    "one_liner": "Cloudflare provides a comprehensive API and official MCP servers for managing web infrastructure, security, and...",
+    "auth_methods": [
+      "Bearer Token",
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can create a free Cloudflare account and generate API tokens or keys directly from the dashboard for production use."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None.",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developers.cloudflare.com/fundamentals/api/get-started/keys/",
+      "https://developers.cloudflare.com/fundamentals/api/reference/permissions/",
+      "https://developers.cloudflare.com/api/",
+      "https://developers.cloudflare.com/agents/model-context-protocol/cloudflare/servers-for-cloudflare/"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "cloudflare",
+    "primary_docs_url": "https://developers.cloudflare.com/fundamentals/api/get-started/keys/",
+    "rate_limit_note": "Standard API rate limits apply; specific limits depend on the endpoint and the user's account plan.",
+    "last_verified": "2026-07-11"
+  },
+  {
+    "app": "Supabase",
+    "category": "DevInfra",
+    "one_liner": "Supabase provides a comprehensive REST Management API and an official remote MCP server for managing projects and...",
+    "auth_methods": [
+      "Personal Access Token",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up and generate Personal Access Tokens for the Management API or use OAuth2 for the remote MCP server without manual approval."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://supabase.com/docs/reference/api/v1-update-realtime-config",
+      "https://supabase.com/docs/guides/ai-tools/mcp"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "supabase",
+    "primary_docs_url": "https://supabase.com/docs/reference/api/v1-update-realtime-config",
+    "rate_limit_note": "Rate limits are mentioned in the documentation architecture but specific thresholds are not detailed in the fetched snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Neo4j",
+    "category": "DevInfra",
+    "one_liner": "Neo4j is a leading graph database offering an HTTP API, Aura cloud API, and an official MCP server for AI integrations.",
+    "auth_methods": [
+      "OAuth2",
+      "Basic Auth"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "All Aura tiers, including free/trial, can create API credentials. Self-managed instances also support basic auth."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://neo4j.com/docs/aura/api/authentication/",
+      "https://neo4j.com/docs/http-api/current/authentication-authorization/",
+      "https://github.com/neo4j/mcp",
+      "https://neo4j.com/blog/developer/model-context-protocol/"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "neo4j",
+    "primary_docs_url": "https://neo4j.com/developer/kb/a-lightweight-approach-to-testing-the-neo4j-rest-api-with-authentication/",
+    "rate_limit_note": "Not explicitly detailed in the provided snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Snowflake",
+    "category": "DevInfra",
+    "one_liner": "Snowflake provides extensive REST APIs and an official MCP server for data management, analytics, and Cortex AI.",
+    "auth_methods": [
+      "OAuth2",
+      "Personal Access Token",
+      "Service Account"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Production use requires a paid Snowflake account; trial accounts are available for testing."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Moderate",
+    "main_blocker": "Production access requires an active, paid Snowflake enterprise account.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://docs.snowflake.com/en/developer-guide/snowflake-rest-api/authentication",
+      "https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents-mcp",
+      "https://github.com/Snowflake-Labs/mcp"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Hand-Checked",
+    "slug": "snowflake",
+    "primary_docs_url": "https://docs.snowflake.com/en/developer-guide/snowflake-rest-api/authentication",
+    "rate_limit_note": "Rate limits depend on warehouse sizing and account tier.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "MongoDB Atlas",
+    "category": "DevInfra",
+    "one_liner": "MongoDB Atlas provides a multi-cloud database platform with a REST Administration API and an official MCP server.",
+    "auth_methods": [
+      "OAuth2",
+      "API Key",
+      "Service Account"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up for free and generate API keys or OAuth2 Service Accounts to access the Atlas Administration API."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://www.mongodb.com/docs/atlas/api/atlas-admin-api-ref/",
+      "https://www.mongodb.com/docs/atlas/api/api-authentication/",
+      "https://www.mongodb.com/docs/atlas/architecture/current/auth/authentication/",
+      "https://www.mongodb.com/docs/atlas/configure-api-access/",
+      "https://www.mongodb.com/company/blog/announcing-mongodb-mcp-server",
+      "https://mcpatlas.dev/server/mcp-mongodb"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "mongodb-atlas",
+    "primary_docs_url": "https://www.mongodb.com/docs/atlas/api/atlas-admin-api-ref/",
+    "rate_limit_note": "Standard rate limits apply to the Atlas Administration API, though specific thresholds are not detailed in the provided snippets.",
+    "last_verified": "2026-07-11"
+  },
+  {
+    "app": "Datadog",
+    "category": "DevInfra",
+    "one_liner": "Datadog provides a comprehensive observability and security platform with a REST API and an official MCP server.",
+    "auth_methods": [
+      "API Key",
+      "Personal Access Token",
+      "Service Account"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up for a Datadog account to generate API and Application keys for integration access."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.datadoghq.com/api/latest/authentication/",
+      "https://docs.datadoghq.com/account_management/api-app-keys/",
+      "https://docs.datadoghq.com/mcp_server/setup/"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Hand-Checked",
+    "slug": "datadog",
+    "primary_docs_url": "https://docs.datadoghq.com/api/latest/authentication/",
+    "rate_limit_note": "Standard API rate limits apply based on the Datadog subscription plan, though specific limits are not detailed in the provided snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Sentry",
+    "category": "DevInfra",
+    "one_liner": "Sentry provides a comprehensive REST API and an official MCP server for error tracking and performance monitoring.",
+    "auth_methods": [
+      "Personal Access Token",
+      "OAuth2",
+      "Other Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Personal access tokens and internal integration tokens are self-serve. Creating a public OAuth2 application requires partner registration and approval."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.sentry.io/api/auth/",
+      "https://github.com/getsentry/sentry-mcp"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "sentry",
+    "primary_docs_url": "https://docs.sentry.io/api/auth/",
+    "rate_limit_note": "Rate limits apply and are documented in the API reference, though specific limits depend on the endpoint and account.",
+    "last_verified": "2026-07-11"
+  },
+  {
+    "app": "Notion",
+    "category": "Productivity/PM",
+    "one_liner": "Notion provides a comprehensive REST API and an official hosted MCP server for integrating AI tools and external apps.",
+    "auth_methods": [
+      "OAuth2",
+      "Personal Access Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can create internal connections or public OAuth apps directly from the Notion Developer Portal without manual approval."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developers.notion.com/reference/authentication",
+      "https://developers.notion.com/guides/get-started/personal-access-tokens",
+      "https://developers.notion.com/guides/mcp/overview"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "notion",
+    "primary_docs_url": "https://developers.notion.com/reference/authentication",
+    "rate_limit_note": "Request limits exist and are documented in the API reference, though specific thresholds are not detailed in the fetched snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Airtable",
+    "category": "Productivity/PM",
+    "one_liner": "Airtable provides a REST API and an official MCP server for managing bases, tables, and records.",
+    "auth_methods": [
+      "Personal Access Token",
+      "OAuth2",
+      "Service Account"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Personal access tokens and OAuth integrations can be created by users without manual approval."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://community.airtable.com/announcements-6/new-beta-new-api-authentication-methods-endpoints-and-public-api-docs-1442",
+      "https://support.airtable.com/docs/using-the-airtable-mcp-server"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "airtable",
+    "primary_docs_url": "https://community.airtable.com/announcements-6/new-beta-new-api-authentication-methods-endpoints-and-public-api-docs-1442",
+    "rate_limit_note": "Not explicitly detailed in the provided evidence.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Linear",
+    "category": "Productivity/PM",
+    "one_liner": "Linear provides a GraphQL API, TypeScript SDK, and an official MCP server for managing issues, projects, and workflows.",
+    "auth_methods": [
+      "OAuth2",
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up and generate personal API keys or create OAuth2 applications without manual approval."
+    },
+    "api_type": "GraphQL",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developers.linear.app",
+      "https://linear.app/developers/oauth-2-0-authentication",
+      "https://linear.app/docs/mcp"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "linear",
+    "primary_docs_url": "https://linear.app/developers/oauth-2-0-authentication",
+    "rate_limit_note": "Rate limiting is enforced on the GraphQL API; specific limits are detailed in the developer documentation.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Jira",
+    "category": "Productivity/PM",
+    "one_liner": "Jira provides a comprehensive REST API and an official MCP server for integrating project management workflows.",
+    "auth_methods": [
+      "OAuth2",
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can generate API tokens for Basic Auth or create OAuth 2.0 apps via the developer console without manual approval."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developer.atlassian.com/cloud/jira/platform/basic-auth-for-rest-apis/",
+      "https://developer.atlassian.com/cloud/jira/platform/oauth-2-3lo-apps/",
+      "https://support.atlassian.com/atlassian-rovo-mcp-server/docs/getting-started-with-the-atlassian-remote-mcp-server/"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "jira",
+    "primary_docs_url": "https://developer.atlassian.com/cloud/jira/platform/basic-auth-for-rest-apis/",
+    "rate_limit_note": "Rate limiting applies to the REST API, with specific documentation available for Bulk Operation APIs.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Asana",
+    "category": "Productivity/PM",
+    "one_liner": "Asana provides a comprehensive REST API and an official MCP server to integrate applications and AI assistants with...",
+    "auth_methods": [
+      "Personal Access Token",
+      "OAuth2",
+      "Service Account"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can quickly generate a Personal Access Token (PAT) or set up an OAuth app via the developer console without manual approval."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developers.asana.com/docs/authentication",
+      "https://developers.asana.com/docs/oauth",
+      "https://developers.asana.com/docs/mcp-server",
+      "https://developers.asana.com/docs/using-asanas-mcp-server"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "asana",
+    "primary_docs_url": "https://developers.asana.com/docs/authentication",
+    "rate_limit_note": "Rate limits apply and are documented in the API reference, though specific limits are not detailed in the fetched snippets.",
+    "last_verified": "2026-07-11"
+  },
+  {
+    "app": "Monday.com",
+    "category": "Productivity/PM",
+    "one_liner": "Monday.com provides a GraphQL API and an official Model Context Protocol (MCP) server for integrating AI agents and...",
+    "auth_methods": [
+      "OAuth2",
+      "Personal Access Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up for a free developer account to access the API and MCP without manual approval."
+    },
+    "api_type": "GraphQL",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developer.monday.com/api-reference/docs/authentication",
+      "https://developer.monday.com/api-reference/docs/basics",
+      "https://developer.monday.com/api-reference/docs/monday-mcp-overview"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "monday",
+    "primary_docs_url": "https://developer.monday.com/api-reference/docs/authentication",
+    "rate_limit_note": "Rate limits are enforced and documented in the API reference, though specific quotas depend on the account plan.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "ClickUp",
+    "category": "Productivity/PM",
+    "one_liner": "ClickUp provides a REST API and an official MCP server for managing tasks, workspaces, and productivity workflows.",
+    "auth_methods": [
+      "Personal Access Token",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can generate personal API tokens directly from their account settings on any plan, or create OAuth apps for broader integrations."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None.",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developer.clickup.com/docs/authentication",
+      "https://developer.clickup.com/docs/connect-an-ai-assistant-to-clickups-mcp-server",
+      "https://help.clickup.com/hc/en-us/articles/33335772678423-What-is-ClickUp-MCP"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "clickup",
+    "primary_docs_url": "https://developer.clickup.com/reference/authorization",
+    "rate_limit_note": "Rate limits apply to the ClickUp API and are detailed in their official Rate Limits documentation.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Coda",
+    "category": "Productivity/PM",
+    "one_liner": "Coda (now Superhuman Docs) provides a comprehensive REST API and an official MCP server for interacting with docs...",
+    "auth_methods": [
+      "OAuth2",
+      "Personal Access Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Standard API tokens and OAuth2 apps can be created by users, though some Admin API endpoints require Enterprise plans."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://coda.io/developers/apis/v1",
+      "https://help.coda.io/hc/en-us/articles/44722769665549-Security-recommendations-for-the-Coda-MCP",
+      "https://help.coda.io/hc/en-us/articles/44722661982989-Connect-to-the-Coda-MCP"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "coda",
+    "primary_docs_url": "https://coda.io/developers/apis/v1",
+    "rate_limit_note": "Rate limiting is enforced; specific limits are detailed in the API documentation.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Smartsheet",
+    "category": "Productivity/PM",
+    "one_liner": "Smartsheet provides a REST API and an official MCP server for programmatically managing projects, sheets, and workflows.",
+    "auth_methods": [
+      "API Key",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can generate an API access token directly in the Smartsheet UI under Personal Settings to start making API calls immediately."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None.",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developers.smartsheet.com/api/smartsheet/guides/basics/authentication",
+      "https://developers.smartsheet.com/api/smartsheet/guides/getting-started",
+      "https://developers.smartsheet.com/api/smartsheet/guides/advanced-topics/oauth",
+      "https://developers.smartsheet.com/ai-mcp/smartsheet/mcp-server",
+      "https://developers.smartsheet.com/ai-mcp/smartsheet/install-the-smartsheet-mcp-server"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "smartsheet",
+    "primary_docs_url": "https://developers.smartsheet.com/api/smartsheet/guides/basics/authentication",
+    "rate_limit_note": "Specific rate limits are not detailed in the provided snippets, but standard API limitations apply.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Harvest",
+    "category": "Productivity/PM",
+    "one_liner": "Harvest provides a REST API and community MCP servers for managing time tracking, invoicing, and projects.",
+    "auth_methods": [
+      "Personal Access Token",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "All Harvest accounts have API access. Developers can generate Personal Access Tokens or register OAuth2 applications directly from the Developers section of Harvest ID."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://help.getharvest.com/api-v2/authentication-api/authentication/authentication/",
+      "https://support.getharvest.com/hc/en-us/articles/360048180732-The-Harvest-API",
+      "https://github.com/taiste/harvest-mcp-server"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "harvest",
+    "primary_docs_url": "https://help.getharvest.com/api-v2/authentication-api/authentication/authentication/",
+    "rate_limit_note": "Harvest throttles API requests, with details available in their API overview documentation.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Stripe",
+    "category": "Fintech",
+    "one_liner": "Stripe provides a comprehensive REST API and an official MCP server for integrating payments, billing, and financial...",
+    "auth_methods": [
+      "API Key",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Test keys are immediate, but live Stripe services require business verification and account activation."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Hard",
+    "main_blocker": "Production use requires Stripe business verification and activation of the applicable live service.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://docs.stripe.com/api/authentication",
+      "https://docs.stripe.com/connect/oauth-reference",
+      "https://docs.stripe.com/get-started/account/set-up",
+      "https://docs.stripe.com/mcp"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "stripe",
+    "primary_docs_url": "https://docs.stripe.com/api/authentication",
+    "rate_limit_note": "Not explicitly detailed in the fetched evidence, but standard API limits apply.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Plaid",
+    "category": "Fintech",
+    "one_liner": "Plaid provides APIs for connecting financial accounts, verifying identity, and moving money, along with official MCP...",
+    "auth_methods": [
+      "API Key",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Sandbox access is self-serve, but production access requires passing validation and a formal approval process from Plaid."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Moderate",
+    "main_blocker": "Production access requires passing endpoint validation and requesting approval from Plaid.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://plaid.com/docs/api/",
+      "https://plaid.com/docs/link/oauth/",
+      "https://plaid.com/docs/resources/mcp/"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Hand-Checked",
+    "slug": "plaid",
+    "primary_docs_url": "https://plaid.com/docs/api/",
+    "rate_limit_note": "Not explicitly detailed in the provided evidence.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Binance",
+    "category": "Fintech",
+    "one_liner": "Binance provides a comprehensive REST API for cryptocurrency trading, market data, and account management.",
+    "auth_methods": [
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "API keys can be generated directly from the API Management page of a user's Binance account."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.binance.us/",
+      "https://developers.binance.com/legacy-docs/binance-spot-api-docs/rest-api/request-security",
+      "https://github.com/TermiX-official/binance-mcp",
+      "https://agenthotspot.com/connectors/oss/binance-termix-official"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "binance",
+    "primary_docs_url": "https://docs.binance.us/",
+    "rate_limit_note": "The API enforces IP limits, order rate limits, and general REST rate limits.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Paygent Connect",
+    "category": "Fintech",
+    "one_liner": "Paygent Connect provides a REST API for marketplace payments with self-serve access and a free plan.",
+    "auth_methods": [
+      "Bearer Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "The site shows sandbox testing, signup, and a free plan, indicating self-serve access."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "None",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://www.gopaygent.com/"
+    ],
+    "confidence": 0.7,
+    "verification_status": "Auto",
+    "slug": "paygent-connect",
+    "primary_docs_url": "https://www.gopaygent.com/",
+    "rate_limit_note": "Not found in the fetched documentation.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "iPayX",
+    "category": "Fintech",
+    "one_liner": "iPayX provides a REST API for fiat-to-crypto payments and a community MCP server for forensic FX auditing.",
+    "auth_methods": [
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "REST API requires a self-serve account and API key. The community MCP server requires no authentication or signup."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.i-pay.io/",
+      "https://docs.i-pay.io/testing-and-faqs/FAQ/",
+      "https://mcpservers.org/servers/ipayx-technologies/mcp-fx-audit"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Auto",
+    "slug": "ipayx",
+    "primary_docs_url": "https://docs.i-pay.io/",
+    "rate_limit_note": "The MCP audit_transaction tool is limited to 3 free requests per month per IP.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "QuickBooks",
+    "category": "Fintech",
+    "one_liner": "QuickBooks provides a REST API and an official MCP server for integrating with its accounting and financial software.",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can create an app on the Intuit Developer Portal to get credentials. Publicly listing an app requires a publishing review."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developer.intuit.com/app/developer/qbpayments/docs/develop/authentication-and-authorization/oauth-2.0",
+      "https://github.com/intuit/quickbooks-online-mcp-server"
+    ],
+    "confidence": 0.85,
+    "verification_status": "Auto",
+    "slug": "quickbooks",
+    "primary_docs_url": "https://developer.intuit.com/app/developer/qbo/docs/develop/authentication-and-authorization/faq",
+    "rate_limit_note": "Standard API rate limits apply; specific limits are not detailed in the provided snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Xero",
+    "category": "Fintech",
+    "one_liner": "Xero provides a comprehensive developer platform with REST APIs and an official MCP server for accounting data...",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up for a free account to build on the Xero platform and access the API and MCP server."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developer.xero.com",
+      "https://developer.xero.com/documentation/guides/oauth2/auth-flow/",
+      "https://github.com/xeroapi/xero-mcp-server",
+      "https://developer.xero.com/faq/AI-Toolkit"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "xero",
+    "primary_docs_url": "https://developer.xero.com",
+    "rate_limit_note": "Not explicitly detailed in the provided evidence.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Brex",
+    "category": "Fintech",
+    "one_liner": "Brex provides a unified spend platform API and an official MCP server for managing expenses, cards, and budgets.",
+    "auth_methods": [
+      "Bearer Token",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Requires an active Brex business account with admin privileges to accept the developer agreement and generate tokens or enable the MCP beta."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Moderate",
+    "main_blocker": "Developers must have an active Brex business account with admin privileges to access the Developer settings, generate API tokens, or enable the MCP integration.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://developer.brex.com/guides/authentication",
+      "https://developer.brex.com/docs/mcp",
+      "https://developer.brex.com"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "brex",
+    "primary_docs_url": "https://developer.brex.com/guides/partner_authentication",
+    "rate_limit_note": "Rate limits are mentioned in the documentation navigation, but specific limits are not detailed in the fetched text.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Ramp",
+    "category": "Fintech",
+    "one_liner": "Ramp provides a Developer API and an official MCP server for programmatic access to corporate cards and spend...",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Requires Admin access to an existing Ramp business account. Sandbox access is not self-serve and requires contacting an account manager."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Hard",
+    "main_blocker": "API access requires an existing Ramp business account with Admin privileges, and sandbox access is manually provisioned by an account manager.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://support.ramp.com/accessing-the-developer-api/",
+      "https://support.ramp.com/ramp-mcp/",
+      "https://github.com/ramp-public/ramp_mcp"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Auto",
+    "slug": "ramp",
+    "primary_docs_url": "https://support.ramp.com/accessing-the-developer-api/",
+    "rate_limit_note": "Not explicitly detailed in the provided text, though MCP docs mention ETL operation limits.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "PitchBook",
+    "category": "Fintech",
+    "one_liner": "PitchBook provides an enterprise REST API and an official MCP server for accessing private and public capital market...",
+    "auth_methods": [
+      "OAuth2",
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "Access to the PitchBook API and Premium MCP server requires a standalone enterprise contract agreement."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Hard",
+    "main_blocker": "Requires an enterprise contract and licensed user account to obtain API credentials or access the Premium MCP server.",
+    "recommended_next_action": "Partner-Gated",
+    "evidence_urls": [
+      "https://pitchbook.com/help/PitchBook-api",
+      "https://pitchbook.com/media/press-releases/pitchbook-announces-new-essential-mcp-integration-with-perplexity-expanding-access-to-ai-powered-verifiable-market-intelligence",
+      "https://apigene.ai/mcp/official/pitchbook",
+      "https://mcpservers.org/remote-mcp-servers/pitchbook"
+    ],
+    "confidence": 0.8,
+    "verification_status": "Auto",
+    "slug": "pitchbook",
+    "primary_docs_url": "https://pitchbook.com/help/PitchBook-api",
+    "rate_limit_note": "Each request incurs a credit cost according to the enterprise contract.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "NotebookLM",
+    "category": "AI/Meeting-tools",
+    "one_liner": "NotebookLM offers a gated Enterprise REST API for managing notebooks, while community MCPs rely on browser cookies.",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "The official REST API is restricted to NotebookLM Enterprise, requiring Google Cloud setup, licenses, and an identity provider. Community MCPs exist but use unsupported browser cookie extraction."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Hard",
+    "main_blocker": "No public self-serve API for standard NotebookLM; the official API requires NotebookLM Enterprise licenses and Google Cloud identity setup.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://docs.cloud.google.com/gemini/enterprise/notebooklm-enterprise/docs/api-notebooks",
+      "https://docs.cloud.google.com/gemini/enterprise/notebooklm-enterprise/docs/set-up-notebooklm",
+      "https://cloud.google.com/gemini",
+      "https://github.com/jacob-bd/notebooklm-mcp-cli",
+      "https://mcp.directory/servers/notebooklm"
+    ],
+    "confidence": 0.8,
+    "verification_status": "Auto",
+    "slug": "notebooklm",
+    "primary_docs_url": "https://docs.cloud.google.com/gemini/enterprise/notebooklm-enterprise/docs/set-up-notebooklm",
+    "rate_limit_note": "Not explicitly documented in the provided snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Otter AI",
+    "category": "AI/Meeting-tools",
+    "one_liner": "Otter AI provides a REST API and an official MCP server for meeting transcripts, gated behind Enterprise plans.",
+    "auth_methods": [
+      "API Key",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Gated",
+      "note": "API and MCP access is restricted to Enterprise customers and requires contacting an account manager to enable."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Hard",
+    "main_blocker": "Access requires an Enterprise plan and manual approval from an account manager.",
+    "recommended_next_action": "Needs Outreach",
+    "evidence_urls": [
+      "https://help.otter.ai/hc/en-us/articles/36130822688279-Otter-ai-Public-API",
+      "https://help.otter.ai/hc/en-us/articles/4412365535895-Does-Otter-offer-an-open-API",
+      "https://help.otter.ai/hc/en-us/articles/35287607569687-Otter-MCP-Server"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Hand-Checked",
+    "slug": "otter-ai",
+    "primary_docs_url": "https://help.otter.ai/hc/en-us/articles/36130822688279-Otter-ai-Public-API",
+    "rate_limit_note": "Enterprise Public API access is currently limited to 10 requests per second.",
+    "last_verified": "2026-07-12"
+  },
+  {
+    "app": "Fathom",
+    "category": "AI/Meeting-tools",
+    "one_liner": "Fathom provides a REST API, SDKs, and an official MCP server to access AI meeting transcripts and summaries.",
+    "auth_methods": [
+      "API Key",
+      "Bearer Token",
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can register an OAuth app or generate API keys directly from their account settings."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Official",
+    "composio_toolkit": "Yes",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developers.fathom.ai/sdks/authentication",
+      "https://developers.fathom.ai/sdks/oauth",
+      "https://developers.fathom.ai/mcp-docs"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Hand-Checked",
+    "slug": "fathom",
+    "primary_docs_url": "https://developers.fathom.ai/sdks/authentication",
+    "rate_limit_note": "Rate limits are mentioned in the documentation for OAuth and API usage, but specific thresholds are not detailed in the provided text.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Consensus",
+    "category": "AI/Meeting-tools",
+    "one_liner": "Consensus provides an AI-powered search engine for peer-reviewed academic papers, offering both a gated REST API and...",
+    "auth_methods": [
+      "OAuth2"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "The REST API requires requesting access (Gated), but the official MCP server is self-serve via OAuth2 using a standard Consensus account."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None for the MCP server; however, direct REST API access requires manual approval.",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://consensus.app/home/api/",
+      "https://docs.consensus.app/docs/mcp"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Auto",
+    "slug": "consensus",
+    "primary_docs_url": "https://consensus.app/home/api/",
+    "rate_limit_note": "No specific rate limits are mentioned in the provided documentation.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Reducto",
+    "category": "AI/Meeting-tools",
+    "one_liner": "Reducto provides a REST API and an official MCP server for AI-driven document parsing, extraction, and processing.",
+    "auth_methods": [
+      "Bearer Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up, obtain an API key, and start using the API or MCP server immediately."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.reducto.ai/quickstart",
+      "https://docs.reducto.ai/api-reference/legacy/pipeline",
+      "https://docs.reducto.ai/mcp-server"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "reducto",
+    "primary_docs_url": "https://docs.reducto.ai/quickstart",
+    "rate_limit_note": "Rate limits and concurrency throttles exist and are documented in the API reference, though specific limits depend on the account tier.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Devin",
+    "category": "AI/Meeting-tools",
+    "one_liner": "Devin is an autonomous AI software engineer offering a REST API and an official MCP server for programmatic access.",
+    "auth_methods": [
+      "API Key",
+      "Personal Access Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up, create an organization, and generate Service User API keys for automation."
+    },
+    "api_type": "REST",
+    "api_breadth": "Broad",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://docs.devin.ai/api-reference/authentication",
+      "https://docs.devin.ai/work-with-devin/devin-mcp"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Auto",
+    "slug": "devin",
+    "primary_docs_url": "https://docs.devin.ai/api-reference/authentication",
+    "rate_limit_note": "Rate limits are not explicitly detailed in the provided snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "higgsfield",
+    "category": "AI/Meeting-tools",
+    "one_liner": "Higgsfield provides an AI video and image generation platform with an official MCP server and REST API.",
+    "auth_methods": [
+      "OAuth2",
+      "API Key"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up and authenticate via the CLI or MCP using a browser-based login, or generate API keys for SDK use."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None.",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://higgsfield.ai/mcp",
+      "https://higgsfield.ai/cli",
+      "https://github.com/geopopos/higgsfield_ai_mcp"
+    ],
+    "confidence": 0.9,
+    "verification_status": "Auto",
+    "slug": "higgsfield",
+    "primary_docs_url": "https://higgsfield.ai/cli",
+    "rate_limit_note": "Not explicitly detailed in the provided snippets.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Mermaid CLI",
+    "category": "AI/Meeting-tools",
+    "one_liner": "Mermaid CLI is an open-source command-line tool for generating diagrams, lacking a hosted API but supported by...",
+    "auth_methods": [
+      "None / Not Applicable"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Open-source local CLI tool; no hosted API credentials required."
+    },
+    "api_type": "None",
+    "api_breadth": "Narrow",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Blocked",
+    "main_blocker": "Mermaid CLI is a local open-source tool, not a hosted API service.",
+    "recommended_next_action": "Blocked",
+    "evidence_urls": [
+      "https://github.com/mermaid-js/mermaid-cli",
+      "https://github.com/peng-shawn/mermaid-mcp-server"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "mermaid-cli",
+    "primary_docs_url": "https://github.com/data-mermaid/mermaid-api",
+    "rate_limit_note": "Not applicable as it is a local tool.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "YouTube Transcript",
+    "category": "AI/Meeting-tools",
+    "one_liner": "TranscriptAPI provides a REST API and official MCP server to extract YouTube transcripts, search videos, and fetch...",
+    "auth_methods": [
+      "Bearer Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Developers can sign up for free, access the dashboard, and generate an API key immediately."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Official",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://transcriptapi.com",
+      "https://transcriptapi.com/docs/llms-small.txt",
+      "https://transcriptapi.com/blog/youtube-mcp-server-setup-connect-claude"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "youtube-transcript",
+    "primary_docs_url": "https://transcriptapi.com/blog/youtube-transcript-api-complete-developer-guide",
+    "rate_limit_note": "Usage is credit-based; extracting a transcript or searching costs 1 credit, while some metadata endpoints are free.",
+    "last_verified": "2026-07-10"
+  },
+  {
+    "app": "Grain",
+    "category": "AI/Meeting-tools",
+    "one_liner": "Grain provides a REST API and a community MCP server to access meeting recordings, transcripts, and workspace data.",
+    "auth_methods": [
+      "Personal Access Token",
+      "OAuth2",
+      "Other Token"
+    ],
+    "access_model": {
+      "kind": "Self-Serve",
+      "note": "Personal Access Tokens can be generated by users on the Starter plan and above. Workspace Access Tokens require Business or Enterprise plans."
+    },
+    "api_type": "REST",
+    "api_breadth": "Moderate",
+    "existing_mcp": "Community",
+    "composio_toolkit": "No",
+    "buildability": "Easy",
+    "main_blocker": "None",
+    "recommended_next_action": "Build Now",
+    "evidence_urls": [
+      "https://developers.grain.com",
+      "https://support.grain.com/en/articles/15507288-grain-api",
+      "https://github.com/eadm/grain-mcp-server"
+    ],
+    "confidence": 0.95,
+    "verification_status": "Auto",
+    "slug": "grain",
+    "primary_docs_url": "https://developers.grain.com",
+    "rate_limit_note": "300 requests per minute per token.",
+    "last_verified": "2026-07-10"
+  }
+]

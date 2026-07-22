@@ -1,0 +1,36 @@
+# Environment and local Python state
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Secret-bearing and private runtime state
+private/
+secrets/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+auth.json
+storage_state.json
+cookies.json
+recordings/private/
+screenshots/private/
+
+# Local tooling and OS files
+.DS_Store
+.idea/
+.vscode/
+dist/
+build/
+*.egg-info/

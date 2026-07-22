@@ -1,0 +1,1936 @@
+{
+  "schema_version": 1,
+  "generated": "2026-07-12T08:56:27.762913+00:00",
+  "source": "Composio Python SDK",
+  "sdk_version": "0.17.1",
+  "summary": {
+    "n_apps": 100,
+    "active": 50,
+    "catalog_only": 1,
+    "missing": 49,
+    "tools_total": 6902,
+    "tools_median": 97.0,
+    "trigger_enabled": 16,
+    "without_triggers": 35
+  },
+  "apps": {
+    "salesforce": {
+      "app": "Salesforce",
+      "status": "Active",
+      "toolkit_slug": "salesforce",
+      "toolkit_name": "Salesforce",
+      "tools_count": 184,
+      "triggers_count": 7,
+      "auth_schemes": [
+        "OAUTH2",
+        "S2S_OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260708_00",
+      "versions_count": 50,
+      "categories": [
+        "CRM",
+        "Contact Management"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/salesforce",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "hubspot": {
+      "app": "HubSpot",
+      "status": "Active",
+      "toolkit_slug": "hubspot",
+      "toolkit_name": "HubSpot",
+      "tools_count": 244,
+      "triggers_count": 2,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260708_00",
+      "versions_count": 50,
+      "categories": [
+        "CRM",
+        "Marketing Automation"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/hubspot",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "pipedrive": {
+      "app": "Pipedrive",
+      "status": "Active",
+      "toolkit_slug": "pipedrive",
+      "toolkit_name": "Pipedrive",
+      "tools_count": 399,
+      "triggers_count": 3,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260616_00",
+      "versions_count": 50,
+      "categories": [
+        "CRM",
+        "Sales & CRM"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/pipedrive",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "attio": {
+      "app": "Attio",
+      "status": "Active",
+      "toolkit_slug": "attio",
+      "toolkit_name": "Attio",
+      "tools_count": 99,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260623_00",
+      "versions_count": 50,
+      "categories": [
+        "CRM"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/attio",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "twenty": {
+      "app": "Twenty",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/twenty",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "podio": {
+      "app": "Podio",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/podio",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "zoho-crm": {
+      "app": "Zoho CRM",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/zoho-crm",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "close": {
+      "app": "Close",
+      "status": "Active",
+      "toolkit_slug": "close",
+      "toolkit_name": "Close",
+      "tools_count": 6,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260615_00",
+      "versions_count": 23,
+      "categories": [
+        "CRM",
+        "Drip Emails"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/close",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "copper": {
+      "app": "Copper",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/copper",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "dealcloud": {
+      "app": "DealCloud",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/dealcloud",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "zendesk": {
+      "app": "Zendesk",
+      "status": "Active",
+      "toolkit_slug": "zendesk",
+      "toolkit_name": "Zendesk",
+      "tools_count": 452,
+      "triggers_count": 2,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260702_00",
+      "versions_count": 50,
+      "categories": [
+        "CRM",
+        "Customer Support"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/zendesk",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "intercom": {
+      "app": "Intercom",
+      "status": "Active",
+      "toolkit_slug": "intercom",
+      "toolkit_name": "Intercom",
+      "tools_count": 133,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260618_00",
+      "versions_count": 50,
+      "categories": [
+        "CRM",
+        "Customer Support"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/intercom",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "freshdesk": {
+      "app": "Freshdesk",
+      "status": "Active",
+      "toolkit_slug": "freshdesk",
+      "toolkit_name": "Freshdesk",
+      "tools_count": 178,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260702_00",
+      "versions_count": 42,
+      "categories": [
+        "CRM",
+        "Customer Support"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/freshdesk",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "front": {
+      "app": "Front",
+      "status": "Catalog-only",
+      "toolkit_slug": "front",
+      "toolkit_name": "Front",
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20251208_00",
+      "versions_count": 9,
+      "categories": [
+        "CRM",
+        "Sales & Customer Support"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/front",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "pylon": {
+      "app": "Pylon",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/pylon",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "liveagent": {
+      "app": "LiveAgent",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/liveagent",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "plain": {
+      "app": "Plain",
+      "status": "Active",
+      "toolkit_slug": "plain",
+      "toolkit_name": "Plain",
+      "tools_count": 22,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260615_00",
+      "versions_count": 29,
+      "categories": [
+        "Customer Support"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/plain",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "help-scout": {
+      "app": "Help Scout",
+      "status": "Active",
+      "toolkit_slug": "help_scout",
+      "toolkit_name": "Help Scout",
+      "tools_count": 129,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260615_00",
+      "versions_count": 11,
+      "categories": [
+        "Communication",
+        "Customer Support"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/help_scout",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "gorgias": {
+      "app": "Gorgias",
+      "status": "Active",
+      "toolkit_slug": "gorgias",
+      "toolkit_name": "Gorgias",
+      "tools_count": 32,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260616_00",
+      "versions_count": 29,
+      "categories": [
+        "CRM",
+        "Customer Support"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/gorgias",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "gladly": {
+      "app": "Gladly",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/gladly",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "slack": {
+      "app": "Slack",
+      "status": "Active",
+      "toolkit_slug": "slack",
+      "toolkit_name": "Slack",
+      "tools_count": 158,
+      "triggers_count": 9,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260702_00",
+      "versions_count": 50,
+      "categories": [
+        "Team Chat",
+        "Team Collaboration"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/slack",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "twilio": {
+      "app": "Twilio",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/twilio",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "zoho-cliq": {
+      "app": "Zoho Cliq",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/zoho-cliq",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "lark": {
+      "app": "Lark (Larksuite)",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/lark",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "pumble": {
+      "app": "Pumble",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/pumble",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "discord": {
+      "app": "Discord",
+      "status": "Active",
+      "toolkit_slug": "discord",
+      "toolkit_name": "Discord",
+      "tools_count": 27,
+      "triggers_count": 1,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260615_00",
+      "versions_count": 38,
+      "categories": [
+        "Team Chat",
+        "Team Collaboration"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/discord",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "telegram": {
+      "app": "Telegram",
+      "status": "Active",
+      "toolkit_slug": "telegram",
+      "toolkit_name": "Telegram",
+      "tools_count": 18,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260615_00",
+      "versions_count": 31,
+      "categories": [
+        "Notifications",
+        "Team Chat"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/telegram",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "whatsapp-business": {
+      "app": "WhatsApp Business",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/whatsapp-business",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "aircall": {
+      "app": "Aircall",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/aircall",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "vonage": {
+      "app": "Vonage",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/vonage",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "google-ads": {
+      "app": "Google Ads",
+      "status": "Active",
+      "toolkit_slug": "googleads",
+      "toolkit_name": "Google Ads",
+      "tools_count": 22,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260707_00",
+      "versions_count": 42,
+      "categories": [
+        "Ads & Conversion"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/googleads",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "meta-ads": {
+      "app": "Meta Ads",
+      "status": "Active",
+      "toolkit_slug": "metaads",
+      "toolkit_name": "Meta Ads",
+      "tools_count": 50,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260702_00",
+      "versions_count": 50,
+      "categories": [
+        "Ads & Conversion",
+        "Social Media Marketing"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/metaads",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "linkedin-ads": {
+      "app": "LinkedIn Ads",
+      "status": "Active",
+      "toolkit_slug": "linkedin_ads",
+      "toolkit_name": "Linkedin Ads",
+      "tools_count": 28,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260623_00",
+      "versions_count": 14,
+      "categories": [
+        "Ads & Conversion",
+        "Marketing"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/linkedin_ads",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "gohighlevel": {
+      "app": "GoHighLevel",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/gohighlevel",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "mailchimp": {
+      "app": "Mailchimp",
+      "status": "Active",
+      "toolkit_slug": "mailchimp",
+      "toolkit_name": "Mailchimp",
+      "tools_count": 272,
+      "triggers_count": 4,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260618_00",
+      "versions_count": 43,
+      "categories": [
+        "Email Newsletters",
+        "Marketing Automation"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/mailchimp",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "klaviyo": {
+      "app": "Klaviyo",
+      "status": "Active",
+      "toolkit_slug": "klaviyo",
+      "toolkit_name": "Klaviyo",
+      "tools_count": 225,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260615_00",
+      "versions_count": 45,
+      "categories": [
+        "Email Newsletters",
+        "Marketing Automation"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/klaviyo",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "systeme-io": {
+      "app": "systeme.io",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/systeme-io",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "pinterest": {
+      "app": "Pinterest",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/pinterest",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "threads": {
+      "app": "Threads (Meta)",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/threads",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "sendgrid": {
+      "app": "SendGrid",
+      "status": "Active",
+      "toolkit_slug": "sendgrid",
+      "toolkit_name": "SendGrid",
+      "tools_count": 359,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260707_00",
+      "versions_count": 29,
+      "categories": [
+        "Email Newsletters",
+        "Transactional Email"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/sendgrid",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "shopify": {
+      "app": "Shopify",
+      "status": "Active",
+      "toolkit_slug": "shopify",
+      "toolkit_name": "Shopify",
+      "tools_count": 315,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2",
+        "S2S_OAUTH2"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260616_00",
+      "versions_count": 50,
+      "categories": [
+        "eCommerce"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/shopify",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "woocommerce": {
+      "app": "WooCommerce",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/woocommerce",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "bigcommerce": {
+      "app": "BigCommerce",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/bigcommerce",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "salesforce-commerce-cloud": {
+      "app": "Salesforce Commerce Cloud",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/salesforce-commerce-cloud",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "magento": {
+      "app": "Magento (Adobe Commerce)",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/magento",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "squarespace": {
+      "app": "Squarespace",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/squarespace",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "ecwid": {
+      "app": "Ecwid",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/ecwid",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "gumroad": {
+      "app": "Gumroad",
+      "status": "Active",
+      "toolkit_slug": "gumroad",
+      "toolkit_name": "Gumroad",
+      "tools_count": 7,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260615_00",
+      "versions_count": 28,
+      "categories": [
+        "eCommerce"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/gumroad",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "amazon-selling-partner": {
+      "app": "Amazon Selling Partner",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/amazon-selling-partner",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "fanbasis": {
+      "app": "fanbasis",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/fanbasis",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "dataforseo": {
+      "app": "DataForSEO",
+      "status": "Active",
+      "toolkit_slug": "dataforseo",
+      "toolkit_name": "Dataforseo",
+      "tools_count": 312,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "BASIC"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260615_00",
+      "versions_count": 13,
+      "categories": [
+        "Developer Tools",
+        "Marketing"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/dataforseo",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "se-ranking": {
+      "app": "SE Ranking",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/se-ranking",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "ahrefs": {
+      "app": "Ahrefs",
+      "status": "Active",
+      "toolkit_slug": "ahrefs",
+      "toolkit_name": "Ahrefs",
+      "tools_count": 40,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260615_00",
+      "versions_count": 25,
+      "categories": [
+        "Analytics",
+        "Marketing Automation"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/ahrefs",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "mrscraper": {
+      "app": "MrScraper",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/mrscraper",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "apify": {
+      "app": "Apify",
+      "status": "Active",
+      "toolkit_slug": "apify",
+      "toolkit_name": "Apify",
+      "tools_count": 112,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260707_00",
+      "versions_count": 50,
+      "categories": [
+        "AI Web Scraping",
+        "Developer Tools"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/apify",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "firecrawl": {
+      "app": "Firecrawl",
+      "status": "Active",
+      "toolkit_slug": "firecrawl",
+      "toolkit_name": "Firecrawl",
+      "tools_count": 29,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260615_00",
+      "versions_count": 46,
+      "categories": [
+        "AI Web Scraping",
+        "Developer Tools"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/firecrawl",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "bright-data": {
+      "app": "Bright Data",
+      "status": "Active",
+      "toolkit_slug": "brightdata",
+      "toolkit_name": "Bright Data",
+      "tools_count": 10,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260616_00",
+      "versions_count": 27,
+      "categories": [
+        "AI Web Scraping",
+        "Developer Tools"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/brightdata",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "sherlock": {
+      "app": "Sherlock",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/sherlock",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "waterfall": {
+      "app": "Waterfall.io",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/waterfall",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "clay": {
+      "app": "Clay",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/clay",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "github": {
+      "app": "GitHub",
+      "status": "Active",
+      "toolkit_slug": "github",
+      "toolkit_name": "GitHub",
+      "tools_count": 871,
+      "triggers_count": 46,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260708_00",
+      "versions_count": 50,
+      "categories": [
+        "Developer Tools"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/github",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "vercel": {
+      "app": "Vercel",
+      "status": "Active",
+      "toolkit_slug": "vercel",
+      "toolkit_name": "Vercel",
+      "tools_count": 131,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260707_00",
+      "versions_count": 49,
+      "categories": [
+        "Developer Tools"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/vercel",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "netlify": {
+      "app": "Netlify",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/netlify",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "cloudflare": {
+      "app": "Cloudflare",
+      "status": "Active",
+      "toolkit_slug": "cloudflare",
+      "toolkit_name": "Cloudflare",
+      "tools_count": 20,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260615_00",
+      "versions_count": 28,
+      "categories": [
+        "Developer Tools",
+        "Security & Identity Tools"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/cloudflare",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "supabase": {
+      "app": "Supabase",
+      "status": "Active",
+      "toolkit_slug": "supabase",
+      "toolkit_name": "Supabase",
+      "tools_count": 124,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260707_00",
+      "versions_count": 50,
+      "categories": [
+        "Databases",
+        "Developer Tools"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/supabase",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "neo4j": {
+      "app": "Neo4j",
+      "status": "Active",
+      "toolkit_slug": "neo4j",
+      "toolkit_name": "Neo4J",
+      "tools_count": 21,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2",
+        "S2S_OAUTH2"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260615_00",
+      "versions_count": 2,
+      "categories": [
+        "Developer Tools"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/neo4j",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "snowflake": {
+      "app": "Snowflake",
+      "status": "Active",
+      "toolkit_slug": "snowflake",
+      "toolkit_name": "Snowflake",
+      "tools_count": 16,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260615_00",
+      "versions_count": 28,
+      "categories": [
+        "Analytics",
+        "Databases"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/snowflake",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "mongodb-atlas": {
+      "app": "MongoDB Atlas",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/mongodb-atlas",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "datadog": {
+      "app": "Datadog",
+      "status": "Active",
+      "toolkit_slug": "datadog",
+      "toolkit_name": "Datadog",
+      "tools_count": 63,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260709_00",
+      "versions_count": 44,
+      "categories": [
+        "Developer Tools",
+        "Server Monitoring"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/datadog",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "sentry": {
+      "app": "Sentry",
+      "status": "Active",
+      "toolkit_slug": "sentry",
+      "toolkit_name": "Sentry",
+      "tools_count": 209,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260615_00",
+      "versions_count": 50,
+      "categories": [
+        "Developer Tools",
+        "Server Monitoring"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/sentry",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "notion": {
+      "app": "Notion",
+      "status": "Active",
+      "toolkit_slug": "notion",
+      "toolkit_name": "Notion",
+      "tools_count": 45,
+      "triggers_count": 8,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260707_00",
+      "versions_count": 50,
+      "categories": [
+        "Documents",
+        "Notes",
+        "Project Management"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/notion",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "airtable": {
+      "app": "Airtable",
+      "status": "Active",
+      "toolkit_slug": "airtable",
+      "toolkit_name": "Airtable",
+      "tools_count": 24,
+      "triggers_count": 6,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260707_00",
+      "versions_count": 50,
+      "categories": [
+        "Databases",
+        "Productivity",
+        "Spreadsheets"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/airtable",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "linear": {
+      "app": "Linear",
+      "status": "Active",
+      "toolkit_slug": "linear",
+      "toolkit_name": "Linear",
+      "tools_count": 46,
+      "triggers_count": 12,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260707_00",
+      "versions_count": 50,
+      "categories": [
+        "Project Management",
+        "Task Management"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/linear",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "jira": {
+      "app": "Jira",
+      "status": "Active",
+      "toolkit_slug": "jira",
+      "toolkit_name": "Jira",
+      "tools_count": 97,
+      "triggers_count": 3,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2",
+        "S2S_OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260707_00",
+      "versions_count": 50,
+      "categories": [
+        "Project Management",
+        "Task Management"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/jira",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "asana": {
+      "app": "Asana",
+      "status": "Active",
+      "toolkit_slug": "asana",
+      "toolkit_name": "Asana",
+      "tools_count": 153,
+      "triggers_count": 6,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260623_00",
+      "versions_count": 50,
+      "categories": [
+        "Project Management",
+        "Task Management"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/asana",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "monday": {
+      "app": "Monday.com",
+      "status": "Active",
+      "toolkit_slug": "monday",
+      "toolkit_name": "Monday",
+      "tools_count": 121,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260707_00",
+      "versions_count": 50,
+      "categories": [
+        "Project Management",
+        "Task Management"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/monday",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "clickup": {
+      "app": "ClickUp",
+      "status": "Active",
+      "toolkit_slug": "clickup",
+      "toolkit_name": "ClickUp",
+      "tools_count": 162,
+      "triggers_count": 21,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260615_00",
+      "versions_count": 50,
+      "categories": [
+        "Productivity",
+        "Project Management",
+        "Task Management"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/clickup",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "coda": {
+      "app": "Coda",
+      "status": "Active",
+      "toolkit_slug": "coda",
+      "toolkit_name": "Coda",
+      "tools_count": 109,
+      "triggers_count": 4,
+      "auth_schemes": [
+        "API_KEY"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260618_00",
+      "versions_count": 40,
+      "categories": [
+        "Productivity",
+        "Project Management"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/coda",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "smartsheet": {
+      "app": "Smartsheet",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/smartsheet",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "harvest": {
+      "app": "Harvest",
+      "status": "Active",
+      "toolkit_slug": "harvest",
+      "toolkit_name": "Harvest",
+      "tools_count": 57,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260615_00",
+      "versions_count": 36,
+      "categories": [
+        "Proposal & Invoice Management",
+        "Time Tracking Software"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/harvest",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "stripe": {
+      "app": "Stripe",
+      "status": "Active",
+      "toolkit_slug": "stripe",
+      "toolkit_name": "Stripe",
+      "tools_count": 425,
+      "triggers_count": 7,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260615_00",
+      "versions_count": 50,
+      "categories": [
+        "Payment Processing",
+        "eCommerce"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/stripe",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "plaid": {
+      "app": "Plaid",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/plaid",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "binance": {
+      "app": "Binance",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/binance",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "paygent-connect": {
+      "app": "Paygent Connect",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/paygent-connect",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "ipayx": {
+      "app": "iPayX",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/ipayx",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "quickbooks": {
+      "app": "QuickBooks",
+      "status": "Active",
+      "toolkit_slug": "quickbooks",
+      "toolkit_name": "QuickBooks",
+      "tools_count": 114,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260707_00",
+      "versions_count": 46,
+      "categories": [
+        "Accounting",
+        "Payment Processing"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/quickbooks",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "xero": {
+      "app": "Xero",
+      "status": "Active",
+      "toolkit_slug": "xero",
+      "toolkit_name": "Xero",
+      "tools_count": 53,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260615_00",
+      "versions_count": 41,
+      "categories": [
+        "Accounting"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/xero",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "brex": {
+      "app": "Brex",
+      "status": "Active",
+      "toolkit_slug": "brex",
+      "toolkit_name": "Brex",
+      "tools_count": 84,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260616_00",
+      "versions_count": 35,
+      "categories": [
+        "Accounting"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/brex",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "ramp": {
+      "app": "Ramp",
+      "status": "Active",
+      "toolkit_slug": "ramp",
+      "toolkit_name": "Ramp",
+      "tools_count": 88,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [],
+      "latest_version": "20260707_00",
+      "versions_count": 39,
+      "categories": [
+        "Accounting"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/ramp",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "pitchbook": {
+      "app": "PitchBook",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/pitchbook",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "notebooklm": {
+      "app": "NotebookLM",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/notebooklm",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "otter-ai": {
+      "app": "Otter AI",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/otter-ai",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "fathom": {
+      "app": "Fathom",
+      "status": "Active",
+      "toolkit_slug": "fathom",
+      "toolkit_name": "Fathom",
+      "tools_count": 7,
+      "triggers_count": 0,
+      "auth_schemes": [
+        "API_KEY",
+        "OAUTH2"
+      ],
+      "managed_auth_schemes": [
+        "OAUTH2"
+      ],
+      "latest_version": "20260615_00",
+      "versions_count": 16,
+      "categories": [
+        "AI Meeting Assistants",
+        "Transcription"
+      ],
+      "catalog_url": "https://composio.dev/toolkits/fathom",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "consensus": {
+      "app": "Consensus",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/consensus",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "reducto": {
+      "app": "Reducto",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/reducto",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "devin": {
+      "app": "Devin",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/devin",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "higgsfield": {
+      "app": "higgsfield",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/higgsfield",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "mermaid-cli": {
+      "app": "Mermaid CLI",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/mermaid-cli",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "youtube-transcript": {
+      "app": "YouTube Transcript",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/youtube-transcript",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    },
+    "grain": {
+      "app": "Grain",
+      "status": "Missing",
+      "toolkit_slug": null,
+      "toolkit_name": null,
+      "tools_count": 0,
+      "triggers_count": 0,
+      "auth_schemes": [],
+      "managed_auth_schemes": [],
+      "latest_version": null,
+      "versions_count": 0,
+      "categories": [],
+      "catalog_url": "https://composio.dev/toolkits/grain",
+      "source": "sdk",
+      "checked_at": "2026-07-12T08:56:27.762913+00:00"
+    }
+  }
+}
