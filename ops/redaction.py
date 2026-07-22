@@ -18,8 +18,12 @@ _SENSITIVE_KEY = re.compile(
     r"api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|"
     r"oauth[_-]?(?:client[_-]?)?secret|(?:session|id|auth|oauth)[_-]?token|"
     r"authorization|password|passwd|private[_-]?key|totp(?:[_-]?seed)?|"
-    r"cookie|session[_-]?cookie|oauth[_-]?code|credentials?|token|secret|key|code"
+    r"cookie|session[_-]?cookie|credentials?|token|secret|key"
     r")(?:$|[_-])"
+)
+_SENSITIVE_CODE_KEY = re.compile(
+    r"(?ix)^(?:code|(?:oauth|auth|authorization|verification|device|totp)[_-]?code|"
+    r"one[_-]?time[_-]?code)$"
 )
 
 _PRIVATE_KEY = re.compile(
@@ -42,16 +46,22 @@ _ASSIGNMENT = re.compile(
     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;&}]+)"
 )
 _TOKEN_QUERY = re.compile(
-    r"(?ix)([?&](?:token|code|key|secret|credentials?|password|api[_-]?key|"
-    r"access[_-]?token|refresh[_-]?token|(?:session|id|auth|oauth)[_-]?token)=)"
+    r"(?ix)([?&#](?:token|code|key|secret|credentials?|password|api[_-]?key|"
+    r"client[_-]?secret|access[_-]?token|refresh[_-]?token|"
+    r"(?:session|id|auth|oauth)[_-]?token|authorization|jwt|signature|sig)=)"
     r"([^&#\s]+)"
 )
 _PROVIDER_KEY = re.compile(
     r"(?<![A-Za-z0-9])(?:"
-    r"sk-(?:live-|test-)?[A-Za-z0-9_-]{12,}|"
+    r"(?:sk|rk)-(?:live-|test-)?[A-Za-z0-9_-]{12,}|"
+    r"(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{12,}|"
     r"gh[pousr]_[A-Za-z0-9]{20,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|"
     r"AIza[A-Za-z0-9_-]{20,}|"
-    r"xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"xox[baprs]-[A-Za-z0-9-]{10,}|"
+    r"(?:AKIA|ASIA)[0-9A-Z]{16}|"
+    r"pplx-[A-Za-z0-9_-]{12,}|"
+    r"SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"
     r")(?![A-Za-z0-9])"
 )
 
@@ -70,6 +80,12 @@ def _is_reference_payload(value: object, *, key: str) -> bool:
         and isinstance(value, Mapping)
         and all(is_vault_reference(reference) for reference in value.values())
     )
+
+
+def _is_sensitive_key(key: str) -> bool:
+    """Classify credential-bearing field names without hiding benign reason codes."""
+
+    return _SENSITIVE_KEY.search(key) is not None or _SENSITIVE_CODE_KEY.fullmatch(key) is not None
 
 
 def redact_text(value: str) -> str:
@@ -99,7 +115,7 @@ def redact_data(value: Any, *, key: str | None = None) -> Any:
 
     if isinstance(value, (SecretStr, SecretBytes)):
         return REDACTED
-    if key is not None and _SENSITIVE_KEY.search(key) and not _is_reference_payload(value, key=key):
+    if key is not None and _is_sensitive_key(key) and not _is_reference_payload(value, key=key):
         return REDACTED
     if isinstance(value, BaseModel):
         return redact_data(value.model_dump(mode="json"), key=key)

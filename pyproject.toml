@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11,<3.12"
 
 [tool.setuptools.packages.find]
-include = ["ops*"]
+include = ["api*", "ops*"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

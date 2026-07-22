@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import stat
 
 import pytest
@@ -31,6 +32,25 @@ def test_storage_initializes_owner_only_database_and_round_trips_runs(tmp_path) 
     assert storage.list_runs() == [created]
     assert mode(db_path.parent) == 0o700
     assert mode(db_path) == 0o600
+
+
+def test_storage_lists_runs_with_bounded_pagination(tmp_path) -> None:
+    storage = OperationsStorage(tmp_path / "ops.db")
+    create_run(storage, run_id="run-001")
+    create_run(storage, run_id="run-002")
+
+    first_page = storage.list_runs(limit=1, offset=0)
+    second_page = storage.list_runs(limit=1, offset=1)
+
+    assert storage.count_runs() == 2
+    assert len(first_page) == 1
+    assert len(second_page) == 1
+    assert {first_page[0]["run_id"], second_page[0]["run_id"]} == {
+        "run-001",
+        "run-002",
+    }
+    with pytest.raises(ValueError, match="zero or greater"):
+        storage.list_runs(offset=-1)
 
 
 def test_run_and_audit_writes_are_sanitized_before_sqlite(tmp_path) -> None:
@@ -160,3 +180,62 @@ def test_storage_rejects_existing_permissive_database_without_mutating_it(tmp_pa
         OperationsStorage(db_path).initialize()
 
     assert mode(db_path) == 0o644
+
+
+def test_initialize_migrates_an_existing_database_for_internal_idempotency(tmp_path) -> None:
+    db_path = tmp_path / "ops.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY,
+                thread_id TEXT UNIQUE NOT NULL,
+                app_name TEXT NOT NULL,
+                app_slug TEXT NOT NULL,
+                status TEXT NOT NULL,
+                access_route TEXT,
+                browser_session_id TEXT,
+                browser_live_url TEXT,
+                gmail_session_id TEXT,
+                gmail_thread_id TEXT,
+                integrator_bundle_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                sanitized_payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+            );
+            """
+        )
+    db_path.chmod(0o600)
+    storage = OperationsStorage(db_path)
+
+    storage.initialize()
+    storage.initialize()
+    record = storage.create_run(
+        run_id="run-migrated",
+        thread_id="thread-migrated",
+        app_name="Example App",
+        app_slug="example-app",
+        idempotency_key="idem_0123456789abcdef0123456789abcdef",
+        request_fingerprint="a" * 64,
+    )
+
+    assert "idempotency_key" not in record
+    assert "request_fingerprint" not in record
+    with sqlite3.connect(db_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
+        index_names = {row[1] for row in connection.execute("PRAGMA index_list(runs)")}
+        stored = connection.execute(
+            "SELECT idempotency_key, request_fingerprint FROM runs WHERE run_id = ?",
+            ("run-migrated",),
+        ).fetchone()
+
+    assert {"idempotency_key", "request_fingerprint"} <= columns
+    assert "idx_runs_idempotency_key" in index_names
+    assert stored == ("idem_0123456789abcdef0123456789abcdef", "a" * 64)

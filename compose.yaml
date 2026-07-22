@@ -1,0 +1,49 @@
+name: composio-toolkit-ops-agent
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    environment:
+      ALLOW_LIVE_VENDOR_EMAIL: "false"
+      CHECKPOINT_DB_PATH: /private/checkpoints.db
+      LANGGRAPH_STRICT_MSGPACK: "true"
+      OPS_DB_PATH: /private/ops.db
+      SECRET_VAULT_DB_PATH: /private/secret_vault.db
+    volumes:
+      - ops_private:/private
+    ports:
+      - "127.0.0.1:${OPS_API_PORT:-8000}:8000"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    environment:
+      OPS_API_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${OPS_WEB_PORT:-3000}:3000"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+      - /app/.next/cache:rw,noexec,nosuid,nodev,size=128m,uid=1000,gid=1000
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  ops_private:

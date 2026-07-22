@@ -1,9 +1,8 @@
-"""Local-only command line interface for the Phase 0/1 operations ledger.
+"""Local-only command line interface for the Phase 0/1/2 operations ledger.
 
-The CLI deliberately exposes a narrow, sanitized view of persisted runs.  Phase
-0/1 does not invoke providers, send email, start browsers, or produce an
-``IntegratorBundle``.  Commands for those capabilities fail explicitly instead
-of implying that work happened.
+The CLI exposes a narrow, sanitized view of verified P1 lookup and deterministic
+routing. It does not invoke providers, send email, start browsers, or produce an
+``IntegratorBundle``. Commands for those capabilities fail explicitly.
 """
 
 from __future__ import annotations
@@ -16,14 +15,14 @@ import re
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, cast
-from uuid import uuid4
+from typing import Any
 
 from cryptography.fernet import Fernet
 from pydantic import ValidationError
 
-from ops.models import CompanyProfile, IntegratorBundle, OperationsRequest
+from ops.models import CompanyProfile, OperationsRequest
 from ops.redaction import install_redacting_filter
+from ops.run_service import RunService
 from ops.storage import OperationsStorage
 
 EXIT_OK = 0
@@ -35,16 +34,6 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATABASE_PATH = REPOSITORY_ROOT / "private" / "operations.sqlite3"
 SNAPSHOT_PATH = REPOSITORY_ROOT / "data" / "p1" / "SNAPSHOT.json"
 
-_SAFE_RUN_FIELDS = (
-    "run_id",
-    "thread_id",
-    "app_name",
-    "app_slug",
-    "status",
-    "access_route",
-    "created_at",
-    "updated_at",
-)
 _SENSITIVE_KEY = re.compile(
     r"(?:authorization|cookie|password|secret|token|api[_-]?key|private[_-]?key)",
     re.IGNORECASE,
@@ -136,33 +125,8 @@ def _emit(payload: Mapping[str, Any], *, stream: Any = None) -> None:
     print(json.dumps(_safe_value(payload), sort_keys=True), file=output)
 
 
-def _slugify(app_name: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", app_name.strip().lower()).strip("-")
-    return slug or "app"
-
-
-def _public_run(record: Any) -> dict[str, Any]:
-    source = _as_mapping(record)
-    public = {
-        field: source.get(field) for field in _SAFE_RUN_FIELDS if source.get(field) is not None
-    }
-    public["execution_mode"] = "local_dry_run"
-    public["external_actions"] = False
-    return cast(dict[str, Any], _safe_value(public))
-
-
-def _append_event(
-    store: OperationsStorage,
-    run_id: str,
-    event_type: str,
-    payload: Mapping[str, Any],
-) -> Any:
-    safe_payload = _safe_value(payload)
-    return store.append_audit_event(
-        run_id=run_id,
-        event_type=event_type,
-        payload=safe_payload,
-    )
+def _run_service(db_path: str | Path | None = None) -> RunService:
+    return RunService(storage=_storage(db_path))
 
 
 def create_dry_run(
@@ -170,44 +134,17 @@ def create_dry_run(
     *,
     db_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Create a local ledger entry and no external side effects."""
+    """Create, verify, and deterministically route a local Phase 2 run."""
 
-    if not request.dry_run:
-        raise ValueError("Phase 0/1 accepts dry-run requests only")
-
-    store = _storage(db_path)
-    run_id = f"run_{uuid4().hex}"
-    thread_id = f"local_{uuid4().hex}"
-    created = store.create_run(
-        run_id=run_id,
-        thread_id=thread_id,
-        app_name=request.app_name,
-        app_slug=_slugify(request.app_name),
-        status="created",
-        access_route=None,
-    )
-    _append_event(
-        store,
-        run_id,
-        "dry_run_created",
-        {
-            "status": "created",
-            "scope_policy": request.requested_scope_policy,
-            "execution_mode": "local_dry_run",
-            "external_actions": False,
-        },
-    )
-    return _public_run(created)
+    return _run_service(db_path).create_run(request)
 
 
 def get_run_status(run_id: str, *, db_path: str | Path | None = None) -> dict[str, Any] | None:
-    record = _storage(db_path).get_run(run_id)
-    return _public_run(record) if record else None
+    return _run_service(db_path).get_run(run_id)
 
 
 def get_run_timeline(run_id: str, *, db_path: str | Path | None = None) -> list[dict[str, Any]]:
-    store = _storage(db_path)
-    events = store.list_audit_events(run_id)
+    events = _run_service(db_path).get_timeline(run_id)
     timeline: list[dict[str, Any]] = []
     for event in events:
         source = _as_mapping(event)
@@ -233,19 +170,7 @@ def get_run_timeline(run_id: str, *, db_path: str | Path | None = None) -> list[
 
 
 def get_run_output(run_id: str, *, db_path: str | Path | None = None) -> dict[str, Any] | None:
-    record = _as_mapping(_storage(db_path).get_run(run_id))
-    if not record:
-        return None
-    bundle = record.get("integrator_bundle", record.get("integrator_bundle_json"))
-    if not bundle:
-        return {}
-    if isinstance(bundle, str):
-        bundle = json.loads(bundle)
-    validated = IntegratorBundle.model_validate(bundle)
-    return cast(
-        dict[str, Any],
-        _safe_value(validated.model_dump(mode="json")),
-    )
+    return _run_service(db_path).get_output(run_id)
 
 
 def _sha256(path: Path) -> str:
@@ -317,8 +242,8 @@ def doctor(*, db_path: str | Path | None = None) -> tuple[dict[str, Any], bool]:
     ready = all(check["status"] != "fail" for check in checks)
     return (
         {
-            "status": "ready_for_local_dry_run" if ready else "configuration_error",
-            "phase": "0/1",
+            "status": "ready_for_phase_2_local" if ready else "configuration_error",
+            "phase": "0/1/2",
             "external_operations": "unavailable",
             "checks": checks,
         },
@@ -347,7 +272,7 @@ def _default_company(args: argparse.Namespace) -> CompanyProfile:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="composio-ops",
-        description="Secure local operations ledger (Phase 0/1).",
+        description="Secure local operations ledger (Phase 0/1/2).",
     )
     parser.add_argument("--db-path", help=argparse.SUPPRESS)
     subparsers = parser.add_subparsers(dest="command", required=True)

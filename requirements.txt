@@ -16,4 +16,5 @@ composio==0.18.0
 streamlit==1.59.2
 aiosqlite==0.22.1
 cryptography==48.0.1
-httpx>=0.28,<1
+fastapi==0.139.2
+uvicorn[standard]==0.51.0

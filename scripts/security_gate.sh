@@ -9,7 +9,7 @@ if [[ -d "${repo_root}/.venv/bin" ]]; then
   export PATH="${repo_root}/.venv/bin:${PATH}"
 fi
 
-required_commands=(detect-secrets detect-secrets-hook ruff pytest mypy pip-audit git python)
+required_commands=(detect-secrets detect-secrets-hook ruff pytest mypy pip-audit git python npm)
 for command_name in "${required_commands[@]}"; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "security gate: missing command ${command_name}" >&2
@@ -43,9 +43,26 @@ fi
 ruff check .
 ruff format --check .
 pytest -q
-mypy ops streamlit_app.py
-python -m compileall -q ops streamlit_app.py
+mypy api ops streamlit_app.py
+python -m compileall -q api ops streamlit_app.py
 pip-audit -r requirements.txt
+
+if [[ ! -f web/package-lock.json ]]; then
+  echo "security gate: web/package-lock.json is required" >&2
+  exit 1
+fi
+if [[ ! -d web/node_modules ]]; then
+  echo "security gate: web dependencies are missing; run npm ci in web/" >&2
+  exit 1
+fi
+
+(
+  cd web
+  npm audit --audit-level=high
+  npm run lint
+  npm run typecheck
+  npm run build
+)
 
 git grep --untracked -nEI \
   '(client_secret|access_token|refresh_token|api[_-]?key|password|private[_-]?key|PRIVATE KEY|sk-|sk_live_|rk_live_|gh[pousr]_|github_pat_|AIza|xox[baprs]-|AKIA|ASIA|pplx-|SG\.)' \

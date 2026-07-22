@@ -43,7 +43,7 @@ def _create_run(
     return run_id
 
 
-def test_run_creates_only_a_local_dry_run(
+def test_run_creates_and_routes_only_a_local_dry_run(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -56,7 +56,8 @@ def test_run_creates_only_a_local_dry_run(
     assert isinstance(run, dict)
     assert run["app_name"] == "Example App"
     assert run["app_slug"] == "example-app"
-    assert run["status"] == "created"
+    assert run["status"] == "researching"
+    assert run["access_route"] == "unknown"
     assert run["execution_mode"] == "local_dry_run"
     assert run["external_actions"] is False
     assert "browser_live_url" not in run
@@ -78,10 +79,12 @@ def test_status_returns_sanitized_run_and_timeline(
     timeline = payload["timeline"]
     assert isinstance(run, dict)
     assert run["run_id"] == run_id
-    assert run["status"] == "created"
+    assert run["status"] == "route_selected"
     assert isinstance(timeline, list)
     assert timeline[0]["event_type"] == "dry_run_created"
     assert timeline[0]["payload"]["external_actions"] is False
+    assert timeline[-1]["event_type"] == "route_selected"
+    assert timeline[-1]["payload"]["external_actions"] is False
 
 
 @pytest.mark.parametrize("command", ["resume", "poll-email", "show-output"])
@@ -157,7 +160,8 @@ def test_doctor_checks_snapshot_and_safe_email_default(
     exit_code, payload = _run_cli(capsys, tmp_path / "ops.db", "doctor")
 
     assert exit_code == EXIT_OK
-    assert payload["status"] == "ready_for_local_dry_run"
+    assert payload["status"] == "ready_for_phase_2_local"
+    assert payload["phase"] == "0/1/2"
     assert payload["external_operations"] == "unavailable"
     checks = payload["checks"]
     assert isinstance(checks, list)

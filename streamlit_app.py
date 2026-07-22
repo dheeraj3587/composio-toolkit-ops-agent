@@ -1,4 +1,4 @@
-"""Editorial Streamlit shell for the Phase 0/1 operations ledger."""
+"""Internal debugging ledger for the local Phase 0/1/2 workflow."""
 
 from __future__ import annotations
 
@@ -335,9 +335,9 @@ st.markdown(
 st.markdown(
     """
 <header class="ledger-hero">
-  <div class="ledger-kicker">Composio / private operations desk / phase 0–1</div>
+  <div class="ledger-kicker">Composio / internal debugging desk / phase 0–2</div>
   <h1 class="ledger-title">Access work,<br>without the theatre.</h1>
-  <p class="ledger-deck">A quiet, auditable ledger for turning verified research into integration readiness. This foundation records local dry runs only; it does not contact vendors or operate browsers.</p>
+  <p class="ledger-deck">A quiet, auditable ledger for verifying the immutable P1 snapshot and its deterministic access route. It records local dry runs only; it does not contact vendors or operate browsers.</p>
 </header>
 <hr class="ledger-rule">
 """,
@@ -349,8 +349,8 @@ with stamp_col:
     st.markdown('<span class="ledger-stamp">Local only</span>', unsafe_allow_html=True)
 with note_col:
     st.caption(
-        "Phase boundary — encrypted storage, strict contracts, and redaction are active. "
-        "Browser, email, routing, and provider execution remain deliberately unavailable."
+        "Phase boundary — verified P1 lookup and deterministic routing are active. "
+        "Browser, HITL, email, and provider execution remain deliberately unavailable."
     )
 
 st.write("")
@@ -522,7 +522,7 @@ st.header("What is—and is not—operational")
 phase_one, phase_browser, phase_email, phase_output = st.columns(4)
 with phase_one:
     st.markdown(
-        """<div class="ledger-card"><span class="ledger-index">Available now</span><h3>Foundation</h3><p>Strict contracts, encrypted vault boundary, sanitized audit storage, provenance, and local dry runs.</p></div>""",
+        """<div class="ledger-card"><span class="ledger-index">Available now</span><h3>Verified routing</h3><p>Strict contracts, snapshot integrity, deterministic access classification, encrypted vault boundary, and sanitized audit storage.</p></div>""",
         unsafe_allow_html=True,
     )
 with phase_browser:
@@ -542,4 +542,4 @@ with phase_output:
     )
 
 st.write("")
-st.caption("PRIVATE OPERATIONS LEDGER · PHASE 0/1 · NO EXTERNAL PROVIDER ACTIONS")
+st.caption("INTERNAL OPERATIONS LEDGER · PHASE 0/1/2 · NO EXTERNAL PROVIDER ACTIONS")

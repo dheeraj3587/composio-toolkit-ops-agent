@@ -4,6 +4,7 @@ import io
 import json
 import logging
 
+import pytest
 from pydantic import SecretStr
 
 from ops.redaction import (
@@ -166,3 +167,61 @@ def test_installed_logging_filter_redacts_exception_tracebacks() -> None:
     rendered = stream.getvalue()
     assert marker not in rendered
     assert REDACTED in rendered
+
+
+@pytest.mark.parametrize(
+    "provider_key",
+    [
+        "sk_live_0123456789abcdef",  # pragma: allowlist secret
+        "sk_test_0123456789abcdef",  # pragma: allowlist secret
+        "rk_live_0123456789abcdef",  # pragma: allowlist secret
+        "rk_test_0123456789abcdef",  # pragma: allowlist secret
+        "sk-live-0123456789abcdef",  # pragma: allowlist secret
+        "rk-test-0123456789abcdef",  # pragma: allowlist secret
+        "ghp_0123456789abcdefghijklmnop",  # pragma: allowlist secret
+        "github_pat_0123456789abcdefABCDEF",  # pragma: allowlist secret
+        "AKIA0123456789ABCDEF",  # pragma: allowlist secret
+        "ASIAFEDCBA9876543210",  # pragma: allowlist secret
+        "AIza0123456789abcdefghijKLMN",  # pragma: allowlist secret
+        "xoxb-0123456789-abcdef",  # pragma: allowlist secret
+        "pplx-0123456789abcdefghijkl",  # pragma: allowlist secret
+        "SG.0123456789abcdef.abcdef0123456789",  # pragma: allowlist secret
+    ],
+)
+def test_runtime_provider_redaction_matches_security_gate(provider_key: str) -> None:
+    assert redact_text(provider_key) == REDACTED
+
+
+def test_redaction_preserves_safe_reason_code_but_hides_credential_codes() -> None:
+    payload = {
+        "reason_code": "insufficient_evidence_probe_available",
+        "status_code": 202,
+        "oauth_code": "oauth-one-time-value",
+        "authorization_code": "authorization-one-time-value",
+        "code": "ambiguous-sensitive-value",
+    }
+
+    result = redact_data(payload)
+
+    assert result["reason_code"] == "insufficient_evidence_probe_available"
+    assert result["status_code"] == 202
+    assert result["oauth_code"] == REDACTED
+    assert result["authorization_code"] == REDACTED
+    assert result["code"] == REDACTED
+    assert redact_text("reason_code=verified_evidence_route") == (
+        "reason_code=verified_evidence_route"
+    )
+
+
+def test_redact_text_covers_additional_token_bearing_url_parameters() -> None:
+    source = (
+        "https://example.test/callback?client_secret=temporary-secret"
+        "&signature=temporary-signature&view=compact#jwt=temporary-jwt"
+    )
+
+    redacted = redact_text(source)
+
+    assert "temporary-secret" not in redacted
+    assert "temporary-signature" not in redacted
+    assert "temporary-jwt" not in redacted
+    assert "view=compact" in redacted

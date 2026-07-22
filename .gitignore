@@ -12,6 +12,20 @@ __pycache__/
 .coverage
 htmlcov/
 
+# Next.js/frontend local state
+web/node_modules/
+web/.next/
+web/out/
+web/coverage/
+web/.vercel/
+web/*.tsbuildinfo
+web/npm-debug.log*
+web/yarn-debug.log*
+web/yarn-error.log*
+web/.pnpm-debug.log*
+web/.env*
+!web/.env.example
+
 # Secret-bearing and private runtime state
 private/
 secrets/

@@ -5,3 +5,4 @@ ruff>=0.12,<1
 mypy>=1.17,<2
 pip-audit>=2.9,<3
 detect-secrets>=1.5,<2
+httpx2==2.7.0

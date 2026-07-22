@@ -65,12 +65,12 @@ def test_graph_is_explicitly_unavailable() -> None:
     assert exc_info.value.capability == "LangGraph workflow"
 
 
-def test_p1_and_final_routing_are_deferred_without_fabricated_results() -> None:
-    with pytest.raises(PhaseUnavailableError, match="Phase 2"):
-        asyncio.run(get_operational_research("Example App"))
+def test_p1_and_final_routing_use_verified_phase_2_evidence() -> None:
+    research = asyncio.run(get_operational_research("HubSpot"))
 
-    with pytest.raises(PhaseUnavailableError, match="Phase 2"):
-        classify_access(None)  # type: ignore[arg-type]
+    assert research.app_name == "HubSpot"
+    assert research.access_route == "self_serve"
+    assert classify_access(research) == "self_serve"
 
 
 def test_browser_and_capture_boundaries_are_explicitly_unavailable() -> None:

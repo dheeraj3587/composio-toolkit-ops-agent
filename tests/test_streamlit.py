@@ -69,7 +69,8 @@ def test_streamlit_form_records_a_local_run(
     assert "Local run recorded: run_" in app.success[0].value
     rendered = _rendered_text(app)
     assert "Local dry run" in rendered
-    assert "Not researched" in rendered
+    assert "Route Selected" in rendered
+    assert "self_serve" in rendered
     assert "external actions: false" in rendered
     assert (tmp_path / "ops.db").is_file()
 
