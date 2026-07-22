@@ -42,42 +42,44 @@
   --color-ring: var(--ring);
   --color-paper: var(--paper);
   --color-ink: var(--ink);
+  --color-rail: var(--rail);
   --color-viridian: var(--viridian);
   --color-rust: var(--rust);
   --color-clay: var(--clay);
-  --font-sans: var(--font-plex-sans);
-  --font-mono: var(--font-plex-mono);
-  --font-heading: var(--font-newsreader);
-  --radius-sm: 0;
-  --radius-md: 0.125rem;
-  --radius-lg: 0.125rem;
-  --radius-xl: 0.25rem;
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-heading: var(--font-geist-sans);
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
 }
 
 :root {
-  --paper: oklch(0.915 0.025 79);
-  --ink: oklch(0.22 0.028 156);
-  --viridian: oklch(0.42 0.075 158);
-  --rust: oklch(0.49 0.115 42);
-  --clay: oklch(0.72 0.08 62);
+  --paper: #f7f7f5;
+  --ink: #17171a;
+  --rail: #0b0b0e;
+  --viridian: #067a5f;
+  --rust: #6d4aff;
+  --clay: #d4a949;
   --background: var(--paper);
   --foreground: var(--ink);
-  --card: oklch(0.945 0.019 80);
+  --card: #ffffff;
   --card-foreground: var(--ink);
-  --popover: oklch(0.96 0.017 80);
+  --popover: #ffffff;
   --popover-foreground: var(--ink);
-  --primary: var(--ink);
-  --primary-foreground: oklch(0.95 0.019 80);
-  --secondary: oklch(0.86 0.029 80);
-  --secondary-foreground: var(--ink);
-  --muted: oklch(0.875 0.022 80);
-  --muted-foreground: oklch(0.46 0.025 155);
-  --accent: oklch(0.85 0.045 155);
-  --accent-foreground: var(--ink);
-  --destructive: oklch(0.49 0.16 28);
-  --border: oklch(0.38 0.026 155 / 30%);
-  --input: oklch(0.36 0.026 155 / 34%);
-  --ring: var(--viridian);
+  --primary: #17171a;
+  --primary-foreground: #ffffff;
+  --secondary: #ededeb;
+  --secondary-foreground: #202024;
+  --muted: #efefec;
+  --muted-foreground: #68686f;
+  --accent: #eeeafe;
+  --accent-foreground: #38278c;
+  --destructive: #b4232e;
+  --border: #deded9;
+  --input: #d2d2cc;
+  --ring: #7157e6;
 }
 
 @layer base {
@@ -91,27 +93,18 @@
   }
 
   body {
-    @apply min-h-svh bg-background text-foreground;
-    position: relative;
-  }
-
-  body::before {
-    position: fixed;
-    inset: 0;
-    z-index: -1;
-    background-image: url("data:image/svg+xml,%3Csvg width='44' height='44' viewBox='0 0 44 44' xmlns='http://www.w3.org/2000/svg'%3E%3Ccircle cx='1' cy='1' r='.55' fill='%231b2a24' fill-opacity='.14'/%3E%3C/svg%3E");
-    content: "";
-    pointer-events: none;
+    @apply min-h-svh bg-background text-foreground antialiased;
   }
 
   ::selection {
-    background: var(--viridian);
-    color: var(--paper);
+    background: #ddd5ff;
+    color: #211664;
   }
 
   a,
   button,
   input,
+  select,
   textarea,
   [role="combobox"] {
     @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background;
@@ -119,20 +112,13 @@
 }
 
 @layer components {
-  .site-header {
-    position: sticky;
-    top: 0;
-    z-index: 40;
-    background: var(--paper);
-  }
-
   .eyebrow,
   .data-label {
-    font-family: var(--font-plex-mono), monospace;
+    font-family: var(--font-geist-mono), monospace;
     font-size: 0.625rem;
     font-weight: 600;
-    letter-spacing: 0.16em;
-    line-height: 1.3;
+    letter-spacing: 0.12em;
+    line-height: 1.4;
     text-transform: uppercase;
   }
 
@@ -145,21 +131,29 @@
   }
 
   .page-enter {
-    animation: page-enter 480ms cubic-bezier(0.22, 0.75, 0.2, 1) both;
+    animation: page-enter 320ms cubic-bezier(0.22, 0.75, 0.2, 1) both;
   }
 
   .editorial-rule {
     height: 1px;
-    background: var(--ink);
+    background: var(--border);
     transform-origin: left;
-    animation: rule-enter 620ms cubic-bezier(0.22, 0.75, 0.2, 1) both;
+    animation: rule-enter 420ms cubic-bezier(0.22, 0.75, 0.2, 1) both;
+  }
+
+  .panel {
+    @apply border border-border bg-card shadow-[0_1px_2px_rgba(0,0,0,0.025)];
+  }
+
+  .metric-value {
+    @apply text-3xl font-semibold tracking-[-0.035em] text-foreground;
   }
 }
 
 @keyframes page-enter {
   from {
     opacity: 0;
-    transform: translateY(10px);
+    transform: translateY(6px);
   }
   to {
     opacity: 1;

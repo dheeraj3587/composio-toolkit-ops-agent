@@ -2,20 +2,27 @@ name: composio-toolkit-ops-agent
 
 services:
   api:
+    init: true
     build:
       context: .
       dockerfile: Dockerfile.api
     environment:
       ALLOW_LIVE_VENDOR_EMAIL: "false"
+      ALLOW_LIVE_BROWSER: "false"
       CHECKPOINT_DB_PATH: /private/checkpoints.db
       LANGGRAPH_STRICT_MSGPACK: "true"
       OPS_DB_PATH: /private/ops.db
+      OPS_CORS_ORIGINS: ${OPS_CORS_ORIGINS:-http://127.0.0.1:3000,http://localhost:3000}
+      OPS_ENABLE_API_DOCS: "false"
+      PROVIDER_EFFECTS_DB_PATH: /private/provider_effects.db
+      RUN_LIVE_TESTS: "0"
       SECRET_VAULT_DB_PATH: /private/secret_vault.db
     volumes:
       - ops_private:/private
     ports:
       - "127.0.0.1:${OPS_API_PORT:-8000}:8000"
     restart: unless-stopped
+    pids_limit: 256
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
@@ -25,6 +32,7 @@ services:
       - no-new-privileges:true
 
   web:
+    init: true
     build:
       context: .
       dockerfile: web/Dockerfile
@@ -36,6 +44,7 @@ services:
     ports:
       - "127.0.0.1:${OPS_WEB_PORT:-3000}:3000"
     restart: unless-stopped
+    pids_limit: 256
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777

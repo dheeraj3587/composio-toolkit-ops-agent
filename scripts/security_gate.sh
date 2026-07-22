@@ -9,7 +9,22 @@ if [[ -d "${repo_root}/.venv/bin" ]]; then
   export PATH="${repo_root}/.venv/bin:${PATH}"
 fi
 
-required_commands=(detect-secrets detect-secrets-hook ruff pytest mypy pip-audit git python npm)
+gate_scope="${1:-all}"
+case "${gate_scope}" in
+  all | backend | frontend) ;;
+  *)
+    echo "usage: $0 [all|backend|frontend]" >&2
+    exit 64
+    ;;
+esac
+
+required_commands=(git)
+if [[ "${gate_scope}" == "all" || "${gate_scope}" == "backend" ]]; then
+  required_commands+=(detect-secrets detect-secrets-hook ruff pytest mypy pip-audit python)
+fi
+if [[ "${gate_scope}" == "all" || "${gate_scope}" == "frontend" ]]; then
+  required_commands+=(npm)
+fi
 for command_name in "${required_commands[@]}"; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "security gate: missing command ${command_name}" >&2
@@ -17,58 +32,48 @@ for command_name in "${required_commands[@]}"; do
   fi
 done
 
-grep_output="$(mktemp "${TMPDIR:-/tmp}/composio-ops-secret-grep.XXXXXX")"
-trap 'rm -f "${grep_output}"' EXIT
+if [[ "${gate_scope}" == "all" || "${gate_scope}" == "backend" ]]; then
+  grep_output="$(mktemp "${TMPDIR:-/tmp}/composio-ops-secret-grep.XXXXXX")"
+  scan_output="$(mktemp "${TMPDIR:-/tmp}/composio-ops-detect-secrets.XXXXXX")"
+  trap 'rm -f "${grep_output}" "${scan_output}"' EXIT
 
-if [[ ! -f .secrets.baseline ]]; then
-  echo "security gate: .secrets.baseline is required" >&2
-  echo "generate and audit it with detect-secrets before running this gate" >&2
-  exit 1
-fi
-
-secret_scan_files=()
-while IFS= read -r -d '' candidate; do
-  case "${candidate}" in
-    .secrets.baseline | PLAN.md | data/p1/SNAPSHOT.json) continue ;;
-  esac
-  if [[ -f "${candidate}" ]]; then
-    secret_scan_files+=("${candidate}")
+  if [[ ! -f .secrets.baseline ]]; then
+    echo "security gate: .secrets.baseline is required" >&2
+    echo "generate and audit it with detect-secrets before running this gate" >&2
+    exit 1
   fi
-done < <(git ls-files -z --cached --others --exclude-standard)
 
-if (( ${#secret_scan_files[@]} > 0 )); then
-  detect-secrets-hook --baseline .secrets.baseline "${secret_scan_files[@]}"
-fi
+  secret_scan_files=()
+  while IFS= read -r -d '' candidate; do
+    case "${candidate}" in
+      .secrets.baseline | PLAN.md | data/p1/SNAPSHOT.json) continue ;;
+    esac
+    if [[ -f "${candidate}" ]]; then
+      secret_scan_files+=("${candidate}")
+    fi
+  done < <(git ls-files -z --cached --others --exclude-standard)
 
-ruff check .
-ruff format --check .
-pytest -q
-mypy api ops streamlit_app.py
-python -m compileall -q api ops streamlit_app.py
-pip-audit -r requirements.txt
+  if (( ${#secret_scan_files[@]} > 0 )); then
+    detect-secrets-hook --baseline .secrets.baseline "${secret_scan_files[@]}"
+  fi
+  # Run the required recursive scanner without printing candidate material. The audited
+  # baseline hook above is the enforcing comparison for source-controlled files.
+  detect-secrets scan --all-files \
+    --exclude-files '(?:^|/)(?:\.git|\.venv|web/node_modules|web/\.next|private)(?:/|$)' \
+    >"${scan_output}"
 
-if [[ ! -f web/package-lock.json ]]; then
-  echo "security gate: web/package-lock.json is required" >&2
-  exit 1
-fi
-if [[ ! -d web/node_modules ]]; then
-  echo "security gate: web dependencies are missing; run npm ci in web/" >&2
-  exit 1
-fi
+  ruff check .
+  ruff format --check .
+  RUN_LIVE_TESTS=0 pytest -q
+  mypy ops api streamlit_app.py
+  python -m compileall -q ops api streamlit_app.py
+  pip-audit -r requirements-dev.txt
 
-(
-  cd web
-  npm audit --audit-level=high
-  npm run lint
-  npm run typecheck
-  npm run build
-)
+  git grep --untracked -nEI \
+    '(client_secret|access_token|refresh_token|api[_-]?key|password|private[_-]?key|PRIVATE KEY|sk-|sk_live_|rk_live_|gh[pousr]_|github_pat_|AIza|xox[baprs]-|AKIA|ASIA|pplx-|SG\.)' \
+    -- ':!PLAN.md' ':!.secrets.baseline' >"${grep_output}" || true
 
-git grep --untracked -nEI \
-  '(client_secret|access_token|refresh_token|api[_-]?key|password|private[_-]?key|PRIVATE KEY|sk-|sk_live_|rk_live_|gh[pousr]_|github_pat_|AIza|xox[baprs]-|AKIA|ASIA|pplx-|SG\.)' \
-  -- ':!PLAN.md' ':!.secrets.baseline' >"${grep_output}" || true
-
-python - "${grep_output}" <<'PY'
+  python - "${grep_output}" <<'PY'
 import re
 import sys
 
@@ -127,5 +132,26 @@ if suspicious:
         print(f"  {location}", file=sys.stderr)
     raise SystemExit(1)
 PY
+fi
 
-echo "security gate: passed"
+if [[ "${gate_scope}" == "all" || "${gate_scope}" == "frontend" ]]; then
+  if [[ ! -f web/package-lock.json ]]; then
+    echo "security gate: web/package-lock.json is required" >&2
+    exit 1
+  fi
+  if [[ ! -d web/node_modules ]]; then
+    echo "security gate: web dependencies are missing; run npm ci in web/" >&2
+    exit 1
+  fi
+
+  (
+    cd web
+    npm audit --audit-level=high
+    npm run lint
+    npm run typecheck
+    npm run test
+    npm run build
+  )
+fi
+
+echo "security gate (${gate_scope}): passed"

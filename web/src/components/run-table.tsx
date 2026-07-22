@@ -13,7 +13,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import type { RunSummary } from "@/lib/types"
-import { formatTimestamp, humanize } from "@/lib/format"
+import { formatTimestamp, humanize, relativeTimestamp } from "@/lib/format"
 
 export function RunTable({ runs }: { runs: RunSummary[] }) {
   if (runs.length === 0) {
@@ -27,10 +27,10 @@ export function RunTable({ runs }: { runs: RunSummary[] }) {
   }
 
   return (
-    <div className="overflow-hidden border border-ink/25 bg-card/50">
+    <div className="overflow-x-auto rounded-md border border-border bg-card">
       <Table>
         <TableHeader>
-          <TableRow className="border-ink/20 bg-ink/[0.035] hover:bg-ink/[0.035]">
+          <TableRow className="border-border bg-muted/45 hover:bg-muted/45">
             <TableHead className="font-mono text-[10px] uppercase tracking-[0.14em]">Application</TableHead>
             <TableHead className="font-mono text-[10px] uppercase tracking-[0.14em]">Route</TableHead>
             <TableHead className="font-mono text-[10px] uppercase tracking-[0.14em]">Status</TableHead>
@@ -42,9 +42,9 @@ export function RunTable({ runs }: { runs: RunSummary[] }) {
         </TableHeader>
         <TableBody>
           {runs.map((run) => (
-            <TableRow key={run.run_id} className="border-ink/15 hover:bg-viridian/[0.045]">
+            <TableRow key={run.run_id} className="border-border hover:bg-violet-50/35">
               <TableCell>
-                <span className="block font-heading text-lg leading-tight">{run.app_name}</span>
+                <span className="block text-sm font-semibold leading-tight">{run.app_name}</span>
                 <span className="mt-1 block max-w-48 truncate font-mono text-[10px] text-muted-foreground">
                   {run.run_id}
                 </span>
@@ -53,11 +53,11 @@ export function RunTable({ runs }: { runs: RunSummary[] }) {
                 {humanize(run.access_route)}
               </TableCell>
               <TableCell><StatusBadge status={run.status} /></TableCell>
-              <TableCell className="hidden font-mono text-xs text-muted-foreground lg:table-cell">
-                {formatTimestamp(run.updated_at)}
+              <TableCell className="hidden text-xs text-muted-foreground lg:table-cell" title={formatTimestamp(run.updated_at)}>
+                {relativeTimestamp(run.updated_at)}
               </TableCell>
               <TableCell className="text-right">
-                <Button asChild variant="ghost" size="icon" className="rounded-none" aria-label={`Open ${run.app_name} run`}>
+                <Button asChild variant="ghost" size="icon" className="rounded-md" aria-label={`Open ${run.app_name} run`}>
                   <Link href={`/runs/${encodeURIComponent(run.run_id)}`}>
                     <ArrowUpRight aria-hidden="true" />
                   </Link>

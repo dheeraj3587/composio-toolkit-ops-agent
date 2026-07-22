@@ -14,10 +14,14 @@ export type RunStatus =
   | "waiting_for_hitl"
   | "outreach_sent"
   | "waiting_for_reply"
+  | "validating_credentials"
   | "credentials_ready"
+  | "configuration_required"
   | "blocked"
   | "failed"
   | "completed"
+
+export type ExecutionMode = "local_dry_run" | "operations"
 
 export interface RunSummary {
   run_id: string
@@ -26,8 +30,8 @@ export interface RunSummary {
   app_slug: string
   status: RunStatus
   access_route?: AccessRoute | null
-  execution_mode: "local_dry_run" | "operations"
-  external_actions: false
+  execution_mode: ExecutionMode
+  external_actions: boolean
   created_at: string
   updated_at: string
 }
@@ -65,11 +69,14 @@ export interface OperationalResearch {
   contact_url: string | null
   evidence_urls: string[]
   confidence: number
+  source?: "p1_snapshot" | "official_enrichment" | "combined" | "unavailable"
+  missing_fields?: string[]
 }
 
 export type PhaseStatus =
   | "not_started"
   | "unavailable"
+  | "configuration_required"
   | "ready"
   | "running"
   | "waiting"
@@ -80,25 +87,41 @@ export type PhaseStatus =
 export interface PhaseState {
   key?: string
   name?: string
+  phase?: string
   status?: PhaseStatus | string
   detail?: string | null
   available?: boolean
+  retryable?: boolean
   updated_at?: string | null
 }
 
-export type PhaseCollection =
-  | PhaseState[]
-  | Record<string, PhaseState | string | null>
-  | null
+export type PhaseCollection = PhaseState[] | Record<string, PhaseState | string | null> | null
 
 export interface SecurityState {
-  redaction: "enabled"
-  secret_vault: "not_initialized" // pragma: allowlist secret
-  owner_only_storage: "verified_owner_only" | "verification_failed"
-  live_vendor_email: "disabled_in_phase_2"
-  external_actions: false
-  raw_secrets_exposed: false
-  notes: string[]
+  redaction?: string
+  secret_vault?: string
+  checkpoint_encryption?: string
+  owner_only_storage?: string
+  live_vendor_email?: string
+  live_browser?: string
+  external_actions?: boolean
+  raw_secrets_exposed?: false
+  notes?: string[]
+}
+
+export interface HitlRequest {
+  kind: "captcha" | "otp" | "legal_approval" | "billing" | "identity" | "manual_review" | "other"
+  title: string
+  instruction: string
+  requested_at?: string | null
+  expires_at?: string | null
+}
+
+export interface RouteDecision {
+  route: AccessRoute
+  reason_code: string
+  explanation: string
+  is_final?: boolean
 }
 
 export interface RunDetailResponse {
@@ -106,6 +129,10 @@ export interface RunDetailResponse {
   research: OperationalResearch | null
   phases: PhaseCollection
   security: SecurityState | null
+  route_decision?: RouteDecision | null
+  hitl_request?: HitlRequest | null
+  missing_fields?: string[]
+  provider_states?: ProviderStatus[]
 }
 
 export interface TimelineItem {
@@ -131,15 +158,24 @@ export interface SnapshotHealth {
 
 export interface HealthCheck {
   name: string
-  status: "pass" | "fail"
+  status: "pass" | "fail" | "configuration_required" | "disabled"
+  detail?: string | null
+}
+
+export interface ProviderStatus {
+  provider: string
+  status: "ready" | "configured" | "configuration_required" | "disabled" | "unavailable"
+  detail: string
+  live_tested?: boolean
 }
 
 export interface HealthResponse {
-  status: "healthy" | "degraded"
-  phase: "2"
-  version: "0.1.0"
+  status: "healthy" | "degraded" | "configuration_required"
+  phase: string
+  version: string
   snapshot: SnapshotHealth
   checks: HealthCheck[]
+  providers?: ProviderStatus[]
 }
 
 export interface CompanyProfileInput {
@@ -166,6 +202,7 @@ export interface IntegratorOutput {
     | "credentials_ready"
     | "awaiting_provider"
     | "human_action_required"
+    | "configuration_required"
     | "blocked"
     | "failed"
   api_type: string
@@ -187,12 +224,14 @@ export interface RunOutputResponse {
   integrator_bundle: IntegratorOutput
 }
 
-export type RunPhaseAction = "resume" | "poll-email"
+export type RunPhaseAction = "resume" | "poll-email" | "retry"
+export type RetryCapability = "research" | "browser" | "email" | "validation"
 
 export interface ActionReceipt {
   run_id: string
-  action: "resume" | "poll_email"
-  status: "accepted"
+  action: "resume" | "poll_email" | "retry"
+  status: "accepted" | "configuration_required" | "unavailable" | "no_change"
+  detail?: string | null
 }
 
 export interface PhaseConflict {
@@ -201,4 +240,29 @@ export interface PhaseConflict {
   action: string | null
   available_in: string[]
   external_actions: boolean | null
+  message?: string | null
+}
+
+export interface AppSearchItem {
+  app_name: string
+  app_slug: string
+  category: string | null
+  api_type: string | null
+  access_route: AccessRoute | null
+  auth_methods: string[]
+  confidence: number | null
+  buildability: string
+  verification_status: string
+}
+
+export interface AppSearchResponse {
+  query: string
+  items: AppSearchItem[]
+  total: number
+}
+
+export interface AppResearchResponse {
+  app: AppSearchItem
+  research: OperationalResearch
+  provenance?: SnapshotHealth | null
 }

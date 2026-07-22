@@ -62,9 +62,16 @@ def test_run_and_audit_writes_are_sanitized_before_sqlite(tmp_path) -> None:
     credential_ref = "vault://example-app/client_secret/ref_123"  # pragma: allowlist secret
     create_run(storage)
 
+    with pytest.raises(ValueError, match="capability URLs"):
+        storage.update_run(
+            "run-001",
+            browser_live_url=(
+                f"https://browser.example.test/live?token={raw_token}&view=operator"
+            ),
+        )
+
     storage.update_run(
         "run-001",
-        browser_live_url=(f"https://browser.example.test/live?token={raw_token}&view=operator"),
         integrator_bundle={
             "credential_refs": {"client_secret": credential_ref},
             "operational_notes": [f"api_key={raw_api_key}"],
@@ -87,7 +94,7 @@ def test_run_and_audit_writes_are_sanitized_before_sqlite(tmp_path) -> None:
 
     updated = storage.get_run("run-001")
     assert updated is not None
-    assert "temporary-browser-token-value" not in updated["browser_live_url"]
+    assert updated["browser_live_url"] is None
     assert updated["integrator_bundle"]["credential_refs"]["client_secret"] == credential_ref
     assert "sk-test-" not in updated["integrator_bundle"]["operational_notes"][0]
 

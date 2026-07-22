@@ -5,9 +5,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     LANGGRAPH_STRICT_MSGPACK=true \
+    ALLOW_LIVE_BROWSER=false \
+    ALLOW_LIVE_VENDOR_EMAIL=false \
+    RUN_LIVE_TESTS=0 \
     OPS_DB_PATH=/private/ops.db \
     CHECKPOINT_DB_PATH=/private/checkpoints.db \
-    SECRET_VAULT_DB_PATH=/private/secret_vault.db
+    SECRET_VAULT_DB_PATH=/private/secret_vault.db \
+    PROVIDER_EFFECTS_DB_PATH=/private/provider_effects.db
 
 RUN addgroup --system ops && adduser --system --ingroup ops --home /app ops
 

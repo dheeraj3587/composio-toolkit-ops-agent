@@ -36,8 +36,8 @@ def _validate_http_url(value: str) -> str:
         _ = parsed.port
     except ValueError as exc:
         raise ValueError("URL is malformed") from exc
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not hostname:
-        raise ValueError("URL must use HTTP or HTTPS and include a host")
+    if parsed.scheme != "https" or not parsed.netloc or not hostname:
+        raise ValueError("URL must use HTTPS and include a host")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("URL must not include user information")
     if parsed.netloc.rsplit("@", 1)[-1].endswith(":"):
@@ -103,17 +103,58 @@ class PhaseState(StrictApiModel):
     key: Literal["research", "browser", "hitl", "email", "output"]
     name: str
     phase: str
-    status: Literal["ready", "waiting", "unavailable"]
+    status: Literal[
+        "not_started",
+        "ready",
+        "running",
+        "waiting",
+        "configuration_required",
+        "unavailable",
+        "blocked",
+        "failed",
+        "complete",
+    ]
     detail: str
     available: bool
 
 
+class ProviderState(StrictApiModel):
+    provider: Literal["langgraph", "vault", "perplexity", "gemini", "composio", "browser_use"]
+    status: Literal[
+        "not_configured",
+        "disabled",
+        "configured_not_verified",
+        "ready",
+        "schema_incompatible",
+    ]
+    detail: str
+
+
+class RouteDecisionView(StrictApiModel):
+    route: AccessRoute
+    reason_code: str
+    explanation: str
+    is_final: bool
+
+
+class HitlRequestView(StrictApiModel):
+    action_type: str
+    message: str
+    expected_completion_signal: str
+    resumable: bool
+
+
 class SecurityState(StrictApiModel):
     redaction: Literal["enabled"] = "enabled"
-    secret_vault: Literal["not_initialized"] = "not_initialized"
+    secret_vault: Literal[
+        "not_configured",
+        "configured_not_verified",
+        "ready",
+    ] = "not_configured"
     owner_only_storage: Literal["verified_owner_only", "verification_failed"]
-    live_vendor_email: Literal["disabled_in_phase_2"] = "disabled_in_phase_2"
-    external_actions: Literal[False] = False
+    live_vendor_email: Literal["disabled", "enabled"] = "disabled"
+    live_browser: Literal["disabled", "enabled"] = "disabled"
+    external_actions: bool = False
     raw_secrets_exposed: Literal[False] = False
     notes: list[str] = Field(default_factory=list)
 
@@ -136,6 +177,10 @@ class RunDetailResponse(StrictApiModel):
     research: OperationalResearch | None
     phases: list[PhaseState] | None
     security: SecurityState | None
+    route_decision: RouteDecisionView | None = None
+    missing_fields: list[str] = Field(default_factory=list)
+    provider_states: list[ProviderState] = Field(default_factory=list)
+    hitl_request: HitlRequestView | None = None
 
 
 class RunListResponse(StrictApiModel):
@@ -157,10 +202,19 @@ class TimelineResponse(StrictApiModel):
     items: list[TimelineEvent]
 
 
+class ResumeRequest(StrictApiModel):
+    signal: Literal["completed", "cancelled"] = "completed"
+
+
+class RetryRequest(StrictApiModel):
+    capability: Literal["research", "browser", "email", "validation"]
+
+
 class ActionReceipt(StrictApiModel):
     run_id: str
-    action: Literal["resume", "poll_email"]
-    status: Literal["accepted"] = "accepted"
+    action: Literal["resume", "poll_email", "retry"]
+    status: Literal["accepted", "configuration_required", "no_change"] = "accepted"
+    detail: str | None = None
 
 
 class IntegratorBundleView(StrictApiModel):
@@ -170,6 +224,7 @@ class IntegratorBundleView(StrictApiModel):
         "credentials_ready",
         "awaiting_provider",
         "human_action_required",
+        "configuration_required",
         "blocked",
         "failed",
     ]
@@ -182,6 +237,8 @@ class IntegratorBundleView(StrictApiModel):
     callback_urls: list[str]
     credential_refs: dict[str, VaultReference]
     access_route: AccessRoute
+    provider_account_id: str | None = None
+    developer_app_id: str | None = None
     evidence_urls: list[str]
     operational_notes: list[str]
     created_at: str
@@ -203,15 +260,40 @@ class SnapshotHealth(StrictApiModel):
 
 class HealthCheck(StrictApiModel):
     name: str
-    status: Literal["pass", "fail"]
+    status: Literal["pass", "fail", "configuration_required", "disabled"]
 
 
 class HealthResponse(StrictApiModel):
     status: Literal["healthy", "degraded"]
     phase: Literal["2"] = "2"
-    version: Literal["0.1.0"] = "0.1.0"
+    version: Literal["0.2.0"] = "0.2.0"
     snapshot: SnapshotHealth
     checks: list[HealthCheck]
+    providers: list[ProviderState] = Field(default_factory=list)
+
+
+class AppSummary(StrictApiModel):
+    app_name: str
+    app_slug: str
+    category: str
+    api_type: str
+    auth_methods: list[str]
+    access_route: AccessRoute
+    buildability: str
+    verification_status: str
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class AppSearchResponse(StrictApiModel):
+    query: str
+    items: list[AppSummary]
+    total: int = Field(ge=0)
+
+
+class AppResearchResponse(StrictApiModel):
+    app: AppSummary
+    research: OperationalResearch
+    provenance: SnapshotHealth
 
 
 class InvalidRequestResponse(StrictApiModel):
@@ -232,10 +314,8 @@ class ResourceNotFoundResponse(StrictApiModel):
 
 
 class PhaseUnavailableResponse(StrictApiModel):
-    error: Literal["phase_unavailable"] = "phase_unavailable"
-    message: Literal["Action is unavailable in the current implementation phase."] = (
-        "Action is unavailable in the current implementation phase."
-    )
+    error: Literal["phase_unavailable", "configuration_required"] = "phase_unavailable"
+    message: str = "Action is unavailable in the current runtime configuration."
     run_id: str
     action: str
     available_in: list[str] = Field(min_length=1, max_length=8)

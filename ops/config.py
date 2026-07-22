@@ -83,6 +83,7 @@ class Settings(BaseModel):
 
     outreach_recipient_override: str | None = None
     allow_live_vendor_email: bool = False
+    allow_live_browser: bool = False
     max_outreach_rounds: int = Field(default=5, ge=1)
     max_unclear_retries: int = Field(default=1, ge=0)
     max_browser_attempts: int = Field(default=2, ge=1)
@@ -91,6 +92,7 @@ class Settings(BaseModel):
     ops_db_path: Path = Path("./private/ops.db")
     checkpoint_db_path: Path = Path("./private/checkpoints.db")
     secret_vault_db_path: Path = Path("./private/secret_vault.db")
+    provider_effects_db_path: Path = Path("./private/provider_effects.db")
 
     @field_validator("company_work_email_ref")
     @classmethod
@@ -137,6 +139,7 @@ class Settings(BaseModel):
             "allow_live_vendor_email": _boolean(
                 source.get("ALLOW_LIVE_VENDOR_EMAIL"), default=False
             ),
+            "allow_live_browser": _boolean(source.get("ALLOW_LIVE_BROWSER"), default=False),
             "max_outreach_rounds": _integer(source.get("MAX_OUTREACH_ROUNDS"), default=5),
             "max_unclear_retries": _integer(source.get("MAX_UNCLEAR_RETRIES"), default=1),
             "max_browser_attempts": _integer(source.get("MAX_BROWSER_ATTEMPTS"), default=2),
@@ -147,6 +150,9 @@ class Settings(BaseModel):
             ),
             "secret_vault_db_path": Path(
                 source.get("SECRET_VAULT_DB_PATH", "./private/secret_vault.db")
+            ),
+            "provider_effects_db_path": Path(
+                source.get("PROVIDER_EFFECTS_DB_PATH", "./private/provider_effects.db")
             ),
         }
         return cls.model_validate(values)

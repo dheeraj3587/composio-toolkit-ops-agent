@@ -4,6 +4,8 @@ import type { ZodType } from "zod"
 
 import {
   actionReceiptSchema,
+  appResearchResponseSchema,
+  appSearchResponseSchema,
   healthResponseSchema,
   runDetailResponseSchema,
   runListResponseSchema,
@@ -12,6 +14,8 @@ import {
 } from "@/lib/api-schemas"
 import type {
   ActionReceipt,
+  AppResearchResponse,
+  AppSearchResponse,
   HealthResponse,
   IntegratorOutput,
   OperationsRequestInput,
@@ -19,6 +23,7 @@ import type {
   RunDetailResponse,
   RunListResponse,
   RunPhaseAction,
+  RetryCapability,
   TimelineResponse,
 } from "@/lib/types"
 
@@ -125,6 +130,7 @@ async function apiRequest<T>(path: string, schema: ZodType<T>, init?: RequestIni
         available_in: availableIn,
         external_actions:
           typeof detail?.external_actions === "boolean" ? detail.external_actions : null,
+        message: typeof detail?.message === "string" ? detail.message.slice(0, 240) : null,
       })
     }
 
@@ -148,6 +154,19 @@ function runPath(runId: string, suffix = ""): string {
 
 export function getHealth(): Promise<HealthResponse> {
   return apiRequest("/api/system/health", healthResponseSchema)
+}
+
+export function searchApps(query: string): Promise<AppSearchResponse> {
+  const normalized = query.trim().slice(0, 120)
+  const search = new URLSearchParams({ q: normalized })
+  return apiRequest(`/api/apps/search?${search}`, appSearchResponseSchema)
+}
+
+export function getAppResearch(slug: string): Promise<AppResearchResponse> {
+  return apiRequest(
+    `/api/apps/${encodeURIComponent(slug)}/research`,
+    appResearchResponseSchema,
+  )
 }
 
 export function listRuns(limit = 25, offset = 0): Promise<RunListResponse> {
@@ -186,10 +205,11 @@ export function createRun(
 export function performPhaseAction(
   runId: string,
   action: RunPhaseAction,
+  capability?: RetryCapability,
 ): Promise<ActionReceipt> {
-  const suffix = action === "poll-email" ? "/poll-email" : "/resume"
+  const suffix = action === "poll-email" ? "/poll-email" : action === "retry" ? "/retry" : "/resume"
   return apiRequest(runPath(runId, suffix), actionReceiptSchema, {
     method: "POST",
-    body: JSON.stringify({}),
+    body: JSON.stringify(action === "retry" ? { capability } : {}),
   })
 }

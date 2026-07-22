@@ -1,9 +1,10 @@
-"""Application service for local Phase 2 runs.
+"""Application service for durable, sanitized operations-ledger runs.
 
-This module is the single orchestration boundary shared by HTTP, CLI, and
-internal debugging surfaces. It performs no paid or external provider work:
-run creation verifies the immutable P1 snapshot, builds a conservative
-``OperationalResearch`` baseline, and records the deterministic route.
+This module is the single application boundary shared by HTTP, CLI, LangGraph,
+and internal debugging surfaces. Creating a run is intentionally side-effect
+free: it verifies the immutable P1 snapshot, builds a conservative research
+baseline, records the deterministic route, and leaves provider execution to
+explicit retry/resume actions guarded by runtime policy.
 """
 
 from __future__ import annotations
@@ -84,8 +85,8 @@ def _public_run(record: Mapping[str, object]) -> dict[str, Any]:
     public = {
         field: record.get(field) for field in _PUBLIC_RUN_FIELDS if record.get(field) is not None
     }
-    public["execution_mode"] = "local_dry_run"
-    public["external_actions"] = False
+    public["execution_mode"] = record.get("execution_mode") or "local_dry_run"
+    public["external_actions"] = bool(record.get("external_actions", False))
     sanitized = redact_data(public)
     if not isinstance(sanitized, dict):  # pragma: no cover - fixed mapping invariant
         raise RuntimeError("run response could not be sanitized")
@@ -149,7 +150,7 @@ class RunService:
         *,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Create and route one local run without invoking external providers."""
+        """Create and route one run without invoking an external provider."""
 
         if not request.dry_run:
             raise ValueError("Phase 2 accepts dry-run requests only")
@@ -197,6 +198,39 @@ class RunService:
                 app_name=request.app_name,
                 app_slug=_slugify(request.app_name),
                 status="created",
+                p1_summary=(
+                    {
+                        "category": lookup.record.category,
+                        "one_liner": lookup.record.one_liner,
+                        "auth_methods": lookup.record.auth_methods,
+                        "access_model": lookup.record.access_model.kind,
+                        "api_type": lookup.record.api_type,
+                        "buildability": lookup.record.buildability,
+                        "recommended_next_action": lookup.record.recommended_next_action,
+                        "verification_status": lookup.record.verification_status,
+                        "confidence": lookup.record.confidence,
+                        "last_verified": lookup.record.last_verified,
+                    }
+                    if isinstance(lookup, P1LookupFound)
+                    else None
+                ),
+                operational_research=research_payload,
+                route_reason_code=decision.reason_code,
+                route_explanation=decision.explanation,
+                missing_fields=(
+                    _missing_operational_fields(research_payload)
+                    if research_payload is not None
+                    else ["p1_record", "operational_research"]
+                ),
+                provider_status={
+                    "research": "baseline_ready" if research_payload is not None else "not_started",
+                    "browser": "not_started",
+                    "email": "not_started",
+                    "validation": "not_started",
+                },
+                scope_policy=request.requested_scope_policy,
+                execution_mode="local_dry_run",
+                external_actions=False,
                 idempotency_key=validated_idempotency_key,
                 request_fingerprint=request_fingerprint,
             )
@@ -237,6 +271,8 @@ class RunService:
                 run_id,
                 status=persisted_status,
                 access_route=decision.route,
+                route_reason_code=decision.reason_code,
+                route_explanation=decision.explanation,
             )
             transaction.append_audit_event(
                 run_id=run_id,
@@ -309,13 +345,67 @@ class RunService:
         return self.storage.list_audit_events(run_id)
 
     def get_research(self, run_id: str) -> OperationalResearch | None:
-        """Return verified P1-derived research for a run, never audit reconstruction."""
+        """Return the persisted sanitized research projection for a run."""
 
         record = self.storage.get_run(run_id)
         if record is None:
             return None
-        lookup = self.p1_adapter.lookup(str(record["app_name"]))
-        return to_operational_research(lookup.record) if isinstance(lookup, P1LookupFound) else None
+        persisted = record.get("operational_research")
+        if isinstance(persisted, Mapping):
+            return OperationalResearch.model_validate(persisted)
+        return None
+
+    def search_apps(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Search the verified P1 catalog and return a minimal safe projection."""
+
+        if limit < 1 or limit > 100:
+            raise ValueError("limit must be between 1 and 100")
+        normalized = " ".join(query.casefold().split())
+        snapshot = load_verified_snapshot(self.p1_adapter.snapshot_root)
+        matches: list[dict[str, Any]] = []
+        for record in snapshot.records:
+            haystack = " ".join((record.app, record.slug, record.category)).casefold()
+            if normalized and normalized not in haystack:
+                continue
+            matches.append(
+                {
+                    "app_name": record.app,
+                    "app_slug": record.slug,
+                    "category": record.category,
+                    "api_type": record.api_type,
+                    "auth_methods": list(record.auth_methods),
+                    "access_route": to_operational_research(record).access_route,
+                    "buildability": record.buildability,
+                    "verification_status": record.verification_status,
+                    "confidence": record.confidence,
+                }
+            )
+            if len(matches) >= limit:
+                break
+        sanitized = redact_data(matches)
+        if not isinstance(sanitized, list):  # pragma: no cover - fixed list invariant
+            raise RuntimeError("app search response could not be sanitized")
+        return cast(list[dict[str, Any]], sanitized)
+
+    def get_app_research(self, app_slug: str) -> tuple[dict[str, Any], OperationalResearch] | None:
+        """Return a verified app summary and its conservative operational baseline."""
+
+        lookup = self.p1_adapter.lookup(app_slug)
+        if not isinstance(lookup, P1LookupFound):
+            return None
+        record = lookup.record
+        summary = {
+            "app_name": record.app,
+            "app_slug": record.slug,
+            "category": record.category,
+            "api_type": record.api_type,
+            "auth_methods": list(record.auth_methods),
+            "access_route": to_operational_research(record).access_route,
+            "buildability": record.buildability,
+            "verification_status": record.verification_status,
+            "confidence": record.confidence,
+        }
+        return summary, to_operational_research(record)
 
     def get_output(self, run_id: str) -> dict[str, Any] | None:
         record = self.storage.get_run(run_id)

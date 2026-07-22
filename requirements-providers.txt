@@ -1,0 +1,11 @@
+# External orchestration and provider adapters. Runtime calls remain configuration-gated.
+langgraph==1.2.9
+langgraph-checkpoint-sqlite==3.1.0
+
+browser-use-sdk==3.10.0
+playwright==1.61.0
+
+composio==0.18.0
+
+google-genai==2.12.1
+perplexityai==0.42.0

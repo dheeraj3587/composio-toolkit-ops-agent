@@ -1,5 +1,6 @@
 -r requirements.txt
-pytest>=8.4,<9
+-r requirements-providers.txt
+pytest==9.0.3
 pytest-asyncio>=1.1,<2
 ruff>=0.12,<1
 mypy>=1.17,<2

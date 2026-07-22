@@ -26,9 +26,35 @@ _RUN_COLUMNS = (
     "gmail_session_id",
     "gmail_thread_id",
     "integrator_bundle_json",
+    "p1_summary_json",
+    "operational_research_json",
+    "route_reason_code",
+    "route_explanation",
+    "missing_fields_json",
+    "provider_status_json",
+    "hitl_request_json",
+    "validation_json",
+    "scope_policy",
+    "execution_mode",
+    "external_actions",
     "created_at",
     "updated_at",
 )
+
+_JSON_RUN_FIELDS = {
+    "integrator_bundle": "integrator_bundle_json",
+    "p1_summary": "p1_summary_json",
+    "operational_research": "operational_research_json",
+    "missing_fields": "missing_fields_json",
+    "provider_status": "provider_status_json",
+    "hitl_request": "hitl_request_json",
+    "validation": "validation_json",
+}
+
+_DEFAULT_JSON_VALUES: dict[str, object] = {
+    "missing_fields": [],
+    "provider_status": {},
+}
 
 
 def _utc_now() -> str:
@@ -38,6 +64,36 @@ def _utc_now() -> str:
 def _json(value: object) -> str:
     return json.dumps(
         redact_data(value),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _sanitize_structured(value: object) -> object:
+    """Redact leaf strings while preserving a validated model's field shapes.
+
+    Audit payloads use key-aware redaction because their shape is open-ended.
+    Persisted Pydantic projections have fixed schemas whose legitimate field
+    names include words such as ``token_url`` and ``credential_fields``.  A
+    key-aware pass would replace those fields wholesale and make the stored
+    model impossible to validate on read.
+    """
+
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, Mapping):
+        return {str(key): _sanitize_structured(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_sanitize_structured(item) for item in value]
+    return redact_data(value)
+
+
+def _structured_json(value: object) -> str:
+    return json.dumps(
+        _sanitize_structured(value),
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -69,6 +125,17 @@ class OperationsUnitOfWork:
         gmail_session_id: str | None = None,
         gmail_thread_id: str | None = None,
         integrator_bundle: Mapping[str, object] | None = None,
+        p1_summary: Mapping[str, object] | None = None,
+        operational_research: Mapping[str, object] | None = None,
+        route_reason_code: str | None = None,
+        route_explanation: str | None = None,
+        missing_fields: list[str] | None = None,
+        provider_status: Mapping[str, object] | None = None,
+        hitl_request: Mapping[str, object] | None = None,
+        validation: Mapping[str, object] | None = None,
+        scope_policy: str = "maximum",
+        execution_mode: str = "local_dry_run",
+        external_actions: bool = False,
         idempotency_key: str | None = None,
         request_fingerprint: str | None = None,
     ) -> dict[str, Any]:
@@ -85,6 +152,17 @@ class OperationsUnitOfWork:
             gmail_session_id=gmail_session_id,
             gmail_thread_id=gmail_thread_id,
             integrator_bundle=integrator_bundle,
+            p1_summary=p1_summary,
+            operational_research=operational_research,
+            route_reason_code=route_reason_code,
+            route_explanation=route_explanation,
+            missing_fields=missing_fields,
+            provider_status=provider_status,
+            hitl_request=hitl_request,
+            validation=validation,
+            scope_policy=scope_policy,
+            execution_mode=execution_mode,
+            external_actions=external_actions,
             idempotency_key=idempotency_key,
             request_fingerprint=request_fingerprint,
         )
@@ -114,6 +192,38 @@ class OperationsUnitOfWork:
             payload=payload,
         )
 
+    def reserve_side_effect(
+        self,
+        *,
+        run_id: str,
+        operation_key: str,
+        provider: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically reserve one external mutation inside this transaction."""
+
+        return self._storage._reserve_side_effect(
+            self._connection,
+            run_id=run_id,
+            operation_key=operation_key,
+            provider=provider,
+        )
+
+    def update_side_effect(
+        self,
+        *,
+        run_id: str,
+        operation_key: str,
+        status: str,
+        external_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._storage._update_side_effect(
+            self._connection,
+            run_id=run_id,
+            operation_key=operation_key,
+            status=status,
+            external_id=external_id,
+        )
+
 
 class OperationsStorage:
     """SQLite persistence that sanitizes every free-form value before writing."""
@@ -137,6 +247,17 @@ class OperationsStorage:
                     gmail_session_id TEXT,
                     gmail_thread_id TEXT,
                     integrator_bundle_json TEXT,
+                    p1_summary_json TEXT,
+                    operational_research_json TEXT,
+                    route_reason_code TEXT,
+                    route_explanation TEXT,
+                    missing_fields_json TEXT NOT NULL DEFAULT '[]',
+                    provider_status_json TEXT NOT NULL DEFAULT '{}',
+                    hitl_request_json TEXT,
+                    validation_json TEXT,
+                    scope_policy TEXT NOT NULL DEFAULT 'maximum',
+                    execution_mode TEXT NOT NULL DEFAULT 'local_dry_run',
+                    external_actions INTEGER NOT NULL DEFAULT 0,
                     idempotency_key TEXT,
                     request_fingerprint TEXT,
                     created_at TEXT NOT NULL,
@@ -154,14 +275,42 @@ class OperationsStorage:
 
                 CREATE INDEX IF NOT EXISTS idx_audit_events_run_id
                 ON audit_events(run_id, id);
+
+                CREATE TABLE IF NOT EXISTS side_effect_intents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    operation_key TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    external_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (run_id, operation_key),
+                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+                );
                 """
             )
             existing_columns = {
                 str(row[1]) for row in connection.execute("PRAGMA table_info(runs)").fetchall()
             }
-            for column_name in ("idempotency_key", "request_fingerprint"):
+            migration_columns = {
+                "idempotency_key": "TEXT",
+                "request_fingerprint": "TEXT",
+                "p1_summary_json": "TEXT",
+                "operational_research_json": "TEXT",
+                "route_reason_code": "TEXT",
+                "route_explanation": "TEXT",
+                "missing_fields_json": "TEXT NOT NULL DEFAULT '[]'",
+                "provider_status_json": "TEXT NOT NULL DEFAULT '{}'",
+                "hitl_request_json": "TEXT",
+                "validation_json": "TEXT",
+                "scope_policy": "TEXT NOT NULL DEFAULT 'maximum'",
+                "execution_mode": "TEXT NOT NULL DEFAULT 'local_dry_run'",
+                "external_actions": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for column_name, declaration in migration_columns.items():
                 if column_name not in existing_columns:
-                    connection.execute(f"ALTER TABLE runs ADD COLUMN {column_name} TEXT")
+                    connection.execute(f"ALTER TABLE runs ADD COLUMN {column_name} {declaration}")
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_idempotency_key
@@ -196,6 +345,17 @@ class OperationsStorage:
         gmail_session_id: str | None = None,
         gmail_thread_id: str | None = None,
         integrator_bundle: Mapping[str, object] | None = None,
+        p1_summary: Mapping[str, object] | None = None,
+        operational_research: Mapping[str, object] | None = None,
+        route_reason_code: str | None = None,
+        route_explanation: str | None = None,
+        missing_fields: list[str] | None = None,
+        provider_status: Mapping[str, object] | None = None,
+        hitl_request: Mapping[str, object] | None = None,
+        validation: Mapping[str, object] | None = None,
+        scope_policy: str = "maximum",
+        execution_mode: str = "local_dry_run",
+        external_actions: bool = False,
         idempotency_key: str | None = None,
         request_fingerprint: str | None = None,
     ) -> dict[str, Any]:
@@ -214,6 +374,17 @@ class OperationsStorage:
                 gmail_session_id=gmail_session_id,
                 gmail_thread_id=gmail_thread_id,
                 integrator_bundle=integrator_bundle,
+                p1_summary=p1_summary,
+                operational_research=operational_research,
+                route_reason_code=route_reason_code,
+                route_explanation=route_explanation,
+                missing_fields=missing_fields,
+                provider_status=provider_status,
+                hitl_request=hitl_request,
+                validation=validation,
+                scope_policy=scope_policy,
+                execution_mode=execution_mode,
+                external_actions=external_actions,
                 idempotency_key=idempotency_key,
                 request_fingerprint=request_fingerprint,
             )
@@ -233,11 +404,24 @@ class OperationsStorage:
         gmail_session_id: str | None = None,
         gmail_thread_id: str | None = None,
         integrator_bundle: Mapping[str, object] | None = None,
+        p1_summary: Mapping[str, object] | None = None,
+        operational_research: Mapping[str, object] | None = None,
+        route_reason_code: str | None = None,
+        route_explanation: str | None = None,
+        missing_fields: list[str] | None = None,
+        provider_status: Mapping[str, object] | None = None,
+        hitl_request: Mapping[str, object] | None = None,
+        validation: Mapping[str, object] | None = None,
+        scope_policy: str = "maximum",
+        execution_mode: str = "local_dry_run",
+        external_actions: bool = False,
         idempotency_key: str | None = None,
         request_fingerprint: str | None = None,
     ) -> dict[str, Any]:
         if (idempotency_key is None) != (request_fingerprint is None):
             raise ValueError("idempotency key and request fingerprint must be provided together")
+        if browser_live_url is not None:
+            raise ValueError("browser live capability URLs cannot be persisted")
         now = _utc_now()
         values = (
             _safe_text(run_id),
@@ -250,7 +434,18 @@ class OperationsStorage:
             _safe_text(browser_live_url),
             _safe_text(gmail_session_id),
             _safe_text(gmail_thread_id),
-            _json(integrator_bundle) if integrator_bundle is not None else None,
+            _structured_json(integrator_bundle) if integrator_bundle is not None else None,
+            _structured_json(p1_summary) if p1_summary is not None else None,
+            _structured_json(operational_research) if operational_research is not None else None,
+            _safe_text(route_reason_code),
+            _safe_text(route_explanation),
+            _structured_json(missing_fields or []),
+            _structured_json(provider_status or {}),
+            _structured_json(hitl_request) if hitl_request is not None else None,
+            _structured_json(validation) if validation is not None else None,
+            _safe_text(scope_policy),
+            _safe_text(execution_mode),
+            int(external_actions),
             _safe_text(idempotency_key),
             _safe_text(request_fingerprint),
             now,
@@ -261,9 +456,13 @@ class OperationsStorage:
             INSERT INTO runs (
                 run_id, thread_id, app_name, app_slug, status, access_route,
                 browser_session_id, browser_live_url, gmail_session_id,
-                gmail_thread_id, integrator_bundle_json, idempotency_key,
-                request_fingerprint, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                gmail_thread_id, integrator_bundle_json,
+                p1_summary_json, operational_research_json, route_reason_code,
+                route_explanation, missing_fields_json, provider_status_json,
+                hitl_request_json, validation_json, scope_policy, execution_mode,
+                external_actions, idempotency_key, request_fingerprint,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             values,
         )
@@ -328,6 +527,17 @@ class OperationsStorage:
             "gmail_session_id",
             "gmail_thread_id",
             "integrator_bundle",
+            "p1_summary",
+            "operational_research",
+            "route_reason_code",
+            "route_explanation",
+            "missing_fields",
+            "provider_status",
+            "hitl_request",
+            "validation",
+            "scope_policy",
+            "execution_mode",
+            "external_actions",
         }
         unknown = set(changes) - allowed
         if unknown:
@@ -341,10 +551,21 @@ class OperationsStorage:
         assignments: list[str] = []
         values: list[object] = []
         for name, value in changes.items():
-            column = "integrator_bundle_json" if name == "integrator_bundle" else name
+            if name == "browser_live_url" and value is not None:
+                raise ValueError("browser live capability URLs cannot be persisted")
+            column = _JSON_RUN_FIELDS.get(name, name)
             assignments.append(f"{column} = ?")
-            if name == "integrator_bundle":
-                values.append(_json(value) if value is not None else None)
+            if name in _JSON_RUN_FIELDS:
+                default = _DEFAULT_JSON_VALUES.get(name)
+                values.append(
+                    _structured_json(default)
+                    if value is None and default is not None
+                    else _structured_json(value)
+                    if value is not None
+                    else None
+                )
+            elif name == "external_actions":
+                values.append(int(bool(value)))
             elif isinstance(value, str):
                 values.append(_safe_text(value))
             else:
@@ -452,13 +673,155 @@ class OperationsStorage:
             for row in rows
         ]
 
+    def reserve_side_effect(
+        self,
+        *,
+        run_id: str,
+        operation_key: str,
+        provider: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Reserve an idempotent external mutation and report whether it is new."""
+
+        self.initialize()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return self._reserve_side_effect(
+                connection,
+                run_id=run_id,
+                operation_key=operation_key,
+                provider=provider,
+            )
+
+    def _reserve_side_effect(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        operation_key: str,
+        provider: str,
+    ) -> tuple[dict[str, Any], bool]:
+        if not operation_key or len(operation_key) > 200:
+            raise ValueError("operation key is invalid")
+        if not provider or len(provider) > 64:
+            raise ValueError("provider name is invalid")
+        now = _utc_now()
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO side_effect_intents (
+                run_id, operation_key, provider, status, created_at, updated_at
+            ) VALUES (?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                _safe_text(run_id),
+                _safe_text(operation_key),
+                _safe_text(provider),
+                now,
+                now,
+            ),
+        )
+        record = self._get_side_effect(connection, run_id, operation_key)
+        if record is None:  # pragma: no cover - foreign key/insertion invariant
+            raise KeyError("run was not found")
+        return (record, cursor.rowcount == 1)
+
+    def get_side_effect(self, run_id: str, operation_key: str) -> dict[str, Any] | None:
+        self.initialize()
+        with self._connect() as connection:
+            return self._get_side_effect(connection, run_id, operation_key)
+
+    @staticmethod
+    def _get_side_effect(
+        connection: sqlite3.Connection,
+        run_id: str,
+        operation_key: str,
+    ) -> dict[str, Any] | None:
+        row = connection.execute(
+            """
+            SELECT run_id, operation_key, provider, status, external_id,
+                   created_at, updated_at
+            FROM side_effect_intents
+            WHERE run_id = ? AND operation_key = ?
+            """,
+            (_safe_text(run_id), _safe_text(operation_key)),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(
+            zip(
+                (
+                    "run_id",
+                    "operation_key",
+                    "provider",
+                    "status",
+                    "external_id",
+                    "created_at",
+                    "updated_at",
+                ),
+                row,
+                strict=True,
+            )
+        )
+
+    def update_side_effect(
+        self,
+        *,
+        run_id: str,
+        operation_key: str,
+        status: str,
+        external_id: str | None = None,
+    ) -> dict[str, Any]:
+        self.initialize()
+        with self._connect() as connection:
+            return self._update_side_effect(
+                connection,
+                run_id=run_id,
+                operation_key=operation_key,
+                status=status,
+                external_id=external_id,
+            )
+
+    def _update_side_effect(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        operation_key: str,
+        status: str,
+        external_id: str | None = None,
+    ) -> dict[str, Any]:
+        if status not in {"pending", "completed", "outcome_unknown", "failed"}:
+            raise ValueError("side-effect status is invalid")
+        cursor = connection.execute(
+            """
+            UPDATE side_effect_intents
+            SET status = ?, external_id = ?, updated_at = ?
+            WHERE run_id = ? AND operation_key = ?
+            """,
+            (
+                status,
+                _safe_text(external_id),
+                _utc_now(),
+                _safe_text(run_id),
+                _safe_text(operation_key),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise KeyError("side-effect intent was not found")
+        record = self._get_side_effect(connection, run_id, operation_key)
+        if record is None:  # pragma: no cover - update invariant
+            raise RuntimeError("side-effect intent could not be read back")
+        return record
+
     @staticmethod
     def _run_from_row(row: sqlite3.Row | tuple[object, ...]) -> dict[str, Any]:
         record = dict(zip(_RUN_COLUMNS, row, strict=True))
-        serialized_bundle = record.pop("integrator_bundle_json")
-        record["integrator_bundle"] = (
-            json.loads(str(serialized_bundle)) if serialized_bundle is not None else None
-        )
+        for public_name, column_name in _JSON_RUN_FIELDS.items():
+            serialized = record.pop(column_name)
+            if serialized is None:
+                record[public_name] = _DEFAULT_JSON_VALUES.get(public_name)
+            else:
+                record[public_name] = json.loads(str(serialized))
+        record["external_actions"] = bool(record["external_actions"])
         return record
 
     @contextmanager

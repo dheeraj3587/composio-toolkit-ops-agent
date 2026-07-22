@@ -1,48 +1,48 @@
 import type { Metadata, Viewport } from "next"
-import { IBM_Plex_Mono, IBM_Plex_Sans, Newsreader } from "next/font/google"
+import { Geist, Geist_Mono } from "next/font/google"
 
 import { AppShell } from "@/components/app-shell"
+import { DemoBanner } from "@/components/demo-banner"
+import { Providers } from "@/components/providers"
 
 import "./globals.css"
 
-const plexSans = IBM_Plex_Sans({
-  variable: "--font-plex-sans",
+const geistSans = Geist({
+  variable: "--font-geist-sans",
   subsets: ["latin"],
   display: "swap",
 })
 
-const plexMono = IBM_Plex_Mono({
-  variable: "--font-plex-mono",
-  subsets: ["latin"],
-  weight: ["400", "500", "600"],
-  display: "swap",
-})
-
-const newsreader = Newsreader({
-  variable: "--font-newsreader",
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
   subsets: ["latin"],
   display: "swap",
 })
 
 export const metadata: Metadata = {
   title: {
-    default: "Operations Ledger · Composio",
-    template: "%s · Operations Ledger",
+    default: "Composio Operations",
+    template: "%s · Composio Operations",
   },
-  description: "A secure, reference-only control plane for toolkit access operations.",
+  description: "A secure operations control plane for toolkit access and credential delivery.",
   robots: { index: false, follow: false },
 }
 
 export const viewport: Viewport = {
   colorScheme: "light",
-  themeColor: "#e6ddc9",
+  themeColor: "#0b0b0e",
 }
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
+  const demoMode = process.env.NEXT_PUBLIC_DEMO_MODE === "true"
+
   return (
-    <html lang="en" className={`${plexSans.variable} ${plexMono.variable} ${newsreader.variable}`}>
+    <html lang="en" className={`${geistSans.variable} ${geistMono.variable}`}>
       <body>
-        <AppShell>{children}</AppShell>
+        <Providers>
+          <DemoBanner enabled={demoMode} />
+          <AppShell demoMode={demoMode}>{children}</AppShell>
+        </Providers>
       </body>
     </html>
   )

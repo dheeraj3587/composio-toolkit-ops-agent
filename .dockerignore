@@ -1,5 +1,7 @@
 .git
+.github
 .gitignore
+.secrets.baseline
 .env
 .env.*
 !.env.example
@@ -39,6 +41,11 @@ recordings
 screenshots
 tests
 fixtures
+Makefile
+compose.yaml
+requirements-dev.txt
+PLAN.md
+DECISIONS.md
 .DS_Store
 dist
 build

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -11,6 +12,13 @@ from ops.state import AccessRoute
 
 VAULT_REFERENCE_PATTERN = re.compile(r"^vault://[a-z0-9-]+/[a-z0-9_-]+/[A-Za-z0-9_-]+$")
 VaultReference = Annotated[str, Field(min_length=12, max_length=512)]
+CapabilityStatus = Literal[
+    "ready",
+    "configuration_required",
+    "contract_incompatible",
+    "disabled",
+    "failed",
+]
 
 
 def validate_vault_reference(value: str) -> str:
@@ -18,6 +26,24 @@ def validate_vault_reference(value: str) -> str:
 
     if VAULT_REFERENCE_PATTERN.fullmatch(value) is None:
         raise ValueError("credential values must be exact vault:// references")
+    return value
+
+
+def validate_https_url(value: str) -> str:
+    """Validate a bounded HTTPS URL without performing network I/O.
+
+    Network-facing boundaries perform DNS and redirect validation as well.  The
+    model validator prevents credentials, relative URLs, and non-HTTPS schemes
+    from ever becoming durable workflow data.
+    """
+
+    if len(value) > 2_048:
+        raise ValueError("URL exceeds the supported length")
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("an absolute HTTPS URL is required")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URLs containing user information are not allowed")
     return value
 
 
@@ -32,34 +58,40 @@ class StrictModel(BaseModel):
 
 
 class CompanyProfile(StrictModel):
-    legal_name: str
+    legal_name: str = Field(min_length=1, max_length=200)
     website: str
     work_email_ref: VaultReference
-    use_case: str
-    expected_volume: str | None = None
+    use_case: str = Field(min_length=1, max_length=2_000)
+    expected_volume: str | None = Field(default=None, max_length=200)
     callback_urls: list[str] = Field(default_factory=list)
 
     _validate_work_email_ref = field_validator("work_email_ref")(validate_vault_reference)
+    _validate_website = field_validator("website")(validate_https_url)
+    _validate_callback_urls = field_validator("callback_urls")(
+        lambda values: [validate_https_url(value) for value in values]
+    )
 
 
 class OperationsRequest(StrictModel):
-    app_name: str
+    app_name: str = Field(min_length=1, max_length=200)
     company: CompanyProfile
     requested_scope_policy: Literal["minimum", "recommended", "maximum"] = "maximum"
     dry_run: bool = True
-    outreach_recipient_override: str | None = None
+    outreach_recipient_override: str | None = Field(default=None, max_length=320)
 
 
 class ScopeRequirement(StrictModel):
-    name: str
-    description: str | None = None
+    name: str = Field(min_length=1, max_length=300)
+    description: str | None = Field(default=None, max_length=2_000)
     required: bool | None = None
     source_url: str
 
+    _validate_source_url = field_validator("source_url")(validate_https_url)
+
 
 class OperationalResearch(StrictModel):
-    app_name: str
-    app_slug: str
+    app_name: str = Field(min_length=1, max_length=200)
+    app_slug: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$", max_length=120)
     api_available: bool | None
     api_type: str
     api_base_url: str | None
@@ -74,8 +106,54 @@ class OperationalResearch(StrictModel):
     production_approval_required: bool | None
     contact_email: str | None
     contact_url: str | None
-    evidence_urls: list[str]
+    evidence_urls: list[str] = Field(max_length=50)
     confidence: float = Field(ge=0.0, le=1.0)
+
+    @field_validator(
+        "api_base_url",
+        "authorization_url",
+        "token_url",
+        "developer_portal_url",
+        "signup_url",
+        "contact_url",
+    )
+    @classmethod
+    def validate_optional_urls(cls, value: str | None) -> str | None:
+        return validate_https_url(value) if value is not None else None
+
+    _validate_evidence_urls = field_validator("evidence_urls")(
+        lambda values: [validate_https_url(value) for value in values]
+    )
+
+
+class CapabilityAvailability(StrictModel):
+    """Sanitized capability state suitable for API and workflow persistence."""
+
+    capability: str = Field(min_length=1, max_length=100)
+    status: CapabilityStatus
+    reason_code: str = Field(min_length=1, max_length=100)
+    detail: str = Field(min_length=1, max_length=500)
+
+
+class HitlRequest(StrictModel):
+    """A bounded human-action request containing no credential material."""
+
+    type: Literal[
+        "captcha",
+        "email_otp",
+        "phone_otp",
+        "passkey",
+        "security_key",
+        "device_approval",
+        "provider_verification",
+        "legal_acceptance",
+        "billing",
+        "account_selection",
+    ]
+    app_name: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=500)
+    expected_completion_signal: str = Field(min_length=1, max_length=500)
+    live_view_available: bool = False
 
 
 class IntegratorBundle(StrictModel):
@@ -85,6 +163,7 @@ class IntegratorBundle(StrictModel):
         "credentials_ready",
         "awaiting_provider",
         "human_action_required",
+        "configuration_required",
         "blocked",
         "failed",
     ]

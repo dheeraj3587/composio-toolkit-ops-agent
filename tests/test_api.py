@@ -72,7 +72,7 @@ def harness(tmp_path: Path) -> Iterator[ApiHarness]:
     db_path = tmp_path / "private" / "ops.db"
     core = CoreRunService.from_paths(db_path=db_path)
     service = TrackingRunService(db_path, core)
-    application = create_app(service=service)
+    application = create_app(service=service, cors_origins=["http://localhost:5173"])
     with TestClient(application, raise_server_exceptions=False) as client:
         assert service.started is True
         yield ApiHarness(client=client, service=service, core=core, db_path=db_path)
@@ -106,7 +106,10 @@ def test_exact_requested_routes_are_registered(harness: ApiHarness) -> None:
         ("/api/runs/{run_id}/timeline", "GET"),
         ("/api/runs/{run_id}/resume", "POST"),
         ("/api/runs/{run_id}/poll-email", "POST"),
+        ("/api/runs/{run_id}/retry", "POST"),
         ("/api/runs/{run_id}/output", "GET"),
+        ("/api/apps/search", "GET"),
+        ("/api/apps/{app_slug}/research", "GET"),
         ("/api/system/health", "GET"),
     }
 
@@ -114,7 +117,16 @@ def test_exact_requested_routes_are_registered(harness: ApiHarness) -> None:
 def test_create_and_detail_expose_verified_phase_two_contract(harness: ApiHarness) -> None:
     created = create_run(harness)
 
-    assert set(created) == {"run", "research", "phases", "security"}
+    assert set(created) == {
+        "run",
+        "research",
+        "phases",
+        "security",
+        "route_decision",
+        "missing_fields",
+        "provider_states",
+        "hitl_request",
+    }
     run = created["run"]
     assert isinstance(run, dict)
     assert set(run) == {
@@ -143,17 +155,18 @@ def test_create_and_detail_expose_verified_phase_two_contract(harness: ApiHarnes
     phases = {phase["key"]: phase["status"] for phase in created["phases"]}
     assert phases == {
         "research": "ready",
-        "browser": "unavailable",
-        "hitl": "unavailable",
-        "email": "unavailable",
-        "output": "unavailable",
+        "browser": "configuration_required",
+        "hitl": "configuration_required",
+        "email": "configuration_required",
+        "output": "waiting",
     }
     assert created["security"]["redaction"] == "enabled"
     assert (
-        created["security"]["secret_vault"] == "not_initialized"  # pragma: allowlist secret
+        created["security"]["secret_vault"] == "not_configured"  # pragma: allowlist secret
     )
     assert created["security"]["owner_only_storage"] == "verified_owner_only"
-    assert created["security"]["live_vendor_email"] == "disabled_in_phase_2"
+    assert created["security"]["live_vendor_email"] == "disabled"
+    assert created["security"]["live_browser"] == "disabled"
     assert created["security"]["external_actions"] is False
     assert created["security"]["raw_secrets_exposed"] is False
 
@@ -276,10 +289,11 @@ def test_future_actions_are_typed_http_409(
     response = getattr(harness.client, method)(f"/api/runs/{run_id}/{suffix}")
 
     assert response.status_code == 409
-    assert response.json()["error"] == "phase_unavailable"
+    expected_error = "phase_unavailable" if action == "output" else "configuration_required"
+    assert response.json()["error"] == expected_error
     assert response.json()["action"] == action
     assert response.json()["available_in"]
-    assert all(item.startswith("phase_") for item in response.json()["available_in"])
+    assert all(isinstance(item, str) and item for item in response.json()["available_in"])
     assert response.json()["external_actions"] is False
     assert response.headers["cache-control"] == "no-store"
 
@@ -310,11 +324,13 @@ def test_future_action_success_contract_matches_frontend_receipt(tmp_path: Path)
         ("get", "/api/runs/run_00000000000000000000000000000000/timeline"),
         ("post", "/api/runs/run_00000000000000000000000000000000/resume"),
         ("post", "/api/runs/run_00000000000000000000000000000000/poll-email"),
+        ("post", "/api/runs/run_00000000000000000000000000000000/retry"),
         ("get", "/api/runs/run_00000000000000000000000000000000/output"),
     ],
 )
 def test_unknown_runs_return_typed_404(harness: ApiHarness, method: str, path: str) -> None:
-    response = getattr(harness.client, method)(path)
+    kwargs = {"json": {"capability": "research"}} if path.endswith("/retry") else {}
+    response = getattr(harness.client, method)(path, **kwargs)
 
     assert response.status_code == 404
     assert response.json() == {
@@ -335,9 +351,10 @@ def test_health_reports_verified_snapshot_without_environment_or_paths(
 
     assert response.status_code == 200
     payload = response.json()
-    assert set(payload) == {"status", "phase", "version", "snapshot", "checks"}
+    assert set(payload) == {"status", "phase", "version", "snapshot", "checks", "providers"}
     assert payload["status"] == "healthy"
     assert payload["phase"] == "2"
+    assert payload["version"] == "0.2.0"
     assert payload["snapshot"]["verified"] is True
     assert len(payload["snapshot"]["results_sha256"]) == 64
     assert len(payload["snapshot"]["coverage_sha256"]) == 64
@@ -504,10 +521,14 @@ def test_response_projection_omits_provider_sessions_and_internal_records(
 ) -> None:
     created = create_run(harness)
     run_id = created["run"]["run_id"]
+    with pytest.raises(ValueError, match="capability URLs"):
+        harness.core.storage.update_run(
+            run_id,
+            browser_live_url="https://browser.example.test/live?token=internal-marker",
+        )
     harness.core.storage.update_run(
         run_id,
         browser_session_id="browser-session-internal",
-        browser_live_url="https://browser.example.test/live?token=internal-marker",
         gmail_session_id="gmail-session-internal",
         gmail_thread_id="gmail-thread-internal",
     )

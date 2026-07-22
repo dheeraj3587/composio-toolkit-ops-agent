@@ -33,21 +33,35 @@ exact `vault://...` references.
 
 ## Provider isolation
 
-Provider-facing modules are typed boundaries or explicit phase-unavailable stubs. They intentionally
-do not import or call LangGraph, Browser Use, Playwright, Composio, Gemini, or Perplexity. This keeps
-Gate A deterministic and prevents an innocent CLI/UI smoke test from creating network side effects.
-Real providers are introduced only at their later phase gates with current SDK contracts and opt-in
-live verification.
+Provider-facing modules remain typed, injectable boundaries even after the real SDK adapters were
+introduced. Importing the application, running normal tests, starting the UI, or creating a run does
+not itself authorize a paid/network side effect. A missing key, connected account, encrypted
+checkpoint key, live-browser flag, or controlled email recipient produces a typed
+configuration-required state. Live tests additionally require `RUN_LIVE_TESTS=1`; fixture and fake
+adapter tests are never reported as live-provider evidence.
 
 ## Dependencies and deployment
 
 The runtime set retains the versions locked in `PLAN.md` except for Pydantic. The resolver confirmed
 that `composio==0.18.0` requires `pydantic>=2.13.4`, which conflicts with the plan's
-`pydantic==2.12.5`; `requirements.txt` therefore uses the smallest compatible exact pin,
-`pydantic==2.13.4`. Transitive locking is deferred until the first passing integration run, as
-directed by the plan. The Dockerfile is included with an unprivileged runtime user, owner-only
-`/private` mount, and no local-secret build context; image-build verification is deferred because
-Docker is unavailable locally.
+`pydantic==2.12.5`; the project therefore uses the smallest compatible exact pin,
+`pydantic==2.13.4`. Direct dependencies are split by trust boundary: `requirements.txt` contains the
+secure core, API, CLI, and internal UI; `requirements-providers.txt` contains LangGraph and external
+provider SDKs; `requirements-dev.txt` composes both with verification tools; and
+`requirements-api.txt` composes the complete container runtime. `httpx==0.28.1` is an explicit core
+pin because the enrichment/validation boundaries use it and every installed provider supports the
+same release. `httpx2==2.7.0` remains a development-only dependency because the installed
+Starlette `1.3.1` test client imports it explicitly; production provider clients continue to use
+`httpx==0.28.1`.
+
+The 2026-07-23 dependency audit reported `PYSEC-2026-1845` against the installed `pytest==8.4.2`;
+the first published fixed version is `9.0.3`. `requirements-dev.txt` therefore moves only the pytest
+development range from `>=8.4,<9` to `>=9.0.3,<10`. The advisory is not suppressed, and the complete
+test suite must pass on pytest 9 before delivery.
+
+Transitive locking remains deferred until a complete configured integration run, as directed by the
+plan. Container definitions use unprivileged users and owner-only `/private` state; image-build
+verification remains deferred because Docker is unavailable locally.
 
 ## Phase 2 snapshot adapter and routing
 
@@ -73,10 +87,13 @@ Tailwind, and shadcn/ui product surface. The Next.js server is the only frontend
 storage. The Streamlit application remains a trusted internal debugging ledger rather than the
 primary product UI.
 
-The HTTP API exposes run create/list/detail/timeline, phase action, output, and health routes.
-External actions that belong to later gates return explicit typed unavailable responses. API schema
-and documentation endpoints are disabled, responses use no-store and restrictive security headers,
-and neither environment values nor database/vault paths are part of a response contract.
+The HTTP API exposes app search/research, run create/list/detail/timeline, resume, polling, retry,
+output, and health routes. External actions return explicit typed configuration-required or
+unavailable responses until their exact evidence exists. API schema and documentation endpoints are
+available only when `OPS_ENABLE_API_DOCS=true` for local development; containers force them off.
+CORS origins come only from the explicit `OPS_CORS_ORIGINS` environment allowlist. Responses use
+no-store and restrictive security headers, and neither environment values nor database/vault paths
+are part of a response contract.
 
 ## Container runtime boundary
 
@@ -89,6 +106,12 @@ trusted host or behind an authenticated private-access layer.
 Docker is unavailable on the development Mac. The Dockerfiles and Compose configuration are
 included and statically reviewed, but image builds, container health checks, and Compose startup are
 truthfully deferred until a Docker-capable environment is available.
+
+Compose deliberately does not interpolate provider credentials into its checked-in service
+environment because `docker compose config` can render interpolated values. Production operators
+must use their deployment platform's secret manager. The checked-in Compose service environment
+sets API documentation, live Browser Use, live tests, and vendor email off, publishes only to
+loopback, and adds init handling plus a bounded process count.
 
 ## Phase 2 runtime hardening
 
@@ -110,3 +133,19 @@ now assembles both into `.next/standalone`, so local `npm start` and the contain
 complete artifact. The FastAPI image installs only `requirements-api.txt`; application code and the
 P1 snapshot are root-owned and read-only, while `/private` is the sole application-owned writable
 path. The Compose read-only root filesystem and `/tmp` tmpfs remain defense-in-depth controls.
+
+## Delivery automation and live-test policy
+
+The GitHub Actions workflow has independent backend/security and frontend jobs. The backend job uses
+Python 3.11, installs the complete development/provider set and local Playwright Chromium, runs
+Ruff, non-live pytest, strict mypy, compileall, detect-secrets enforcement, dependency auditing, and
+the targeted credential-pattern scan. The frontend job uses Node.js 22 and the committed npm
+lockfile, then runs the dependency audit, ESLint, TypeScript, tests, and production build. Both jobs
+run without provider credentials; the backend job forces `RUN_LIVE_TESTS=0`,
+`ALLOW_LIVE_BROWSER=false`, and `ALLOW_LIVE_VENDOR_EMAIL=false`.
+
+The local `scripts/security_gate.sh` accepts `backend`, `frontend`, or its default `all` scope so CI
+and developers use the same checks. `Makefile` commands are convenience wrappers only; they do not
+change the security defaults or load secrets into command arguments. No successful fixture test is
+treated as proof of email delivery, Browser Use completion, provider approval, credential capture,
+credential validation, or integrator-bundle readiness.

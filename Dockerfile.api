@@ -7,16 +7,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     LANGGRAPH_STRICT_MSGPACK=true \
+    ALLOW_LIVE_BROWSER=false \
     ALLOW_LIVE_VENDOR_EMAIL=false \
+    OPS_ENABLE_API_DOCS=false \
+    RUN_LIVE_TESTS=0 \
     OPS_DB_PATH=/private/ops.db \
     CHECKPOINT_DB_PATH=/private/checkpoints.db \
-    SECRET_VAULT_DB_PATH=/private/secret_vault.db
+    SECRET_VAULT_DB_PATH=/private/secret_vault.db \
+    PROVIDER_EFFECTS_DB_PATH=/private/provider_effects.db
 
 RUN addgroup --system ops && adduser --system --ingroup ops --home /app ops
 
 WORKDIR /app
 
-COPY requirements-api.txt ./
+COPY requirements.txt requirements-providers.txt requirements-api.txt ./
 RUN python -m pip install --no-cache-dir --requirement requirements-api.txt
 
 COPY --chown=root:root api ./api
@@ -35,4 +39,4 @@ STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/system/health', timeout=3)" || exit 1
 
-CMD ["uvicorn", "api.app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log"]
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log"]

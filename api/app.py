@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, cast
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, Query, Request, status
 from fastapi import Path as ApiPath
@@ -19,6 +21,8 @@ from starlette.responses import Response
 
 from api.models import (
     ActionReceipt,
+    AppResearchResponse,
+    AppSearchResponse,
     CreateRunRequest,
     HealthResponse,
     IdempotencyConflictResponse,
@@ -26,26 +30,31 @@ from api.models import (
     InvalidRequestResponse,
     PhaseUnavailableResponse,
     ResourceNotFoundResponse,
+    RetryRequest,
     RunDetailResponse,
     RunListResponse,
     RunNotFoundResponse,
     RunOutputResponse,
     TimelineResponse,
 )
-from api.service import LocalRunService, PhaseUnavailableError, RunNotFoundError, RunService
+from api.service import (
+    AppNotFoundError,
+    LocalRunService,
+    PhaseUnavailableError,
+    RunNotFoundError,
+    RunService,
+)
 from ops.redaction import install_redacting_filter
 from ops.run_service import IdempotencyConflictError, validate_idempotency_key
 
 LOGGER = logging.getLogger("composio_ops.api")
-LOCAL_FRONTEND_ORIGINS = (
-    "http://127.0.0.1:3000",
-    "http://localhost:3000",
-    "http://127.0.0.1:5173",
-    "http://localhost:5173",
-)
 RunId = Annotated[
     str,
     ApiPath(min_length=36, max_length=36, pattern=r"^run_[0-9a-f]{32}$"),
+]
+AppSlug = Annotated[
+    str,
+    ApiPath(min_length=1, max_length=128, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$"),
 ]
 IdempotencyKeyHeader = Annotated[
     str | None,
@@ -72,12 +81,50 @@ _KNOWN_VALIDATION_FIELDS = frozenset(
         "body.requested_scope_policy",
         "body.dry_run",
         "body.outreach_recipient_override",
+        "body.capability",
         "header.idempotency-key",
         "path.run_id",
+        "path.app_slug",
+        "query.q",
         "query.limit",
         "query.offset",
     }
 )
+
+
+def _environment_flag(name: str, *, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be true or false")
+
+
+def _cors_origins() -> list[str]:
+    configured = os.environ.get("OPS_CORS_ORIGINS", "")
+    origins: list[str] = []
+    for item in configured.split(","):
+        origin = item.strip().rstrip("/")
+        if not origin:
+            continue
+        # Reuse the request-model URL parser, then require an origin only.
+        parsed = urlsplit(origin)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+            or parsed.username
+            or parsed.password
+        ):
+            raise RuntimeError("OPS_CORS_ORIGINS contains an invalid origin")
+        origins.append(origin)
+    return sorted(set(origins))
 
 
 def get_run_service(request: Request) -> RunService:
@@ -118,6 +165,8 @@ def create_app(
     *,
     service: RunService | None = None,
     db_path: str | Path | None = None,
+    cors_origins: list[str] | None = None,
+    enable_docs: bool | None = None,
 ) -> FastAPI:
     """Create an API instance; injected services are initialized through lifespan."""
 
@@ -132,17 +181,26 @@ def create_app(
         finally:
             await active_service.shutdown()
 
+    docs_enabled = (
+        _environment_flag("OPS_ENABLE_API_DOCS", default=False)
+        if enable_docs is None
+        else enable_docs
+    )
     application = FastAPI(
         title="Composio Toolkit Ops API",
-        version="0.1.0",
+        description=(
+            "Sanitized control-plane API. Provider payloads, environment values, database paths, "
+            "and vault values are never part of the public contract."
+        ),
+        version="0.2.0",
         lifespan=lifespan,
-        docs_url=None,
-        redoc_url=None,
-        openapi_url=None,
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
     )
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=list(LOCAL_FRONTEND_ORIGINS),
+        allow_origins=cors_origins if cors_origins is not None else _cors_origins(),
         allow_credentials=False,
         allow_methods=["GET", "POST"],
         allow_headers=["Accept", "Content-Type", "Idempotency-Key"],
@@ -160,9 +218,17 @@ def create_app(
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
-        )
+        if docs_enabled and request.url.path in {"/docs", "/redoc"}:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; "
+                "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+                "img-src 'self' data: https://fastapi.tiangolo.com; "
+                "frame-ancestors 'none'; base-uri 'none'"
+            )
+        else:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+            )
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         return response
 
@@ -185,6 +251,14 @@ def create_app(
             status_code=status.HTTP_404_NOT_FOUND,
         )
 
+    @application.exception_handler(AppNotFoundError)
+    async def app_not_found_handler(request: Request, exc: AppNotFoundError) -> JSONResponse:
+        del request, exc
+        return _model_response(
+            ResourceNotFoundResponse(),
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
     @application.exception_handler(PhaseUnavailableError)
     async def phase_unavailable_handler(
         request: Request,
@@ -193,6 +267,8 @@ def create_app(
         del request
         return _model_response(
             PhaseUnavailableResponse(
+                error=exc.error,  # type: ignore[arg-type]
+                message=exc.safe_message,
                 run_id=exc.run_id,
                 action=exc.action,
                 available_in=list(exc.available_in),
@@ -292,6 +368,7 @@ def create_app(
     @application.post(
         "/api/runs/{run_id}/resume",
         response_model=ActionReceipt,
+        response_model_exclude_none=True,
         responses=common_responses,
     )
     async def resume_run(run_id: RunId, run_service: ServiceDependency) -> ActionReceipt:
@@ -300,10 +377,24 @@ def create_app(
     @application.post(
         "/api/runs/{run_id}/poll-email",
         response_model=ActionReceipt,
+        response_model_exclude_none=True,
         responses=common_responses,
     )
     async def poll_email(run_id: RunId, run_service: ServiceDependency) -> ActionReceipt:
         return await run_service.poll_email(run_id)
+
+    @application.post(
+        "/api/runs/{run_id}/retry",
+        response_model=ActionReceipt,
+        response_model_exclude_none=True,
+        responses=common_responses,
+    )
+    async def retry_run(
+        run_id: RunId,
+        payload: RetryRequest,
+        run_service: ServiceDependency,
+    ) -> ActionReceipt:
+        return await run_service.retry(run_id, payload.capability)
 
     @application.get(
         "/api/runs/{run_id}/output",
@@ -313,6 +404,34 @@ def create_app(
     )
     async def get_output(run_id: RunId, run_service: ServiceDependency) -> RunOutputResponse:
         return await run_service.get_output(run_id)
+
+    @application.get(
+        "/api/apps/search",
+        response_model=AppSearchResponse,
+        response_model_exclude_none=True,
+        responses={422: {"model": InvalidRequestResponse}, 500: {"model": InternalErrorResponse}},
+    )
+    async def search_apps(
+        run_service: ServiceDependency,
+        q: Annotated[str, Query(min_length=0, max_length=200)] = "",
+    ) -> AppSearchResponse:
+        return await run_service.search_apps(q)
+
+    @application.get(
+        "/api/apps/{app_slug}/research",
+        response_model=AppResearchResponse,
+        response_model_exclude_none=True,
+        responses={
+            404: {"model": ResourceNotFoundResponse},
+            422: {"model": InvalidRequestResponse},
+            500: {"model": InternalErrorResponse},
+        },
+    )
+    async def app_research(
+        app_slug: AppSlug,
+        run_service: ServiceDependency,
+    ) -> AppResearchResponse:
+        return await run_service.get_app_research(app_slug)
 
     @application.get(
         "/api/system/health",
