@@ -49,3 +49,8 @@ screenshots/private/
 dist/
 build/
 *.egg-info/
+
+# Agent / IDE assistant files (kept local, not tracked)
+.kiro/
+AGENTS.md
+web/AGENTS.md
