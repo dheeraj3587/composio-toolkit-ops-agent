@@ -20,7 +20,7 @@ RUN addgroup --system ops && adduser --system --ingroup ops --home /app ops
 
 WORKDIR /app
 
-COPY requirements.txt requirements-providers.txt requirements-api.txt ./
+COPY requirements-api.txt ./
 RUN python -m pip install --no-cache-dir --requirement requirements-api.txt
 
 COPY --chown=root:root api ./api

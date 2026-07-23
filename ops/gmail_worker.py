@@ -9,8 +9,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import SecretStr
-
 from ops.config import Settings
 from ops.effect_ledger import EffectStore, SQLiteEffectStore
 from ops.provider_errors import (
@@ -363,7 +361,7 @@ class GmailWorker:
             if self._settings.composio_api_key is None:  # pragma: no cover - guarded above
                 raise RuntimeError("Composio configuration is missing")
             module = importlib.import_module("composio")
-            client_type = getattr(module, "Composio")
+            client_type = module.Composio
             self._sdk_client = client_type(
                 api_key=self._settings.composio_api_key.get_secret_value(),
                 toolkit_versions={"gmail": GMAIL_TOOLKIT_VERSION},
@@ -384,7 +382,7 @@ class GmailWorker:
             },
             manage_connections=False,
             sandbox={"enable": False},
-            session_preset=getattr(module, "SESSION_PRESET_DIRECT_TOOLS"),
+            session_preset=module.SESSION_PRESET_DIRECT_TOOLS,
         )
         session_id = getattr(session, "id", None)
         if not isinstance(session_id, str) or not session_id:
@@ -504,6 +502,49 @@ class GmailWorker:
             return f"{match.group('kind')}: [REDACTED_SECRET:{kind}]"
 
         return _SECRET_LINE.sub(replace, body), tuple(references)
+
+
+def _mark_after_contract_error(
+    store: EffectStore,
+    action: str,
+    idempotency_key: str,
+    exc: ProviderContractError,
+) -> None:
+    """Force reconciliation after a provider-contract failure.
+
+    A contract error can arise before the request is dispatched (a pre-send
+    schema mismatch) or after it (a response that cannot be parsed), so the
+    true side-effect state is ambiguous. The reservation is marked
+    outcome-unknown to force a later reconciliation instead of a blind resend.
+    """
+
+    del exc
+    store.mark_outcome_unknown(
+        provider="composio_gmail",
+        action=action,
+        idempotency_key=idempotency_key,
+    )
+
+
+def _mark_after_operation_error(
+    store: EffectStore,
+    action: str,
+    idempotency_key: str,
+    exc: ProviderOperationError,
+) -> None:
+    """Force reconciliation after a provider-operation failure.
+
+    The provider reported a failure once the request was already dispatched, so
+    the side effect may or may not have taken hold. The reservation is marked
+    outcome-unknown to block a blind resend.
+    """
+
+    del exc
+    store.mark_outcome_unknown(
+        provider="composio_gmail",
+        action=action,
+        idempotency_key=idempotency_key,
+    )
 
 
 def _validate_tool_schema(

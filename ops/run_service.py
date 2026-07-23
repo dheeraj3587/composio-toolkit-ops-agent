@@ -12,11 +12,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
+from ops.config import Settings
+from ops.graph import DurableOperationsWorkflow, WorkflowDependencies, build_graph
 from ops.models import IntegratorBundle, OperationalResearch, OperationsRequest
 from ops.p1_adapter import (
     DEFAULT_P1_ROOT,
@@ -26,11 +29,21 @@ from ops.p1_adapter import (
     load_verified_snapshot,
     to_operational_research,
 )
+from ops.provider_errors import ConfigurationRequiredError
 from ops.redaction import redact_data, redact_text
 from ops.routing import RoutingDecision, decide_access
+from ops.state import RunStatus, validate_status_transition
 from ops.storage import OperationsStorage, OperationsUnitOfWork
 
 IDEMPOTENCY_KEY_PATTERN = re.compile(r"^idem_[0-9a-f]{32}$")
+
+# The public RunService boundary exposes logical execution modes, while storage
+# keeps its existing persisted tokens (no migration of existing rows).
+_PERSISTED_EXECUTION_MODE = {
+    "plan_only": "local_dry_run",
+    "execute_when_configured": "operations",
+}
+_LOGICAL_EXECUTION_MODE = {value: key for key, value in _PERSISTED_EXECUTION_MODE.items()}
 
 _PUBLIC_RUN_FIELDS = (
     "run_id",
@@ -50,6 +63,15 @@ class InvalidIdempotencyKeyError(ValueError):
 
 class IdempotencyConflictError(ValueError):
     """Raised when a key is reused for a different canonical request."""
+
+
+class RunConflictError(RuntimeError):
+    """Raised when a competing command mutates the same run concurrently."""
+
+    def __init__(self, run_id: str, action: str) -> None:
+        self.run_id = run_id
+        self.action = action
+        super().__init__("a competing command is already modifying this run")
 
 
 def validate_idempotency_key(value: str | None) -> str | None:
@@ -85,7 +107,8 @@ def _public_run(record: Mapping[str, object]) -> dict[str, Any]:
     public = {
         field: record.get(field) for field in _PUBLIC_RUN_FIELDS if record.get(field) is not None
     }
-    public["execution_mode"] = record.get("execution_mode") or "local_dry_run"
+    persisted_execution_mode = str(record.get("execution_mode") or "local_dry_run")
+    public["execution_mode"] = _LOGICAL_EXECUTION_MODE.get(persisted_execution_mode, "plan_only")
     public["external_actions"] = bool(record.get("external_actions", False))
     sanitized = redact_data(public)
     if not isinstance(sanitized, dict):  # pragma: no cover - fixed mapping invariant
@@ -122,9 +145,15 @@ class RunService:
         *,
         storage: OperationsStorage,
         p1_adapter: P1OperationalAdapter | None = None,
+        settings: Settings | None = None,
+        workflow: DurableOperationsWorkflow | None = None,
     ) -> None:
         self.storage = storage
         self.p1_adapter = p1_adapter or P1OperationalAdapter()
+        self._settings = settings
+        self._workflow = workflow
+        self._run_locks: dict[str, threading.RLock] = {}
+        self._run_locks_guard = threading.Lock()
 
     @classmethod
     def from_paths(
@@ -132,10 +161,14 @@ class RunService:
         *,
         db_path: str | Path,
         snapshot_root: str | Path = DEFAULT_P1_ROOT,
+        settings: Settings | None = None,
+        workflow: DurableOperationsWorkflow | None = None,
     ) -> RunService:
         return cls(
             storage=OperationsStorage(db_path),
             p1_adapter=P1OperationalAdapter(snapshot_root),
+            settings=settings,
+            workflow=workflow,
         )
 
     def initialize(self) -> None:
@@ -144,16 +177,58 @@ class RunService:
         self.storage.initialize()
         load_verified_snapshot(self.p1_adapter.snapshot_root)
 
+    def startup(self) -> None:
+        """Initialize storage and build the durable workflow when configured.
+
+        The workflow is built only when an encryption key is present, and never
+        with provider adapters in this milestone. When the key is absent the
+        workflow stays unavailable and ``execute_when_configured`` reports
+        ``configuration_required`` truthfully.
+        """
+
+        self.initialize()
+        if self._workflow is not None:
+            return
+        settings = self._settings or Settings.from_env()
+        if settings.langgraph_aes_key is None:
+            return
+        try:
+            self._workflow = build_graph(
+                checkpoint_path=settings.checkpoint_db_path,
+                encryption_key=settings.langgraph_aes_key,
+                dependencies=WorkflowDependencies(browser=None, gmail=None),
+            )
+        except ConfigurationRequiredError:
+            self._workflow = None
+
+    def shutdown(self) -> None:
+        """Close the durable workflow and its checkpoint connection, if built."""
+
+        workflow = self._workflow
+        self._workflow = None
+        if workflow is not None:
+            workflow.close()
+
     def create_run(
         self,
         request: OperationsRequest,
         *,
         idempotency_key: str | None = None,
+        execution_mode: Literal["plan_only", "execute_when_configured"] = "plan_only",
     ) -> dict[str, Any]:
-        """Create and route one run without invoking an external provider."""
+        """Create and route one run without invoking an external provider.
 
-        if not request.dry_run:
-            raise ValueError("Phase 2 accepts dry-run requests only")
+        ``execution_mode`` is the single canonical control. ``plan_only`` runs the
+        verified P1 lookup, deterministic routing, and sanitized persistence with
+        no provider or network action. ``execute_when_configured`` establishes the
+        mode-aware branch consumed by later workflow wiring: in this task it still
+        performs only the side-effect-free planning above, never invokes a
+        provider, and never fabricates a completed run. The deprecated
+        ``request.dry_run`` flag is no longer consulted as a runtime control.
+        """
+
+        persisted_execution_mode = _PERSISTED_EXECUTION_MODE[execution_mode]
+        created_event_type = "dry_run_created" if execution_mode == "plan_only" else "run_created"
         validated_idempotency_key = validate_idempotency_key(idempotency_key)
         request_fingerprint = (
             _request_fingerprint(request) if validated_idempotency_key is not None else None
@@ -229,18 +304,18 @@ class RunService:
                     "validation": "not_started",
                 },
                 scope_policy=request.requested_scope_policy,
-                execution_mode="local_dry_run",
+                execution_mode=persisted_execution_mode,
                 external_actions=False,
                 idempotency_key=validated_idempotency_key,
                 request_fingerprint=request_fingerprint,
             )
             transaction.append_audit_event(
                 run_id=run_id,
-                event_type="dry_run_created",
+                event_type=created_event_type,
                 payload={
                     "status": "created",
                     "scope_policy": request.requested_scope_policy,
-                    "execution_mode": "local_dry_run",
+                    "execution_mode": persisted_execution_mode,
                     "external_actions": False,
                 },
             )
@@ -265,14 +340,42 @@ class RunService:
                     },
                 )
 
-            persisted_status = "route_selected" if decision.is_final else "researching"
+            routed_status: RunStatus = "route_selected" if decision.is_final else "researching"
             decision_event = "route_selected" if decision.is_final else "route_pending"
+            if (
+                execution_mode == "execute_when_configured"
+                and self._workflow is not None
+                and isinstance(lookup, P1LookupFound)
+            ):
+                # Invoke the durable engine with no provider adapters and project
+                # its routed state. In this milestone the graph runs
+                # initialize -> research -> route -> finalize and produces the
+                # same routed state as a plan_only run, now via encrypted
+                # checkpoints; no provider action occurs.
+                workflow_state = self._workflow.start(
+                    request.model_copy(update={"dry_run": True}),
+                    thread_id=thread_id,
+                )
+                persisted_status = workflow_state.get("status") or routed_status
+                decision_event = (
+                    "route_selected" if persisted_status == "route_selected" else "route_pending"
+                )
+            elif execution_mode == "execute_when_configured" and self._workflow is None:
+                # The durable engine is not configured (no encryption key); report
+                # the truthful state without performing any provider action.
+                persisted_status = "configuration_required"
+                decision_event = "configuration_required"
+            else:
+                persisted_status = routed_status
+            validate_status_transition("created", persisted_status, "create")
             transaction.update_run(
                 run_id,
                 status=persisted_status,
                 access_route=decision.route,
                 route_reason_code=decision.reason_code,
                 route_explanation=decision.explanation,
+                state_revision=1,
+                last_projected_revision=1,
             )
             transaction.append_audit_event(
                 run_id=run_id,
@@ -419,6 +522,120 @@ class RunService:
         if not isinstance(sanitized, dict):  # pragma: no cover - model invariant
             raise RuntimeError("output response could not be sanitized")
         return cast(dict[str, Any], sanitized)
+
+    def project(
+        self,
+        run_id: str,
+        state: Mapping[str, object],
+        revision: int,
+        *,
+        command: str = "workflow",
+    ) -> dict[str, Any]:
+        """Idempotently project durable graph state into the sanitized ledger.
+
+        A revision equal to or lower than the last projected revision is a
+        no-op: no status is rewritten and no audit event is appended. Every
+        status write first passes the single ``validate_status_transition``
+        authority. The operations ledger remains a derived projection and never
+        overrides the checkpoint.
+        """
+
+        with self.storage.unit_of_work() as transaction:
+            result = self._apply_projection(transaction, run_id, state, revision, command)
+            return _public_run(result)
+
+    def _apply_projection(
+        self,
+        transaction: OperationsUnitOfWork,
+        run_id: str,
+        state: Mapping[str, object],
+        revision: int,
+        command: str,
+    ) -> dict[str, Any]:
+        current = transaction.get_run(run_id)
+        if current is None:
+            raise KeyError("run was not found")
+        last_projected = int(current.get("last_projected_revision", 0) or 0)
+        if revision <= last_projected:
+            return current
+        previous_status = cast(RunStatus, current["status"])
+        next_status = cast(RunStatus, state.get("status") or previous_status)
+        validate_status_transition(previous_status, next_status, command)
+        changes: dict[str, object] = {
+            "status": next_status,
+            "state_revision": revision,
+            "last_projected_revision": revision,
+        }
+        access_route = state.get("access_route")
+        if access_route is not None:
+            changes["access_route"] = access_route
+        route_reason_code = state.get("route_reason_code")
+        if route_reason_code is not None:
+            changes["route_reason_code"] = route_reason_code
+        route_reason = state.get("route_reason")
+        if route_reason is not None:
+            changes["route_explanation"] = route_reason
+        research = state.get("operational_research")
+        if isinstance(research, Mapping):
+            changes["operational_research"] = dict(research)
+        missing = state.get("missing_fields")
+        if isinstance(missing, list):
+            changes["missing_fields"] = list(missing)
+        updated = transaction.update_run(run_id, **changes)
+        transaction.append_audit_event(
+            run_id=run_id,
+            event_type="state_projected",
+            payload={
+                "status": next_status,
+                "revision": revision,
+                "external_actions": False,
+            },
+        )
+        return updated
+
+    def _run_lock(self, run_id: str) -> threading.RLock:
+        with self._run_locks_guard:
+            return self._run_locks.setdefault(run_id, threading.RLock())
+
+    def guarded_status_update(
+        self,
+        run_id: str,
+        *,
+        expected_revision: int,
+        next_status: RunStatus,
+        command: str,
+        **changes: object,
+    ) -> dict[str, Any]:
+        """Apply one mutating command under per-run serialization.
+
+        Competing commands are rejected with ``RunConflictError`` (surfaced as
+        HTTP 409) without any partial write or external action. Concurrency is
+        guarded by a per-run lock plus an optimistic ``state_revision`` check.
+        """
+
+        lock = self._run_lock(run_id)
+        if not lock.acquire(blocking=False):
+            raise RunConflictError(run_id, command)
+        try:
+            with self.storage.unit_of_work() as transaction:
+                current = transaction.get_run(run_id)
+                if current is None:
+                    raise KeyError("run was not found")
+                if int(current.get("state_revision", 0) or 0) != expected_revision:
+                    raise RunConflictError(run_id, command)
+                previous_status = cast(RunStatus, current["status"])
+                validate_status_transition(previous_status, next_status, command)
+                new_revision = expected_revision + 1
+                updated = transaction.update_run(
+                    run_id,
+                    status=next_status,
+                    state_revision=new_revision,
+                    last_projected_revision=new_revision,
+                    **changes,
+                )
+                return _public_run(updated)
+        finally:
+            lock.release()
 
     def snapshot_provenance(self) -> P1SnapshotProvenance:
         return load_verified_snapshot(self.p1_adapter.snapshot_root).provenance

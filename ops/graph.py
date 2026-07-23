@@ -20,7 +20,6 @@ from ops.gmail_worker import GmailSendResult
 from ops.integrator import build_integrator_bundle
 from ops.models import (
     CapabilityAvailability,
-    CompanyProfile,
     HitlRequest,
     OperationalResearch,
     OperationsRequest,
@@ -33,7 +32,7 @@ from ops.provider_errors import (
     ProviderContractError,
     ProviderOperationError,
 )
-from ops.routing import RoutingDecision, decide_access
+from ops.routing import decide_access
 from ops.state import OperationsState
 
 ResearchLoader = Callable[[str], OperationalResearch]
@@ -135,7 +134,7 @@ class DurableOperationsWorkflow:
         _validate_thread_id(thread_id)
         normalized_signal = _resume_signal(signal)
         config = _config(thread_id)
-        command_type = getattr(importlib.import_module("langgraph.types"), "Command")
+        command_type = importlib.import_module("langgraph.types").Command
         with self._lock(thread_id), self._database_lock:
             snapshot = self._graph.get_state(config)
             if not snapshot.values:
@@ -185,9 +184,9 @@ class DurableOperationsWorkflow:
 
     def _compile_graph(self, saver: object) -> Any:
         graph_module = importlib.import_module("langgraph.graph")
-        state_graph_type = getattr(graph_module, "StateGraph")
-        start = getattr(graph_module, "START")
-        end = getattr(graph_module, "END")
+        state_graph_type = graph_module.StateGraph
+        start = graph_module.START
+        end = graph_module.END
         graph = state_graph_type(OperationsState)
         graph.add_node("initialize", self._initialize)
         graph.add_node("research", self._research)
@@ -331,7 +330,7 @@ class DurableOperationsWorkflow:
             expected_completion_signal="The developer dashboard is visible.",
             live_view_available=state.get("browser_live_view_available", False),
         )
-        interrupt = getattr(importlib.import_module("langgraph.types"), "interrupt")
+        interrupt = importlib.import_module("langgraph.types").interrupt
         resumed = interrupt(request.model_dump(mode="json"))
         return {
             "hitl_request": None,
@@ -535,16 +534,16 @@ def _build_saver(connection: sqlite3.Connection, key: bytes) -> object:
     json_module = importlib.import_module("langgraph.checkpoint.serde.jsonplus")
     encrypted_module = importlib.import_module("langgraph.checkpoint.serde.encrypted")
     sqlite_module = importlib.import_module("langgraph.checkpoint.sqlite")
-    strict = getattr(json_module, "JsonPlusSerializer")(
+    strict = json_module.JsonPlusSerializer(
         pickle_fallback=False,
         allowed_json_modules=None,
         allowed_msgpack_modules=None,
     )
-    encrypted = getattr(encrypted_module, "EncryptedSerializer").from_pycryptodome_aes(
+    encrypted = encrypted_module.EncryptedSerializer.from_pycryptodome_aes(
         serde=strict,
         key=key,
     )
-    saver = getattr(sqlite_module, "SqliteSaver")(connection, serde=encrypted)
+    saver = sqlite_module.SqliteSaver(connection, serde=encrypted)
     saver.setup()
     return saver
 

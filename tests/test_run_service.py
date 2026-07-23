@@ -246,3 +246,72 @@ def test_run_creation_rolls_back_when_the_status_update_fails(
     assert service.storage.count_runs() == 0
     with sqlite3.connect(service.storage.db_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM audit_events").fetchone() == (0,)
+
+
+def test_plan_only_terminates_at_route_selected(tmp_path: Path) -> None:
+    service = RunService.from_paths(db_path=tmp_path / "private" / "ops.db")
+
+    run = service.create_run(request_for("HubSpot"), execution_mode="plan_only")
+
+    assert run["status"] == "route_selected"
+    assert run["access_route"] == "self_serve"
+    assert run["external_actions"] is False
+    # plan_only never advances into execution states.
+    assert run["status"] not in {"browser_running", "outreach_sent", "completed"}
+
+
+def test_plan_only_persists_local_dry_run_token_but_exposes_logical_mode(
+    tmp_path: Path,
+) -> None:
+    service = RunService.from_paths(db_path=tmp_path / "private" / "ops.db")
+
+    run = service.create_run(request_for("HubSpot"), execution_mode="plan_only")
+
+    # The public boundary exposes the logical mode, not the persisted token.
+    assert run["execution_mode"] == "plan_only"
+    # The persisted storage token is unchanged (no migration).
+    stored = service.storage.get_run(run["run_id"])
+    assert stored is not None
+    assert stored["execution_mode"] == "local_dry_run"
+
+
+def test_default_execution_mode_is_plan_only(tmp_path: Path) -> None:
+    service = RunService.from_paths(db_path=tmp_path / "ops.db")
+
+    run = service.create_run(request_for("HubSpot"))
+
+    assert run["execution_mode"] == "plan_only"
+    stored = service.storage.get_run(run["run_id"])
+    assert stored is not None
+    assert stored["execution_mode"] == "local_dry_run"
+
+
+def test_operations_token_is_presented_as_execute_when_configured(tmp_path: Path) -> None:
+    service = RunService.from_paths(db_path=tmp_path / "private" / "ops.db")
+
+    run = service.create_run(request_for("HubSpot"), execution_mode="execute_when_configured")
+
+    # Persisted "operations" token maps to the logical public value.
+    assert run["execution_mode"] == "execute_when_configured"
+    stored = service.storage.get_run(run["run_id"])
+    assert stored is not None
+    assert stored["execution_mode"] == "operations"
+    # Without a configured durable workflow (no encryption key), execute_when_configured
+    # is truthful: configuration_required, no provider action, never a fabricated success.
+    assert run["external_actions"] is False
+    assert run["status"] == "configuration_required"
+    assert run["status"] not in {"browser_running", "outreach_sent", "completed"}
+
+
+def test_execution_mode_does_not_change_idempotent_replay(tmp_path: Path) -> None:
+    service = RunService.from_paths(db_path=tmp_path / "private" / "ops.db")
+    request = request_for("HubSpot")
+    idempotency_key = "idem_0f0e0d0c0b0a09080706050403020100"
+
+    first = service.create_run(request, idempotency_key=idempotency_key, execution_mode="plan_only")
+    replay = service.create_run(
+        request, idempotency_key=idempotency_key, execution_mode="plan_only"
+    )
+
+    assert replay == first
+    assert service.storage.count_runs() == 1

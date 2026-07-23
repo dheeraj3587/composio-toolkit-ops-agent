@@ -1,2 +1,4 @@
--r requirements.txt
--r requirements-providers.txt
+fastapi==0.139.2
+pydantic==2.13.4
+python-dotenv==1.2.2
+uvicorn[standard]==0.51.0

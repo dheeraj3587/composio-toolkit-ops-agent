@@ -33,6 +33,81 @@ RunStatus = Literal[
 ]
 
 
+class IllegalStatusTransition(ValueError):
+    """Raised when a run status change is not permitted by the legal table."""
+
+
+# Terminal statuses have no legal outgoing transition. There is deliberately no
+# ``route_selected -> completed`` edge: a plan_only run terminates at
+# ``route_selected`` and only an executed run that reaches ``credentials_ready``
+# may become ``completed``.
+_LEGAL_STATUS_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
+    "created": frozenset(
+        {"researching", "route_selected", "configuration_required", "blocked", "failed"}
+    ),
+    "researching": frozenset(
+        {"researching", "route_selected", "configuration_required", "blocked", "failed"}
+    ),
+    "route_selected": frozenset(
+        {"browser_running", "outreach_sent", "configuration_required", "blocked", "failed"}
+    ),
+    "browser_running": frozenset(
+        {"waiting_for_hitl", "credentials_ready", "configuration_required", "blocked", "failed"}
+    ),
+    "waiting_for_hitl": frozenset({"browser_running", "blocked", "failed"}),
+    "outreach_sent": frozenset({"waiting_for_reply", "configuration_required", "failed"}),
+    "waiting_for_reply": frozenset(
+        {
+            "waiting_for_reply",
+            "browser_running",
+            "credentials_ready",
+            "configuration_required",
+            "blocked",
+            "failed",
+        }
+    ),
+    "credentials_ready": frozenset({"completed", "failed"}),
+    "configuration_required": frozenset(
+        {
+            "researching",
+            "route_selected",
+            "browser_running",
+            "outreach_sent",
+            "waiting_for_reply",
+            "blocked",
+            "failed",
+        }
+    ),
+    "blocked": frozenset(),
+    "failed": frozenset({"researching", "browser_running", "outreach_sent"}),
+    "completed": frozenset(),
+}
+
+
+def validate_status_transition(
+    previous_status: RunStatus,
+    next_status: RunStatus,
+    command: str,
+) -> RunStatus:
+    """Return ``next_status`` when the transition is legal, else raise.
+
+    This is the single transition authority consumed by the domain projection
+    layer; the API, graph, and storage do not keep separate transition logic.
+    An identity transition (no status change) is always permitted so an
+    idempotent re-projection never fails. ``completed`` and ``blocked`` are
+    terminal.
+    """
+
+    if previous_status == next_status:
+        return next_status
+    if next_status not in _LEGAL_STATUS_TRANSITIONS.get(previous_status, frozenset()):
+        raise IllegalStatusTransition(
+            f"illegal status transition {previous_status!r} -> {next_status!r} "
+            f"for command {command!r}"
+        )
+    return next_status
+
+
 class OperationsState(TypedDict, total=False):
     """Serializable orchestration state containing references, never secrets."""
 
@@ -51,6 +126,8 @@ class OperationsState(TypedDict, total=False):
     route_reason: str
     route_reason_code: str
     status: RunStatus
+    state_revision: int
+    last_projected_revision: int
 
     browser_profile_id: str
     browser_session_id: str

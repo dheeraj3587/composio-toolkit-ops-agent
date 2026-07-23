@@ -5,7 +5,14 @@ from __future__ import annotations
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from ops.models import OperationalResearch
 from ops.state import AccessRoute, RunStatus
@@ -79,7 +86,11 @@ class CreateRunRequest(StrictApiModel):
     app_name: str = Field(min_length=1, max_length=200)
     company: CompanyInput
     requested_scope_policy: Literal["minimum", "recommended", "maximum"] = "maximum"
-    dry_run: Literal[True] = True
+    execution_mode: Literal["plan_only", "execute_when_configured"] = "plan_only"
+    # Deprecated compatibility alias for execution_mode="plan_only". Only an
+    # explicitly supplied dry_run=true carries intent; execution_mode is the single
+    # canonical control and dry_run is never rewritten from it.
+    dry_run: bool = True
     outreach_recipient_override: str | None = Field(default=None, max_length=320)
 
     @field_validator("outreach_recipient_override")
@@ -97,6 +108,22 @@ class CreateRunRequest(StrictApiModel):
         if not local_part or not domain:
             raise ValueError("outreach recipient override must be a single email address")
         return value
+
+    @model_validator(mode="after")
+    def _reject_conflicting_dry_run_alias(self) -> CreateRunRequest:
+        # dry_run is a deprecated alias for execution_mode="plan_only". Only an
+        # explicitly supplied dry_run=true carries intent, and it must not
+        # contradict an explicit execution_mode="execute_when_configured".
+        # execution_mode defaults to plan_only and only becomes
+        # execute_when_configured when explicitly provided, so no other
+        # normalization is required and dry_run is never rewritten.
+        dry_run_explicitly_true = "dry_run" in self.model_fields_set and self.dry_run is True
+        if dry_run_explicitly_true and self.execution_mode == "execute_when_configured":
+            raise ValueError(
+                "dry_run=true is a deprecated alias for execution_mode='plan_only' "
+                "and cannot be combined with execution_mode='execute_when_configured'"
+            )
+        return self
 
 
 class PhaseState(StrictApiModel):
@@ -168,7 +195,7 @@ class RunSummary(StrictApiModel):
     access_route: AccessRoute | None = None
     created_at: str
     updated_at: str
-    execution_mode: Literal["local_dry_run", "operations"]
+    execution_mode: Literal["plan_only", "execute_when_configured"]
     external_actions: bool
 
 
@@ -327,6 +354,16 @@ class IdempotencyConflictResponse(StrictApiModel):
     message: Literal["Idempotency key was already used for another request."] = (
         "Idempotency key was already used for another request."
     )
+    external_actions: Literal[False] = False
+
+
+class RunConflictResponse(StrictApiModel):
+    error: Literal["run_conflict"] = "run_conflict"
+    message: Literal["A competing command is already modifying this run."] = (
+        "A competing command is already modifying this run."
+    )
+    run_id: str
+    action: str
     external_actions: Literal[False] = False
 
 

@@ -55,14 +55,14 @@ const vaultReference = z
   .max(512)
   .regex(/^vault:\/\/[a-z0-9-]+\/[a-z0-9_-]+\/[A-Za-z0-9_-]+$/)
 
-const scopeRequirement = z.object({
+const scopeRequirement = z.strictObject({
   name: boundedText(200),
   description: optionalText(2_000).optional(),
   required: z.boolean().nullable().optional(),
   source_url: httpUrl,
 })
 
-export const operationalResearchSchema = z.object({
+export const operationalResearchSchema = z.strictObject({
   app_name: boundedText(200),
   app_slug: appSlug,
   api_available: z.boolean().nullable(),
@@ -85,7 +85,7 @@ export const operationalResearchSchema = z.object({
   missing_fields: z.array(boundedText(120)).max(100).optional(),
 })
 
-export const runSummarySchema = z.object({
+export const runSummarySchema = z.strictObject({
   run_id: runId,
   thread_id: z.string().regex(/^[a-z0-9_-]{8,160}$/i),
   app_name: boundedText(200),
@@ -98,7 +98,7 @@ export const runSummarySchema = z.object({
   external_actions: z.boolean(),
 })
 
-const phaseState = z.object({
+const phaseState = z.strictObject({
   key: safeToken.optional(),
   name: boundedText(80).optional(),
   phase: boundedText(40).optional(),
@@ -115,7 +115,7 @@ const phaseCollection = z.union([
   z.null(),
 ])
 
-const securityState = z.object({
+const securityState = z.strictObject({
   redaction: safeToken.optional(),
   secret_vault: safeToken.optional(), // pragma: allowlist secret
   checkpoint_encryption: safeToken.optional(),
@@ -127,7 +127,7 @@ const securityState = z.object({
   notes: z.array(boundedText(500)).max(20).optional(),
 })
 
-const hitlRequest = z.object({
+const hitlRequest = z.strictObject({
   kind: z.enum(["captcha", "otp", "legal_approval", "billing", "identity", "manual_review", "other"]),
   title: boundedText(160),
   instruction: boundedText(1_000),
@@ -135,21 +135,21 @@ const hitlRequest = z.object({
   expires_at: isoTimestamp.nullable().optional(),
 })
 
-const routeDecision = z.object({
+const routeDecision = z.strictObject({
   route: accessRoute,
   reason_code: safeToken,
   explanation: boundedText(1_000),
   is_final: z.boolean().optional(),
 })
 
-const providerStatus = z.object({
+const providerStatus = z.strictObject({
   provider: safeToken,
   status: z.enum(["ready", "configured", "configuration_required", "disabled", "unavailable"]),
   detail: boundedText(500),
   live_tested: z.boolean().optional(),
 })
 
-export const runDetailResponseSchema = z.object({
+export const runDetailResponseSchema = z.strictObject({
   run: runSummarySchema,
   research: operationalResearchSchema.nullable(),
   phases: phaseCollection,
@@ -160,18 +160,18 @@ export const runDetailResponseSchema = z.object({
   provider_states: z.array(providerStatus).max(30).optional(),
 })
 
-export const runListResponseSchema = z.object({
+export const runListResponseSchema = z.strictObject({
   items: z.array(runSummarySchema).max(100),
   total: z.number().int().nonnegative(),
   limit: z.number().int().min(1).max(100),
   offset: z.number().int().nonnegative(),
 })
 
-export const timelineResponseSchema = z.object({
+export const timelineResponseSchema = z.strictObject({
   run_id: runId,
   items: z
     .array(
-      z.object({
+      z.strictObject({
         event_type: safeToken,
         summary: boundedText(500),
         status: z.enum(["recorded", "completed", "blocked", "failed"]),
@@ -181,7 +181,7 @@ export const timelineResponseSchema = z.object({
     .max(1_000),
 })
 
-const integratorBundle = z.object({
+const integratorBundle = z.strictObject({
   app_name: boundedText(200),
   app_slug: appSlug,
   readiness: z.enum([
@@ -206,12 +206,12 @@ const integratorBundle = z.object({
   created_at: isoTimestamp,
 })
 
-export const runOutputResponseSchema = z.object({
+export const runOutputResponseSchema = z.strictObject({
   run_id: runId,
   integrator_bundle: integratorBundle,
 })
 
-export const snapshotHealthSchema = z.object({
+export const snapshotHealthSchema = z.strictObject({
   verified: z.boolean(),
   source_repository: boundedText(300).optional(),
   source_commit: z.string().regex(/^[0-9a-f]{40}$/).optional(),
@@ -220,14 +220,14 @@ export const snapshotHealthSchema = z.object({
   coverage_sha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
 })
 
-export const healthResponseSchema = z.object({
+export const healthResponseSchema = z.strictObject({
   status: z.enum(["healthy", "degraded", "configuration_required"]),
   phase: boundedText(40),
   version: boundedText(40),
   snapshot: snapshotHealthSchema,
   checks: z
     .array(
-      z.object({
+      z.strictObject({
         name: boundedText(120),
         status: z.enum(["pass", "fail", "configuration_required", "disabled"]),
         detail: optionalText(500).optional(),
@@ -237,14 +237,14 @@ export const healthResponseSchema = z.object({
   providers: z.array(providerStatus).max(30).optional(),
 })
 
-export const actionReceiptSchema = z.object({
+export const actionReceiptSchema = z.strictObject({
   run_id: runId,
   action: z.enum(["resume", "poll_email", "retry"]),
   status: z.enum(["accepted", "configuration_required", "unavailable", "no_change"]),
   detail: optionalText(500).optional(),
 })
 
-export const appSearchItemSchema = z.object({
+export const appSearchItemSchema = z.strictObject({
   app_name: boundedText(200),
   app_slug: appSlug,
   category: boundedText(120).nullable(),
@@ -256,13 +256,13 @@ export const appSearchItemSchema = z.object({
   verification_status: safeToken,
 })
 
-export const appSearchResponseSchema = z.object({
+export const appSearchResponseSchema = z.strictObject({
   query: z.string().max(200),
   items: z.array(appSearchItemSchema).max(100),
   total: z.number().int().nonnegative(),
 })
 
-export const appResearchResponseSchema = z.object({
+export const appResearchResponseSchema = z.strictObject({
   app: appSearchItemSchema,
   research: operationalResearchSchema,
   provenance: snapshotHealthSchema.nullish(),

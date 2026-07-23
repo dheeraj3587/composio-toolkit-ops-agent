@@ -53,7 +53,7 @@ class CredentialCapture:
         self._require_configuration()
         _validate_capture_request(cdp_url, app_slug, field_selectors)
         module = importlib.import_module("playwright.async_api")
-        async_playwright = getattr(module, "async_playwright")
+        async_playwright = module.async_playwright
         browser: Any | None = None
         async with async_playwright() as playwright:
             try:

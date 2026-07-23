@@ -37,6 +37,8 @@ _RUN_COLUMNS = (
     "scope_policy",
     "execution_mode",
     "external_actions",
+    "state_revision",
+    "last_projected_revision",
     "created_at",
     "updated_at",
 )
@@ -258,6 +260,8 @@ class OperationsStorage:
                     scope_policy TEXT NOT NULL DEFAULT 'maximum',
                     execution_mode TEXT NOT NULL DEFAULT 'local_dry_run',
                     external_actions INTEGER NOT NULL DEFAULT 0,
+                    state_revision INTEGER NOT NULL DEFAULT 0,
+                    last_projected_revision INTEGER NOT NULL DEFAULT 0,
                     idempotency_key TEXT,
                     request_fingerprint TEXT,
                     created_at TEXT NOT NULL,
@@ -307,6 +311,8 @@ class OperationsStorage:
                 "scope_policy": "TEXT NOT NULL DEFAULT 'maximum'",
                 "execution_mode": "TEXT NOT NULL DEFAULT 'local_dry_run'",
                 "external_actions": "INTEGER NOT NULL DEFAULT 0",
+                "state_revision": "INTEGER NOT NULL DEFAULT 0",
+                "last_projected_revision": "INTEGER NOT NULL DEFAULT 0",
             }
             for column_name, declaration in migration_columns.items():
                 if column_name not in existing_columns:
@@ -538,6 +544,8 @@ class OperationsStorage:
             "scope_policy",
             "execution_mode",
             "external_actions",
+            "state_revision",
+            "last_projected_revision",
         }
         unknown = set(changes) - allowed
         if unknown:

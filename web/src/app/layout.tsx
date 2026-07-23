@@ -34,7 +34,7 @@ export const viewport: Viewport = {
 }
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  const demoMode = process.env.NEXT_PUBLIC_DEMO_MODE === "true"
+  const demoMode = process.env.OPS_DEMO_MODE === "true"
 
   return (
     <html lang="en" className={`${geistSans.variable} ${geistMono.variable}`}>

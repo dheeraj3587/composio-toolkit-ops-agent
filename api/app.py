@@ -31,6 +31,7 @@ from api.models import (
     PhaseUnavailableResponse,
     ResourceNotFoundResponse,
     RetryRequest,
+    RunConflictResponse,
     RunDetailResponse,
     RunListResponse,
     RunNotFoundResponse,
@@ -45,7 +46,11 @@ from api.service import (
     RunService,
 )
 from ops.redaction import install_redacting_filter
-from ops.run_service import IdempotencyConflictError, validate_idempotency_key
+from ops.run_service import (
+    IdempotencyConflictError,
+    RunConflictError,
+    validate_idempotency_key,
+)
 
 LOGGER = logging.getLogger("composio_ops.api")
 RunId = Annotated[
@@ -284,6 +289,17 @@ def create_app(
         del request, exc
         return _model_response(
             IdempotencyConflictResponse(),
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+    @application.exception_handler(RunConflictError)
+    async def run_conflict_handler(
+        request: Request,
+        exc: RunConflictError,
+    ) -> JSONResponse:
+        del request
+        return _model_response(
+            RunConflictResponse(run_id=exc.run_id, action=exc.action),
             status_code=status.HTTP_409_CONFLICT,
         )
 

@@ -58,7 +58,7 @@ def test_run_creates_and_routes_only_a_local_dry_run(
     assert run["app_slug"] == "example-app"
     assert run["status"] == "researching"
     assert run["access_route"] == "unknown"
-    assert run["execution_mode"] == "local_dry_run"
+    assert run["execution_mode"] == "plan_only"
     assert run["external_actions"] is False
     assert "browser_live_url" not in run
     assert "gmail_thread_id" not in run

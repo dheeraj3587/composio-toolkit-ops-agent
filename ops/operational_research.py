@@ -5,11 +5,10 @@ from __future__ import annotations
 import asyncio
 import importlib
 import ipaddress
-import re
 import socket
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from html.parser import HTMLParser
-from typing import Any, Protocol
+from typing import Protocol
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
@@ -251,7 +250,7 @@ class PerplexitySearchDiscovery:
 
     async def discover(self, *, app_name: str) -> tuple[str, ...]:
         module = importlib.import_module("perplexity")
-        client_type = getattr(module, "AsyncPerplexity")
+        client_type = module.AsyncPerplexity
         client = client_type(api_key=self._api_key.get_secret_value(), max_retries=1)
         try:
             response = await client.search.create(

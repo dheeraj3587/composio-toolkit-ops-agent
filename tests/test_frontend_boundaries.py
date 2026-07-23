@@ -27,11 +27,19 @@ def test_server_action_modules_export_only_async_functions_or_types() -> None:
         assert not RUNTIME_EXPORT.search(source), path
 
 
+TEST_SOURCE_SUFFIXES = (".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx")
+
+
 def test_frontend_has_no_browser_storage_or_public_api_origin() -> None:
+    # Scan real production TypeScript source only. Frontend test/spec files
+    # legitimately reference these identifiers inside their own security
+    # assertions and must be excluded from the production-source scan.
     source = "\n".join(
         path.read_text(encoding="utf-8")
         for path in WEB_SOURCE.rglob("*")
-        if path.is_file() and path.suffix in {".ts", ".tsx"}
+        if path.is_file()
+        and path.suffix in {".ts", ".tsx"}
+        and not path.name.endswith(TEST_SOURCE_SUFFIXES)
     )
 
     assert "localStorage" not in source
@@ -49,7 +57,10 @@ def test_frontend_validates_success_envelopes_and_idempotency_keys() -> None:
     assert "Promise<ActionReceipt>" in api_source
     assert "^idem_[0-9a-f]{32}$" in api_source
     assert '"Idempotency-Key": idempotencyKey' in api_source
-    assert schema_source.count("z.strictObject(") >= 10
+    # Semantic strictness: every response/envelope object rejects unknown keys.
+    # Assert no lax `z.object(` remains rather than a brittle raw count.
+    assert "z.object(" not in schema_source
+    assert "z.strictObject(" in schema_source
     assert "vaultReference" in schema_source
 
 

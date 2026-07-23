@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import stat
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from starlette.concurrency import run_in_threadpool
 
@@ -126,17 +126,21 @@ class LocalRunService:
         core_service: CoreRunService | None = None,
         settings: Settings | None = None,
     ) -> None:
-        resolved_path = Path(db_path) if db_path is not None else load_settings().ops_db_path
-        self._service = core_service or CoreRunService.from_paths(db_path=resolved_path)
         self._settings = settings or load_settings()
+        resolved_path = Path(db_path) if db_path is not None else self._settings.ops_db_path
+        self._service = core_service or CoreRunService.from_paths(
+            db_path=resolved_path,
+            settings=self._settings,
+        )
         self._started = False
 
     async def startup(self) -> None:
-        await run_in_threadpool(self._service.initialize)
+        await run_in_threadpool(self._service.startup)
         self._started = True
 
     async def shutdown(self) -> None:
         self._started = False
+        await run_in_threadpool(self._service.shutdown)
 
     def _require_started(self) -> None:
         if not self._started:
@@ -153,7 +157,7 @@ class LocalRunService:
             access_route=record.get("access_route"),  # type: ignore[arg-type]
             created_at=str(record["created_at"]),
             updated_at=str(record["updated_at"]),
-            execution_mode=record.get("execution_mode", "local_dry_run"),  # type: ignore[arg-type]
+            execution_mode=record.get("execution_mode", "plan_only"),  # type: ignore[arg-type]
             external_actions=bool(record.get("external_actions", False)),
         )
 
@@ -367,8 +371,13 @@ class LocalRunService:
         self,
         operation: OperationsRequest,
         idempotency_key: str | None,
+        execution_mode: Literal["plan_only", "execute_when_configured"],
     ) -> RunDetailResponse:
-        record = self._service.create_run(operation, idempotency_key=idempotency_key)
+        record = self._service.create_run(
+            operation,
+            idempotency_key=idempotency_key,
+            execution_mode=execution_mode,
+        )
         return self._detail(self._summary(record))
 
     def _list_sync(self, *, limit: int, offset: int) -> RunListResponse:
@@ -515,7 +524,12 @@ class LocalRunService:
             dry_run=True,
             outreach_recipient_override=request.outreach_recipient_override,
         )
-        return await run_in_threadpool(self._create_sync, operation, idempotency_key)
+        return await run_in_threadpool(
+            self._create_sync,
+            operation,
+            idempotency_key,
+            request.execution_mode,
+        )
 
     async def list_runs(self, *, limit: int, offset: int) -> RunListResponse:
         self._require_started()

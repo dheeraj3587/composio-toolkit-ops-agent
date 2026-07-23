@@ -283,7 +283,7 @@ class BrowserWorker:
             if self._settings.browser_use_api_key is None:  # pragma: no cover - guarded above
                 raise RuntimeError("Browser Use configuration is missing")
             module = importlib.import_module("browser_use_sdk.v3")
-            client_type = getattr(module, "AsyncBrowserUse")
+            client_type = module.AsyncBrowserUse
             self._client = client_type(
                 api_key=self._settings.browser_use_api_key.get_secret_value()
             )
@@ -309,7 +309,7 @@ def validate_allowed_domains(domains: tuple[str, ...]) -> tuple[str, ...]:
         except ValueError:
             labels = hostname.split(".")
             if any(_HOST_LABEL.fullmatch(label) is None for label in labels):
-                raise ValueError("allowed domain is invalid")
+                raise ValueError("allowed domain is invalid") from None
         else:
             if not address.is_global:
                 raise ValueError("private or special IP domains are not allowed")
