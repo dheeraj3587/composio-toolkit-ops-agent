@@ -69,6 +69,7 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
       expected_volume: "",
     },
   })
+  // eslint-disable-next-line react-hooks/incompatible-library
   const executionMode = watch("execution_mode")
 
   useEffect(() => {

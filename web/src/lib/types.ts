@@ -167,11 +167,10 @@ export interface ProviderStatus {
   // backend-reported status without silently dropping unmapped values.
   status: string
   detail: string
-  live_tested?: boolean
 }
 
 export interface HealthResponse {
-  status: "healthy" | "degraded" | "configuration_required"
+  status: "healthy" | "degraded"
   phase: string
   version: string
   snapshot: SnapshotHealth
@@ -200,12 +199,12 @@ export interface IntegratorOutput {
   app_name: string
   app_slug: string
   readiness:
-    | "credentials_ready"
-    | "awaiting_provider"
-    | "human_action_required"
-    | "configuration_required"
-    | "blocked"
-    | "failed"
+  | "credentials_ready"
+  | "awaiting_provider"
+  | "human_action_required"
+  | "configuration_required"
+  | "blocked"
+  | "failed"
   api_type: string
   api_base_url?: string | null
   auth_scheme: string

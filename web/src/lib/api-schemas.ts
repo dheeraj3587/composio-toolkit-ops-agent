@@ -148,7 +148,6 @@ const providerStatus = z.strictObject({
   provider: safeToken,
   status: safeToken,
   detail: boundedText(500),
-  live_tested: z.boolean().optional(),
 })
 
 export const runDetailResponseSchema = z.strictObject({
@@ -225,7 +224,7 @@ export const snapshotHealthSchema = z.strictObject({
 })
 
 export const healthResponseSchema = z.strictObject({
-  status: z.enum(["healthy", "degraded", "configuration_required"]),
+  status: z.enum(["healthy", "degraded"]),
   phase: boundedText(40),
   version: boundedText(40),
   snapshot: snapshotHealthSchema,

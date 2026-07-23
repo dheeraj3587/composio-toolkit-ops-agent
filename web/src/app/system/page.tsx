@@ -62,7 +62,7 @@ export default async function SystemPage() {
       </section>
 
       <section aria-labelledby="provider-status">
-        <div className="mb-3"><p className="eyebrow">Capability adapters</p><h2 id="provider-status" className="mt-1 text-xl font-semibold">Provider readiness</h2></div>
+        <div className="mb-3"><p className="eyebrow">Configuration and policy</p><h2 id="provider-status" className="mt-1 text-xl font-semibold">Runtime configuration and policy</h2></div>
         {health?.providers?.length ? (
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             {health.providers.map((provider) => (

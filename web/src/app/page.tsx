@@ -50,7 +50,7 @@ export default async function DashboardPage() {
           </p>
         </div>
         <Button asChild className="h-10 w-fit rounded-md bg-primary px-4 text-primary-foreground">
-          <Link href="/runs/new">Create dry-run plan <ArrowRight aria-hidden="true" /></Link>
+          <Link href="/runs/new">Create operations plan <ArrowRight aria-hidden="true" /></Link>
         </Button>
       </header>
 

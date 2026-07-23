@@ -121,7 +121,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
 
       {detail.provider_states?.length ? (
         <section aria-labelledby="run-providers">
-          <div className="mb-3"><p className="eyebrow">Adapter configuration</p><h2 id="run-providers" className="mt-1 text-xl font-semibold">Run provider state</h2></div>
+          <div className="mb-3"><p className="eyebrow">Configuration and policy</p><h2 id="run-providers" className="mt-1 text-xl font-semibold">Run-level configuration and policy</h2></div>
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             {detail.provider_states.map((provider) => (
               <ProviderStateCard key={provider.provider} provider={provider} evidenceScope="run" />

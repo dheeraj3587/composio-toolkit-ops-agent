@@ -5,14 +5,8 @@ import { describe, expect, it } from "vitest"
 
 import { ProviderStateCard } from "./provider-state-card"
 
-const baseProvider = {
-  provider: "browser_use",
-  status: "configured_not_verified",
-  detail: "Adapter configuration was found.",
-}
-
 function renderProvider(
-  provider: typeof baseProvider & { live_tested?: boolean },
+  provider: { provider: string; status: string; detail: string },
   evidenceScope: "system" | "run" = "system",
 ) {
   return renderToStaticMarkup(
@@ -21,46 +15,96 @@ function renderProvider(
 }
 
 describe("ProviderStateCard", () => {
-  it("renders an absent live_tested value as Not reported, never No", () => {
-    const html = renderProvider(baseProvider)
-
-    expect(html).toContain("Live verification")
-    expect(html).toContain(">Not reported<")
-    expect(html).not.toContain(">No<")
-  })
-
-  it("explains that disabled Gmail actions do not disable the Composio toolkit", () => {
+  // Point 3 / 11-a: absent live verification → Not reported
+  it("renders verification as Not reported (backend has no verification field)", () => {
     const html = renderProvider({
-      provider: "composio_gmail",
-      status: "disabled",
-      detail: "Composio disabled",
+      provider: "browser_use",
+      status: "configured_not_verified",
+      detail: "Adapter configuration was found.",
     })
 
-    expect(html).toContain("External Gmail actions are disabled by policy")
-    expect(html).toContain("does not mean the Composio toolkit is disabled")
-    expect(html).not.toContain(">Composio disabled<")
+    expect(html).toContain("Verification")
+    expect(html).toContain(">Not reported<")
   })
 
-  it("defines configured_not_verified without claiming live verification", () => {
-    const html = renderProvider(baseProvider)
+  // Point 11-h: old "LIVE TESTED · NO" wording is absent
+  it("does not contain stale LIVE TESTED wording", () => {
+    const html = renderProvider({
+      provider: "perplexity",
+      status: "configured_not_verified",
+      detail: "Search is used only for bounded official-document discovery.",
+    })
+
+    expect(html).not.toMatch(/live.?test/i)
+    expect(html).not.toMatch(/live.?verified/i)
+  })
+
+  // Point 11-b: disabled policy is not a failure
+  it("displays disabled status as policy-disabled, not as a failure", () => {
+    const html = renderProvider({
+      provider: "browser_use",
+      status: "disabled",
+      detail: "Live browser execution is policy-disabled.",
+    })
+
+    expect(html).toContain("Policy disabled")
+    // Indigo treatment for policy, not red for failure
+    expect(html).toContain("text-indigo-800")
+    expect(html).not.toContain("text-red-800")
+  })
+
+  // Point 11-c: disabled does not imply configured
+  it("does not infer configuration presence from disabled status", () => {
+    const html = renderProvider({
+      provider: "browser_use",
+      status: "disabled",
+      detail: "Live browser execution is policy-disabled.",
+    })
+
+    expect(html).toContain("Not reported by this state")
+    expect(html).not.toMatch(/>Configured</)
+    expect(html).not.toMatch(/>Present</)
+  })
+
+  // Point 11-d: Composio Gmail delivery title
+  it("renders the composio provider as Composio Gmail delivery", () => {
+    const html = renderProvider({
+      provider: "composio",
+      status: "disabled",
+      detail: "Live Gmail is policy-disabled.",
+    })
+
+    expect(html).toContain("Composio Gmail delivery")
+    expect(html).not.toMatch(/>Composio<\/h3>/)
+  })
+
+  // Point 11-e: toolkit capability is described as run-specific
+  it("explains that Composio toolkit capability is evaluated during runs", () => {
+    const html = renderProvider({
+      provider: "composio",
+      status: "disabled",
+      detail: "Live Gmail is policy-disabled.",
+    })
+
+    expect(html).toContain("toolkit capability is evaluated separately during individual runs")
+  })
+
+  // Point 11-f: configured_not_verified explanation
+  it("explains configured_not_verified without claiming live verification", () => {
+    const html = renderProvider({
+      provider: "gemini",
+      status: "configured_not_verified",
+      detail: "Structured extraction runs only against fetched official evidence.",
+    })
 
     expect(html).toContain(
-      "Configuration is present, but no live provider verification was reported.",
+      "Configuration is present, but the health endpoint has not performed a live provider probe.",
     )
     expect(html).not.toContain("Live verified")
+    expect(html).not.toContain("Live tested")
   })
 
-  it("keeps system configuration separate from run-specific evidence", () => {
-    const systemHtml = renderProvider(baseProvider, "system")
-    const runHtml = renderProvider(baseProvider, "run")
-
-    for (const label of ["Configuration", "Action policy", "Live verification", "Run evidence"]) {
-      expect(systemHtml).toContain(label)
-    }
-    expect(systemHtml).toContain("Not shown at system level")
-    expect(runHtml).toContain("See run phases and timeline")
-  })
-
+  // Point 11-g: unknown states render without invented certainty
   it("does not convert unknown or absent fields into false states", () => {
     const html = renderProvider({
       provider: "future_adapter",
@@ -70,7 +114,47 @@ describe("ProviderStateCard", () => {
 
     expect(html).toContain("Not reported")
     expect(html).not.toContain(">Disabled<")
-    expect(html).not.toContain(">Not live tested<")
+    expect(html).not.toContain(">Configured<")
+  })
+
+  // System vs run evidence distinction
+  it("keeps system configuration separate from run-specific evidence", () => {
+    const systemHtml = renderProvider(
+      { provider: "browser_use", status: "configured_not_verified", detail: "d" },
+      "system",
+    )
+    const runHtml = renderProvider(
+      { provider: "browser_use", status: "configured_not_verified", detail: "d" },
+      "run",
+    )
+
+    for (const label of ["Configuration", "Policy", "Verification", "Evidence source"]) {
+      expect(systemHtml).toContain(label)
+    }
+    expect(systemHtml).toContain("System configuration/policy only")
+    expect(runHtml).toContain("See run phases and timeline")
+  })
+
+  // For configured_not_verified: policy shows "Allowed" for gated providers
+  it("shows policy as Allowed when a policy-gated provider is configured", () => {
+    const html = renderProvider({
+      provider: "browser_use",
+      status: "configured_not_verified",
+      detail: "Browser configuration is present.",
+    })
+
+    expect(html).toContain(">Allowed<")
+  })
+
+  // For non-gated providers: policy shows "No policy gate"
+  it("shows No policy gate for providers without a policy gate", () => {
+    const html = renderProvider({
+      provider: "perplexity",
+      status: "configured_not_verified",
+      detail: "Search is used only for bounded official-document discovery.",
+    })
+
+    expect(html).toContain("No policy gate")
   })
 
   it("does not retain stale demo or placeholder-record wording", () => {

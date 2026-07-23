@@ -79,6 +79,7 @@ class Settings(BaseModel):
     browser_use_api_key: SecretStr | None = Field(default=None, repr=False)
     langgraph_aes_key: SecretStr | None = Field(default=None, repr=False)
     secret_vault_key: SecretStr | None = Field(default=None, repr=False)
+    ops_internal_api_token: SecretStr | None = Field(default=None, repr=False)
 
     langgraph_strict_msgpack: bool = True
     composio_user_id: str = "ops-assignment-user"
@@ -152,6 +153,7 @@ class Settings(BaseModel):
             "browser_use_api_key": _secret(source.get("BROWSER_USE_API_KEY")),
             "langgraph_aes_key": _secret(source.get("LANGGRAPH_AES_KEY")),
             "secret_vault_key": _secret(source.get("SECRET_VAULT_KEY")),
+            "ops_internal_api_token": _secret(source.get("OPS_INTERNAL_API_TOKEN")),
             "langgraph_strict_msgpack": _boolean(
                 source.get("LANGGRAPH_STRICT_MSGPACK"), default=True
             ),
@@ -204,3 +206,4 @@ def load_settings(
     """Public convenience wrapper used by CLI and Streamlit entrypoints."""
 
     return Settings.from_env(env=env, dotenv_path=dotenv_path)
+
