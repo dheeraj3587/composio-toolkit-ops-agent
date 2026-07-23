@@ -33,16 +33,9 @@ from ops.credential_validator import (
     hubspot_validation_policy,
     pipedrive_validation_policy,
 )
-from ops.network_endpoint_policy import validation_endpoint as network_validation_endpoint
 from ops.effect_ledger import SQLiteEffectStore
 from ops.gmail_worker import GmailWorker
 from ops.graph import DurableOperationsWorkflow, WorkflowDependencies, build_graph
-from ops.operational_research import (
-    GeminiStructuredExtractor,
-    OperationalResearchEnricher,
-    PerplexitySearchDiscovery,
-)
-from ops.secret_store import SQLiteSecretStore
 from ops.integrator import build_integrator_bundle
 from ops.models import (
     CapabilityAvailability,
@@ -52,7 +45,14 @@ from ops.models import (
     OperationsRequest,
     validate_vault_reference,
 )
-from ops.operational_research import ResearchEnricher, ResearchEnrichmentOutcome
+from ops.network_endpoint_policy import validation_endpoint as network_validation_endpoint
+from ops.operational_research import (
+    GeminiStructuredExtractor,
+    OperationalResearchEnricher,
+    PerplexitySearchDiscovery,
+    ResearchEnricher,
+    ResearchEnrichmentOutcome,
+)
 from ops.p1_adapter import (
     DEFAULT_P1_ROOT,
     P1AppRecord,
@@ -65,6 +65,7 @@ from ops.p1_adapter import (
 from ops.provider_errors import ConfigurationRequiredError
 from ops.redaction import redact_data, redact_text
 from ops.routing import RoutingDecision, decide_access
+from ops.secret_store import SQLiteSecretStore
 from ops.state import AccessRoute, RunStatus, validate_status_transition
 from ops.storage import OperationsStorage, OperationsUnitOfWork
 

@@ -47,6 +47,6 @@ EXPOSE 8000
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/system/health', timeout=3)" || exit 1
+  CMD python -c "import os, urllib.request; token=os.environ.get('OPS_INTERNAL_API_TOKEN') or ''; request=urllib.request.Request('http://127.0.0.1:8000/api/system/health', headers={'X-Ops-Internal-Token': token}); urllib.request.urlopen(request, timeout=3)" || exit 1
 
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log"]

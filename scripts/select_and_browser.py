@@ -98,7 +98,9 @@ async def main() -> None:
     )
 
     if settings.browser_use_api_key is None or not settings.allow_live_browser:
-        _line("Browser Use is not enabled (need BROWSER_USE_API_KEY + ALLOW_LIVE_BROWSER); stopping.")
+        _line(
+            "Browser Use is not enabled (need BROWSER_USE_API_KEY + ALLOW_LIVE_BROWSER); stopping."
+        )
         return
 
     worker = BrowserWorker(settings=settings)

@@ -92,8 +92,9 @@ def test_container_runtime_has_one_writable_application_path() -> None:
     api_dockerfile = (ROOT / "Dockerfile.api").read_text(encoding="utf-8")
     requirements = (ROOT / "requirements-api.txt").read_text(encoding="utf-8").splitlines()
 
-    assert "COPY requirements-api.txt ./" in api_dockerfile
+    assert "COPY requirements-api.txt requirements-providers.txt ./" in api_dockerfile
     assert "--requirement requirements-api.txt" in api_dockerfile
+    assert "--requirement requirements-providers.txt" in api_dockerfile
     assert "COPY --chown=root:root api ./api" in api_dockerfile
     assert "COPY --chown=root:root ops ./ops" in api_dockerfile
     assert "COPY --chown=root:root data/p1 ./data/p1" in api_dockerfile
@@ -105,6 +106,7 @@ def test_container_runtime_has_one_writable_application_path() -> None:
         "langgraph==1.2.9",
         "langgraph-checkpoint-sqlite==3.1.0",
         "pycryptodome>=3.23,<4",
+        "cryptography==48.0.1",
         "pydantic==2.13.4",
         "python-dotenv==1.2.2",
         "uvicorn[standard]==0.51.0",

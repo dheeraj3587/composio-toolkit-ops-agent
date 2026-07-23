@@ -34,31 +34,28 @@
 	header -Server
 
 	# Ordered routing (a `route` block preserves written order; first match wins):
-	#   1. Next.js owns its browser-facing route handlers under /api/ops/*.
-	#   2. All other /api/* traffic is the FastAPI control plane.
-	#   3. Everything else is the Next.js UI.
+	#   1. /healthz is an unauthenticated load-balancer probe.
+	#   2. Every other browser route is protected by Basic Auth and sent only to
+	#      Next.js. FastAPI is intentionally not exposed through Caddy.
 	#
 	# Caddy's reverse_proxy automatically sets X-Forwarded-For, X-Forwarded-Proto
 	# and X-Forwarded-Host, and forwards the original Host header upstream.
 	route {
-		reverse_proxy /api/ops/* web:3000 {
-			transport http {
-				dial_timeout 5s
-				response_header_timeout 30s
-			}
+		handle /healthz {
+			respond "ok" 200
 		}
 
-		reverse_proxy /api/* api:8000 {
-			transport http {
-				dial_timeout 5s
-				response_header_timeout 30s
+		handle {
+			basic_auth {
+				{$OPS_BASIC_AUTH_USER} {$OPS_BASIC_AUTH_HASH}
 			}
-		}
 
-		reverse_proxy web:3000 {
-			transport http {
-				dial_timeout 5s
-				response_header_timeout 30s
+			reverse_proxy web:3000 {
+				header_up -Authorization
+				transport http {
+					dial_timeout 5s
+					response_header_timeout 30s
+				}
 			}
 		}
 	}

@@ -82,6 +82,14 @@ function apiOrigin(): string {
   return parsed.origin
 }
 
+function internalApiToken(): string {
+  const token = process.env.OPS_INTERNAL_API_TOKEN?.trim()
+  if (!token) {
+    throw new ApiError(503, "INTERNAL_API_TOKEN_MISSING", "The operations API token is not configured.")
+  }
+  return token
+}
+
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -116,6 +124,7 @@ async function apiRequest<T>(
       cache: "no-store",
       headers: {
         Accept: "application/json",
+        "X-Ops-Internal-Token": internalApiToken(),
         ...(init?.body ? { "Content-Type": "application/json" } : {}),
         ...init?.headers,
       },

@@ -94,6 +94,24 @@ def test_container_defaults_disable_live_actions_and_bind_host_ports_to_loopback
         assert private_pattern in dockerignore
 
 
+def test_production_proxy_keeps_fastapi_private_and_requires_internal_token() -> None:
+    compose = (ROOT / "compose.prod.yaml").read_text(encoding="utf-8")
+    caddyfile = (ROOT / "deploy" / "Caddyfile").read_text(encoding="utf-8")
+
+    assert "OPS_INTERNAL_API_TOKEN:" in compose
+    assert "X-Ops-Internal-Token" in compose
+    assert "ALLOW_LIVE_BROWSER: ${ALLOW_LIVE_BROWSER:-false}" in compose
+    assert 'ports:\n      - "80:80"\n      - "443:443"' in compose
+    assert "8000:8000" not in compose
+    assert "3000:3000" not in compose
+
+    assert "handle /healthz" in caddyfile
+    assert "basic_auth" in caddyfile
+    assert "reverse_proxy web:3000" in caddyfile
+    assert "reverse_proxy /api/* api:8000" not in caddyfile
+    assert "reverse_proxy api:8000" not in caddyfile
+
+
 def test_security_gate_shell_is_syntactically_valid() -> None:
     result = subprocess.run(
         ["bash", "-n", str(ROOT / "scripts" / "security_gate.sh")],

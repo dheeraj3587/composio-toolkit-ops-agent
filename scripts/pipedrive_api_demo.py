@@ -240,7 +240,9 @@ def main() -> None:
 
         raw_haystack = created.text + submitted.text + got.text + timeline.text + output.text
         leaked = token in raw_haystack and not live
-        print(f"\nvault reference names only: {list(body.get('integrator_bundle', {}).get('credential_refs', {}))}")
+        print(
+            f"\nvault reference names only: {list(body.get('integrator_bundle', {}).get('credential_refs', {}))}"
+        )
         print(f"raw token present in any API response: {token in raw_haystack} (expected False)")
         assert not leaked, "raw fixture token leaked into an API response"
 

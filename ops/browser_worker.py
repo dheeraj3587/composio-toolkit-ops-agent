@@ -49,6 +49,7 @@ class BrowserTaskOutput(BaseModel):
     hitl_reason: str | None = Field(default=None, max_length=500)
     safe_summary: str = Field(default="", max_length=1_000)
 
+
 BrowserObservationStatus = Literal[
     "navigating",
     "human_action_required",

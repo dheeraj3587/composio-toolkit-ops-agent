@@ -96,6 +96,7 @@ class Settings(BaseModel):
 
         ordered = [self.gemini_model, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"]
         return tuple(dict.fromkeys(model for model in ordered if model))
+
     # Session count is the real quota (not dollars), so use the most capable
     # Browser Use model for reliable multi-step onboarding navigation. The latest
     # Opus available on Browser Use Cloud is claude-opus-4.7 (there is no 4.8).
@@ -163,9 +164,7 @@ class Settings(BaseModel):
             ),
             "gemini_model": _optional(source.get("GEMINI_MODEL")) or "gemini-3.5-flash",
             "browser_use_model": _optional(source.get("BROWSER_USE_MODEL")) or "claude-opus-4.7",
-            "browser_use_max_cost_usd": _float(
-                source.get("BROWSER_USE_MAX_COST_USD"), default=1.0
-            ),
+            "browser_use_max_cost_usd": _float(source.get("BROWSER_USE_MAX_COST_USD"), default=1.0),
             "allow_local_credential_submission": _boolean(
                 source.get("ALLOW_LOCAL_CREDENTIAL_SUBMISSION"), default=False
             ),
@@ -206,4 +205,3 @@ def load_settings(
     """Public convenience wrapper used by CLI and Streamlit entrypoints."""
 
     return Settings.from_env(env=env, dotenv_path=dotenv_path)
-

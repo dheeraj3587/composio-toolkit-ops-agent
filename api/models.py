@@ -15,13 +15,13 @@ from pydantic import (
     model_validator,
 )
 
+from ops.models import OperationalResearch
+from ops.state import AccessRoute, RunStatus
+
 CredentialFieldName = Annotated[
     str,
     StringConstraints(pattern=r"^[a-z0-9][a-z0-9_-]{0,99}$", min_length=1, max_length=100),
 ]
-
-from ops.models import OperationalResearch
-from ops.state import AccessRoute, RunStatus
 
 VaultReference = Annotated[
     str,

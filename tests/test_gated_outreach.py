@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -96,6 +98,14 @@ class _FakeComposio:
 
     def close(self) -> None:  # pragma: no cover - parity with the real client
         return None
+
+
+@pytest.fixture(autouse=True)
+def fake_composio_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep GmailWorker unit tests offline and independent of the installed SDK."""
+
+    module = types.SimpleNamespace(SESSION_PRESET_DIRECT_TOOLS="direct_tools")
+    monkeypatch.setitem(sys.modules, "composio", module)
 
 
 class _StubPreflight:

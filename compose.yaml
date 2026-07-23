@@ -14,6 +14,7 @@ services:
       OPS_DB_PATH: /private/ops.db
       OPS_CORS_ORIGINS: ${OPS_CORS_ORIGINS:-http://127.0.0.1:3000,http://localhost:3000}
       OPS_ENABLE_API_DOCS: "false"
+      OPS_INTERNAL_API_TOKEN: ${OPS_INTERNAL_API_TOKEN:-dev-internal-token-change-me}
       PROVIDER_EFFECTS_DB_PATH: /private/provider_effects.db
       RUN_LIVE_TESTS: "0"
       SECRET_VAULT_DB_PATH: /private/secret_vault.db
@@ -38,6 +39,7 @@ services:
       dockerfile: web/Dockerfile
     environment:
       OPS_API_URL: http://api:8000
+      OPS_INTERNAL_API_TOKEN: ${OPS_INTERNAL_API_TOKEN:-dev-internal-token-change-me}
     depends_on:
       api:
         condition: service_healthy

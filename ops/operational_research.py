@@ -385,9 +385,7 @@ class GeminiStructuredExtractor:
                 continue
             self.model_used = model
             return OperationalResearch.model_validate_json(text)
-        raise RuntimeError(
-            f"all Gemini models failed ({', '.join(self._models)})"
-        ) from last_error
+        raise RuntimeError(f"all Gemini models failed ({', '.join(self._models)})") from last_error
 
 
 def _render_extraction_prompt(

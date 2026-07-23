@@ -32,7 +32,9 @@ _MATRIX_ROUTES = {
 _ACTIVE_BROWSER_APPS = {"pipedrive", "twenty"}
 
 
-def _research(slug: str, route: str, evidence_host: str = "developers.example.com") -> OperationalResearch:
+def _research(
+    slug: str, route: str, evidence_host: str = "developers.example.com"
+) -> OperationalResearch:
     return OperationalResearch.model_validate(
         {
             "app_name": slug.title(),

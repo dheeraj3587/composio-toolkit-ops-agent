@@ -1,9 +1,8 @@
 # Production deployment for a single DigitalOcean Ubuntu Droplet.
 #
 #   Internet ── :80/:443 ──▶ caddy (reverse proxy, automatic HTTPS)
-#                              ├─ /api/ops/* ─▶ web  (Next.js route handlers)
-#                              ├─ /api/*     ─▶ api  (FastAPI control plane)
-#                              └─ everything ─▶ web  (Next.js UI)
+#                              ├─ /healthz       ─▶ static 200
+#                              └─ authenticated  ─▶ web  (Next.js UI + route handlers)
 #
 # Only the reverse proxy publishes ports. The api (8000) and web (3000) services
 # are reachable only on the private "opsnet" network. Secrets are provided at
@@ -39,6 +38,7 @@ services:
       ALLOW_LIVE_BROWSER: ${ALLOW_LIVE_BROWSER:-false}
       OPS_ENABLE_API_DOCS: "false"
       RUN_LIVE_TESTS: "0"
+      OPS_INTERNAL_API_TOKEN: ${OPS_INTERNAL_API_TOKEN:?OPS_INTERNAL_API_TOKEN is required}
       LANGGRAPH_STRICT_MSGPACK: "true"
       OPS_DB_PATH: /data/ops.db
       CHECKPOINT_DB_PATH: /data/checkpoints.db
@@ -64,10 +64,8 @@ services:
       - no-new-privileges:true
     healthcheck:
       test:
-        - CMD
-        - python
-        - -c
-        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/system/health', timeout=3)
+        - CMD-SHELL
+        - python -c 'import os, urllib.request; token=os.environ.get("OPS_INTERNAL_API_TOKEN") or ""; request=urllib.request.Request("http://127.0.0.1:8000/api/system/health", headers={"X-Ops-Internal-Token": token}); urllib.request.urlopen(request, timeout=3)'
       interval: 30s
       timeout: 5s
       start_period: 20s
@@ -78,13 +76,14 @@ services:
     build:
       context: .
       dockerfile: web/Dockerfile
-    # Only server-only, non-secret values reach the frontend container. Provider
-    # secrets are intentionally NOT passed here. OPS_API_URL is read exclusively
-    # by Next.js server code (see web/src/lib/api.ts) and is never exposed to the
-    # browser bundle.
+    # Only server-only runtime values reach the frontend container. Provider
+    # secrets are intentionally NOT passed here. OPS_API_URL and
+    # OPS_INTERNAL_API_TOKEN are read exclusively by Next.js server code
+    # (see web/src/lib/api.ts) and are never exposed to the browser bundle.
     environment:
       NODE_ENV: production
       OPS_API_URL: ${OPS_API_URL:-http://api:8000}
+      OPS_INTERNAL_API_TOKEN: ${OPS_INTERNAL_API_TOKEN:?OPS_INTERNAL_API_TOKEN is required}
       OPS_DEMO_MODE: ${OPS_DEMO_MODE:-false}
     depends_on:
       api:
@@ -128,6 +127,8 @@ services:
     environment:
       DOMAIN: ${DOMAIN:-your-domain.example}
       ACME_EMAIL: ${ACME_EMAIL:-admin@example.com}
+      OPS_BASIC_AUTH_USER: ${OPS_BASIC_AUTH_USER:?OPS_BASIC_AUTH_USER is required}
+      OPS_BASIC_AUTH_HASH: ${OPS_BASIC_AUTH_HASH:?OPS_BASIC_AUTH_HASH is required}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -144,7 +145,7 @@ services:
         - wget
         - --spider
         - -q
-        - http://127.0.0.1:80/
+        - http://127.0.0.1:80/healthz
       interval: 30s
       timeout: 5s
       start_period: 15s

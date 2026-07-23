@@ -20,9 +20,11 @@ function safeHttpUrl(value: string): boolean {
 
 const boundedText = (maximum: number) => z.string().min(1).max(maximum)
 const optionalText = (maximum: number) => z.string().max(maximum).nullable()
+const nullableText = (maximum: number) => z.string().max(maximum).nullish().default(null)
 const safeToken = z.string().regex(/^[a-z0-9][a-z0-9_.:-]{0,119}$/i)
 const httpUrl = z.string().min(8).max(MAX_URL_LENGTH).refine(safeHttpUrl)
-const optionalHttpUrl = httpUrl.nullable()
+const nullableHttpUrl = httpUrl.nullish().default(null)
+const nullableBoolean = z.boolean().nullish().default(null)
 const isoTimestamp = z.string().max(80).refine((value) => !Number.isNaN(Date.parse(value)))
 const runId = z.string().regex(/^run_[0-9a-f]{32}$/)
 const appSlug = z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/)
@@ -64,20 +66,20 @@ const scopeRequirement = z.strictObject({
 export const operationalResearchSchema = z.strictObject({
   app_name: boundedText(200),
   app_slug: appSlug,
-  api_available: z.boolean().nullable(),
+  api_available: nullableBoolean,
   api_type: boundedText(80),
-  api_base_url: optionalHttpUrl,
+  api_base_url: nullableHttpUrl,
   auth_methods: z.array(boundedText(120)).max(50),
-  authorization_url: optionalHttpUrl,
-  token_url: optionalHttpUrl,
+  authorization_url: nullableHttpUrl,
+  token_url: nullableHttpUrl,
   credential_fields: z.array(boundedText(120)).max(50),
   scopes: z.array(scopeRequirement).max(100),
-  developer_portal_url: optionalHttpUrl,
-  signup_url: optionalHttpUrl,
+  developer_portal_url: nullableHttpUrl,
+  signup_url: nullableHttpUrl,
   access_route: accessRoute,
-  production_approval_required: z.boolean().nullable(),
-  contact_email: optionalText(320),
-  contact_url: optionalHttpUrl,
+  production_approval_required: nullableBoolean,
+  contact_email: nullableText(320),
+  contact_url: nullableHttpUrl,
   evidence_urls: z.array(httpUrl).max(100),
   confidence: z.number().min(0).max(1),
   source: z.enum(["p1_snapshot", "official_enrichment", "combined", "unavailable"]).optional(),

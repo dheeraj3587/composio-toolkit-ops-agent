@@ -25,7 +25,7 @@ export default async function AppResearchPage({ params }: { params: Promise<{ sl
     result = await getAppResearch(slug)
   } catch (error) {
     if (error instanceof ApiError && error.status === 404) notFound()
-    return <ResearchUnavailable />
+    return <ResearchUnavailable {...researchErrorCopy(error)} />
   }
 
   const { app, research } = result
@@ -92,14 +92,38 @@ function Summary({ icon: Icon, label, value }: { icon: typeof Boxes; label: stri
   )
 }
 
-function ResearchUnavailable() {
+function researchErrorCopy(error: unknown): {
+  copy: string
+  title: string
+} {
+  if (error instanceof ApiError && error.code === "INVALID_API_RESPONSE") {
+    return {
+      title: "Response contract mismatch",
+      copy: "The backend returned a sanitized payload that does not match the frontend contract. No synthetic app details are shown.",
+    }
+  }
+
+  if (error instanceof ApiError && error.status === 503) {
+    return {
+      title: "Backend unavailable",
+      copy: "The operations API is unreachable or not configured for this deployment. No synthetic app details are shown.",
+    }
+  }
+
+  return {
+    title: "The backend could not return verified research.",
+    copy: "No synthetic app details are shown. Confirm the API is running and try again.",
+  }
+}
+
+function ResearchUnavailable({ copy, title }: { copy: string; title: string }) {
   return (
     <div className="mx-auto grid min-h-[65vh] max-w-xl place-items-center text-center">
       <div>
         <Boxes className="mx-auto size-6 text-muted-foreground" aria-hidden="true" />
         <p className="eyebrow mt-4">App profile unavailable</p>
-        <h1 className="mt-2 text-2xl font-semibold">The backend could not return verified research.</h1>
-        <p className="mt-3 text-sm leading-6 text-muted-foreground">No synthetic app details are shown. Confirm the API is running and try again.</p>
+        <h1 className="mt-2 text-2xl font-semibold">{title}</h1>
+        <p className="mt-3 text-sm leading-6 text-muted-foreground">{copy}</p>
         <Button asChild variant="outline" className="mt-6 rounded-md"><Link href="/"><ArrowLeft aria-hidden="true" /> Overview</Link></Button>
       </div>
     </div>

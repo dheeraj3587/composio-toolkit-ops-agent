@@ -154,8 +154,8 @@ def test_doctor_checks_snapshot_and_safe_email_default(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("ALLOW_LIVE_VENDOR_EMAIL", raising=False)
-    monkeypatch.delenv("SECRET_VAULT_KEY", raising=False)
+    monkeypatch.setenv("ALLOW_LIVE_VENDOR_EMAIL", "false")
+    monkeypatch.setenv("SECRET_VAULT_KEY", "")
 
     exit_code, payload = _run_cli(capsys, tmp_path / "ops.db", "doctor")
 
@@ -192,7 +192,7 @@ def test_doctor_accepts_a_valid_fernet_vault_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SECRET_VAULT_KEY", Fernet.generate_key().decode("ascii"))
-    monkeypatch.delenv("ALLOW_LIVE_VENDOR_EMAIL", raising=False)
+    monkeypatch.setenv("ALLOW_LIVE_VENDOR_EMAIL", "false")
 
     exit_code, payload = _run_cli(capsys, tmp_path / "ops.db", "doctor")
 
@@ -210,7 +210,7 @@ def test_doctor_rejects_invalid_fernet_key_without_echoing_it(
 ) -> None:
     invalid_key = "invalid-vault-key-must-never-render"
     monkeypatch.setenv("SECRET_VAULT_KEY", invalid_key)
-    monkeypatch.delenv("ALLOW_LIVE_VENDOR_EMAIL", raising=False)
+    monkeypatch.setenv("ALLOW_LIVE_VENDOR_EMAIL", "false")
 
     exit_code = main(["--db-path", str(tmp_path / "ops.db"), "doctor"])
     captured = capsys.readouterr()

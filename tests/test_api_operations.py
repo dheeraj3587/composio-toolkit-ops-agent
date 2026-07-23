@@ -46,6 +46,52 @@ def test_catalog_search_and_research_are_verified_safe_projections(tmp_path: Pat
     assert "environment" not in rendered
 
 
+def test_app_research_response_includes_explicit_nullable_fields(tmp_path: Path) -> None:
+    application = create_app(db_path=tmp_path / "private" / "ops.db")
+    with TestClient(application) as client:
+        response = client.get("/api/apps/github/research")
+
+    assert response.status_code == 200
+    research = response.json()["research"]
+    for field in {
+        "api_available",
+        "api_base_url",
+        "authorization_url",
+        "token_url",
+        "developer_portal_url",
+        "signup_url",
+        "production_approval_required",
+        "contact_email",
+        "contact_url",
+    }:
+        assert field in research
+        assert research[field] is None
+
+
+def test_api_routes_require_internal_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPS_INTERNAL_API_TOKEN", "expected-internal-token")
+    application = create_app(db_path=tmp_path / "private" / "ops.db")
+    with TestClient(application) as client:
+        client.headers.pop("X-Ops-Internal-Token", None)
+        missing = client.get("/api/system/health")
+        wrong = client.get(
+            "/api/system/health",
+            headers={"X-Ops-Internal-Token": "wrong-internal-token"},
+        )
+        valid = client.get(
+            "/api/system/health",
+            headers={"X-Ops-Internal-Token": "expected-internal-token"},
+        )
+
+    assert missing.status_code == 401
+    assert wrong.status_code == 401
+    assert valid.status_code == 200
+    assert missing.json() == {
+        "error": "unauthorized",
+        "message": "Internal API token is required.",
+    }
+
+
 def test_run_detail_explains_route_and_configuration_without_claiming_success(
     tmp_path: Path,
 ) -> None:

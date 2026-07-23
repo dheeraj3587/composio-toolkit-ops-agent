@@ -283,9 +283,7 @@ class _ComposioToolkitCatalog:
         available = True if enabled is None else bool(enabled)
         managed = bool(data.get("composio_managed_auth", False))
         schemes: list[str] = [
-            str(scheme)
-            for scheme in (data.get("composio_managed_auth_schemes") or [])
-            if scheme
+            str(scheme) for scheme in (data.get("composio_managed_auth_schemes") or []) if scheme
         ]
         for detail in data.get("auth_config_details") or []:
             if isinstance(detail, dict) and detail.get("mode"):

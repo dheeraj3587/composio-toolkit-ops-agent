@@ -21,8 +21,8 @@ import sys
 
 import httpx
 
-from ops.config import load_settings
 from ops.composio_capability import ComposioCapabilityPreflight
+from ops.config import load_settings
 from ops.operational_research import (
     GeminiStructuredExtractor,
     OperationalResearchEnricher,

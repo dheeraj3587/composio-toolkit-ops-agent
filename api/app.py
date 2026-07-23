@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -27,9 +28,9 @@ from api.models import (
     CredentialSubmissionRequest,
     HealthResponse,
     IdempotencyConflictResponse,
-    LiveViewResponse,
     InternalErrorResponse,
     InvalidRequestResponse,
+    LiveViewResponse,
     PhaseUnavailableResponse,
     ResourceNotFoundResponse,
     RetryRequest,
@@ -135,6 +136,27 @@ def _cors_origins() -> list[str]:
     return sorted(set(origins))
 
 
+def _internal_api_auth_response(request: Request) -> JSONResponse | None:
+    """Require the server-only internal token for every FastAPI API request."""
+
+    if not request.url.path.startswith("/api/"):
+        return None
+
+    expected = os.environ.get("OPS_INTERNAL_API_TOKEN", "").strip()
+    provided = request.headers.get("X-Ops-Internal-Token", "")
+    if expected and provided and secrets.compare_digest(provided, expected):
+        return None
+
+    return JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        content={
+            "error": "unauthorized",
+            "message": "Internal API token is required.",
+        },
+        headers={"WWW-Authenticate": "OpsInternalToken"},
+    )
+
+
 def get_run_service(request: Request) -> RunService:
     """Resolve the lifespan-managed service without exposing it as a request parameter."""
 
@@ -211,7 +233,7 @@ def create_app(
         allow_origins=cors_origins if cors_origins is not None else _cors_origins(),
         allow_credentials=False,
         allow_methods=["GET", "POST"],
-        allow_headers=["Accept", "Content-Type", "Idempotency-Key"],
+        allow_headers=["Accept", "Content-Type", "Idempotency-Key", "X-Ops-Internal-Token"],
         max_age=600,
     )
 
@@ -220,7 +242,9 @@ def create_app(
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
-        response = await call_next(request)
+        response = _internal_api_auth_response(request)
+        if response is None:
+            response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -496,7 +520,6 @@ def create_app(
     @application.get(
         "/api/apps/{app_slug}/research",
         response_model=AppResearchResponse,
-        response_model_exclude_none=True,
         responses={
             404: {"model": ResourceNotFoundResponse},
             422: {"model": InvalidRequestResponse},
