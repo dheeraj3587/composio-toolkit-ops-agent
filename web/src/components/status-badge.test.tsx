@@ -7,7 +7,7 @@ describe("StatusBadge", () => {
   it("renders the exact backend status without promoting configuration-required to success", () => {
     render(<StatusBadge status="configuration_required" />)
 
-    const badge = screen.getByText("Configuration Required").closest("div")
+    const badge = screen.getByText("Configuration Required")
     expect(badge).toHaveClass("text-amber-800")
     expect(screen.queryByText("Ready")).not.toBeInTheDocument()
   })

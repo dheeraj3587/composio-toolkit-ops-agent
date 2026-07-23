@@ -9,6 +9,7 @@ explicit retry/resume actions guarded by runtime policy.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -20,9 +21,16 @@ from uuid import uuid4
 
 from ops.config import Settings
 from ops.graph import DurableOperationsWorkflow, WorkflowDependencies, build_graph
-from ops.models import IntegratorBundle, OperationalResearch, OperationsRequest
+from ops.models import (
+    CapabilityAvailability,
+    IntegratorBundle,
+    OperationalResearch,
+    OperationsRequest,
+)
+from ops.operational_research import ResearchEnricher, ResearchEnrichmentOutcome
 from ops.p1_adapter import (
     DEFAULT_P1_ROOT,
+    P1AppRecord,
     P1LookupFound,
     P1OperationalAdapter,
     P1SnapshotProvenance,
@@ -84,9 +92,9 @@ def validate_idempotency_key(value: str | None) -> str | None:
     return value
 
 
-def _request_fingerprint(request: OperationsRequest) -> str:
+def _request_fingerprint(request: OperationsRequest, execution_mode: str) -> str:
     canonical = json.dumps(
-        request.model_dump(mode="json"),
+        {"execution_mode": execution_mode, "request": request.model_dump(mode="json")},
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -147,11 +155,17 @@ class RunService:
         p1_adapter: P1OperationalAdapter | None = None,
         settings: Settings | None = None,
         workflow: DurableOperationsWorkflow | None = None,
+        research_enricher: ResearchEnricher | None = None,
     ) -> None:
         self.storage = storage
         self.p1_adapter = p1_adapter or P1OperationalAdapter()
         self._settings = settings
         self._workflow = workflow
+        # Optional, injected one-probe enrichment boundary. When absent (the
+        # default), run creation performs no enrichment and stays byte-identical
+        # to the plan-only baseline; the enricher never performs a browser,
+        # Gmail, or credential side effect.
+        self._enricher = research_enricher
         self._run_locks: dict[str, threading.RLock] = {}
         self._run_locks_guard = threading.Lock()
 
@@ -163,12 +177,14 @@ class RunService:
         snapshot_root: str | Path = DEFAULT_P1_ROOT,
         settings: Settings | None = None,
         workflow: DurableOperationsWorkflow | None = None,
+        research_enricher: ResearchEnricher | None = None,
     ) -> RunService:
         return cls(
             storage=OperationsStorage(db_path),
             p1_adapter=P1OperationalAdapter(snapshot_root),
             settings=settings,
             workflow=workflow,
+            research_enricher=research_enricher,
         )
 
     def initialize(self) -> None:
@@ -231,15 +247,38 @@ class RunService:
         created_event_type = "dry_run_created" if execution_mode == "plan_only" else "run_created"
         validated_idempotency_key = validate_idempotency_key(idempotency_key)
         request_fingerprint = (
-            _request_fingerprint(request) if validated_idempotency_key is not None else None
+            _request_fingerprint(request, execution_mode)
+            if validated_idempotency_key is not None
+            else None
         )
 
         # Verify all immutable inputs before writing any run state.
         lookup = self.p1_adapter.lookup(request.app_name)
         research_payload: Mapping[str, object] | None = None
+        research_source = "verified_p1_snapshot"
+        enrichment_attempts = 0
+        enrichment_documents = 0
+        enrichment_capability: CapabilityAvailability | None = None
         if isinstance(lookup, P1LookupFound):
             research = to_operational_research(lookup.record)
-            decision = decide_access(research)
+            # One bounded, guarded official-evidence probe runs only when an
+            # enricher is configured and the verified baseline is operationally
+            # incomplete. The probe fetches allowlisted official documents only;
+            # it never invokes a browser, Gmail, or credential side effect, and
+            # when providers are unconfigured it truthfully retains the baseline.
+            if self._enricher is not None and _missing_operational_fields(
+                research.model_dump(mode="json")
+            ):
+                outcome = self._run_enrichment_probe(lookup.record, research)
+                research = outcome.research
+                enrichment_capability = outcome.capability
+                enrichment_documents = outcome.documents_fetched
+                if outcome.capability.status == "ready":
+                    enrichment_attempts = 1
+                    research_source = "official_evidence_combined"
+                decision = decide_access(research, unknown_probe_attempts=enrichment_attempts)
+            else:
+                decision = decide_access(research)
             research_payload = research.model_dump(mode="json")
         else:
             decision = RoutingDecision(
@@ -298,7 +337,11 @@ class RunService:
                     else ["p1_record", "operational_research"]
                 ),
                 provider_status={
-                    "research": "baseline_ready" if research_payload is not None else "not_started",
+                    "research": (
+                        enrichment_capability.status
+                        if enrichment_capability is not None
+                        else ("baseline_ready" if research_payload is not None else "not_started")
+                    ),
                     "browser": "not_started",
                     "email": "not_started",
                     "validation": "not_started",
@@ -329,6 +372,22 @@ class RunService:
                     lookup,
                     research_payload,
                 )
+                if enrichment_capability is not None:
+                    transaction.append_audit_event(
+                        run_id=run_id,
+                        event_type="operational_research_enriched",
+                        payload={
+                            "status": enrichment_capability.status,
+                            "source": research_source,
+                            "reason_code": enrichment_capability.reason_code,
+                            "detail": enrichment_capability.detail,
+                            "enrichment_attempts": enrichment_attempts,
+                            "documents_fetched": enrichment_documents,
+                            "missing_fields": _missing_operational_fields(research_payload),
+                            "confidence": research_payload.get("confidence"),
+                            "external_actions": False,
+                        },
+                    )
             else:
                 transaction.append_audit_event(
                     run_id=run_id,
@@ -395,6 +454,28 @@ class RunService:
             if created is None:  # pragma: no cover - persistence invariant
                 raise RuntimeError("created run could not be read")
             return _public_run(created)
+
+    def _run_enrichment_probe(
+        self,
+        record: P1AppRecord,
+        baseline: OperationalResearch,
+    ) -> ResearchEnrichmentOutcome:
+        """Run the single bounded enrichment probe synchronously.
+
+        ``create_run`` is synchronous and, at the API boundary, is dispatched in
+        a worker thread with no running event loop, so ``asyncio.run`` is safe
+        and mirrors the durable workflow's async-invocation pattern.
+        """
+
+        if self._enricher is None:  # pragma: no cover - guarded by the caller
+            raise RuntimeError("no research enricher is configured")
+        return asyncio.run(
+            self._enricher.enrich(
+                app_name=baseline.app_name,
+                p1_record=record.model_dump(mode="json"),
+                baseline=baseline,
+            )
+        )
 
     def _record_verified_research(
         self,

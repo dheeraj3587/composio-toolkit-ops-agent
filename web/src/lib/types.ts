@@ -14,14 +14,13 @@ export type RunStatus =
   | "waiting_for_hitl"
   | "outreach_sent"
   | "waiting_for_reply"
-  | "validating_credentials"
   | "credentials_ready"
   | "configuration_required"
   | "blocked"
   | "failed"
   | "completed"
 
-export type ExecutionMode = "local_dry_run" | "operations"
+export type ExecutionMode = "plan_only" | "execute_when_configured"
 
 export interface RunSummary {
   run_id: string

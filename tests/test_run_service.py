@@ -7,7 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from ops.models import CompanyProfile, OperationsRequest
+from ops.models import (
+    CapabilityAvailability,
+    CompanyProfile,
+    OperationalResearch,
+    OperationsRequest,
+    ScopeRequirement,
+)
+from ops.operational_research import ResearchEnrichmentOutcome
 from ops.p1_adapter import DEFAULT_P1_ROOT, SnapshotIntegrityError
 from ops.run_service import (
     IdempotencyConflictError,
@@ -166,6 +173,26 @@ def test_idempotency_key_reuse_with_different_request_is_rejected(tmp_path: Path
     assert service.storage.count_runs() == 1
 
 
+def test_idempotency_key_reuse_with_different_execution_mode_is_rejected(tmp_path: Path) -> None:
+    service = RunService.from_paths(db_path=tmp_path / "ops.db")
+    idempotency_key = "idem_abcdef0123456789abcdef0123456789"
+    service.create_run(
+        request_for("HubSpot"),
+        idempotency_key=idempotency_key,
+        execution_mode="plan_only",
+    )
+
+    with pytest.raises(IdempotencyConflictError) as raised:
+        service.create_run(
+            request_for("HubSpot"),
+            idempotency_key=idempotency_key,
+            execution_mode="execute_when_configured",
+        )
+
+    assert idempotency_key not in str(raised.value)
+    assert service.storage.count_runs() == 1
+
+
 @pytest.mark.parametrize(
     "idempotency_key",
     [
@@ -315,3 +342,159 @@ def test_execution_mode_does_not_change_idempotent_replay(tmp_path: Path) -> Non
 
     assert replay == first
     assert service.storage.count_runs() == 1
+
+
+# --- M3: one-probe operational-research enrichment wiring -------------------
+
+
+def _event_types(service: RunService, run_id: str) -> list[str]:
+    return [event["event_type"] for event in service.get_timeline(run_id)]
+
+
+class _ReadyEnricher:
+    """Fake configured enricher: returns an enriched baseline, no side effects."""
+
+    async def enrich(
+        self,
+        *,
+        app_name: str,
+        p1_record: dict[str, object],
+        baseline: OperationalResearch,
+    ) -> ResearchEnrichmentOutcome:
+        del app_name, p1_record
+        enriched = baseline.model_copy(
+            update={
+                "signup_url": "https://developers.hubspot.com/get-started",
+                "developer_portal_url": "https://developers.hubspot.com",
+                "authorization_url": "https://app.hubspot.com/oauth/authorize",
+                "token_url": "https://api.hubapi.com/oauth/v1/token",
+                "evidence_urls": ["https://developers.hubspot.com/docs/oauth"],
+                "scopes": [
+                    ScopeRequirement(
+                        name="crm.objects.contacts.read",
+                        source_url="https://developers.hubspot.com/docs/oauth",
+                    )
+                ],
+                "confidence": 0.9,
+            }
+        )
+        return ResearchEnrichmentOutcome(
+            research=enriched,
+            capability=CapabilityAvailability(
+                capability="operational_research",
+                status="ready",
+                reason_code="official_evidence_enriched",
+                detail="Operational fields were extracted from fetched allowlisted evidence.",
+            ),
+            missing_fields=[],
+            documents_fetched=2,
+        )
+
+
+class _UnconfiguredEnricher:
+    """Fake unconfigured enricher: retains the verified baseline truthfully."""
+
+    async def enrich(
+        self,
+        *,
+        app_name: str,
+        p1_record: dict[str, object],
+        baseline: OperationalResearch,
+    ) -> ResearchEnrichmentOutcome:
+        del app_name, p1_record
+        return ResearchEnrichmentOutcome(
+            research=baseline,
+            capability=CapabilityAvailability(
+                capability="operational_research",
+                status="configuration_required",
+                reason_code="provider_credentials_missing",
+                detail="Perplexity discovery and Gemini extraction must both be configured.",
+            ),
+            missing_fields=["scopes"],
+            documents_fetched=0,
+        )
+
+
+class _RaisingEnricher:
+    """Fails loudly if a probe is ever attempted for an out-of-scope run."""
+
+    async def enrich(self, *, app_name, p1_record, baseline):  # type: ignore[no-untyped-def]
+        raise AssertionError("enrichment must not run for this case")
+
+
+def test_incomplete_verified_record_triggers_single_bounded_enrichment(tmp_path: Path) -> None:
+    service = RunService.from_paths(
+        db_path=tmp_path / "private" / "ops.db",
+        research_enricher=_ReadyEnricher(),
+    )
+
+    run = service.create_run(request_for("HubSpot"), execution_mode="plan_only")
+    research = service.get_research(run["run_id"])
+    events = _event_types(service, run["run_id"])
+    enriched_event = next(
+        event
+        for event in service.get_timeline(run["run_id"])
+        if event["event_type"] == "operational_research_enriched"
+    )
+
+    assert run["status"] == "route_selected"
+    assert run["access_route"] == "self_serve"
+    assert run["external_actions"] is False
+    assert "operational_research_enriched" in events
+    assert research is not None
+    assert research.signup_url == "https://developers.hubspot.com/get-started"
+    assert research.token_url == "https://api.hubapi.com/oauth/v1/token"
+    assert enriched_event["payload"]["status"] == "ready"
+    assert enriched_event["payload"]["enrichment_attempts"] == 1
+    assert enriched_event["payload"]["documents_fetched"] == 2
+    assert enriched_event["payload"]["source"] == "official_evidence_combined"
+    assert enriched_event["payload"]["external_actions"] is False
+
+
+def test_unconfigured_enricher_retains_baseline_and_reports_configuration_required(
+    tmp_path: Path,
+) -> None:
+    service = RunService.from_paths(
+        db_path=tmp_path / "private" / "ops.db",
+        research_enricher=_UnconfiguredEnricher(),
+    )
+
+    run = service.create_run(request_for("HubSpot"), execution_mode="plan_only")
+    research = service.get_research(run["run_id"])
+    enriched_event = next(
+        event
+        for event in service.get_timeline(run["run_id"])
+        if event["event_type"] == "operational_research_enriched"
+    )
+
+    # Baseline retained, no fabricated operational fields, truthful route.
+    assert run["access_route"] == "self_serve"
+    assert run["external_actions"] is False
+    assert research is not None
+    assert research.signup_url is None
+    assert research.token_url is None
+    assert enriched_event["payload"]["status"] == "configuration_required"
+    assert enriched_event["payload"]["enrichment_attempts"] == 0
+    assert enriched_event["payload"]["documents_fetched"] == 0
+
+
+def test_default_run_service_performs_no_enrichment(tmp_path: Path) -> None:
+    service = RunService.from_paths(db_path=tmp_path / "private" / "ops.db")
+
+    run = service.create_run(request_for("HubSpot"), execution_mode="plan_only")
+
+    assert "operational_research_enriched" not in _event_types(service, run["run_id"])
+
+
+def test_missing_record_never_triggers_enrichment_probe(tmp_path: Path) -> None:
+    service = RunService.from_paths(
+        db_path=tmp_path / "private" / "ops.db",
+        research_enricher=_RaisingEnricher(),
+    )
+
+    run = service.create_run(request_for("An App Outside The Snapshot"))
+
+    # Not-found runs have no official allowlist source, so no probe is attempted.
+    assert run["access_route"] == "unknown"
+    assert run["status"] == "researching"
+    assert "operational_research_enriched" not in _event_types(service, run["run_id"])

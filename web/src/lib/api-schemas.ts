@@ -42,7 +42,6 @@ const runStatus = z.enum([
   "waiting_for_hitl",
   "outreach_sent",
   "waiting_for_reply",
-  "validating_credentials",
   "credentials_ready",
   "configuration_required",
   "blocked",
@@ -94,7 +93,7 @@ export const runSummarySchema = z.strictObject({
   access_route: accessRoute.nullish(),
   created_at: isoTimestamp,
   updated_at: isoTimestamp,
-  execution_mode: z.enum(["local_dry_run", "operations"]),
+  execution_mode: z.enum(["plan_only", "execute_when_configured"]),
   external_actions: z.boolean(),
 })
 

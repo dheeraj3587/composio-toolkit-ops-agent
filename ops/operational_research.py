@@ -49,6 +49,18 @@ class ResearchEnrichmentOutcome(StrictModel):
     documents_fetched: int = Field(ge=0, le=MAX_EVIDENCE_DOCUMENTS)
 
 
+class ResearchEnricher(Protocol):
+    """The injectable one-probe enrichment boundary consumed by ``RunService``."""
+
+    async def enrich(
+        self,
+        *,
+        app_name: str,
+        p1_record: Mapping[str, object],
+        baseline: OperationalResearch,
+    ) -> ResearchEnrichmentOutcome: ...
+
+
 class OperationalResearchProvider(Protocol):
     async def enrich(
         self,
