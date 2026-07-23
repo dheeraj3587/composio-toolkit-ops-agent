@@ -12,6 +12,12 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ops.browser_host_policy import (
+    BrowserHostDecision,
+    BrowserPolicyInactiveError,
+    build_browser_allowed_hosts,
+    evaluate_navigation,
+)
 from ops.config import Settings
 from ops.models import OperationalResearch
 from ops.provider_errors import (
@@ -266,6 +272,18 @@ class BrowserWorker:
                 reason_code="provider_request_failed",
             ) from None
 
+    async def _safe_stop(self, session_id: str) -> None:
+        """Best-effort session stop that reclaims credit and never raises."""
+
+        self._live_urls.pop(session_id, None)
+        client = self._client
+        if client is None or not session_id:
+            return
+        try:
+            await client.sessions.stop(session_id)
+        except Exception:
+            pass
+
     async def _run_bounded_task(
         self,
         *,
@@ -273,40 +291,53 @@ class BrowserWorker:
         research: OperationalResearch,
         resume_signal: str | None,
     ) -> BrowserObservation:
-        allowed_domains = _official_domains_from_research(research)
-        target_url = _official_target_url(research, allowed_domains)
-        task = _render_browser_task(target_url, allowed_domains, resume_signal)
+        try:
+            allowed = build_browser_allowed_hosts(
+                research.app_slug,
+                research,
+                access_route=research.access_route,
+            )
+        except BrowserPolicyInactiveError as exc:
+            # Fail closed: this app/route is not an approved browser route.
+            raise ProviderContractError(
+                phase=5,
+                capability="browser onboarding",
+                reason_code=exc.reason_code,
+            ) from None
+        patterns = validate_allowed_domains(allowed.patterns())
+        target_url = _official_target_url(research, patterns)
+        task = _render_browser_task(target_url, patterns, resume_signal)
         client = self._get_client()
         try:
             run_handle = client.run(
                 task,
                 schema=BrowserTaskOutput,
                 session_id=context.session_id,
+                model=self._settings.browser_use_model,
                 keep_alive=True,
                 max_cost_usd=self._settings.browser_use_max_cost_usd,
                 enable_recording=False,
             )
             result = await _await_if_needed(run_handle)
         except Exception:
+            # Reclaim the session so a failed run never lingers idle burning credit.
+            await self._safe_stop(context.session_id)
             raise ProviderOperationError(
                 capability="browser onboarding",
                 reason_code="provider_request_failed",
             ) from None
         output = _coerce_task_output(result)
         current_url = sanitize_browser_url(output.current_url)
-        if not is_allowed_browser_url(current_url, allowed_domains):
-            # The agent left the verified official allowlist: stop and fail closed.
-            try:
-                await client.sessions.stop(context.session_id)
-            except Exception:
-                pass
-            self._live_urls.pop(context.session_id, None)
-            raise ProviderOperationError(
-                capability="browser onboarding",
-                reason_code="provider_policy_violation",
-            )
+        decision = evaluate_navigation(current_url, allowed)
+        if not decision.allowed:
+            # The agent left the app's reviewed host allowlist: stop and fail
+            # closed, returning the sanitized blocked-navigation details.
+            await self._safe_stop(context.session_id)
+            return _blocked_observation(decision)
         title = (output.safe_summary or "Developer setup page")[:500]
         if output.hitl_required:
+            # Keep the session alive: the owner must act in the live browser, then
+            # the same session is resumed. This is the only path that stays alive.
             reason = output.hitl_reason or "A human action is required in the live browser."
             return BrowserObservation(
                 status="human_action_required",
@@ -315,6 +346,10 @@ class BrowserWorker:
                 human_action_type=_classify_human_action(reason),
                 human_instruction=reason[:1_000],
             )
+        # The agent task finished without needing a human. Reclaim the session so
+        # it does not sit idle burning credit; the credential page (if reached) is
+        # handled through the owner credential form, not the live browser.
+        await self._safe_stop(context.session_id)
         status: BrowserObservationStatus = (
             "credential_page_ready" if output.reached_official_setup_page else "navigating"
         )
@@ -566,45 +601,45 @@ def _coerce_task_output(result: Any) -> BrowserTaskOutput:  # pragma: no cover -
     )
 
 
-def _official_domains_from_research(research: OperationalResearch) -> tuple[str, ...]:
-    """Derive a bounded official hostname allowlist from verified research URLs."""
+def _blocked_observation(decision: BrowserHostDecision) -> BrowserObservation:
+    """Fail-closed observation carrying sanitized blocked-navigation details."""
 
-    urls = [
-        research.developer_portal_url,
-        research.signup_url,
-        research.api_base_url,
-        research.authorization_url,
-        research.token_url,
-        *research.evidence_urls,
-    ]
-    hosts: list[str] = []
-    for url in urls:
-        if not isinstance(url, str) or not url:
-            continue
-        hostname = (urlsplit(url).hostname or "").rstrip(".").casefold()
-        if hostname and hostname not in hosts:
-            hosts.append(hostname)
-    if not hosts:
-        raise ProviderOperationError(
-            capability="browser onboarding",
-            reason_code="official_domains_unavailable",
-        )
-    return validate_allowed_domains(tuple(hosts[:20]))
+    notes = (
+        f"blocked_hostname={decision.blocked_hostname or 'unknown'}",
+        f"reason_code={decision.reason_code}",
+        f"allowed_hosts={','.join(decision.allowed_hosts)}"[:1_000],
+        f"backend_policy_update_required={str(decision.backend_policy_update_required).lower()}",
+    )
+    return BrowserObservation(
+        status="failed",
+        current_url=decision.current_url,
+        page_title="Navigation blocked by app host policy",
+        non_secret_notes=notes,
+    )
 
 
 def _official_target_url(
     research: OperationalResearch,
     allowed_domains: tuple[str, ...],
 ) -> str:
-    """Select the verified official developer/setup entry URL."""
+    """Select the verified official entry URL within the app's allowlist.
+
+    The verified P1 baseline leaves the specific URL fields empty, so the first
+    allowlisted evidence URL is used as the entry point when enrichment has not
+    populated a developer/setup URL.
+    """
 
     for candidate in (
         research.developer_portal_url,
         research.signup_url,
         research.api_base_url,
+        *research.evidence_urls,
     ):
         if isinstance(candidate, str) and candidate:
-            safe = sanitize_browser_url(candidate)
+            try:
+                safe = sanitize_browser_url(candidate)
+            except ValueError:
+                continue
             if is_allowed_browser_url(safe, allowed_domains):
                 return safe
     raise ProviderOperationError(
@@ -620,21 +655,40 @@ def _render_browser_task(
 ) -> str:  # pragma: no cover - live only
     allowlist = ", ".join(allowed_domains)
     resume_note = (
-        f"The human just reported: '{resume_signal}'. Continue from the current page. "
+        f"A human just completed a step and reported: '{resume_signal}'. Do NOT restart from "
+        f"the beginning. Continue from the CURRENT page and proceed to the next step. "
         if resume_signal
         else ""
     )
     return (
-        "You are assisting an authorized owner with developer API onboarding. "
+        "ROLE: You are an autonomous web agent helping an authorized account owner reach the "
+        "page where they can create or view their developer API credentials. Act decisively and "
+        "take real navigation steps; do not stop after only opening the first page.\n\n"
         f"{resume_note}"
-        f"Open only {target_url} and stay strictly within these hostnames: {allowlist}. "
-        "Navigate toward the API credential or developer-app setup page. "
-        "Never submit payment or billing details. Never accept legal agreements. "
-        "Never bypass login, CAPTCHA, MFA, email verification, consent, or account "
-        "ownership checks. If any such gate appears, stop and set hitl_required=true "
-        "with a short hitl_reason. Never read, type, copy, or report any password, "
-        "secret, token, cookie, or credential value. Report only the structured fields: "
-        "current_url, reached_official_setup_page, hitl_required, hitl_reason, safe_summary."
+        f"START: Open {target_url}. Stay strictly within these hostnames: {allowlist}. Never "
+        "navigate to any other domain.\n\n"
+        "GOAL: Reach the account's API credentials / developer-app / API-token page (for example "
+        "an account 'Settings -> Personal preferences -> API' or a developer app's credentials "
+        "screen). Take the concrete steps a person would: click 'Log in' or 'Sign up' if shown, "
+        "click through onboarding/continue buttons, open account or developer settings, and open "
+        "the API/token section. Keep going step by step until you either reach that page or hit a "
+        "gate that only a human can clear.\n\n"
+        "SAFE ACTIONS you may do yourself: click navigation links/buttons, open menus and "
+        "settings, dismiss cookie banners, and fill clearly non-secret fields (name, company, "
+        "website, work email, use case) ONLY when their values are already visibly present on the "
+        "page. Never invent values.\n\n"
+        "HARD STOPS — set hitl_required=true and STOP (do not attempt these yourself): entering a "
+        "password, solving a CAPTCHA, any MFA/OTP/2FA code, email or phone verification, passkey "
+        "or security-key prompts, device approval, accepting legal/terms/consent, confirming "
+        "account ownership, entering billing/payment details, or any 'reveal/copy your API token' "
+        "step. In hitl_reason, name the single specific action the human must take (e.g. "
+        "'Enter your Pipedrive password to log in').\n\n"
+        "NEVER read, type, copy, transcribe, or report any password, secret, API token, cookie, "
+        "or credential value, even if it is visible.\n\n"
+        "OUTPUT: When you stop (goal reached or a hard stop), return the structured fields: "
+        "current_url (the exact current page URL), reached_official_setup_page (true only if the "
+        "API credentials/token page is actually visible), hitl_required, hitl_reason (specific "
+        "action or null), and safe_summary (one short sentence, no secrets)."
     )
 
 

@@ -227,6 +227,12 @@ export interface RunOutputResponse {
   integrator_bundle: IntegratorOutput
 }
 
+export interface LiveViewResponse {
+  run_id: string
+  available: boolean
+  live_url?: string | null
+}
+
 export type RunPhaseAction = "resume" | "poll-email" | "retry"
 export type RetryCapability = "research" | "browser" | "email" | "validation"
 

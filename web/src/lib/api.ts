@@ -7,6 +7,7 @@ import {
   appResearchResponseSchema,
   appSearchResponseSchema,
   healthResponseSchema,
+  liveViewResponseSchema,
   runDetailResponseSchema,
   runListResponseSchema,
   runOutputResponseSchema,
@@ -16,8 +17,10 @@ import type {
   ActionReceipt,
   AppResearchResponse,
   AppSearchResponse,
+  CompanyProfileInput,
   HealthResponse,
   IntegratorOutput,
+  LiveViewResponse,
   OperationsRequestInput,
   PhaseConflict,
   RunDetailResponse,
@@ -27,8 +30,14 @@ import type {
   TimelineResponse,
 } from "@/lib/types"
 
+const CREDENTIAL_FIELD_PATTERN = /^[a-z0-9][a-z0-9_-]{0,99}$/
+
 const DEFAULT_API_ORIGIN = "http://127.0.0.1:8000"
 const REQUEST_TIMEOUT_MS = 8_000
+// execute_when_configured runs (and same-session resume) drive a real Browser
+// Use session synchronously on the backend, which routinely exceeds 8s.
+const RUN_ACTION_TIMEOUT_MS = 180_000
+const CREDENTIAL_TIMEOUT_MS = 30_000
 const IDEMPOTENCY_KEY_PATTERN = /^idem_[0-9a-f]{32}$/
 
 export class ApiError extends Error {
@@ -93,7 +102,12 @@ async function responseBody(response: Response): Promise<unknown> {
   return response.json().catch(() => null)
 }
 
-async function apiRequest<T>(path: string, schema: ZodType<T>, init?: RequestInit): Promise<T> {
+async function apiRequest<T>(
+  path: string,
+  schema: ZodType<T>,
+  init?: RequestInit,
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
+): Promise<T> {
   let response: Response
 
   try {
@@ -105,7 +119,7 @@ async function apiRequest<T>(path: string, schema: ZodType<T>, init?: RequestIni
         ...(init?.body ? { "Content-Type": "application/json" } : {}),
         ...init?.headers,
       },
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     })
   } catch (error) {
     if (error instanceof ApiError) throw error
@@ -195,11 +209,16 @@ export function createRun(
     throw new ApiError(400, "INVALID_IDEMPOTENCY_KEY", "The run request is invalid.")
   }
 
-  return apiRequest("/api/runs", runDetailResponseSchema, {
-    method: "POST",
-    headers: { "Idempotency-Key": idempotencyKey },
-    body: JSON.stringify(request),
-  })
+  return apiRequest(
+    "/api/runs",
+    runDetailResponseSchema,
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify(request),
+    },
+    RUN_ACTION_TIMEOUT_MS,
+  )
 }
 
 export function performPhaseAction(
@@ -208,8 +227,47 @@ export function performPhaseAction(
   capability?: RetryCapability,
 ): Promise<ActionReceipt> {
   const suffix = action === "poll-email" ? "/poll-email" : action === "retry" ? "/retry" : "/resume"
-  return apiRequest(runPath(runId, suffix), actionReceiptSchema, {
-    method: "POST",
-    body: JSON.stringify(action === "retry" ? { capability } : {}),
-  })
+  // Resume drives a same-session browser task synchronously; allow the longer bound.
+  const timeout = action === "resume" ? RUN_ACTION_TIMEOUT_MS : REQUEST_TIMEOUT_MS
+  return apiRequest(
+    runPath(runId, suffix),
+    actionReceiptSchema,
+    {
+      method: "POST",
+      body: JSON.stringify(action === "retry" ? { capability } : {}),
+    },
+    timeout,
+  )
+}
+
+export function getLiveView(runId: string): Promise<LiveViewResponse> {
+  return apiRequest(runPath(runId, "/live-view"), liveViewResponseSchema)
+}
+
+export function submitCredentials(
+  runId: string,
+  credentials: Record<string, string>,
+  company: CompanyProfileInput,
+): Promise<RunDetailResponse> {
+  const fields = Object.keys(credentials)
+  if (fields.length === 0 || fields.length > 20) {
+    throw new ApiError(400, "INVALID_CREDENTIAL_FIELDS", "Provide one to twenty credential fields.")
+  }
+  for (const field of fields) {
+    if (!CREDENTIAL_FIELD_PATTERN.test(field) || !credentials[field]) {
+      throw new ApiError(400, "INVALID_CREDENTIAL_FIELD", "A credential field is invalid.")
+    }
+  }
+  // Matches the existing required backend contract: company + credentials. The
+  // raw values leave the server-only client immediately for the loopback API;
+  // they are never logged, cached, or returned to the browser.
+  return apiRequest(
+    runPath(runId, "/credentials"),
+    runDetailResponseSchema,
+    {
+      method: "POST",
+      body: JSON.stringify({ company, credentials }),
+    },
+    CREDENTIAL_TIMEOUT_MS,
+  )
 }

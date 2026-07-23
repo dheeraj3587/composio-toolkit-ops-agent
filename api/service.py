@@ -18,6 +18,8 @@ from api.models import (
     CredentialSubmissionRequest,
     HealthCheck,
     HealthResponse,
+    HitlRequestView,
+    LiveViewResponse,
     PhaseState,
     ProviderState,
     RouteDecisionView,
@@ -93,6 +95,8 @@ class RunService(Protocol):
     async def get_timeline(self, run_id: str) -> TimelineResponse: ...
 
     async def resume(self, run_id: str) -> ActionReceipt: ...
+
+    async def get_live_view(self, run_id: str) -> LiveViewResponse: ...
 
     async def poll_email(self, run_id: str) -> ActionReceipt: ...
 
@@ -337,6 +341,25 @@ class LocalRunService:
             ),
         ]
 
+    @staticmethod
+    def _hitl_view(record: dict[str, object]) -> HitlRequestView | None:
+        if record.get("status") != "waiting_for_hitl":
+            return None
+        hitl = record.get("hitl_request")
+        if not isinstance(hitl, dict):
+            return None
+        action_type = str(hitl.get("type") or hitl.get("action_type") or "provider_verification")
+        message = str(hitl.get("message") or "A human action is required in the live browser.")
+        signal = str(
+            hitl.get("expected_completion_signal") or "The required action has been completed."
+        )
+        return HitlRequestView(
+            action_type=action_type,
+            message=message,
+            expected_completion_signal=signal,
+            resumable=True,
+        )
+
     def _detail(self, summary: RunSummary) -> RunDetailResponse:
         research = self._service.get_research(summary.run_id)
         record = self._service.storage.get_run(summary.run_id)
@@ -382,7 +405,7 @@ class LocalRunService:
             ),
             missing_fields=[str(item) for item in record.get("missing_fields", [])],
             provider_states=self._provider_states(),
-            hitl_request=None,
+            hitl_request=self._hitl_view(record),
         )
 
     def _create_sync(
@@ -592,6 +615,29 @@ class LocalRunService:
         self._require_started()
         return await run_in_threadpool(self._timeline_sync, run_id)
 
+    def _resume_sync(self, run_id: str) -> ActionReceipt:
+        try:
+            record = self._service.resume_run(run_id, signal="completed")
+        except KeyError:
+            raise RunNotFoundError(run_id) from None
+        except CredentialSubmissionError:
+            # Run is not waiting for human action, or the workflow is unconfigured.
+            return ActionReceipt(
+                run_id=run_id,
+                action="resume",
+                status="no_change",
+                detail="Run is not waiting for a human action.",
+            )
+        status = str(record.get("status"))
+        detail = (
+            "Resumed on the same browser session; the credential page is ready."
+            if status == "browser_running"
+            else "Resumed on the same browser session; another human action is required."
+            if status == "waiting_for_hitl"
+            else f"Run resumed (status: {status})."
+        )
+        return ActionReceipt(run_id=run_id, action="resume", status="accepted", detail=detail)
+
     async def resume(self, run_id: str) -> ActionReceipt:
         await self.get_run(run_id)
         if self._settings.langgraph_aes_key is None:
@@ -601,7 +647,17 @@ class LocalRunService:
                 available_in=("phase_3",),
                 error="configuration_required",
             )
-        raise PhaseUnavailableError(run_id=run_id, action="resume", available_in=("hitl",))
+        return await run_in_threadpool(self._resume_sync, run_id)
+
+    def _live_view_sync(self, run_id: str) -> LiveViewResponse:
+        if self._service.get_run(run_id) is None:
+            raise RunNotFoundError(run_id)
+        live_url = self._service.get_browser_live_url(run_id)
+        return LiveViewResponse(run_id=run_id, available=live_url is not None, live_url=live_url)
+
+    async def get_live_view(self, run_id: str) -> LiveViewResponse:
+        self._require_started()
+        return await run_in_threadpool(self._live_view_sync, run_id)
 
     async def poll_email(self, run_id: str) -> ActionReceipt:
         await self.get_run(run_id)

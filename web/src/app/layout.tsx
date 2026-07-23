@@ -37,8 +37,12 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
   const demoMode = process.env.OPS_DEMO_MODE === "true"
 
   return (
-    <html lang="en" className={`${geistSans.variable} ${geistMono.variable}`}>
-      <body>
+    <html lang="en" className={`${geistSans.variable} ${geistMono.variable}`} suppressHydrationWarning>
+      {/* suppressHydrationWarning: browser extensions (password managers, etc.)
+          inject attributes like bis_register/__processed_* onto <body> before
+          React hydrates. This suppresses that one-level attribute mismatch; it
+          does not mask mismatches in our own rendered content. */}
+      <body suppressHydrationWarning>
         <Providers>
           <DemoBanner enabled={demoMode} />
           <AppShell demoMode={demoMode}>{children}</AppShell>

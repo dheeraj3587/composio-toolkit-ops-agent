@@ -75,10 +75,21 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
     if (state.error) toast.error("Run not created", { description: state.error })
   }, [state.error])
 
-  const submit = (_values: RunFormValues, event?: React.BaseSyntheticEvent) => {
-    const form = event?.currentTarget
-    if (!(form instanceof HTMLFormElement)) return
-    const data = new FormData(form)
+  const submit = (values: RunFormValues) => {
+    // Build the payload from the validated values rather than the DOM event:
+    // react-hook-form validates asynchronously, so the submit event's
+    // currentTarget is already null by the time this runs.
+    const data = new FormData()
+    data.set("app_name", values.app_name)
+    data.set("requested_scope_policy", values.requested_scope_policy)
+    data.set("execution_mode", values.execution_mode)
+    data.set("callback_urls", values.callback_urls)
+    data.set("outreach_recipient_override", values.outreach_recipient_override)
+    data.set("legal_name", values.legal_name)
+    data.set("website", values.website)
+    data.set("work_email_ref", values.work_email_ref)
+    data.set("use_case", values.use_case)
+    data.set("expected_volume", values.expected_volume)
     startTransition(() => formAction(data))
   }
 

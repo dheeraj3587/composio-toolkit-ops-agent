@@ -4,6 +4,7 @@ import { notFound } from "next/navigation"
 import { connection } from "next/server"
 import { ArrowLeft, CircleOff, Clock3, Fingerprint, Globe2, Mail, Route, ServerCog, Settings2 } from "lucide-react"
 
+import { HitlLiveControls } from "@/components/hitl-live-controls"
 import { PhaseActionForm } from "@/components/phase-action-form"
 import { RunAutoRefresh } from "@/components/run-auto-refresh"
 import {
@@ -48,6 +49,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
   const researchPhase = phases.get("research")
   const canResume =
     detail.run.status === "waiting_for_hitl" && detail.hitl_request?.resumable === true
+  const hasBrowserSession = ["waiting_for_hitl", "browser_running"].includes(detail.run.status)
   const canPoll = ["outreach_sent", "waiting_for_reply"].includes(detail.run.status)
   const missingFields = Array.from(new Set([
     ...(detail.missing_fields ?? []),
@@ -97,7 +99,17 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         <div className="mb-3"><p className="eyebrow">Execution surfaces</p><h2 id="execution-surfaces" className="mt-1 text-xl font-semibold">Provider and human gates</h2></div>
         <div className="grid gap-4 lg:grid-cols-3">
           <CapabilityPanel title="Browser onboarding" icon={Globe2} phase={browserPhase}>
-            {isRetryable(browserPhase) ? <PhaseActionForm runId={runId} action="retry" capability="browser" label="Retry browser phase" /> : <ControlUnavailable />}
+            {hasBrowserSession ? (
+              <HitlLiveControls
+                runId={runId}
+                fieldName={detail.research?.credential_fields?.[0] ?? "api_token"}
+                fieldLabel={humanize(detail.research?.credential_fields?.[0] ?? "API token")}
+              />
+            ) : isRetryable(browserPhase) ? (
+              <PhaseActionForm runId={runId} action="retry" capability="browser" label="Retry browser phase" />
+            ) : (
+              <ControlUnavailable />
+            )}
           </CapabilityPanel>
           <HitlPanel request={detail.hitl_request} action={canResume ? <PhaseActionForm runId={runId} action="resume" label="Resume after human action" /> : undefined} />
           <CapabilityPanel title="Provider email" icon={Mail} phase={emailPhase}>

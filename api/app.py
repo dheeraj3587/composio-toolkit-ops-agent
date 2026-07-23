@@ -27,6 +27,7 @@ from api.models import (
     CredentialSubmissionRequest,
     HealthResponse,
     IdempotencyConflictResponse,
+    LiveViewResponse,
     InternalErrorResponse,
     InvalidRequestResponse,
     PhaseUnavailableResponse,
@@ -432,6 +433,22 @@ def create_app(
     )
     async def resume_run(run_id: RunId, run_service: ServiceDependency) -> ActionReceipt:
         return await run_service.resume(run_id)
+
+    @application.get(
+        "/api/runs/{run_id}/live-view",
+        response_model=LiveViewResponse,
+        response_model_exclude_none=True,
+        responses=common_responses,
+    )
+    async def live_view(
+        run_id: RunId,
+        request: Request,
+        run_service: ServiceDependency,
+    ) -> LiveViewResponse:
+        # Owner-only, loopback-only. The signed live URL is read from the
+        # in-memory worker and is never persisted anywhere.
+        _require_local_owner_submission(request)
+        return await run_service.get_live_view(run_id)
 
     @application.post(
         "/api/runs/{run_id}/poll-email",

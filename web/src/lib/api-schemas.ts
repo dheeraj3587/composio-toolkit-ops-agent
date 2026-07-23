@@ -248,6 +248,29 @@ export const actionReceiptSchema = z.strictObject({
   detail: optionalText(500).optional(),
 })
 
+// The signed Browser Use live-view URL may carry an opaque signature query, so
+// the token-bearing-query rejection is intentionally not applied here. It is a
+// short-lived owner-only URL and is never persisted client-side.
+const liveViewUrl = z
+  .string()
+  .min(8)
+  .max(MAX_URL_LENGTH)
+  .refine((value) => {
+    if (/[\u0000-\u0020\u007f]/.test(value)) return false
+    try {
+      const parsed = new URL(value)
+      return parsed.protocol === "https:" && !parsed.username && !parsed.password && !!parsed.hostname
+    } catch {
+      return false
+    }
+  })
+
+export const liveViewResponseSchema = z.strictObject({
+  run_id: runId,
+  available: z.boolean(),
+  live_url: liveViewUrl.nullable().optional(),
+})
+
 export const appSearchItemSchema = z.strictObject({
   app_name: boundedText(200),
   app_slug: appSlug,

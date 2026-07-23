@@ -95,8 +95,12 @@ class Settings(BaseModel):
 
         ordered = [self.gemini_model, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"]
         return tuple(dict.fromkeys(model for model in ordered if model))
-    # Small hard cost cap for a single bounded Browser Use session/run.
-    browser_use_max_cost_usd: float = Field(default=0.50, gt=0)
+    # Session count is the real quota (not dollars), so use the most capable
+    # Browser Use model for reliable multi-step onboarding navigation. The latest
+    # Opus available on Browser Use Cloud is claude-opus-4.7 (there is no 4.8).
+    browser_use_model: str = "claude-opus-4.7"
+    # Per-session cost cap set high so a run never stops mid-task on the cap.
+    browser_use_max_cost_usd: float = Field(default=50.0, gt=0)
     # Owner-only local credential submission is opt-in and loopback-only.
     allow_local_credential_submission: bool = False
 
@@ -156,8 +160,9 @@ class Settings(BaseModel):
                 source.get("COMPOSIO_GMAIL_CONNECTED_ACCOUNT_ID")
             ),
             "gemini_model": _optional(source.get("GEMINI_MODEL")) or "gemini-3.5-flash",
+            "browser_use_model": _optional(source.get("BROWSER_USE_MODEL")) or "claude-opus-4.7",
             "browser_use_max_cost_usd": _float(
-                source.get("BROWSER_USE_MAX_COST_USD"), default=0.50
+                source.get("BROWSER_USE_MAX_COST_USD"), default=1.0
             ),
             "allow_local_credential_submission": _boolean(
                 source.get("ALLOW_LOCAL_CREDENTIAL_SUBMISSION"), default=False

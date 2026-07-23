@@ -433,10 +433,20 @@ def test_gated_outreach_persists_no_secret_material(tmp_path: Path) -> None:
         assert forbidden not in haystack
 
 
-def test_build_workflow_dependencies_injects_gmail_only_when_configured() -> None:
-    configured = RunService._build_workflow_dependencies(_settings())
+def test_build_workflow_dependencies_injects_gmail_only_when_configured(tmp_path: Path) -> None:
+    configured_settings = _settings().model_copy(
+        update={"provider_effects_db_path": tmp_path / "configured_effects.db"}
+    )
+    configured_service = RunService.from_paths(
+        db_path=tmp_path / "configured.db", settings=configured_settings
+    )
+    configured = configured_service._build_workflow_dependencies(configured_settings)
     assert configured.gmail is not None
     assert configured.browser is None
 
-    unconfigured = RunService._build_workflow_dependencies(Settings())
+    unconfigured_settings = Settings(provider_effects_db_path=tmp_path / "unconfigured_effects.db")
+    unconfigured_service = RunService.from_paths(
+        db_path=tmp_path / "unconfigured.db", settings=unconfigured_settings
+    )
+    unconfigured = unconfigured_service._build_workflow_dependencies(unconfigured_settings)
     assert unconfigured.gmail is None

@@ -27,14 +27,13 @@ from ops.browser_worker import BrowserWorker
 from ops.composio_capability import ComposioCapabilityPreflight, ComposioCapabilityReport
 from ops.config import Settings
 from ops.credential_validator import (
-    HUBSPOT_ACCOUNT_INFO_ENDPOINT,
-    PIPEDRIVE_USERS_ME_ENDPOINT,
     CredentialValidationResult,
     CredentialValidator,
     PolicyBoundCredentialValidator,
     hubspot_validation_policy,
     pipedrive_validation_policy,
 )
+from ops.network_endpoint_policy import validation_endpoint as network_validation_endpoint
 from ops.effect_ledger import SQLiteEffectStore
 from ops.gmail_worker import GmailWorker
 from ops.graph import DurableOperationsWorkflow, WorkflowDependencies, build_graph
@@ -443,13 +442,14 @@ class RunService:
             http_client=client,
             policies=(hubspot_validation_policy(), pipedrive_validation_policy()),
         )
-        return PolicyBoundCredentialValidator(
-            validator=validator,
-            endpoints={
-                "hubspot": HUBSPOT_ACCOUNT_INFO_ENDPOINT,
-                "pipedrive": PIPEDRIVE_USERS_ME_ENDPOINT,
-            },
-        )
+        # Read-only validation endpoints come from the reviewed NetworkEndpointPolicy
+        # (the single source of truth for exact backend endpoints).
+        endpoints: dict[str, str] = {}
+        for slug in ("hubspot", "pipedrive"):
+            endpoint = network_validation_endpoint(slug)
+            if endpoint is not None:
+                endpoints[slug] = endpoint
+        return PolicyBoundCredentialValidator(validator=validator, endpoints=endpoints)
 
     def _build_workflow_dependencies(self, settings: Settings) -> WorkflowDependencies:
         """Inject controlled Gmail and Browser Use adapters only when configured.

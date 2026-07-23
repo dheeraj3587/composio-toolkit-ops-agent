@@ -105,6 +105,8 @@ def test_exact_requested_routes_are_registered(harness: ApiHarness) -> None:
         ("/api/runs/{run_id}", "GET"),
         ("/api/runs/{run_id}/timeline", "GET"),
         ("/api/runs/{run_id}/resume", "POST"),
+        ("/api/runs/{run_id}/credentials", "POST"),
+        ("/api/runs/{run_id}/live-view", "GET"),
         ("/api/runs/{run_id}/poll-email", "POST"),
         ("/api/runs/{run_id}/retry", "POST"),
         ("/api/runs/{run_id}/output", "GET"),
