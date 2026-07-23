@@ -121,7 +121,7 @@ services:
       - "443:443/udp"
     environment:
       DOMAIN: ${DOMAIN:-your-domain.example}
-      ACME_EMAIL: ${ACME_EMAIL:-}
+      ACME_EMAIL: ${ACME_EMAIL:-admin@example.com}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
