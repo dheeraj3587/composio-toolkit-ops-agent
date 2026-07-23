@@ -44,6 +44,10 @@ services:
       CHECKPOINT_DB_PATH: /data/checkpoints.db
       SECRET_VAULT_DB_PATH: /data/secret_vault.db
       PROVIDER_EFFECTS_DB_PATH: /data/provider_effects.db
+      # The Composio SDK creates a local metadata cache at import time. The API
+      # root filesystem is intentionally read-only, so keep that ephemeral cache
+      # inside the existing hardened /tmp tmpfs rather than under /app.
+      COMPOSIO_CACHE_DIR: /tmp/composio
     volumes:
       - ops_data:/data
     networks:
