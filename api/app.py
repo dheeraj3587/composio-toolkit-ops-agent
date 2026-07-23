@@ -242,9 +242,14 @@ def create_app(
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
-        response = _internal_api_auth_response(request)
-        if response is None:
+        auth_response = _internal_api_auth_response(request)
+
+        response: Response
+        if auth_response is not None:
+            response = auth_response
+        else:
             response = await call_next(request)
+
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"
         response.headers["X-Content-Type-Options"] = "nosniff"

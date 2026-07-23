@@ -24,7 +24,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ApiError, getRun, getRunOutput, getTimeline } from "@/lib/api"
 import { formatTimestamp, humanize } from "@/lib/format"
-import type { PhaseState, RetryCapability } from "@/lib/types"
+import type { PhaseCollection, PhaseState, RetryCapability } from "@/lib/types"
 
 export const metadata: Metadata = { title: "Run detail" }
 
@@ -43,15 +43,17 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
   const timeline = timelineResult.status === "fulfilled" ? timelineResult.value.items : []
   const timelineUnavailable = timelineResult.status === "rejected"
   const output = outputResult.status === "fulfilled" ? outputResult.value : null
-  const phases = phaseMap(detail.phases)
+  const isPlanOnly = detail.run.execution_mode === "plan_only"
+  const displayPhases = isPlanOnly ? planOnlyPhases(detail.phases) : detail.phases
+  const phases = phaseMap(displayPhases)
   const browserPhase = phases.get("browser")
   const emailPhase = phases.get("email")
   const outputPhase = phases.get("output")
   const researchPhase = phases.get("research")
   const canResume =
     detail.run.status === "waiting_for_hitl" && detail.hitl_request?.resumable === true
-  const hasBrowserSession = ["waiting_for_hitl", "browser_running"].includes(detail.run.status)
-  const canPoll = ["outreach_sent", "waiting_for_reply"].includes(detail.run.status)
+  const hasBrowserSession = !isPlanOnly && ["waiting_for_hitl", "browser_running"].includes(detail.run.status)
+  const canPoll = !isPlanOnly && ["outreach_sent", "waiting_for_reply"].includes(detail.run.status)
   const missingFields = Array.from(new Set([
     ...(detail.missing_fields ?? []),
     ...(detail.research?.missing_fields ?? []),
@@ -76,16 +78,29 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         </div>
       </header>
 
+      {isPlanOnly ? (
+        <Alert className="rounded-md border-sky-300 bg-sky-50 text-sky-950">
+          <AlertTitle>Planning completed</AlertTitle>
+          <AlertDescription>
+            Browser, email, HITL, and credential validation were not attempted. Create a new run with Execute when configured to request approved provider actions.
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
       {missingFields.length ? (
         <Alert className="rounded-md border-amber-300 bg-amber-50 text-amber-950">
-          <AlertTitle>Configuration or evidence is incomplete</AlertTitle>
-          <AlertDescription>Missing fields: {missingFields.map(humanize).join(", ")}. The interface does not mark blocked capabilities as successful.</AlertDescription>
+          <AlertTitle>{isPlanOnly ? "Baseline planning completed" : "Configuration or evidence is incomplete"}</AlertTitle>
+          <AlertDescription>
+            {isPlanOnly
+              ? `Operational fields were not enriched in Plan Only mode: ${missingFields.map(humanize).join(", ")}.`
+              : `Missing fields: ${missingFields.map(humanize).join(", ")}. The interface does not mark blocked capabilities as successful.`}
+          </AlertDescription>
         </Alert>
       ) : null}
 
       <section aria-labelledby="phase-map">
         <div className="mb-3 flex items-end justify-between gap-4"><div><p className="eyebrow">Durable workflow</p><h2 id="phase-map" className="mt-1 text-xl font-semibold">Operational phases</h2></div><Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">Backend state</Badge></div>
-        <PhaseGrid phases={detail.phases} />
+        <PhaseGrid phases={displayPhases} />
       </section>
 
       <section className="grid gap-5 xl:grid-cols-[1.25fr_0.75fr]">
@@ -112,7 +127,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
               <ControlUnavailable />
             )}
           </CapabilityPanel>
-          <HitlPanel request={detail.hitl_request} action={canResume ? <PhaseActionForm runId={runId} action="resume" label="Resume after human action" /> : undefined} />
+          <HitlPanel request={isPlanOnly ? null : detail.hitl_request} action={canResume ? <PhaseActionForm runId={runId} action="resume" label="Resume after human action" /> : undefined} />
           <CapabilityPanel title="Provider email" icon={Mail} phase={emailPhase}>
             {canPoll ? <PhaseActionForm runId={runId} action="poll-email" label="Poll controlled inbox" /> : isRetryable(emailPhase) ? <PhaseActionForm runId={runId} action="retry" capability="email" label="Retry email phase" /> : <ControlUnavailable />}
           </CapabilityPanel>
@@ -137,8 +152,8 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
           <h2 className="mt-1 text-lg font-semibold">Retry authority</h2>
           <p className="mt-2 text-xs leading-5 text-muted-foreground">Retries are idempotent backend commands. A configuration-required or no-change receipt is shown as such, never as success.</p>
           <div className="mt-5 space-y-3 border-t border-border pt-4">
-            <RetryControl label="Research" runId={runId} capability="research" enabled={isRetryable(researchPhase)} />
-            <RetryControl label="Credential validation" runId={runId} capability="validation" enabled={isRetryable(outputPhase)} />
+            <RetryControl label="Research" runId={runId} capability="research" enabled={!isPlanOnly && isRetryable(researchPhase)} />
+            <RetryControl label="Credential validation" runId={runId} capability="validation" enabled={!isPlanOnly && isRetryable(outputPhase)} />
           </div>
         </div>
       </section>
@@ -151,6 +166,26 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
       </section>
     </div>
   )
+}
+
+function planOnlyPhases(phases: PhaseCollection): PhaseState[] {
+  const existing = phaseMap(phases)
+  const research = existing.get("research") ?? {
+    key: "research",
+    name: "Research",
+    phase: "2",
+    status: "ready",
+    detail: "Verified P1 research and deterministic access routing are available.",
+    available: true,
+  }
+
+  return [
+    research,
+    { key: "browser", name: "Browser", phase: "5/6", status: "not_attempted", detail: "Not attempted in Plan Only mode.", available: false },
+    { key: "hitl", name: "HITL", phase: "3", status: "not_attempted", detail: "No human action was requested in Plan Only mode.", available: false },
+    { key: "email", name: "Email", phase: "4", status: "not_attempted", detail: "Not attempted in Plan Only mode.", available: false },
+    { key: "output", name: "Output", phase: "3+", status: "not_attempted", detail: "Credential validation and output generation were not attempted in Plan Only mode.", available: false },
+  ]
 }
 
 function isRetryable(phase: PhaseState | undefined): boolean {

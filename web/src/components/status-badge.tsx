@@ -15,10 +15,10 @@ const negative = new Set(["blocked", "failed", "fail"])
 const running = new Set(["researching", "route_selected", "browser_running", "running", "validating_credentials"])
 // Run outcomes — gated
 const gated = new Set(["gated", "approval_required", "partner_gated", "hybrid"])
-// Unknown / absent
-const unknown = new Set(["unknown", "not_reported", "unavailable", "not_available"])
-// Policy — intentionally disabled by runtime configuration
-const policy = new Set(["disabled"])
+// Unknown / absent / intentionally not attempted
+const unknown = new Set(["unknown", "not_reported", "unavailable", "not_available", "not_started", "not_attempted"])
+// Policy — intentionally disabled or unavailable by reviewed runtime policy
+const policy = new Set(["disabled", "policy_unavailable"])
 // Configuration — present but not verified through a live probe
 const configPresent = new Set(["configured_not_verified"])
 // Configuration — missing
