@@ -109,15 +109,14 @@ async def _retained_run_assignment_task(
 
     live_url = _string(data.get("live_url"))
     if not live_url and provider_session:
-        sessions = getattr(client, "sessions", None)
-        getter = getattr(sessions, "get", None)
-        if callable(getter):
-            try:
-                session = await _await_if_needed(getter(provider_session))
-            except Exception:
-                session = None
-            if session is not None:
-                live_url = _string(_dump(session).get("live_url"))
+        sessions = cast(Any, client).sessions
+        getter = cast(Any, sessions).get
+        try:
+            session = await _await_if_needed(getter(provider_session))
+        except Exception:
+            session = None
+        if session is not None:
+            live_url = _string(_dump(session).get("live_url"))
     if live_url:
         worker._assignment_live_urls[context.session_id] = live_url
 
@@ -182,7 +181,7 @@ async def _compatible_gemini_extract(
         except Exception as exc:
             last_error = exc
             continue
-        text = getattr(response, "text", None)
+        text = cast(Any, response).text
         if not isinstance(text, str) or not text:
             last_error = RuntimeError("structured extraction returned no content")
             continue
