@@ -1,8 +1,9 @@
 import type { Metadata } from "next"
 import Link from "next/link"
 import { connection } from "next/server"
-import { Activity, CheckCircle2, CircleOff, RefreshCw, ServerCog, ShieldCheck } from "lucide-react"
+import { Activity, CheckCircle2, CircleOff, RefreshCw, ShieldCheck } from "lucide-react"
 
+import { ProviderStateCard } from "@/components/provider-state-card"
 import { ProvenanceCard } from "@/components/provenance-card"
 import { StatusBadge } from "@/components/status-badge"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -65,14 +66,7 @@ export default async function SystemPage() {
         {health?.providers?.length ? (
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             {health.providers.map((provider) => (
-              <article key={provider.provider} className="panel flex min-h-48 flex-col justify-between rounded-md p-5">
-                <div className="flex items-start justify-between gap-3"><span className="grid size-8 place-items-center rounded-md bg-secondary"><ServerCog className="size-4" aria-hidden="true" /></span><StatusBadge status={provider.status} /></div>
-                <div>
-                  <h3 className="text-base font-semibold">{humanize(provider.provider)}</h3>
-                  <p className="mt-2 text-xs leading-5 text-muted-foreground">{provider.detail}</p>
-                  <p className="mt-3 font-mono text-[9px] uppercase tracking-[0.12em] text-muted-foreground">Live tested · {provider.live_tested ? "Yes" : "No"}</p>
-                </div>
-              </article>
+              <ProviderStateCard key={provider.provider} provider={provider} evidenceScope="system" />
             ))}
           </div>
         ) : (

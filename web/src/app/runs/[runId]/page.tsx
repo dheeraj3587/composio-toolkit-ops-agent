@@ -2,10 +2,11 @@ import type { Metadata } from "next"
 import Link from "next/link"
 import { notFound } from "next/navigation"
 import { connection } from "next/server"
-import { ArrowLeft, CircleOff, Clock3, Fingerprint, Globe2, Mail, Route, ServerCog, Settings2 } from "lucide-react"
+import { ArrowLeft, CircleOff, Clock3, Fingerprint, Globe2, Mail, Route, Settings2 } from "lucide-react"
 
 import { HitlLiveControls } from "@/components/hitl-live-controls"
 import { PhaseActionForm } from "@/components/phase-action-form"
+import { ProviderStateCard } from "@/components/provider-state-card"
 import { RunAutoRefresh } from "@/components/run-auto-refresh"
 import {
   CapabilityPanel,
@@ -123,7 +124,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
           <div className="mb-3"><p className="eyebrow">Adapter configuration</p><h2 id="run-providers" className="mt-1 text-xl font-semibold">Run provider state</h2></div>
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             {detail.provider_states.map((provider) => (
-              <article key={provider.provider} className="panel rounded-md p-4"><div className="flex items-start justify-between gap-3"><ServerCog className="size-4 text-violet-600" aria-hidden="true" /><StatusBadge status={provider.status} /></div><h3 className="mt-5 text-sm font-semibold">{humanize(provider.provider)}</h3><p className="mt-2 text-xs leading-5 text-muted-foreground">{provider.detail}</p></article>
+              <ProviderStateCard key={provider.provider} provider={provider} evidenceScope="run" />
             ))}
           </div>
         </section>

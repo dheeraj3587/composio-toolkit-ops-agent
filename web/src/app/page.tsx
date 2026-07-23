@@ -59,7 +59,7 @@ export default async function DashboardPage() {
           <RadioTower className="text-amber-700" aria-hidden="true" />
           <AlertTitle>Backend state is partially unavailable</AlertTitle>
           <AlertDescription>
-            The surface remains read-only and does not substitute demo records. Start the operations API configured by the server-only OPS_API_URL.
+            No run or health state is inferred while the backend is unavailable. Start the operations API configured by the server-only OPS_API_URL.
           </AlertDescription>
         </Alert>
       ) : null}
@@ -98,7 +98,7 @@ export default async function DashboardPage() {
             <Link href="/runs/new">New run <ArrowRight aria-hidden="true" /></Link>
           </Button>
         </div>
-        {runs ? <RunTable runs={runs.items} /> : <EmptyState title="Run register unavailable" description="The backend could not return the run list. No placeholder records are shown." />}
+        {runs ? <RunTable runs={runs.items} /> : <EmptyState title="Run register unavailable" description="The backend could not return the run list. No run data is inferred or fabricated." />}
       </section>
     </div>
   )
