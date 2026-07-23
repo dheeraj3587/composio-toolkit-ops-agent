@@ -26,7 +26,6 @@ describe("StatusBadge", () => {
     expect(screen.getByText(status.replaceAll("_", " "), { exact: false })).toHaveClass(className)
   })
 
-  // disabled gets a distinct indigo treatment — it is policy, not failure
   it("gives disabled a distinct policy treatment, not a failure treatment", () => {
     render(<StatusBadge status="disabled" />)
     const badge = screen.getByText("Disabled")
@@ -34,14 +33,13 @@ describe("StatusBadge", () => {
     expect(badge).not.toHaveClass("text-red-800")
   })
 
-  // configured_not_verified gets a distinct amber treatment — it is configuration, not a run state
-  it("gives configured_not_verified a distinct configuration treatment", () => {
+  it("gives configured_not_verified an informational configuration treatment", () => {
     render(<StatusBadge status="configured_not_verified" />)
     const badge = screen.getByText("Configured Not Verified")
-    expect(badge).toHaveClass("text-amber-800")
+    expect(badge).toHaveClass("text-sky-800")
+    expect(badge).not.toHaveClass("text-amber-800")
   })
 
-  // not_configured gets a distinct treatment
   it("gives not_configured a distinct missing-configuration treatment", () => {
     render(<StatusBadge status="not_configured" />)
     const badge = screen.getByText("Not Configured")
