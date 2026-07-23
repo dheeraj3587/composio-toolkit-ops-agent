@@ -38,8 +38,7 @@ def build_integrator_bundle(
     """Build a strict reference-only handoff without guessing readiness."""
 
     refs = {
-        name: validate_vault_reference(reference)
-        for name, reference in credential_refs.items()
+        name: validate_vault_reference(reference) for name, reference in credential_refs.items()
     }
     readiness = _readiness(
         route=research.access_route,
@@ -103,7 +102,10 @@ def _readiness(
         if validation.status == "unavailable":
             return "configuration_required"
         return "failed"
-    if any(capability.status in {"configuration_required", "contract_incompatible"} for capability in capabilities):
+    if any(
+        capability.status in {"configuration_required", "contract_incompatible"}
+        for capability in capabilities
+    ):
         return "configuration_required"
     if stage == "awaiting_provider" or route in {"approval_required", "partner_gated", "hybrid"}:
         return "awaiting_provider"
@@ -119,4 +121,3 @@ def _auth_scheme(methods: list[str]) -> str:
     if "basic" in normalized:
         return "basic"
     return "unknown"
-

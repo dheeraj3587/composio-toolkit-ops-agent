@@ -7,7 +7,7 @@ import importlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 
 from ops.config import Settings
 from ops.effect_ledger import EffectStore, SQLiteEffectStore
@@ -103,7 +103,7 @@ class GmailWorker:
         self._settings = settings or Settings.from_env()
         self._secret_store = secret_store
         self._effect_store = effect_store
-        self._sdk_client = sdk_client
+        self._sdk_client: Any = sdk_client
         self._session_id: str | None = None
         self._connection_lock = asyncio.Lock()
 
@@ -377,9 +377,7 @@ class GmailWorker:
         session = self._client().sessions.create(
             user_id=self._settings.composio_user_id,
             tools={"gmail": {"enable": list(GMAIL_TOOL_ALLOWLIST)}},
-            connected_accounts={
-                "gmail": [str(self._settings.composio_gmail_connected_account_id)]
-            },
+            connected_accounts={"gmail": [str(self._settings.composio_gmail_connected_account_id)]},
             manage_connections=False,
             sandbox={"enable": False},
             session_preset=module.SESSION_PRESET_DIRECT_TOOLS,
@@ -597,7 +595,7 @@ def _json_schema_types(schema: Mapping[object, object]) -> frozenset[str]:
     return frozenset()
 
 
-def _schema_error() -> None:
+def _schema_error() -> NoReturn:
     raise ProviderContractError(
         phase=4,
         capability="Composio Gmail tool execution",
@@ -642,7 +640,9 @@ def _message_sequence(payload: Mapping[str, object]) -> tuple[Mapping[str, objec
         thread = payload.get("thread")
         if isinstance(thread, Mapping):
             candidates = thread.get("messages")
-    if not isinstance(candidates, list) or not all(isinstance(item, Mapping) for item in candidates):
+    if not isinstance(candidates, list) or not all(
+        isinstance(item, Mapping) for item in candidates
+    ):
         raise ProviderContractError(
             phase=4,
             capability="Composio Gmail thread fetch",
@@ -652,13 +652,7 @@ def _message_sequence(payload: Mapping[str, object]) -> tuple[Mapping[str, objec
 
 
 def _validate_email(value: str) -> str:
-    if (
-        not value
-        or len(value) > 320
-        or "\n" in value
-        or "\r" in value
-        or value.count("@") != 1
-    ):
+    if not value or len(value) > 320 or "\n" in value or "\r" in value or value.count("@") != 1:
         raise ValueError("a single safe email address is required")
     local, domain = value.rsplit("@", 1)
     if not local or "." not in domain or domain.startswith(".") or domain.endswith("."):

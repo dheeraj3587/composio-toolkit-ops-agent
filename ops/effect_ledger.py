@@ -278,4 +278,3 @@ class SQLiteEffectStore:
             yield connection
         finally:
             connection.close()
-

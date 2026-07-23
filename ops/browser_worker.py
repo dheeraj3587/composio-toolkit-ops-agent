@@ -6,7 +6,7 @@ import importlib
 import ipaddress
 import re
 from dataclasses import dataclass
-from typing import Generic, Literal, Protocol, TypeVar
+from typing import Any, Literal, Protocol, TypeVar
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ops.config import Settings
@@ -45,6 +45,7 @@ _SENSITIVE_QUERY_NAMES = frozenset(
     {"access_token", "api_key", "code", "key", "password", "secret", "token"}
 )
 T = TypeVar("T")
+T_co = TypeVar("T_co", covariant=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +109,7 @@ class BrowserSessionContext:
     maximum_expires_at: str
 
 
-class TrustedRawBrowserOperation(Protocol, Generic[T]):
+class TrustedRawBrowserOperation(Protocol[T_co]):
     """Internal adapter that validates every page host before secret work."""
 
     @property
@@ -117,7 +118,7 @@ class TrustedRawBrowserOperation(Protocol, Generic[T]):
     @property
     def enforces_host_validation(self) -> bool: ...
 
-    async def execute(self, cdp_url: str) -> T: ...
+    async def execute(self, cdp_url: str) -> T_co: ...
 
 
 class BrowserWorker:
@@ -132,7 +133,7 @@ class BrowserWorker:
 
     def __init__(self, *, settings: Settings | None = None, client: object | None = None) -> None:
         self._settings = settings or Settings.from_env()
-        self._client = client
+        self._client: Any = client
 
     async def start(self, profile_id: str | None) -> BrowserSessionContext:
         del profile_id
@@ -245,7 +246,7 @@ class BrowserWorker:
                 )
         if result is missing:  # pragma: no cover - operation success implies a return value
             raise RuntimeError("trusted raw-browser operation returned no result")
-        return result  # type: ignore[return-value]
+        return result
 
     async def close(self) -> None:
         if not await self._close_safely():
@@ -278,7 +279,7 @@ class BrowserWorker:
                 reason_code="browser_use_api_key_missing",
             )
 
-    def _get_client(self) -> object:
+    def _get_client(self) -> Any:
         if self._client is None:
             if self._settings.browser_use_api_key is None:  # pragma: no cover - guarded above
                 raise RuntimeError("Browser Use configuration is missing")

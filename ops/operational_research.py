@@ -90,7 +90,9 @@ class OfficialURLPolicy:
     """Exact-host/subdomain allowlist plus DNS-level SSRF protection."""
 
     def __init__(self, official_hosts: Sequence[str], resolver: HostResolver | None = None) -> None:
-        normalized = {host.strip().rstrip(".").casefold() for host in official_hosts if host.strip()}
+        normalized = {
+            host.strip().rstrip(".").casefold() for host in official_hosts if host.strip()
+        }
         if not normalized:
             raise ValueError("at least one verified official host is required")
         self._official_hosts = frozenset(normalized)

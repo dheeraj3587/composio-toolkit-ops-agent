@@ -27,9 +27,7 @@ class CredentialCapture:
         connect_timeout_ms: int = 30_000,
     ) -> None:
         self._secret_store = secret_store
-        self._allowed_domains = (
-            validate_allowed_domains(allowed_domains) if allowed_domains else ()
-        )
+        self._allowed_domains = validate_allowed_domains(allowed_domains) if allowed_domains else ()
         if not 1_000 <= connect_timeout_ms <= 120_000:
             raise ValueError("Playwright connection timeout is outside the supported range")
         self._connect_timeout_ms = connect_timeout_ms
@@ -210,4 +208,3 @@ def _validate_fields(app_slug: str, field_selectors: Mapping[str, str]) -> None:
 
 
 __all__ = ["CredentialCapture", "CredentialCaptureOperation", "PhaseUnavailableError"]
-

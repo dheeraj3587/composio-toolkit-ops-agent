@@ -65,9 +65,7 @@ def test_run_and_audit_writes_are_sanitized_before_sqlite(tmp_path) -> None:
     with pytest.raises(ValueError, match="capability URLs"):
         storage.update_run(
             "run-001",
-            browser_live_url=(
-                f"https://browser.example.test/live?token={raw_token}&view=operator"
-            ),
+            browser_live_url=(f"https://browser.example.test/live?token={raw_token}&view=operator"),
         )
 
     storage.update_run(

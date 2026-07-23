@@ -17,9 +17,10 @@ from pydantic import SecretStr
 from ops.browser_worker import BrowserObservation, BrowserSessionContext
 from ops.config import Settings
 from ops.gmail_worker import GmailSendResult
-from ops.integrator import build_integrator_bundle
+from ops.integrator import BundleStage, build_integrator_bundle
 from ops.models import (
     CapabilityAvailability,
+    CapabilityStatus,
     HitlRequest,
     OperationalResearch,
     OperationsRequest,
@@ -319,7 +320,7 @@ class DurableOperationsWorkflow:
         return _observation_update(state, observation)
 
     def _human_interrupt(self, state: OperationsState) -> dict[str, object]:
-        observation = BrowserObservation(**state["browser_observation"])
+        observation = BrowserObservation(**cast(dict[str, Any], state["browser_observation"]))
         action_type = observation.human_action_type
         if action_type is None:  # pragma: no cover - observation validation enforces this
             return _failed_update(state, "workflow HITL", "human_action_type_missing")
@@ -358,7 +359,10 @@ class DurableOperationsWorkflow:
 
     def _after_browser(self, state: OperationsState) -> str:
         observation = state.get("browser_observation")
-        if isinstance(observation, Mapping) and observation.get("status") == "human_action_required":
+        if (
+            isinstance(observation, Mapping)
+            and observation.get("status") == "human_action_required"
+        ):
             return "human_interrupt"
         return "finalize"
 
@@ -389,9 +393,7 @@ class DurableOperationsWorkflow:
         subject, body = _outreach_message(request, research)
         key = f"{state['run_id']}:initial-outreach"
         try:
-            sent = _run_async(
-                self._dependencies.gmail.send_outreach(recipient, subject, body, key)
-            )
+            sent = _run_async(self._dependencies.gmail.send_outreach(recipient, subject, body, key))
         except PhaseUnavailableError as exc:
             return _unavailable_update(state, exc)
         except ProviderOperationError as exc:
@@ -416,6 +418,7 @@ class DurableOperationsWorkflow:
         )
         if request.dry_run:
             return {"status": state.get("status", "route_selected")}
+        stage: BundleStage
         if state.get("status") == "waiting_for_reply":
             stage = "awaiting_provider"
         elif state.get("status") == "waiting_for_hitl":
@@ -602,7 +605,9 @@ def _observation_update(
     state: OperationsState,
     observation: BrowserObservation,
 ) -> dict[str, object]:
-    status = "waiting_for_hitl" if observation.status == "human_action_required" else "browser_running"
+    status = (
+        "waiting_for_hitl" if observation.status == "human_action_required" else "browser_running"
+    )
     if observation.status == "blocked":
         status = "blocked"
     elif observation.status == "failed":
@@ -633,7 +638,11 @@ def _unavailable_update(
     state: OperationsState,
     error: PhaseUnavailableError,
 ) -> dict[str, object]:
-    status = "contract_incompatible" if isinstance(error, ProviderContractError) else "configuration_required"
+    status: CapabilityStatus = (
+        "contract_incompatible"
+        if isinstance(error, ProviderContractError)
+        else "configuration_required"
+    )
     capability = CapabilityAvailability(
         capability=error.capability,
         status=status,

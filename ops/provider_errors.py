@@ -6,7 +6,9 @@ from __future__ import annotations
 class PhaseUnavailableError(RuntimeError):
     """A capability cannot run; the message never includes provider payloads."""
 
-    def __init__(self, *, phase: int, capability: str, reason_code: str = "phase_unavailable") -> None:
+    def __init__(
+        self, *, phase: int, capability: str, reason_code: str = "phase_unavailable"
+    ) -> None:
         self.phase = phase
         self.capability = capability
         self.reason_code = reason_code
