@@ -28,14 +28,14 @@ vi.mock("@/lib/api", () => ({
 import RunDetailPage from "@/app/runs/[runId]/page"
 
 describe("RunDetailPage", () => {
-  it("renders backend-reported workflow context without exposing credential references", async () => {
+  it("renders plan-only runs as completed planning without implying provider failures", async () => {
     mocks.getRun.mockResolvedValue({
       run: {
         run_id: "run_frontend_123",
         thread_id: "thread_frontend_123",
-        app_name: "Linear",
-        app_slug: "linear",
-        status: "configuration_required",
+        app_name: "Pipedrive",
+        app_slug: "pipedrive",
+        status: "route_selected",
         access_route: "self_serve",
         execution_mode: "plan_only",
         external_actions: false,
@@ -43,93 +43,70 @@ describe("RunDetailPage", () => {
         updated_at: "2026-07-23T10:05:00Z",
       },
       research: {
-        app_name: "Linear",
-        app_slug: "linear",
-        api_available: true,
+        app_name: "Pipedrive",
+        app_slug: "pipedrive",
+        api_available: null,
         api_type: "REST",
-        api_base_url: "https://api.linear.app",
-        auth_methods: ["OAuth 2.0"],
-        authorization_url: "https://linear.app/oauth/authorize",
-        token_url: "https://api.linear.app/oauth/token",
-        credential_fields: ["client_id", "client_secret"],
+        api_base_url: null,
+        auth_methods: ["OAuth2", "API Key"],
+        authorization_url: null,
+        token_url: null,
+        credential_fields: [],
         scopes: [],
-        developer_portal_url: "https://linear.app/developers",
+        developer_portal_url: "https://developers.pipedrive.com/docs/api/v1",
         signup_url: null,
         access_route: "self_serve",
-        production_approval_required: false,
+        production_approval_required: null,
         contact_email: null,
         contact_url: null,
-        evidence_urls: ["https://linear.app/developers/oauth-2-0-authentication"],
-        confidence: 0.94,
+        evidence_urls: ["https://developers.pipedrive.com/docs/api/v1"],
+        confidence: 0.95,
         source: "p1_snapshot",
-        missing_fields: ["contact_email"],
+        missing_fields: ["api_base_url", "token_url"],
       },
       phases: {
-        research: { key: "research", status: "complete", detail: "Evidence loaded." },
+        research: { key: "research", status: "ready", detail: "Evidence loaded." },
+        browser: { key: "browser", status: "unavailable", detail: "Static backend blocker." },
+        hitl: { key: "hitl", status: "ready", detail: "Checkpoint configured." },
         email: { key: "email", status: "configuration_required", detail: "Gmail provider is not configured." },
+        output: { key: "output", status: "waiting", detail: "No bundle." },
       },
       security: { redaction: "enabled", external_actions: false },
       route_decision: {
         route: "self_serve",
-        reason_code: "official_self_serve_documented",
+        reason_code: "verified_evidence_route",
         explanation: "Official developer access is documented.",
         is_final: true,
       },
       hitl_request: null,
-      missing_fields: ["company.work_email_ref"],
-      provider_states: [
-        {
-          provider: "composio_gmail",
-          status: "configuration_required",
-          detail: "Gmail capability is not configured.",
-        },
-      ],
+      missing_fields: ["api_base_url", "token_url"],
+      provider_states: [],
     })
     mocks.getTimeline.mockResolvedValue({
       run_id: "run_frontend_123",
       items: [
         {
           event_type: "route_selected",
-          summary: "Selected the documented self-serve route.",
+          summary: "Access route selected.",
           status: "recorded",
           created_at: "2026-07-23T10:03:00Z",
         },
       ],
     })
-    mocks.getRunOutput.mockResolvedValue({
-      app_name: "Linear",
-      app_slug: "linear",
-      readiness: "configuration_required",
-      api_type: "REST",
-      api_base_url: "https://api.linear.app",
-      auth_scheme: "OAuth 2.0",
-      authorization_url: "https://linear.app/oauth/authorize",
-      token_url: "https://api.linear.app/oauth/token",
-      scopes: ["read"],
-      callback_urls: ["https://example.com/oauth/callback"],
-      credential_refs: { client_id: "vault://linear/oauth/client_id_1" },
-      access_route: "self_serve",
-      evidence_urls: ["https://linear.app/developers/oauth-2-0-authentication"],
-      operational_notes: ["Provider configuration is still required."],
-      created_at: "2026-07-23T10:04:00Z",
-    })
+    mocks.getRunOutput.mockRejectedValue(new Error("No output"))
 
     render(await RunDetailPage({ params: Promise.resolve({ runId: "run_frontend_123" }) }))
 
-    expect(screen.getByRole("heading", { name: "Linear", level: 1 })).toBeInTheDocument()
-    expect(screen.getAllByText("Configuration Required").length).toBeGreaterThan(0)
-    expect(screen.getAllByText("Self Serve").length).toBeGreaterThan(0)
+    expect(screen.getByRole("heading", { name: "Pipedrive", level: 1 })).toBeInTheDocument()
+    expect(screen.getByText("Planning completed")).toBeInTheDocument()
+    expect(screen.getByText(/browser, email, hitl, and credential validation were not attempted/i)).toBeInTheDocument()
+    expect(screen.getByText("Baseline planning completed")).toBeInTheDocument()
+    expect(screen.getByText(/operational fields were not enriched in plan only mode/i)).toBeInTheDocument()
+    expect(screen.getAllByText("Not Attempted").length).toBeGreaterThanOrEqual(4)
+    expect(screen.queryByText("Static backend blocker.")).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: /retry browser phase/i })).not.toBeInTheDocument()
     expect(screen.getByText("Plan Only")).toBeInTheDocument()
     expect(screen.getByText("Off")).toBeInTheDocument()
-    expect(screen.getByText(/company\.work email ref/i)).toBeInTheDocument()
-    expect(screen.getByText(/official self serve documented/i)).toBeInTheDocument()
-    expect(screen.getByRole("link", { name: /linear\.app\/developers\/oauth-2-0-authentication/i })).toHaveAttribute(
-      "href",
-      "https://linear.app/developers/oauth-2-0-authentication",
-    )
-    expect(screen.getByText("Selected the documented self-serve route.")).toBeInTheDocument()
-    expect(screen.getByText("Integrator bundle")).toBeInTheDocument()
-    expect(screen.getByText("Gmail capability is not configured.")).toBeInTheDocument()
-    expect(screen.queryByText("vault://linear/oauth/client_id_1")).not.toBeInTheDocument()
+    expect(screen.getByText("Access route selected.")).toBeInTheDocument()
   })
 })
