@@ -30,11 +30,13 @@ services:
     env_file:
       - path: .env.production
         required: false
-    # Hard production invariants are pinned here so a misconfigured env file
-    # cannot enable live side effects, docs, or move databases off /data.
+    # Production-safe defaults are defined here. Live provider capabilities stay
+    # disabled unless the untracked production environment explicitly opts in;
+    # this keeps an intentional Browser Use policy setting from being silently
+    # overridden by Compose at runtime.
     environment:
-      ALLOW_LIVE_VENDOR_EMAIL: "false"
-      ALLOW_LIVE_BROWSER: "false"
+      ALLOW_LIVE_VENDOR_EMAIL: ${ALLOW_LIVE_VENDOR_EMAIL:-false}
+      ALLOW_LIVE_BROWSER: ${ALLOW_LIVE_BROWSER:-false}
       OPS_ENABLE_API_DOCS: "false"
       RUN_LIVE_TESTS: "0"
       LANGGRAPH_STRICT_MSGPACK: "true"

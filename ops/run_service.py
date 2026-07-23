@@ -544,11 +544,11 @@ class RunService:
 
         ``execution_mode`` is the single canonical control. ``plan_only`` runs the
         verified P1 lookup, deterministic routing, and sanitized persistence with
-        no provider or network action. ``execute_when_configured`` establishes the
-        mode-aware branch consumed by later workflow wiring: in this task it still
-        performs only the side-effect-free planning above, never invokes a
-        provider, and never fabricates a completed run. The deprecated
-        ``request.dry_run`` flag is no longer consulted as a runtime control.
+        no provider or network action. ``execute_when_configured`` may perform a
+        bounded, policy-gated provider operation when the relevant dependency is
+        configured; provider failures retain the verified baseline and are
+        recorded as sanitized capability state. The deprecated ``request.dry_run``
+        flag is no longer consulted as a runtime control.
         """
 
         persisted_execution_mode = _PERSISTED_EXECUTION_MODE[execution_mode]
@@ -569,13 +569,14 @@ class RunService:
         enrichment_capability: CapabilityAvailability | None = None
         if isinstance(lookup, P1LookupFound):
             research = to_operational_research(lookup.record)
-            # One bounded, guarded official-evidence probe runs only when an
-            # enricher is configured and the verified baseline is operationally
-            # incomplete. The probe fetches allowlisted official documents only;
-            # it never invokes a browser, Gmail, or credential side effect, and
-            # when providers are unconfigured it truthfully retains the baseline.
-            if self._enricher is not None and _missing_operational_fields(
-                research.model_dump(mode="json")
+            # Plan-only runs are strictly local: no provider or network action is
+            # permitted. An explicit execute request may use one bounded,
+            # allowlisted official-evidence probe when the baseline is incomplete.
+            # Browser, Gmail, and credential side effects remain separately gated.
+            if (
+                execution_mode == "execute_when_configured"
+                and self._enricher is not None
+                and _missing_operational_fields(research.model_dump(mode="json"))
             ):
                 outcome = self._run_enrichment_probe(lookup.record, research)
                 research = outcome.research
@@ -1030,13 +1031,32 @@ class RunService:
 
         if self._enricher is None:  # pragma: no cover - guarded by the caller
             raise RuntimeError("no research enricher is configured")
-        return asyncio.run(
-            self._enricher.enrich(
-                app_name=baseline.app_name,
-                p1_record=record.model_dump(mode="json"),
-                baseline=baseline,
+        try:
+            return asyncio.run(
+                self._enricher.enrich(
+                    app_name=baseline.app_name,
+                    p1_record=record.model_dump(mode="json"),
+                    baseline=baseline,
+                )
             )
-        )
+        except Exception:
+            # A provider/transport/extraction failure must never turn an
+            # otherwise valid run request into an untyped HTTP 500. Preserve the
+            # verified P1 baseline and expose only a stable, sanitized reason.
+            return ResearchEnrichmentOutcome(
+                research=baseline,
+                capability=CapabilityAvailability(
+                    capability="operational_research",
+                    status="failed",
+                    reason_code="official_evidence_provider_failed",
+                    detail=(
+                        "Official-evidence enrichment did not complete; the verified "
+                        "P1 baseline was retained."
+                    ),
+                ),
+                missing_fields=_missing_operational_fields(baseline.model_dump(mode="json")),
+                documents_fetched=0,
+            )
 
     def _run_capability_preflight(self, app_slug: str, app_name: str) -> ComposioCapabilityReport:
         """Evaluate Composio capability once, synchronously, with no side effect."""

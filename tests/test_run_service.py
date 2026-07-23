@@ -416,10 +416,18 @@ class _UnconfiguredEnricher:
 
 
 class _RaisingEnricher:
-    """Fails loudly if a probe is ever attempted for an out-of-scope run."""
+    """Fails loudly if a plan-only or out-of-scope probe is attempted."""
 
     async def enrich(self, *, app_name, p1_record, baseline):  # type: ignore[no-untyped-def]
         raise AssertionError("enrichment must not run for this case")
+
+
+class _FailingEnricher:
+    """Simulates an unavailable provider without exposing its exception."""
+
+    async def enrich(self, *, app_name, p1_record, baseline):  # type: ignore[no-untyped-def]
+        del app_name, p1_record, baseline
+        raise RuntimeError("provider transport failed")
 
 
 def test_incomplete_verified_record_triggers_single_bounded_enrichment(tmp_path: Path) -> None:
@@ -428,7 +436,7 @@ def test_incomplete_verified_record_triggers_single_bounded_enrichment(tmp_path:
         research_enricher=_ReadyEnricher(),
     )
 
-    run = service.create_run(request_for("HubSpot"), execution_mode="plan_only")
+    run = service.create_run(request_for("HubSpot"), execution_mode="execute_when_configured")
     research = service.get_research(run["run_id"])
     events = _event_types(service, run["run_id"])
     enriched_event = next(
@@ -437,7 +445,10 @@ def test_incomplete_verified_record_triggers_single_bounded_enrichment(tmp_path:
         if event["event_type"] == "operational_research_enriched"
     )
 
-    assert run["status"] == "route_selected"
+    # The enrichment is independent of the later durable workflow. This unit
+    # service intentionally has no workflow configured, so the execution branch
+    # reports that prerequisite after persisting the enrichment outcome.
+    assert run["status"] == "configuration_required"
     assert run["access_route"] == "self_serve"
     assert run["external_actions"] is False
     assert "operational_research_enriched" in events
@@ -459,7 +470,7 @@ def test_unconfigured_enricher_retains_baseline_and_reports_configuration_requir
         research_enricher=_UnconfiguredEnricher(),
     )
 
-    run = service.create_run(request_for("HubSpot"), execution_mode="plan_only")
+    run = service.create_run(request_for("HubSpot"), execution_mode="execute_when_configured")
     research = service.get_research(run["run_id"])
     enriched_event = next(
         event
@@ -484,6 +495,38 @@ def test_default_run_service_performs_no_enrichment(tmp_path: Path) -> None:
     run = service.create_run(request_for("HubSpot"), execution_mode="plan_only")
 
     assert "operational_research_enriched" not in _event_types(service, run["run_id"])
+
+
+def test_plan_only_never_calls_a_configured_enricher(tmp_path: Path) -> None:
+    service = RunService.from_paths(
+        db_path=tmp_path / "private" / "ops.db",
+        research_enricher=_RaisingEnricher(),
+    )
+
+    run = service.create_run(request_for("HubSpot"), execution_mode="plan_only")
+
+    assert run["status"] == "route_selected"
+    assert run["access_route"] == "self_serve"
+    assert "operational_research_enriched" not in _event_types(service, run["run_id"])
+
+
+def test_failed_enrichment_retains_verified_baseline_and_persists_run(tmp_path: Path) -> None:
+    service = RunService.from_paths(
+        db_path=tmp_path / "private" / "ops.db",
+        research_enricher=_FailingEnricher(),
+    )
+
+    run = service.create_run(request_for("HubSpot"), execution_mode="execute_when_configured")
+    enriched_event = next(
+        event
+        for event in service.get_timeline(run["run_id"])
+        if event["event_type"] == "operational_research_enriched"
+    )
+
+    assert run["status"] == "configuration_required"
+    assert enriched_event["payload"]["status"] == "failed"
+    assert enriched_event["payload"]["reason_code"] == "official_evidence_provider_failed"
+    assert "provider transport failed" not in str(enriched_event)
 
 
 def test_missing_record_never_triggers_enrichment_probe(tmp_path: Path) -> None:
