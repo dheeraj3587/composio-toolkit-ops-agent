@@ -11,6 +11,10 @@ from api.assignment_runtime import install_assignment_runtime  # noqa: E402
 
 install_assignment_runtime()
 
+from api.assignment_live_bootstrap import install_assignment_live_bootstrap  # noqa: E402
+
+install_assignment_live_bootstrap()
+
 from api.assignment_projection import install_assignment_projection  # noqa: E402
 
 install_assignment_projection()
