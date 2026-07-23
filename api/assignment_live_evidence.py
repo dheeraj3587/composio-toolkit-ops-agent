@@ -10,7 +10,6 @@ import importlib
 from collections.abc import Mapping
 from typing import Any, cast
 
-import ops.browser_worker as browser_worker_module
 from api.assignment_runtime import (
     AssignmentBrowserWorker,
     _await_if_needed,
@@ -27,6 +26,7 @@ from api.assignment_runtime import (
 )
 from api.models import ProviderState
 from api.service import LocalRunService, _EVENT_SUMMARIES
+from ops.browser_host_policy import evaluate_navigation
 from ops.browser_worker import BrowserObservation, BrowserSessionContext, BrowserTaskOutput
 from ops.models import OperationalResearch
 from ops.operational_research import (
@@ -123,7 +123,7 @@ async def _retained_run_assignment_task(
 
     output = _coerce_task_output(result)
     current_url = sanitize_browser_url(output.current_url)
-    decision = browser_worker_module.evaluate_navigation(current_url, allowed)
+    decision = evaluate_navigation(current_url, allowed)
     if not decision.allowed:
         await worker._safe_stop_handle(context.session_id)
         return _blocked_observation(decision)
@@ -240,7 +240,7 @@ def _assignment_provider_states(service: LocalRunService) -> list[ProviderState]
         current = original[provider]
         is_ready, detail = readiness[provider]
         result.append(
-            ProviderState(provider=provider, status="ready", detail=detail)
+            current.model_copy(update={"status": "ready", "detail": detail})
             if is_ready
             else current
         )
