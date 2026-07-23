@@ -77,9 +77,6 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
   }, [state.error])
 
   const submit = (values: RunFormValues) => {
-    // Build the payload from the validated values rather than the DOM event:
-    // react-hook-form validates asynchronously, so the submit event's
-    // currentTarget is already null by the time this runs.
     const data = new FormData()
     data.set("app_name", values.app_name)
     data.set("requested_scope_policy", values.requested_scope_policy)
@@ -115,7 +112,7 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
             01 · Target and policy
           </legend>
           <Field label="Application name" htmlFor="app_name" error={fieldError(errors.app_name?.message, serverInvalid.has("app_name"))}>
-            <Input id="app_name" maxLength={120} placeholder="e.g. HubSpot" aria-invalid={invalid("app_name")} {...register("app_name")} />
+            <Input id="app_name" maxLength={120} placeholder="e.g. Pipedrive" aria-invalid={invalid("app_name")} {...register("app_name")} />
           </Field>
           <Field label="Scope policy" htmlFor="requested_scope_policy" hint="The backend still limits scopes to evidence-backed provider requirements.">
             <Controller
@@ -139,8 +136,8 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
             label="Execution mode"
             htmlFor="execution_mode"
             hint={executionMode === "plan_only"
-              ? "Plan only — no provider side effects are authorized."
-              : "Execution remains subject to backend policy, configuration, and human gates."}
+              ? "Plan only performs research and routing only. Browser, email, HITL, validation, and other external actions are not attempted."
+              : "May perform approved provider actions only when backend policy, configuration, and human gates permit them."}
           >
             <Controller
               name="execution_mode"
@@ -151,8 +148,8 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
                     <SelectValue placeholder="Choose execution mode" />
                   </SelectTrigger>
                   <SelectContent className="rounded-md">
-                    <SelectItem value="plan_only">Plan only</SelectItem>
-                    <SelectItem value="execute_when_configured">Execute when configured</SelectItem>
+                    <SelectItem value="plan_only">Plan only — no network or provider actions</SelectItem>
+                    <SelectItem value="execute_when_configured">Execute when configured — approved actions may run</SelectItem>
                   </SelectContent>
                 </Select>
               )}
@@ -204,7 +201,7 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
           <p className="flex max-w-2xl items-start gap-2 text-xs leading-5 text-muted-foreground">
             <Check className="mt-0.5 size-3.5 shrink-0 text-emerald-600" aria-hidden="true" />
             {executionMode === "plan_only"
-              ? "Plan-only mode keeps external actions disabled."
+              ? "Planning mode keeps all provider and external actions off. Choose Execute when configured to request an approved live path."
               : "Execution can proceed only when backend policy and provider configuration permit each action."}
           </p>
           <Button type="submit" size="lg" disabled={pending} className="h-10 rounded-md px-5">
