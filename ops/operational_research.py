@@ -256,40 +256,100 @@ def _extract_visible_text(body: str, content_type: str) -> tuple[str, str]:
     ]
 
 
-class PerplexitySearchDiscovery:
-    """Native Perplexity Search API adapter; imported only when configured."""
+PERPLEXITY_TIMEOUT_SECONDS = 20.0
+PERPLEXITY_MAX_RESULTS = 5
+GEMINI_TIMEOUT_SECONDS = 45.0
 
-    def __init__(self, api_key: SecretStr | str) -> None:
+
+class PerplexitySearchDiscovery:
+    """Perplexity Search API adapter (perplexityai>=0.42, ``AsyncPerplexity``).
+
+    One bounded request per enrichment attempt, no retry storm, at most five
+    results. Downstream, :class:`OfficialURLPolicy` discards any result outside
+    the verified official allowlist, so only official evidence URLs survive.
+    """
+
+    def __init__(
+        self,
+        api_key: SecretStr | str,
+        *,
+        search_domain_filter: Sequence[str] = (),
+    ) -> None:
         self._api_key = api_key if isinstance(api_key, SecretStr) else SecretStr(api_key)
+        self._search_domain_filter = tuple(
+            value.strip() for value in search_domain_filter if value.strip()
+        )
 
     async def discover(self, *, app_name: str) -> tuple[str, ...]:
         module = importlib.import_module("perplexity")
         client_type = module.AsyncPerplexity
-        client = client_type(api_key=self._api_key.get_secret_value(), max_retries=1)
+        # ``max_retries=0`` avoids a hidden retry storm; the client owns one
+        # bounded HTTP request that we time out explicitly below.
+        client = client_type(
+            api_key=self._api_key.get_secret_value(),
+            max_retries=0,
+            timeout=PERPLEXITY_TIMEOUT_SECONDS,
+        )
+        # ``search_mode`` is intentionally omitted: it is present in the installed
+        # SDK signature but rejected as unsupported by the current Search API
+        # deployment. Only the documented, universally accepted fields are sent.
+        request: dict[str, object] = {
+            "query": (
+                f"{app_name} official developer documentation API authentication "
+                "OAuth scopes token URL developer portal signup"
+            ),
+            "max_results": PERPLEXITY_MAX_RESULTS,
+            "timeout": PERPLEXITY_TIMEOUT_SECONDS,
+        }
+        if self._search_domain_filter:
+            request["search_domain_filter"] = list(self._search_domain_filter)
         try:
-            response = await client.search.create(
-                query=[
-                    f"{app_name} official developer portal API authentication",
-                    f"{app_name} official OAuth scopes authorization token URL",
-                    f"{app_name} API partner access contact production approval",
-                ],
-                max_results=5,
-            )
-            return tuple(
-                str(result.url)
-                for result in response.results
-                if isinstance(getattr(result, "url", None), str)
-            )
+            response = await client.search.create(**request)
         finally:
             await client.close()
 
+        seen: set[str] = set()
+        urls: list[str] = []
+        for result in getattr(response, "results", ()) or ():
+            candidate = getattr(result, "url", None)
+            if not isinstance(candidate, str):
+                continue
+            try:
+                normalized = validate_https_url(candidate)
+            except ValueError:
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            urls.append(normalized)
+            if len(urls) >= PERPLEXITY_MAX_RESULTS:
+                break
+        return tuple(urls)
+
 
 class GeminiStructuredExtractor:
-    """Gemini structured-output adapter validated directly by Pydantic."""
+    """Gemini structured-output adapter (google-genai>=2.12, ``google.genai``).
 
-    def __init__(self, api_key: SecretStr | str, *, model: str = "gemini-3.1-pro-preview") -> None:
+    Uses the current public async client
+    (``client.aio.models.generate_content``) with a strict JSON schema and a
+    pinned production model. The returned JSON is validated by Pydantic, and the
+    enricher separately rejects any evidence/scope URL outside the fetched pack,
+    so the model cannot inject fabricated URLs, scopes, or identities.
+    """
+
+    def __init__(
+        self,
+        api_key: SecretStr | str,
+        *,
+        model: str | Sequence[str] = "gemini-3.6-flash",
+    ) -> None:
         self._api_key = api_key if isinstance(api_key, SecretStr) else SecretStr(api_key)
-        self._model = model
+        models = (model,) if isinstance(model, str) else tuple(model)
+        self._models = tuple(dict.fromkeys(name for name in models if name))
+        if not self._models:
+            raise ValueError("at least one Gemini model id is required")
+        # The model that actually produced the last successful response.
+        self.model_used: str | None = None
 
     async def extract(
         self,
@@ -299,28 +359,35 @@ class GeminiStructuredExtractor:
         documents: tuple[EvidenceDocument, ...],
     ) -> OperationalResearch:
         prompt = _render_extraction_prompt(app_name, p1_record, documents)
-
-        def invoke() -> str:
-            module = importlib.import_module("google.genai")
-            client = module.Client(api_key=self._api_key.get_secret_value())
+        genai = importlib.import_module("google.genai")
+        types = importlib.import_module("google.genai.types")
+        client = genai.Client(api_key=self._api_key.get_secret_value())
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_json_schema=OperationalResearch.model_json_schema(),
+            temperature=0,
+            http_options=types.HttpOptions(timeout=int(GEMINI_TIMEOUT_SECONDS * 1000)),
+        )
+        last_error: Exception | None = None
+        for model in self._models:
             try:
-                response = client.models.generate_content(
-                    model=self._model,
+                response = await client.aio.models.generate_content(
+                    model=model,
                     contents=prompt,
-                    config={
-                        "response_mime_type": "application/json",
-                        "response_json_schema": OperationalResearch.model_json_schema(),
-                        "temperature": 0,
-                    },
+                    config=config,
                 )
-                text = response.text
-                if not isinstance(text, str) or not text:
-                    raise RuntimeError("structured extraction returned no content")
-                return text
-            finally:
-                client.close()
-
-        return OperationalResearch.model_validate_json(await asyncio.to_thread(invoke))
+            except Exception as exc:  # try the next model on unavailability/overload
+                last_error = exc
+                continue
+            text = getattr(response, "text", None)
+            if not isinstance(text, str) or not text:
+                last_error = RuntimeError("structured extraction returned no content")
+                continue
+            self.model_used = model
+            return OperationalResearch.model_validate_json(text)
+        raise RuntimeError(
+            f"all Gemini models failed ({', '.join(self._models)})"
+        ) from last_error
 
 
 def _render_extraction_prompt(
@@ -367,7 +434,11 @@ class OperationalResearchEnricher:
         baseline: OperationalResearch,
     ) -> ResearchEnrichmentOutcome:
         missing = _missing_fields(baseline)
-        if self._discovery is None or self._extractor is None:
+        if self._extractor is None:
+            # Structured extraction (Gemini) is mandatory for enrichment; without
+            # it the verified P1 baseline is retained truthfully. Perplexity
+            # discovery is optional: when absent, only the verified P1 official
+            # URLs are fetched, so no fabricated evidence can be introduced.
             return ResearchEnrichmentOutcome(
                 research=baseline,
                 capability=CapabilityAvailability(
@@ -375,7 +446,7 @@ class OperationalResearchEnricher:
                     status="configuration_required",
                     reason_code="provider_credentials_missing",
                     detail=(
-                        "Perplexity discovery and Gemini extraction must both be configured; "
+                        "Gemini structured extraction must be configured to enrich; "
                         "the verified P1 baseline is retained."
                     ),
                 ),
@@ -385,7 +456,7 @@ class OperationalResearchEnricher:
 
         policy = OfficialURLPolicy.from_p1_record(p1_record, resolver=self._resolver)
         fetcher = OfficialEvidenceFetcher(self._http_client, policy)
-        discovered = await self._discovery.discover(app_name=app_name)
+        discovered = await self._discovery.discover(app_name=app_name) if self._discovery else ()
         candidates = _candidate_urls(p1_record, discovered, policy)
         documents: list[EvidenceDocument] = []
         for candidate in candidates:
@@ -413,7 +484,7 @@ class OperationalResearchEnricher:
             p1_record=p1_record,
             documents=tuple(documents),
         )
-        _validate_extracted_research(research, baseline, documents, policy)
+        _validate_extracted_research(research, baseline, documents, p1_record)
         return ResearchEnrichmentOutcome(
             research=research,
             capability=CapabilityAvailability(
@@ -451,20 +522,70 @@ def _candidate_urls(
     return tuple(result)
 
 
+def _normalize_url(value: str) -> str | None:
+    """Canonicalize an HTTPS URL for citation comparison.
+
+    Lowercases the hostname, drops the fragment, and normalizes a redundant
+    trailing slash while preserving the meaningful path and query. Non-HTTPS
+    URLs return ``None`` so they can never match an allowed citation.
+    """
+
+    parsed = urlsplit(value.strip())
+    if parsed.scheme != "https" or not parsed.hostname:
+        return None
+    hostname = parsed.hostname.rstrip(".").casefold()
+    path = parsed.path or "/"
+    if len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/") or "/"
+    return urlunsplit(("https", hostname, path, parsed.query, ""))
+
+
 def _validate_extracted_research(
     research: OperationalResearch,
     baseline: OperationalResearch,
     documents: Sequence[EvidenceDocument],
-    policy: OfficialURLPolicy,
+    p1_record: Mapping[str, object],
 ) -> None:
     if research.app_slug != baseline.app_slug or research.app_name != baseline.app_name:
         raise ValueError("structured extraction changed the canonical app identity")
-    source_urls = {document.source_url for document in documents}
+
+    # Evidence citations may reference only the normalized union of: trusted P1
+    # evidence URLs, the trusted P1 primary docs URL, and the URLs we actually
+    # fetched. A hostname being "official" is not sufficient; the specific page
+    # must be one we trusted or fetched, so the model cannot fabricate a URL.
+    fetched: set[str] = set()
+    for document in documents:
+        normalized = _normalize_url(document.source_url)
+        if normalized is not None:
+            fetched.add(normalized)
+    allowed_evidence = set(fetched)
+    primary = p1_record.get("primary_docs_url")
+    if isinstance(primary, str):
+        normalized = _normalize_url(primary)
+        if normalized is not None:
+            allowed_evidence.add(normalized)
+    p1_evidence = p1_record.get("evidence_urls")
+    if isinstance(p1_evidence, list):
+        for value in p1_evidence:
+            if isinstance(value, str):
+                normalized = _normalize_url(value)
+                if normalized is not None:
+                    allowed_evidence.add(normalized)
+
     for value in research.evidence_urls:
-        if policy.sanitize_candidate(value) not in source_urls:
-            raise ValueError("structured extraction cited evidence outside the fetched pack")
+        normalized = _normalize_url(value)
+        if normalized is None or normalized not in allowed_evidence:
+            raise ValueError("structured extraction cited evidence outside the trusted union")
+
+    # Scope citations stay stricter: a scope is acceptable only when its source
+    # URL is one we actually fetched, or when that exact scope name already
+    # exists in the trusted P1 baseline. This blocks invented scopes attributed
+    # to unfetched pages.
+    trusted_scope_names = {scope.name for scope in baseline.scopes}
     for scope in research.scopes:
-        if policy.sanitize_candidate(scope.source_url) not in source_urls:
+        normalized = _normalize_url(scope.source_url)
+        cited_from_fetched = normalized is not None and normalized in fetched
+        if not cited_from_fetched and scope.name not in trusted_scope_names:
             raise ValueError("structured extraction cited an unsupported scope source")
 
 

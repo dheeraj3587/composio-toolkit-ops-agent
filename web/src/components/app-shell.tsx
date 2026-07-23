@@ -1,3 +1,5 @@
+"use client"
+
 import Link from "next/link"
 import { Activity, Boxes, LayoutDashboard, LockKeyhole, Plus, ShieldCheck } from "lucide-react"
 

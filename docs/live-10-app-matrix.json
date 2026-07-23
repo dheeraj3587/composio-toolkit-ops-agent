@@ -1,0 +1,128 @@
+{
+  "generated_at": "2026-07-23T06:15:44.987662Z",
+  "composio_user_id": "ops-assignment-user",
+  "app_count": 10,
+  "external_action_taken": false,
+  "results": [
+    {
+      "app_name": "HubSpot",
+      "app_slug": "hubspot",
+      "p1_access_route": "self_serve",
+      "composio_toolkit_slug": "hubspot",
+      "toolkit_available": true,
+      "active_connection_available": false,
+      "capability_state": "connection_required",
+      "resulting_action": "composio_connection_required",
+      "provider_error": null,
+      "external_action_taken": false
+    },
+    {
+      "app_name": "Pipedrive",
+      "app_slug": "pipedrive",
+      "p1_access_route": "self_serve",
+      "composio_toolkit_slug": "pipedrive",
+      "toolkit_available": true,
+      "active_connection_available": false,
+      "capability_state": "custom_auth_or_approval_required",
+      "resulting_action": "browser_fallback",
+      "provider_error": null,
+      "external_action_taken": false
+    },
+    {
+      "app_name": "Attio",
+      "app_slug": "attio",
+      "p1_access_route": "self_serve",
+      "composio_toolkit_slug": "attio",
+      "toolkit_available": true,
+      "active_connection_available": false,
+      "capability_state": "connection_required",
+      "resulting_action": "composio_connection_required",
+      "provider_error": null,
+      "external_action_taken": false
+    },
+    {
+      "app_name": "Twenty",
+      "app_slug": "twenty",
+      "p1_access_route": "self_serve",
+      "composio_toolkit_slug": null,
+      "toolkit_available": false,
+      "active_connection_available": false,
+      "capability_state": "toolkit_unavailable",
+      "resulting_action": "browser_fallback",
+      "provider_error": null,
+      "external_action_taken": false
+    },
+    {
+      "app_name": "Zendesk",
+      "app_slug": "zendesk",
+      "p1_access_route": "approval_required",
+      "composio_toolkit_slug": "zendesk",
+      "toolkit_available": true,
+      "active_connection_available": false,
+      "capability_state": "connection_required",
+      "resulting_action": "composio_connection_required",
+      "provider_error": null,
+      "external_action_taken": false
+    },
+    {
+      "app_name": "Google Ads",
+      "app_slug": "google-ads",
+      "p1_access_route": "approval_required",
+      "composio_toolkit_slug": null,
+      "toolkit_available": false,
+      "active_connection_available": false,
+      "capability_state": "toolkit_unavailable",
+      "resulting_action": "gated_outreach",
+      "provider_error": null,
+      "external_action_taken": false
+    },
+    {
+      "app_name": "WhatsApp Business",
+      "app_slug": "whatsapp-business",
+      "p1_access_route": "approval_required",
+      "composio_toolkit_slug": null,
+      "toolkit_available": false,
+      "active_connection_available": false,
+      "capability_state": "toolkit_unavailable",
+      "resulting_action": "gated_outreach",
+      "provider_error": null,
+      "external_action_taken": false
+    },
+    {
+      "app_name": "Salesforce",
+      "app_slug": "salesforce",
+      "p1_access_route": "partner_gated",
+      "composio_toolkit_slug": "salesforce",
+      "toolkit_available": true,
+      "active_connection_available": false,
+      "capability_state": "connection_required",
+      "resulting_action": "composio_connection_required",
+      "provider_error": null,
+      "external_action_taken": false
+    },
+    {
+      "app_name": "Close",
+      "app_slug": "close",
+      "p1_access_route": "partner_gated",
+      "composio_toolkit_slug": "close",
+      "toolkit_available": true,
+      "active_connection_available": false,
+      "capability_state": "custom_auth_or_approval_required",
+      "resulting_action": "gated_outreach",
+      "provider_error": null,
+      "external_action_taken": false
+    },
+    {
+      "app_name": "Sherlock",
+      "app_slug": "sherlock",
+      "p1_access_route": "blocked",
+      "composio_toolkit_slug": null,
+      "toolkit_available": false,
+      "active_connection_available": false,
+      "capability_state": "toolkit_unavailable",
+      "resulting_action": "configuration_required",
+      "provider_error": null,
+      "external_action_taken": false
+    }
+  ]
+}

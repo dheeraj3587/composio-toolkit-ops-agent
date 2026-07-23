@@ -24,6 +24,7 @@ from api.models import (
     AppResearchResponse,
     AppSearchResponse,
     CreateRunRequest,
+    CredentialSubmissionRequest,
     HealthResponse,
     IdempotencyConflictResponse,
     InternalErrorResponse,
@@ -47,6 +48,7 @@ from api.service import (
 )
 from ops.redaction import install_redacting_filter
 from ops.run_service import (
+    CredentialSubmissionError,
     IdempotencyConflictError,
     RunConflictError,
     validate_idempotency_key,
@@ -303,6 +305,18 @@ def create_app(
             status_code=status.HTTP_409_CONFLICT,
         )
 
+    @application.exception_handler(CredentialSubmissionError)
+    async def credential_submission_handler(
+        request: Request,
+        exc: CredentialSubmissionError,
+    ) -> JSONResponse:
+        del request
+        # reason_code is a fixed, non-sensitive internal code (never a value).
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"error": "credential_submission_rejected", "reason_code": exc.reason_code},
+        )
+
     @application.exception_handler(StarletteHTTPException)
     async def http_error_handler(
         request: Request,
@@ -351,6 +365,35 @@ def create_app(
         idempotency_key: IdempotencyKeyHeader = None,
     ) -> RunDetailResponse:
         return await run_service.create_run(payload, idempotency_key=idempotency_key)
+
+    def _require_local_owner_submission(request: Request) -> None:
+        """Gate credential submission to an opted-in loopback-only owner request."""
+
+        if not _environment_flag("ALLOW_LOCAL_CREDENTIAL_SUBMISSION", default=False):
+            raise StarletteHTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="local credential submission is disabled",
+            )
+        client_host = request.client.host if request.client else None
+        if client_host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+            raise StarletteHTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="credential submission is restricted to loopback",
+            )
+
+    @application.post(
+        "/api/runs/{run_id}/credentials",
+        response_model=RunDetailResponse,
+        responses=common_responses,
+    )
+    async def submit_credentials(
+        run_id: RunId,
+        payload: CredentialSubmissionRequest,
+        request: Request,
+        run_service: ServiceDependency,
+    ) -> RunDetailResponse:
+        _require_local_owner_submission(request)
+        return await run_service.submit_credentials(run_id, payload)
 
     @application.get(
         "/api/runs",

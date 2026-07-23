@@ -10,5 +10,9 @@ export default defineConfig({
     setupFiles: ["./vitest.setup.ts"],
     include: ["src/**/*.test.{ts,tsx}"],
     clearMocks: true,
+    // jsdom environment startup for the heavier form/panel components can exceed
+    // the 5s default under full-suite parallel load, so allow more headroom.
+    testTimeout: 20_000,
+    hookTimeout: 20_000,
   },
 })

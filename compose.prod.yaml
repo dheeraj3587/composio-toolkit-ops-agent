@@ -1,0 +1,159 @@
+# Production deployment for a single DigitalOcean Ubuntu Droplet.
+#
+#   Internet ── :80/:443 ──▶ caddy (reverse proxy, automatic HTTPS)
+#                              ├─ /api/ops/* ─▶ web  (Next.js route handlers)
+#                              ├─ /api/*     ─▶ api  (FastAPI control plane)
+#                              └─ everything ─▶ web  (Next.js UI)
+#
+# Only the reverse proxy publishes ports. The api (8000) and web (3000) services
+# are reachable only on the private "opsnet" network. Secrets are provided at
+# runtime through .env.production and are never baked into images.
+#
+# Verify (no deploy):
+#   docker compose -f compose.prod.yaml --env-file .env.production.example config
+# Build:
+#   docker compose -f compose.prod.yaml --env-file .env.production.example build
+# Deploy:
+#   ./scripts/deploy-droplet.sh
+
+name: composio-ops-prod
+
+services:
+  api:
+    init: true
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    # Provider keys, vault/AES keys, Composio identifiers and CORS origins are
+    # supplied from the untracked .env.production file. Marked not-required so
+    # `docker compose config` can be validated with the example env file.
+    env_file:
+      - path: .env.production
+        required: false
+    # Hard production invariants are pinned here so a misconfigured env file
+    # cannot enable live side effects, docs, or move databases off /data.
+    environment:
+      ALLOW_LIVE_VENDOR_EMAIL: "false"
+      ALLOW_LIVE_BROWSER: "false"
+      OPS_ENABLE_API_DOCS: "false"
+      RUN_LIVE_TESTS: "0"
+      LANGGRAPH_STRICT_MSGPACK: "true"
+      OPS_DB_PATH: /data/ops.db
+      CHECKPOINT_DB_PATH: /data/checkpoints.db
+      SECRET_VAULT_DB_PATH: /data/secret_vault.db
+      PROVIDER_EFFECTS_DB_PATH: /data/provider_effects.db
+    volumes:
+      - ops_data:/data
+    networks:
+      - opsnet
+    restart: unless-stopped
+    stop_grace_period: 30s
+    pids_limit: 256
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/system/health', timeout=3)
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  web:
+    init: true
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    # Only server-only, non-secret values reach the frontend container. Provider
+    # secrets are intentionally NOT passed here. OPS_API_URL is read exclusively
+    # by Next.js server code (see web/src/lib/api.ts) and is never exposed to the
+    # browser bundle.
+    environment:
+      NODE_ENV: production
+      OPS_API_URL: ${OPS_API_URL:-http://api:8000}
+      OPS_DEMO_MODE: ${OPS_DEMO_MODE:-false}
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - opsnet
+    restart: unless-stopped
+    stop_grace_period: 30s
+    pids_limit: 256
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+      - /app/.next/cache:rw,noexec,nosuid,nodev,size=128m,uid=1000,gid=1000
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  caddy:
+    image: caddy:2.10-alpine
+    depends_on:
+      web:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    # The reverse proxy is the only publicly reachable service.
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:-your-domain.example}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - opsnet
+    restart: unless-stopped
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --spider
+        - -q
+        - http://127.0.0.1:80/
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+networks:
+  opsnet:
+    driver: bridge
+
+volumes:
+  # Persistent SQLite state: ops.db, checkpoints.db, secret_vault.db,
+  # provider_effects.db. A first-run named volume inherits the ops:0700
+  # ownership pre-created in Dockerfile.api at /data.
+  ops_data:
+  # Caddy certificate + ACME account state. Preserve across redeploys to avoid
+  # re-issuing certificates and hitting rate limits.
+  caddy_data:
+  caddy_config:

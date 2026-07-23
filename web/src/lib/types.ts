@@ -109,11 +109,10 @@ export interface SecurityState {
 }
 
 export interface HitlRequest {
-  kind: "captcha" | "otp" | "legal_approval" | "billing" | "identity" | "manual_review" | "other"
-  title: string
-  instruction: string
-  requested_at?: string | null
-  expires_at?: string | null
+  action_type: string
+  message: string
+  expected_completion_signal: string
+  resumable: boolean
 }
 
 export interface RouteDecision {
@@ -163,7 +162,10 @@ export interface HealthCheck {
 
 export interface ProviderStatus {
   provider: string
-  status: "ready" | "configured" | "configuration_required" | "disabled" | "unavailable"
+  // Backend emits: not_configured | disabled | configured_not_verified | ready |
+  // schema_incompatible. Kept as a string so the interface renders the exact
+  // backend-reported status without silently dropping unmapped values.
+  status: string
   detail: string
   live_tested?: boolean
 }
@@ -190,7 +192,7 @@ export interface OperationsRequestInput {
   app_name: string
   company: CompanyProfileInput
   requested_scope_policy: "minimum" | "recommended" | "maximum"
-  dry_run: true
+  execution_mode: ExecutionMode
   outreach_recipient_override: string | null
 }
 
@@ -213,6 +215,8 @@ export interface IntegratorOutput {
   callback_urls: string[]
   credential_refs: Record<string, string>
   access_route: AccessRoute
+  provider_account_id?: string | null
+  developer_app_id?: string | null
   evidence_urls: string[]
   operational_notes: string[]
   created_at: string

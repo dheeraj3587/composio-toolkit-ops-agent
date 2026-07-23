@@ -47,6 +47,16 @@ def _integer(value: str | None, *, default: int) -> int:
         raise ValueError("integer environment value is invalid") from None
 
 
+def _float(value: str | None, *, default: float) -> float:
+    normalized = _optional(value)
+    if normalized is None:
+        return default
+    try:
+        return float(normalized)
+    except ValueError:
+        raise ValueError("float environment value is invalid") from None
+
+
 def _csv(value: str | None) -> tuple[str, ...]:
     normalized = _optional(value)
     if normalized is None:
@@ -73,6 +83,22 @@ class Settings(BaseModel):
     langgraph_strict_msgpack: bool = True
     composio_user_id: str = "ops-assignment-user"
     composio_gmail_connected_account_id: str | None = None
+
+    # Gemini production model is pinned to a specific stable id by default; a
+    # hot-swapped ``*-latest`` alias is intentionally not the default. The
+    # fallback chain is tried in order when a model is unavailable/overloaded.
+    gemini_model: str = "gemini-3.6-flash"
+
+    @property
+    def gemini_model_chain(self) -> tuple[str, ...]:
+        """Ordered, de-duplicated Gemini model fallback chain."""
+
+        ordered = [self.gemini_model, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"]
+        return tuple(dict.fromkeys(model for model in ordered if model))
+    # Small hard cost cap for a single bounded Browser Use session/run.
+    browser_use_max_cost_usd: float = Field(default=0.50, gt=0)
+    # Owner-only local credential submission is opt-in and loopback-only.
+    allow_local_credential_submission: bool = False
 
     company_legal_name: str | None = None
     company_website: str | None = None
@@ -128,6 +154,13 @@ class Settings(BaseModel):
             "composio_user_id": _optional(source.get("COMPOSIO_USER_ID")) or "ops-assignment-user",
             "composio_gmail_connected_account_id": _optional(
                 source.get("COMPOSIO_GMAIL_CONNECTED_ACCOUNT_ID")
+            ),
+            "gemini_model": _optional(source.get("GEMINI_MODEL")) or "gemini-3.5-flash",
+            "browser_use_max_cost_usd": _float(
+                source.get("BROWSER_USE_MAX_COST_USD"), default=0.50
+            ),
+            "allow_local_credential_submission": _boolean(
+                source.get("ALLOW_LOCAL_CREDENTIAL_SUBMISSION"), default=False
             ),
             "company_legal_name": _optional(source.get("COMPANY_LEGAL_NAME")),
             "company_website": _optional(source.get("COMPANY_WEBSITE")),

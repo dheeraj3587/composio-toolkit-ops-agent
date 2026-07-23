@@ -127,11 +127,10 @@ const securityState = z.strictObject({
 })
 
 const hitlRequest = z.strictObject({
-  kind: z.enum(["captcha", "otp", "legal_approval", "billing", "identity", "manual_review", "other"]),
-  title: boundedText(160),
-  instruction: boundedText(1_000),
-  requested_at: isoTimestamp.nullable().optional(),
-  expires_at: isoTimestamp.nullable().optional(),
+  action_type: boundedText(120),
+  message: boundedText(1_000),
+  expected_completion_signal: boundedText(500),
+  resumable: z.boolean(),
 })
 
 const routeDecision = z.strictObject({
@@ -142,8 +141,12 @@ const routeDecision = z.strictObject({
 })
 
 const providerStatus = z.strictObject({
+  // The backend ProviderState status vocabulary (not_configured,
+  // configured_not_verified, ready, disabled, schema_incompatible) is validated
+  // as a bounded token rather than a fixed enum so new backend-reported states
+  // render truthfully instead of being rejected as invalid responses.
   provider: safeToken,
-  status: z.enum(["ready", "configured", "configuration_required", "disabled", "unavailable"]),
+  status: safeToken,
   detail: boundedText(500),
   live_tested: z.boolean().optional(),
 })
@@ -200,6 +203,8 @@ const integratorBundle = z.strictObject({
   callback_urls: z.array(httpUrl).max(20),
   credential_refs: z.record(z.string().regex(/^[A-Za-z0-9_-]{1,120}$/), vaultReference),
   access_route: accessRoute,
+  provider_account_id: boundedText(200).nullish(),
+  developer_app_id: boundedText(200).nullish(),
   evidence_urls: z.array(httpUrl).max(100),
   operational_notes: z.array(boundedText(1_000)).max(100),
   created_at: isoTimestamp,

@@ -15,6 +15,7 @@ from api.models import (
     AppSearchResponse,
     AppSummary,
     CreateRunRequest,
+    CredentialSubmissionRequest,
     HealthCheck,
     HealthResponse,
     PhaseState,
@@ -31,6 +32,7 @@ from api.models import (
 )
 from ops.config import Settings, load_settings
 from ops.models import CompanyProfile, OperationalResearch, OperationsRequest
+from ops.run_service import CredentialSubmissionError
 from ops.run_service import RunService as CoreRunService
 
 
@@ -78,6 +80,12 @@ class RunService(Protocol):
         idempotency_key: str | None = None,
     ) -> RunDetailResponse: ...
 
+    async def submit_credentials(
+        self,
+        run_id: str,
+        request: CredentialSubmissionRequest,
+    ) -> RunDetailResponse: ...
+
     async def list_runs(self, *, limit: int, offset: int) -> RunListResponse: ...
 
     async def get_run(self, run_id: str) -> RunDetailResponse: ...
@@ -106,12 +114,22 @@ _EVENT_SUMMARIES = {
     "operational_research_built": "Provider-agnostic operational research built.",
     "route_pending": "Access route remains unknown; one bounded enrichment probe is available.",
     "route_selected": "Access route selected.",
+    "composio_capability_evaluated": "Composio toolkit capability evaluated.",
+    "browser_session_started": "Controlled browser session started.",
+    "browser_navigation_completed": "Browser navigation to the official setup page completed.",
+    "credential_page_ready": "Official credential/developer setup page reached.",
+    "browser_hitl_required": "Human action required in the live browser.",
     "hitl_requested": "Human action requested.",
     "hitl_resumed": "Human action completed; run resumed.",
     "outreach_sent": "Provider outreach sent.",
     "reply_received": "Provider reply received and sanitized.",
     "credential_stored": "Credential material stored behind a vault reference.",
     "credential_validated": "Credential validation completed.",
+    "credential_capture_started": "Deterministic credential capture started.",
+    "credentials_stored": "Captured credentials stored behind vault references.",
+    "credential_validation_started": "Read-only credential validation started.",
+    "credentials_validated": "Credential validation completed.",
+    "integrator_bundle_generated": "Reference-only IntegratorBundle generated.",
     "completed": "Run completed.",
 }
 
@@ -530,6 +548,37 @@ class LocalRunService:
             idempotency_key,
             request.execution_mode,
         )
+
+    def _submit_credentials_sync(
+        self,
+        run_id: str,
+        request: CredentialSubmissionRequest,
+    ) -> RunDetailResponse:
+        company = CompanyProfile(
+            legal_name=request.company.legal_name,
+            website=request.company.website,
+            work_email_ref=request.company.work_email_ref,
+            use_case=request.company.use_case,
+            expected_volume=request.company.expected_volume,
+            callback_urls=request.company.callback_urls,
+        )
+        try:
+            record = self._service.submit_owner_credentials(
+                run_id,
+                company=company,
+                fields=dict(request.credentials),
+            )
+        except KeyError:
+            raise RunNotFoundError(run_id) from None
+        return self._detail(self._summary(record))
+
+    async def submit_credentials(
+        self,
+        run_id: str,
+        request: CredentialSubmissionRequest,
+    ) -> RunDetailResponse:
+        self._require_started()
+        return await run_in_threadpool(self._submit_credentials_sync, run_id, request)
 
     async def list_runs(self, *, limit: int, offset: int) -> RunListResponse:
         self._require_started()

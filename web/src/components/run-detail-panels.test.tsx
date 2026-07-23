@@ -1,8 +1,8 @@
 import { render, screen } from "@testing-library/react"
 import { axe } from "jest-axe"
 
-import { HitlPanel, ResearchPanel, SecurityPanel } from "@/components/run-detail-panels"
-import type { OperationalResearch } from "@/lib/types"
+import { HitlPanel, OutputPanel, ResearchPanel, SecurityPanel } from "@/components/run-detail-panels"
+import type { IntegratorOutput, OperationalResearch } from "@/lib/types"
 
 const research: OperationalResearch = {
   app_name: "Unsafe-looking but escaped",
@@ -25,6 +25,24 @@ const research: OperationalResearch = {
   confidence: 0.9,
 }
 
+const output: IntegratorOutput = {
+  app_name: "Example",
+  app_slug: "example",
+  readiness: "credentials_ready",
+  api_type: "REST",
+  api_base_url: "https://api.example.com",
+  auth_scheme: "OAuth 2.0",
+  authorization_url: "https://example.com/oauth/authorize",
+  token_url: "https://example.com/oauth/token",
+  scopes: ["records:read"],
+  callback_urls: ["https://integrator.example.com/oauth/callback"],
+  credential_refs: { client_id: "vault://example/oauth/client_id_1" },
+  access_route: "self_serve",
+  evidence_urls: ["https://example.com/docs/oauth"],
+  operational_notes: ["Validated against the read-only endpoint."],
+  created_at: "2026-07-23T10:00:00Z",
+}
+
 describe("safe run detail panels", () => {
   it("renders backend text as text rather than executable HTML", () => {
     const { container } = render(<ResearchPanel research={research} />)
@@ -38,13 +56,28 @@ describe("safe run detail panels", () => {
     expect(screen.queryByRole("button", { name: /reveal|show.*secret|copy.*secret/i })).not.toBeInTheDocument() // pragma: allowlist secret
   })
 
+  it("renders a reference-only IntegratorBundle without credential reference values", () => {
+    render(<OutputPanel output={output} />)
+
+    expect(screen.getByText("Integrator bundle")).toBeInTheDocument()
+    expect(screen.getByText("Credentials Ready")).toBeInTheDocument()
+    expect(screen.getAllByText("1", { selector: "p" })).toHaveLength(2)
+    expect(screen.queryByText(output.credential_refs.client_id)).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: /reveal|copy|export/i })).not.toBeInTheDocument()
+  })
+
   it("only renders a HITL action when a real request exists", () => {
     const { rerender } = render(<HitlPanel request={null} action={<button>Resume run</button>} />)
     expect(screen.queryByRole("button", { name: "Resume run" })).not.toBeInTheDocument()
 
     rerender(
       <HitlPanel
-        request={{ kind: "otp", title: "Enter the provider OTP", instruction: "Complete the OTP step in the controlled session." }}
+        request={{
+          action_type: "otp",
+          message: "Complete the OTP step in the controlled session.",
+          expected_completion_signal: "otp_confirmed",
+          resumable: true,
+        }}
         action={<button>Resume run</button>}
       />,
     )

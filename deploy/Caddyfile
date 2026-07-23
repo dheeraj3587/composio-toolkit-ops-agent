@@ -1,0 +1,65 @@
+# Reverse proxy for the Composio Toolkit Ops control plane.
+#
+# The DOMAIN environment variable (from .env.production) selects the site
+# address and therefore the TLS behavior:
+#
+#   Production (real hostname with public DNS pointing at the Droplet):
+#     DOMAIN=ops.example.com
+#     -> Caddy obtains and renews certificates automatically over HTTPS on :443
+#        and redirects :80 -> :443.
+#
+#   Development / IP-only fallback (no domain yet):
+#     DOMAIN=:80
+#     -> Caddy serves plain HTTP on :80 for any host. No certificate is issued.
+#        Reach the app at http://<droplet-ip>/ . Do not use this for real
+#        credentials or provider work; there is no transport encryption.
+#
+# ACME_EMAIL is optional and only used for certificate expiry notices.
+
+{
+	admin off
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	# Compress text responses.
+	encode zstd gzip
+
+	# Bound request bodies. Control-plane requests are small JSON payloads.
+	request_body {
+		max_size 10MB
+	}
+
+	# Remove server fingerprinting.
+	header -Server
+
+	# Ordered routing (a `route` block preserves written order; first match wins):
+	#   1. Next.js owns its browser-facing route handlers under /api/ops/*.
+	#   2. All other /api/* traffic is the FastAPI control plane.
+	#   3. Everything else is the Next.js UI.
+	#
+	# Caddy's reverse_proxy automatically sets X-Forwarded-For, X-Forwarded-Proto
+	# and X-Forwarded-Host, and forwards the original Host header upstream.
+	route {
+		reverse_proxy /api/ops/* web:3000 {
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 30s
+			}
+		}
+
+		reverse_proxy /api/* api:8000 {
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 30s
+			}
+		}
+
+		reverse_proxy web:3000 {
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 30s
+			}
+		}
+	}
+}

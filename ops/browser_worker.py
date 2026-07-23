@@ -1,4 +1,4 @@
-"""Fail-closed Browser Use boundary and trusted raw-browser execution."""
+"""Browser Use Cloud v3 boundary and trusted raw-browser execution."""
 
 from __future__ import annotations
 
@@ -6,8 +6,11 @@ import importlib
 import ipaddress
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol, TypeVar
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from ops.config import Settings
 from ops.models import OperationalResearch
@@ -17,6 +20,28 @@ from ops.provider_errors import (
     ProviderContractError,
     ProviderOperationError,
 )
+
+# Bounded windows used to describe session lifetime in sanitized state. The
+# signed live-view URL is never represented; only its presence is recorded.
+_INACTIVITY_WINDOW = timedelta(minutes=15)
+_MAXIMUM_WINDOW = timedelta(hours=4)
+
+
+class BrowserTaskOutput(BaseModel):
+    """Strict structured output required from every bounded Browser Use task.
+
+    The agent never returns credential values, cookies, or tokens. It reports
+    only where it is and whether a human must act. Host validation is performed
+    against ``current_url`` after the task completes.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    current_url: str = Field(min_length=1, max_length=2_000)
+    reached_official_setup_page: bool = False
+    hitl_required: bool = False
+    hitl_reason: str | None = Field(default=None, max_length=500)
+    safe_summary: str = Field(default="", max_length=1_000)
 
 BrowserObservationStatus = Literal[
     "navigating",
@@ -122,26 +147,68 @@ class TrustedRawBrowserOperation(Protocol[T_co]):
 
 
 class BrowserWorker:
-    """Browser Use Cloud adapter that refuses unsafe agent-session execution.
+    """Browser Use Cloud v3 agent-session adapter (browser-use-sdk>=3.10).
 
-    Installed Browser Use v3 agent sessions do not expose a typed
-    ``allowed_domains`` control or attachable CDP endpoint. Agent navigation is
-    therefore contract-incompatible, not silently downgraded. V3 raw browsers
-    are available only to a trusted deterministic operation that performs host
-    checks immediately before each sensitive action.
+    A single ``keep_alive`` session is created without a task, then one bounded
+    task runs against it and the same ``session_id`` is reused for HITL resume.
+    The installed public ``run``/``sessions.create`` signatures do not expose an
+    ``allowed_domains`` control, so host safety is enforced by verifying the
+    structured ``current_url`` against domains derived from the verified research
+    after each task; recording is disabled and the signed live URL is never
+    persisted, logged, or returned across a boundary.
     """
 
     def __init__(self, *, settings: Settings | None = None, client: object | None = None) -> None:
         self._settings = settings or Settings.from_env()
         self._client: Any = client
+        # Signed live-view URLs live only here, keyed by session, for the
+        # worker's own operational use. They never cross a boundary.
+        self._live_urls: dict[str, str] = {}
+        # Verified research cached per session so a same-session HITL resume can
+        # re-derive the official allowlist without changing the graph contract.
+        self._research: dict[str, OperationalResearch] = {}
 
     async def start(self, profile_id: str | None) -> BrowserSessionContext:
-        del profile_id
         self._require_configuration()
-        raise ProviderContractError(
-            phase=5,
-            capability="Browser Use agent session",
-            reason_code="v3_domain_restriction_unavailable",
+        client = self._get_client()
+        create_kwargs: dict[str, Any] = {
+            "keep_alive": True,
+            "enable_recording": False,
+            "max_cost_usd": self._settings.browser_use_max_cost_usd,
+        }
+        # Only send profile_id when present: an explicit null is rejected by the
+        # current Browser Use API deployment.
+        if profile_id:
+            create_kwargs["profile_id"] = profile_id
+        try:
+            session = await client.sessions.create(**create_kwargs)
+        except Exception:
+            # Ambiguous creation: the session may or may not exist (for example a
+            # read timeout after the server provisioned it). Signal outcome-unknown
+            # so the graph reconciles rather than blindly retrying.
+            raise ProviderOperationError(
+                capability="Browser Use session",
+                reason_code="provider_outcome_unknown",
+            ) from None
+        data = _dump(session)
+        session_id = _string(data.get("id"))
+        if not session_id:
+            raise ProviderOperationError(
+                capability="Browser Use session",
+                reason_code="provider_outcome_unknown",
+            )
+        live_url = _string(data.get("live_url"))
+        if live_url:
+            self._live_urls[session_id] = live_url
+        now = datetime.now(UTC)
+        return BrowserSessionContext(
+            profile_id=profile_id or session_id,
+            session_id=session_id,
+            live_view_available=bool(live_url),
+            allowed_domains=(),
+            created_at=_isoformat(now),
+            inactivity_expires_at=_isoformat(now + _INACTIVITY_WINDOW),
+            maximum_expires_at=_isoformat(now + _MAXIMUM_WINDOW),
         )
 
     async def navigate_onboarding(
@@ -149,34 +216,112 @@ class BrowserWorker:
         context: BrowserSessionContext,
         research: OperationalResearch,
     ) -> BrowserObservation:
-        del context, research
         self._require_configuration()
-        raise ProviderContractError(
-            phase=5,
-            capability="browser onboarding",
-            reason_code="v3_domain_restriction_unavailable",
+        if context.session_id:
+            self._research[context.session_id] = research
+        return await self._run_bounded_task(
+            context=context,
+            research=research,
+            resume_signal=None,
         )
 
     async def resume_after_hitl(
         self,
         context: BrowserSessionContext,
         signal: str,
+        research: OperationalResearch | None = None,
     ) -> BrowserObservation:
-        del context, signal
         self._require_configuration()
-        raise ProviderContractError(
-            phase=5,
-            capability="browser HITL resume",
-            reason_code="v3_domain_restriction_unavailable",
+        resolved = research or self._research.get(context.session_id)
+        if resolved is None:
+            raise ProviderOperationError(
+                capability="browser HITL resume",
+                reason_code="verified_research_required",
+            )
+        return await self._run_bounded_task(
+            context=context,
+            research=resolved,
+            resume_signal=signal,
         )
 
+    def live_url(self, session_id: str) -> str | None:
+        """Owner-only, in-memory accessor for the ephemeral signed live URL.
+
+        The value never crosses a durable boundary (state, checkpoint, ledger,
+        API, or frontend). It exists only for the owner's local interaction while
+        the worker instance is alive.
+        """
+
+        return self._live_urls.get(session_id)
+
     async def stop(self, context: BrowserSessionContext) -> None:
-        del context
         self._require_configuration()
-        raise ProviderContractError(
-            phase=5,
-            capability="Browser Use agent session stop",
-            reason_code="v3_domain_restriction_unavailable",
+        client = self._get_client()
+        self._live_urls.pop(context.session_id, None)
+        try:
+            await client.sessions.stop(context.session_id)
+        except Exception:
+            raise ProviderOperationError(
+                capability="Browser Use agent session stop",
+                reason_code="provider_request_failed",
+            ) from None
+
+    async def _run_bounded_task(
+        self,
+        *,
+        context: BrowserSessionContext,
+        research: OperationalResearch,
+        resume_signal: str | None,
+    ) -> BrowserObservation:
+        allowed_domains = _official_domains_from_research(research)
+        target_url = _official_target_url(research, allowed_domains)
+        task = _render_browser_task(target_url, allowed_domains, resume_signal)
+        client = self._get_client()
+        try:
+            run_handle = client.run(
+                task,
+                schema=BrowserTaskOutput,
+                session_id=context.session_id,
+                keep_alive=True,
+                max_cost_usd=self._settings.browser_use_max_cost_usd,
+                enable_recording=False,
+            )
+            result = await _await_if_needed(run_handle)
+        except Exception:
+            raise ProviderOperationError(
+                capability="browser onboarding",
+                reason_code="provider_request_failed",
+            ) from None
+        output = _coerce_task_output(result)
+        current_url = sanitize_browser_url(output.current_url)
+        if not is_allowed_browser_url(current_url, allowed_domains):
+            # The agent left the verified official allowlist: stop and fail closed.
+            try:
+                await client.sessions.stop(context.session_id)
+            except Exception:
+                pass
+            self._live_urls.pop(context.session_id, None)
+            raise ProviderOperationError(
+                capability="browser onboarding",
+                reason_code="provider_policy_violation",
+            )
+        title = (output.safe_summary or "Developer setup page")[:500]
+        if output.hitl_required:
+            reason = output.hitl_reason or "A human action is required in the live browser."
+            return BrowserObservation(
+                status="human_action_required",
+                current_url=current_url,
+                page_title=title,
+                human_action_type=_classify_human_action(reason),
+                human_instruction=reason[:1_000],
+            )
+        status: BrowserObservationStatus = (
+            "credential_page_ready" if output.reached_official_setup_page else "navigating"
+        )
+        return BrowserObservation(
+            status=status,
+            current_url=current_url,
+            page_title=title,
         )
 
     async def run_trusted_raw_browser(
@@ -285,8 +430,12 @@ class BrowserWorker:
                 raise RuntimeError("Browser Use configuration is missing")
             module = importlib.import_module("browser_use_sdk.v3")
             client_type = module.AsyncBrowserUse
+            # Cloud session provisioning can exceed a short client timeout; a
+            # generous bound avoids a ReadTimeout that would otherwise be treated
+            # as an ambiguous (outcome-unknown) creation.
             self._client = client_type(
-                api_key=self._settings.browser_use_api_key.get_secret_value()
+                api_key=self._settings.browser_use_api_key.get_secret_value(),
+                timeout=120.0,
             )
         return self._client
 
@@ -359,10 +508,160 @@ def sanitize_browser_url(value: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
 
 
+def _dump(value: object) -> dict[str, Any]:  # pragma: no cover - live only
+    """Read documented public fields via ``model_dump``; never parse ``repr``."""
+
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        try:
+            # JSON mode yields native types (UUID -> str, datetime -> ISO str),
+            # so downstream string handling is uniform and never sees a UUID.
+            result = dump(mode="json")
+        except TypeError:
+            result = dump()
+        if isinstance(result, dict):
+            return result
+    if isinstance(value, dict):
+        return dict(value)
+    return {
+        name: getattr(value, name)
+        for name in ("id", "live_url", "status", "output", "is_task_successful")
+        if hasattr(value, name)
+    }
+
+
+def _string(value: object) -> str:  # pragma: no cover - live only
+    return value if isinstance(value, str) and value else ""
+
+
+def _isoformat(moment: datetime) -> str:
+    return moment.isoformat().replace("+00:00", "Z")
+
+
+async def _await_if_needed(value: Any) -> Any:  # pragma: no cover - live only
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+def _coerce_task_output(result: Any) -> BrowserTaskOutput:  # pragma: no cover - live only
+    """Validate the structured task output defensively from public fields only."""
+
+    if isinstance(result, BrowserTaskOutput):
+        return result
+    data = _dump(result)
+    output = data.get("output", data)
+    if isinstance(output, BrowserTaskOutput):
+        return output
+    if isinstance(output, str):
+        return BrowserTaskOutput.model_validate_json(output)
+    if isinstance(output, dict):
+        return BrowserTaskOutput.model_validate(output)
+    dumped = getattr(output, "model_dump", None)
+    if callable(dumped):
+        return BrowserTaskOutput.model_validate(dumped())
+    raise ProviderOperationError(
+        capability="browser onboarding",
+        reason_code="structured_output_missing",
+    )
+
+
+def _official_domains_from_research(research: OperationalResearch) -> tuple[str, ...]:
+    """Derive a bounded official hostname allowlist from verified research URLs."""
+
+    urls = [
+        research.developer_portal_url,
+        research.signup_url,
+        research.api_base_url,
+        research.authorization_url,
+        research.token_url,
+        *research.evidence_urls,
+    ]
+    hosts: list[str] = []
+    for url in urls:
+        if not isinstance(url, str) or not url:
+            continue
+        hostname = (urlsplit(url).hostname or "").rstrip(".").casefold()
+        if hostname and hostname not in hosts:
+            hosts.append(hostname)
+    if not hosts:
+        raise ProviderOperationError(
+            capability="browser onboarding",
+            reason_code="official_domains_unavailable",
+        )
+    return validate_allowed_domains(tuple(hosts[:20]))
+
+
+def _official_target_url(
+    research: OperationalResearch,
+    allowed_domains: tuple[str, ...],
+) -> str:
+    """Select the verified official developer/setup entry URL."""
+
+    for candidate in (
+        research.developer_portal_url,
+        research.signup_url,
+        research.api_base_url,
+    ):
+        if isinstance(candidate, str) and candidate:
+            safe = sanitize_browser_url(candidate)
+            if is_allowed_browser_url(safe, allowed_domains):
+                return safe
+    raise ProviderOperationError(
+        capability="browser onboarding",
+        reason_code="official_target_url_unavailable",
+    )
+
+
+def _render_browser_task(
+    target_url: str,
+    allowed_domains: tuple[str, ...],
+    resume_signal: str | None,
+) -> str:  # pragma: no cover - live only
+    allowlist = ", ".join(allowed_domains)
+    resume_note = (
+        f"The human just reported: '{resume_signal}'. Continue from the current page. "
+        if resume_signal
+        else ""
+    )
+    return (
+        "You are assisting an authorized owner with developer API onboarding. "
+        f"{resume_note}"
+        f"Open only {target_url} and stay strictly within these hostnames: {allowlist}. "
+        "Navigate toward the API credential or developer-app setup page. "
+        "Never submit payment or billing details. Never accept legal agreements. "
+        "Never bypass login, CAPTCHA, MFA, email verification, consent, or account "
+        "ownership checks. If any such gate appears, stop and set hitl_required=true "
+        "with a short hitl_reason. Never read, type, copy, or report any password, "
+        "secret, token, cookie, or credential value. Report only the structured fields: "
+        "current_url, reached_official_setup_page, hitl_required, hitl_reason, safe_summary."
+    )
+
+
+def _classify_human_action(reason: str) -> HumanActionType:
+    lowered = reason.casefold()
+    mapping: tuple[tuple[tuple[str, ...], HumanActionType], ...] = (
+        (("captcha", "recaptcha", "challenge"), "captcha"),
+        (("email", "verification code", "verify your email"), "email_otp"),
+        (("sms", "text message", "phone"), "phone_otp"),
+        (("passkey",), "passkey"),
+        (("security key", "hardware key", "yubikey"), "security_key"),
+        (("device", "approve on"), "device_approval"),
+        (("legal", "terms", "agreement", "consent"), "legal_acceptance"),
+        (("billing", "payment", "card", "subscription"), "billing"),
+        (("select account", "choose account", "which account"), "account_selection"),
+    )
+    for needles, action in mapping:
+        if any(needle in lowered for needle in needles):
+            return action
+    return "provider_verification"
+
+
 __all__ = [
     "BrowserObservation",
     "BrowserObservationStatus",
     "BrowserSessionContext",
+    "BrowserTaskOutput",
     "BrowserWorker",
     "HumanActionType",
     "PhaseUnavailableError",

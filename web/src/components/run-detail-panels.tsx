@@ -187,9 +187,12 @@ export function HitlPanel({ request, action }: { request: HitlRequest | null | u
       <CardContent className="flex min-h-52 flex-col justify-between px-5 py-5">
         <div className="flex items-start justify-between gap-3"><span className="grid size-8 place-items-center rounded-md bg-amber-100"><UserRoundCheck className="size-4 text-amber-700" aria-hidden="true" /></span><StatusBadge status="waiting_for_hitl" /></div>
         <div>
-          <p className="font-mono text-[9px] uppercase tracking-[0.12em] text-amber-800">{humanize(request.kind)}</p>
-          <h3 className="mt-1 text-base font-semibold text-amber-950">{request.title}</h3>
-          <p className="mt-2 text-xs leading-5 text-amber-900/70">{request.instruction}</p>
+          <p className="font-mono text-[9px] uppercase tracking-[0.12em] text-amber-800">Human action · {humanize(request.action_type)}</p>
+          <h3 className="mt-1 text-base font-semibold text-amber-950">{humanize(request.action_type)}</h3>
+          <p className="mt-2 text-xs leading-5 text-amber-900/70">{request.message}</p>
+          <p className="mt-3 font-mono text-[9px] uppercase tracking-[0.1em] text-amber-800/80">
+            Resume signal · {humanize(request.expected_completion_signal)}
+          </p>
           {action ? <div className="mt-4 border-t border-amber-200 pt-4">{action}</div> : null}
         </div>
       </CardContent>

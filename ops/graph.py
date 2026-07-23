@@ -16,6 +16,7 @@ from pydantic import SecretStr
 
 from ops.browser_worker import BrowserObservation, BrowserSessionContext
 from ops.config import Settings
+from ops.effect_ledger import EffectStore
 from ops.gmail_worker import GmailSendResult
 from ops.integrator import BundleStage, build_integrator_bundle
 from ops.models import (
@@ -75,11 +76,15 @@ class WorkflowDependencies:
         browser: WorkflowBrowser | None = None,
         gmail: WorkflowGmail | None = None,
         browser_profile_id: str | None = None,
+        effect_store: EffectStore | None = None,
     ) -> None:
         self.research_loader = research_loader or _load_verified_baseline
         self.browser = browser
         self.gmail = gmail
         self.browser_profile_id = browser_profile_id
+        # Reused effect ledger for effectively-once external actions (browser
+        # session start). When absent, no reservation is performed.
+        self.effect_store = effect_store
 
 
 class DurableOperationsWorkflow:
@@ -275,14 +280,42 @@ class DurableOperationsWorkflow:
                     reason_code="browser_adapter_missing",
                 ),
             )
+        effect_key = f"{state['run_id']}:browser-start"
+        store = self._dependencies.effect_store
+        if store is not None:
+            reservation = store.reserve(
+                provider="browser_use",
+                action="start_session",
+                idempotency_key=effect_key,
+            )
+            if reservation.status == "reconcile_required":
+                return _outcome_unknown_update(state, "Browser Use session")
+            if reservation.status == "completed":  # pragma: no cover - fresh key per run
+                return {}
         try:
             context = _run_async(
                 self._dependencies.browser.start(self._dependencies.browser_profile_id)
             )
         except PhaseUnavailableError as exc:
             return _unavailable_update(state, exc)
-        except ProviderOperationError as exc:
-            return _failed_update(state, exc.capability, exc.reason_code)
+        except ProviderOperationError:
+            # Ambiguous session start: the session may or may not exist. Mark the
+            # reservation outcome-unknown so no blind retry occurs; reconciliation
+            # is required before any further attempt.
+            if store is not None:
+                store.mark_outcome_unknown(
+                    provider="browser_use",
+                    action="start_session",
+                    idempotency_key=effect_key,
+                )
+            return _outcome_unknown_update(state, "Browser Use session")
+        if store is not None:
+            store.complete(
+                provider="browser_use",
+                action="start_session",
+                idempotency_key=effect_key,
+                receipt={"session_id": context.session_id},
+            )
         return {
             "browser_profile_id": context.profile_id,
             "browser_session_id": context.session_id,
@@ -672,18 +705,59 @@ def _failed_update(state: OperationsState, capability: str, reason_code: str) ->
     }
 
 
+def _outcome_unknown_update(state: OperationsState, capability: str) -> dict[str, object]:
+    """Record an ambiguous external outcome without claiming success or retrying."""
+
+    capability_state = CapabilityAvailability(
+        capability=capability,
+        status="configuration_required",
+        reason_code="browser_outcome_unknown",
+        detail="The provider outcome is ambiguous; reconciliation is required before any retry.",
+    )
+    return {
+        "status": "configuration_required",
+        "capability_statuses": [
+            *state.get("capability_statuses", []),
+            capability_state.model_dump(mode="json"),
+        ],
+        "errors": [
+            *state.get("errors", []),
+            {"capability": capability, "reason_code": "browser_outcome_unknown"},
+        ],
+    }
+
+
 def _outreach_message(
     request: OperationsRequest,
     research: OperationalResearch,
 ) -> tuple[str, str]:
+    """Build a deterministic outreach from sanitized company and research fields.
+
+    The message contains only non-secret operational facts: provider/app name,
+    company legal name and website, a bounded use-case summary, and explicit
+    requests for developer access, scopes, approval steps, sandbox availability,
+    and the credentials process. It never contains secrets, tokens, vault
+    values, browser URLs, prompts, or checkpoint data.
+    """
+
     short_id = research.app_slug[:40]
     subject = f"API access request for {research.app_name} [{short_id}]"
-    scopes = ", ".join(scope.name for scope in research.scopes) or "documented integration scopes"
+    scopes = (
+        ", ".join(scope.name for scope in research.scopes) or "the documented integration scopes"
+    )
+    use_case = request.company.use_case[:500]
     body = (
-        f"{request.company.legal_name} is requesting production API access for "
-        f"{research.app_name}.\n\nUse case: {request.company.use_case}\n"
-        f"Requested access: {scopes}.\n"
-        "Please confirm the production access process and credential issuance requirements."
+        "Hello,\n\n"
+        f"{request.company.legal_name} ({request.company.website}) is requesting developer "
+        f"and production API access for {research.app_name}.\n\n"
+        f"Use case: {use_case}\n\n"
+        "To proceed with the integration, we would appreciate confirmation of:\n"
+        f"- the developer/API access request process for {research.app_name}\n"
+        f"- the required OAuth scopes or permissions ({scopes})\n"
+        "- any approval or review steps and their expected timeline\n"
+        "- whether a sandbox or test environment is available\n"
+        "- the credential issuance process for production access\n\n"
+        f"Thank you,\n{request.company.legal_name}"
     )
     return subject, body
 

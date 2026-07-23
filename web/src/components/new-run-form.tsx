@@ -22,6 +22,7 @@ const safeUrl = z.url({ protocol: /^https?$/ })
 const runFormSchema = z.object({
   app_name: z.string().trim().min(2, "Enter an application name.").max(120),
   requested_scope_policy: z.enum(["minimum", "recommended", "maximum"]),
+  execution_mode: z.enum(["plan_only", "execute_when_configured"]),
   callback_urls: z.string().max(2_000).refine((value) => {
     const urls = value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean)
     return urls.length <= 10 && urls.every((url) => safeUrl.safeParse(url).success)
@@ -50,6 +51,7 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
     register,
     control,
     handleSubmit,
+    watch,
     formState: { errors },
   } = useForm<RunFormValues>({
     resolver: zodResolver(runFormSchema),
@@ -57,6 +59,7 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
     defaultValues: {
       app_name: defaultAppName,
       requested_scope_policy: "maximum",
+      execution_mode: "plan_only",
       callback_urls: "",
       outreach_recipient_override: "",
       legal_name: "",
@@ -66,6 +69,7 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
       expected_volume: "",
     },
   })
+  const executionMode = watch("execution_mode")
 
   useEffect(() => {
     if (state.error) toast.error("Run not created", { description: state.error })
@@ -88,8 +92,8 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
           <p className="eyebrow">OperationsRequest</p>
           <h2 className="mt-1 text-lg font-semibold">Define the operating envelope</h2>
         </div>
-        <Badge variant="outline" className="w-fit rounded-md border-emerald-300 bg-emerald-50 text-emerald-800">
-          <ShieldCheck aria-hidden="true" /> Side-effect-free creation
+        <Badge variant="outline" className="w-fit rounded-md border-violet-300 bg-violet-50 text-violet-800">
+          <ShieldCheck aria-hidden="true" /> Backend-gated execution
         </Badge>
       </div>
 
@@ -114,6 +118,29 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
                     <SelectItem value="minimum">Minimum — essential scopes</SelectItem>
                     <SelectItem value="recommended">Recommended — balanced</SelectItem>
                     <SelectItem value="maximum">Maximum — evidence-backed breadth</SelectItem>
+                  </SelectContent>
+                </Select>
+              )}
+            />
+          </Field>
+          <Field
+            label="Execution mode"
+            htmlFor="execution_mode"
+            hint={executionMode === "plan_only"
+              ? "Plan only — no provider side effects are authorized."
+              : "Execution remains subject to backend policy, configuration, and human gates."}
+          >
+            <Controller
+              name="execution_mode"
+              control={control}
+              render={({ field }) => (
+                <Select name={field.name} value={field.value} onValueChange={field.onChange}>
+                  <SelectTrigger id="execution_mode" className="w-full rounded-md bg-white">
+                    <SelectValue placeholder="Choose execution mode" />
+                  </SelectTrigger>
+                  <SelectContent className="rounded-md">
+                    <SelectItem value="plan_only">Plan only</SelectItem>
+                    <SelectItem value="execute_when_configured">Execute when configured</SelectItem>
                   </SelectContent>
                 </Select>
               )}
@@ -164,10 +191,12 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <p className="flex max-w-2xl items-start gap-2 text-xs leading-5 text-muted-foreground">
             <Check className="mt-0.5 size-3.5 shrink-0 text-emerald-600" aria-hidden="true" />
-            Submission creates a local dry-run plan. Any later provider action requires a separate, backend-validated capability command.
+            {executionMode === "plan_only"
+              ? "Plan-only mode keeps external actions disabled."
+              : "Execution can proceed only when backend policy and provider configuration permit each action."}
           </p>
           <Button type="submit" size="lg" disabled={pending} className="h-10 rounded-md px-5">
-            {pending ? "Creating plan…" : "Create dry-run plan"}
+            {pending ? "Creating run…" : "Create operations run"}
             <ArrowRight aria-hidden="true" />
           </Button>
         </div>

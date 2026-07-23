@@ -29,10 +29,14 @@ COPY --chown=root:root data/p1 ./data/p1
 
 RUN find /app/api /app/ops /app/data/p1 -type d -exec chmod 0555 {} + \
     && find /app/api /app/ops /app/data/p1 -type f -exec chmod 0444 {} + \
-    && install -d -o ops -g ops -m 0700 /private
+    && install -d -o ops -g ops -m 0700 /private /data
 
 USER ops
-VOLUME ["/private"]
+# /private preserves the development default; /data is the production mount.
+# Both are pre-created owned by "ops" with mode 0700 so a first-run named volume
+# inherits that ownership and the application's private-file permission checks
+# (ops/private_files.py) pass under the non-root, read-only container.
+VOLUME ["/private", "/data"]
 EXPOSE 8000
 STOPSIGNAL SIGTERM
 

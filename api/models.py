@@ -9,10 +9,16 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SecretStr,
     StringConstraints,
     field_validator,
     model_validator,
 )
+
+CredentialFieldName = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z0-9][a-z0-9_-]{0,99}$", min_length=1, max_length=100),
+]
 
 from ops.models import OperationalResearch
 from ops.state import AccessRoute, RunStatus
@@ -126,6 +132,17 @@ class CreateRunRequest(StrictApiModel):
         return self
 
 
+class CredentialSubmissionRequest(StrictApiModel):
+    """Owner-only credential submission. Raw values are wrapped as ``SecretStr``.
+
+    The values are written straight to the encrypted vault and are never echoed
+    in responses, logs, timeline, checkpoints, or the IntegratorBundle.
+    """
+
+    company: CompanyInput
+    credentials: dict[CredentialFieldName, SecretStr] = Field(min_length=1, max_length=20)
+
+
 class PhaseState(StrictApiModel):
     key: Literal["research", "browser", "hitl", "email", "output"]
     name: str
@@ -227,6 +244,19 @@ class TimelineEvent(StrictApiModel):
 class TimelineResponse(StrictApiModel):
     run_id: str
     items: list[TimelineEvent]
+
+
+class LiveViewResponse(StrictApiModel):
+    """Owner-only, loopback-only ephemeral live-view URL.
+
+    This is the single, deliberate place a signed Browser Use live URL crosses
+    the API boundary. It is read live from the in-memory worker and is never
+    persisted to run state, checkpoints, the ledger, logs, or Git.
+    """
+
+    run_id: str
+    available: bool
+    live_url: str | None = None
 
 
 class ResumeRequest(StrictApiModel):

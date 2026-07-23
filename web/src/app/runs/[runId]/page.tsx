@@ -2,9 +2,10 @@ import type { Metadata } from "next"
 import Link from "next/link"
 import { notFound } from "next/navigation"
 import { connection } from "next/server"
-import { ArrowLeft, CircleOff, Clock3, Fingerprint, Globe2, Mail, Route, ServerCog } from "lucide-react"
+import { ArrowLeft, CircleOff, Clock3, Fingerprint, Globe2, Mail, Route, ServerCog, Settings2 } from "lucide-react"
 
 import { PhaseActionForm } from "@/components/phase-action-form"
+import { RunAutoRefresh } from "@/components/run-auto-refresh"
 import {
   CapabilityPanel,
   HitlPanel,
@@ -45,11 +46,17 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
   const emailPhase = phases.get("email")
   const outputPhase = phases.get("output")
   const researchPhase = phases.get("research")
-  const canResume = detail.run.status === "waiting_for_hitl" && detail.hitl_request != null
+  const canResume =
+    detail.run.status === "waiting_for_hitl" && detail.hitl_request?.resumable === true
   const canPoll = ["outreach_sent", "waiting_for_reply"].includes(detail.run.status)
+  const missingFields = Array.from(new Set([
+    ...(detail.missing_fields ?? []),
+    ...(detail.research?.missing_fields ?? []),
+  ]))
 
   return (
     <div className="page-enter space-y-8">
+      <RunAutoRefresh status={detail.run.status} />
       <Button asChild variant="ghost" size="sm" className="-ml-2 font-mono text-[10px] uppercase tracking-[0.1em]"><Link href="/"><ArrowLeft aria-hidden="true" /> Overview</Link></Button>
 
       <header className="flex flex-col gap-6 border-b border-border pb-7 xl:flex-row xl:items-end xl:justify-between">
@@ -58,17 +65,18 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
           <h1 className="mt-3 text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">{detail.run.app_name}</h1>
           <p className="mt-3 break-all font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">{detail.run.run_id}</p>
         </div>
-        <div className="grid overflow-hidden rounded-md border border-border bg-border sm:grid-cols-3 xl:min-w-[580px]">
-          <Meta icon={Fingerprint} label="Route" value={humanize(detail.run.access_route)} />
+        <div className="grid overflow-hidden rounded-md border border-border bg-border sm:grid-cols-2 xl:min-w-[720px] xl:grid-cols-4">
+          <Meta icon={Fingerprint} label="Access route" value={humanize(detail.run.access_route)} />
+          <Meta icon={Settings2} label="Execution mode" value={humanize(detail.run.execution_mode)} />
           <Meta icon={Clock3} label="Updated · UTC" value={formatTimestamp(detail.run.updated_at)} />
-          <Meta icon={CircleOff} label="External actions" value={detail.run.external_actions ? "Backend reports active" : "Off"} />
+          <Meta icon={CircleOff} label="External actions" value={detail.run.external_actions ? "Enabled" : "Off"} />
         </div>
       </header>
 
-      {detail.missing_fields?.length ? (
+      {missingFields.length ? (
         <Alert className="rounded-md border-amber-300 bg-amber-50 text-amber-950">
           <AlertTitle>Configuration or evidence is incomplete</AlertTitle>
-          <AlertDescription>Missing fields: {detail.missing_fields.map(humanize).join(", ")}. The interface does not mark blocked capabilities as successful.</AlertDescription>
+          <AlertDescription>Missing fields: {missingFields.map(humanize).join(", ")}. The interface does not mark blocked capabilities as successful.</AlertDescription>
         </Alert>
       ) : null}
 
@@ -149,13 +157,22 @@ function Meta({ icon: Icon, label, value }: { icon: typeof Fingerprint; label: s
 }
 
 function RouteCard({ decision, fallbackRoute }: { decision: { route: string; reason_code: string; explanation: string; is_final?: boolean } | null; fallbackRoute: string | null }) {
+  const reportedRoute = decision?.route ?? fallbackRoute ?? "unknown"
   return (
     <div className="panel rounded-md p-5">
-      <div className="flex items-start justify-between gap-3"><span className="grid size-8 place-items-center rounded-md bg-secondary"><Route className="size-4 text-violet-600" aria-hidden="true" /></span><StatusBadge status={decision?.is_final ? "final" : "evidence_input"} /></div>
+      <div className="flex items-start justify-between gap-3">
+        <span className="grid size-8 place-items-center rounded-md bg-secondary"><Route className="size-4 text-violet-600" aria-hidden="true" /></span>
+        <div className="flex flex-wrap justify-end gap-2">
+          <StatusBadge status={reportedRoute} />
+          <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">
+            {decision?.is_final ? "Final decision" : "Evidence input"}
+          </Badge>
+        </div>
+      </div>
       <p className="mt-5 data-label">Deterministic route</p>
-      <h3 className="mt-1 text-base font-semibold">{humanize(decision?.route ?? fallbackRoute)}</h3>
+      <h3 className="mt-1 text-base font-semibold">{humanize(reportedRoute)}</h3>
       <p className="mt-2 text-xs leading-5 text-muted-foreground">{decision?.explanation ?? "The backend has not reported a final route decision."}</p>
-      {decision?.reason_code ? <p className="mt-3 font-mono text-[9px] uppercase tracking-[0.1em] text-muted-foreground">Reason · {humanize(decision.reason_code)}</p> : null}
+      {decision?.reason_code ? <p className="mt-3 font-mono text-[9px] uppercase tracking-[0.1em] text-muted-foreground">Route reason code · {humanize(decision.reason_code)}</p> : null}
     </div>
   )
 }

@@ -52,6 +52,10 @@ export async function createRunAction(
   const policy = ["minimum", "recommended", "maximum"].includes(requestedPolicy)
     ? (requestedPolicy as OperationsRequestInput["requested_scope_policy"])
     : "maximum"
+  const requestedExecutionMode = value(formData, "execution_mode", 40)
+  const executionMode = ["plan_only", "execute_when_configured"].includes(requestedExecutionMode)
+    ? (requestedExecutionMode as OperationsRequestInput["execution_mode"])
+    : "plan_only"
 
   const invalid: string[] = []
   if (appName.length < 2) invalid.push("app_name")
@@ -83,7 +87,7 @@ export async function createRunAction(
       callback_urls: callbacks ?? [],
     },
     requested_scope_policy: policy,
-    dry_run: true,
+    execution_mode: executionMode,
     outreach_recipient_override: outreachOverride || null,
   }
 
@@ -104,7 +108,7 @@ export async function createRunAction(
     return {
       error: unavailable
         ? "The operations API is unavailable. We could not confirm whether the run was persisted. Check the ledger before retrying."
-        : "The backend rejected this dry run. Review the request and try again.",
+        : "The backend rejected this run request. Review the request and try again.",
       fields: [],
       idempotencyKey,
       requestFingerprint,
