@@ -20,8 +20,14 @@ RUN addgroup --system ops && adduser --system --ingroup ops --home /app ops
 
 WORKDIR /app
 
-COPY requirements-api.txt ./
-RUN python -m pip install --no-cache-dir --requirement requirements-api.txt
+COPY requirements-api.txt requirements-providers.txt ./
+# The API imports the encrypted vault at startup and can wire configured
+# provider adapters at runtime. Install both the core and provider lock files in
+# the production image so health checks and Browser Use never depend on a
+# developer-machine virtual environment.
+RUN python -m pip install --no-cache-dir \
+    --requirement requirements-api.txt \
+    --requirement requirements-providers.txt
 
 COPY --chown=root:root api ./api
 COPY --chown=root:root ops ./ops
