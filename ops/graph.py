@@ -53,6 +53,8 @@ class WorkflowBrowser(Protocol):
         self,
         context: BrowserSessionContext,
         signal: str,
+        *,
+        sensitive_data: Mapping[str, str] | None = None,
     ) -> BrowserObservation: ...
 
 
@@ -77,6 +79,7 @@ class WorkflowDependencies:
         gmail: WorkflowGmail | None = None,
         browser_profile_id: str | None = None,
         effect_store: EffectStore | None = None,
+        outreach_recipient: str | None = None,
     ) -> None:
         self.research_loader = research_loader or _load_verified_baseline
         self.browser = browser
@@ -85,6 +88,10 @@ class WorkflowDependencies:
         # Reused effect ledger for effectively-once external actions (browser
         # session start). When absent, no reservation is performed.
         self.effect_store = effect_store
+        # Controlled fallback outreach recipient (the configured override inbox)
+        # used when verified research carries no provider contact address, e.g.
+        # gated apps. GmailWorker still redirects every send to the override.
+        self.outreach_recipient = outreach_recipient
 
 
 class DurableOperationsWorkflow:
@@ -103,6 +110,11 @@ class DurableOperationsWorkflow:
         self._database_lock = threading.RLock()
         self._thread_locks: dict[str, threading.RLock] = {}
         self._thread_locks_guard = threading.Lock()
+        # In-memory, per-thread login credentials for a single resume() call.
+        # Passed to the browser worker as a call argument and cleared immediately
+        # afterwards so they never enter OperationsState or the encrypted
+        # checkpoint. Guarded by the same per-thread lock resume() holds.
+        self._resume_sensitive_data: dict[str, Mapping[str, str]] = {}
         try:
             self._saver = _build_saver(self._connection, _key_bytes(encryption_key))
             self._graph = self._compile_graph(self._saver)
@@ -136,7 +148,13 @@ class DurableOperationsWorkflow:
             result = self._graph.invoke(initial, config=config, durability="sync")
             return cast(OperationsState, dict(result))
 
-    def resume(self, thread_id: str, signal: str) -> OperationsState:
+    def resume(
+        self,
+        thread_id: str,
+        signal: str,
+        *,
+        sensitive_data: Mapping[str, str] | None = None,
+    ) -> OperationsState:
         _validate_thread_id(thread_id)
         normalized_signal = _resume_signal(signal)
         config = _config(thread_id)
@@ -147,11 +165,19 @@ class DurableOperationsWorkflow:
                 raise LookupError("workflow thread was not found")
             if not snapshot.interrupts:
                 raise RuntimeError("workflow thread is not waiting for human input")
-            result = self._graph.invoke(
-                command_type(resume=normalized_signal),
-                config=config,
-                durability="sync",
-            )
+            # Stash login credentials for the single _browser_resume node call in
+            # this invoke. They are read as a call argument and never written to
+            # graph state or the encrypted checkpoint. Always cleared afterwards.
+            if sensitive_data:
+                self._resume_sensitive_data[thread_id] = dict(sensitive_data)
+            try:
+                result = self._graph.invoke(
+                    command_type(resume=normalized_signal),
+                    config=config,
+                    durability="sync",
+                )
+            finally:
+                self._resume_sensitive_data.pop(thread_id, None)
             return cast(OperationsState, dict(result))
 
     def get_state(self, thread_id: str) -> OperationsState:
@@ -377,11 +403,17 @@ class DurableOperationsWorkflow:
             return {"status": "blocked"}
         if self._dependencies.browser is None:
             return _failed_update(state, "browser HITL resume", "browser_adapter_missing")
+        # Login credentials (if the owner submitted any for this resume) are read
+        # from the in-memory per-thread stash, never from graph state. They reach
+        # the worker as a call argument and are cleared by resume() afterwards.
+        thread_id = str(state.get("thread_id") or "")
+        sensitive_data = self._resume_sensitive_data.get(thread_id)
         try:
             observation = _run_async(
                 self._dependencies.browser.resume_after_hitl(
                     _browser_context(state),
                     state.get("resume_signal", "completed"),
+                    sensitive_data=sensitive_data,
                 )
             )
         except PhaseUnavailableError as exc:
@@ -412,7 +444,10 @@ class DurableOperationsWorkflow:
                 ),
             )
         research = OperationalResearch.model_validate(state["operational_research"])
-        recipient = research.contact_email
+        # Prefer the verified provider contact; fall back to the controlled
+        # override inbox for gated apps that carry no discovered contact address.
+        # Either way GmailWorker redirects the actual send to the override.
+        recipient = research.contact_email or self._dependencies.outreach_recipient
         if recipient is None:
             return _unavailable_update(
                 state,

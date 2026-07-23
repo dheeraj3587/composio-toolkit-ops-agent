@@ -122,6 +122,13 @@ _ASSIGNMENT_POLICIES: dict[str, BrowserHostPolicy] = {
 }
 
 
+# Reviewed live-matrix apps with no self-serve credential path: even though they
+# expose a browser surface, obtaining production API access requires vendor
+# approval, so the run sends a single controlled Composio Gmail outreach instead
+# of attempting autonomous browser onboarding + credential capture.
+_GATED_OUTREACH_APPS: frozenset[str] = frozenset({"google-ads", "whatsapp-business", "close"})
+
+
 def assignment_policy(app_slug: str) -> BrowserHostPolicy | None:
     """Return the assignment matrix policy without mutating global state."""
 
@@ -230,6 +237,8 @@ class AssignmentBrowserWorker(BrowserWorker):
         context: BrowserSessionContext,
         signal: str,
         research: OperationalResearch | None = None,
+        *,
+        sensitive_data: Mapping[str, str] | None = None,
     ) -> BrowserObservation:
         resolved = research or self._assignment_research.get(context.session_id)
         if resolved is None:
@@ -246,6 +255,7 @@ class AssignmentBrowserWorker(BrowserWorker):
             context=context,
             research=resolved,
             resume_signal=signal,
+            sensitive_data=sensitive_data,
         )
 
     def live_url(self, session_id: str) -> str | None:
@@ -274,12 +284,17 @@ class AssignmentBrowserWorker(BrowserWorker):
         context: BrowserSessionContext,
         research: OperationalResearch,
         resume_signal: str | None,
+        sensitive_data: Mapping[str, str] | None = None,
     ) -> BrowserObservation:
         self._require_configuration()
         allowed = assignment_allowed_hosts(research)
         patterns = validate_allowed_domains(allowed.patterns())
         target_url = _official_target_url(research, patterns)
-        task = _render_browser_task(target_url, patterns, resume_signal)
+        # Owner-submitted login credentials (if any) are injected as Browser Use v3
+        # secure ``sensitive_data`` placeholders; only their key names reach the
+        # task text, never their values.
+        login_fields = tuple(sensitive_data) if sensitive_data else ()
+        task = _render_browser_task(target_url, patterns, resume_signal, login_fields)
         client = self._get_client()
 
         run_kwargs: dict[str, Any] = {
@@ -290,6 +305,8 @@ class AssignmentBrowserWorker(BrowserWorker):
             "enable_recording": False,
             "allowed_domains": list(patterns),
         }
+        if sensitive_data:
+            run_kwargs["sensitive_data"] = dict(sensitive_data)
         provider_session = self._provider_sessions.get(context.session_id)
         if provider_session:
             run_kwargs["session_id"] = provider_session
@@ -373,6 +390,10 @@ def _assignment_after_route(
     if state.get("access_route") in {"blocked", "unknown"}:
         return "finalize"
     slug = str(state.get("app_slug") or "")
+    # Gated live-matrix apps go straight to controlled outreach; the human cannot
+    # self-serve a credential in the browser, so a vendor email is the honest path.
+    if slug in _GATED_OUTREACH_APPS:
+        return "outreach_send"
     policy = assignment_policy(slug)
     if policy is not None and policy.active:
         return "browser_start"

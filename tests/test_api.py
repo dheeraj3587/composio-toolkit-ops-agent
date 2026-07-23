@@ -50,7 +50,13 @@ class TrackingRunService(LocalRunService):
 class SuccessfulActionService(TrackingRunService):
     """Test double for the stable success contract of future phase actions."""
 
-    async def resume(self, run_id: str) -> ActionReceipt:
+    async def resume(
+        self,
+        run_id: str,
+        *,
+        browser_login: object = None,
+        signal: str = "completed",
+    ) -> ActionReceipt:
         await self.get_run(run_id)
         return ActionReceipt(run_id=run_id, action="resume")
 
@@ -106,6 +112,7 @@ def test_exact_requested_routes_are_registered(harness: ApiHarness) -> None:
         ("/api/runs/{run_id}/timeline", "GET"),
         ("/api/runs/{run_id}/resume", "POST"),
         ("/api/runs/{run_id}/credentials", "POST"),
+        ("/api/runs/{run_id}/credentials/reveal", "POST"),
         ("/api/runs/{run_id}/live-view", "GET"),
         ("/api/runs/{run_id}/poll-email", "POST"),
         ("/api/runs/{run_id}/retry", "POST"),

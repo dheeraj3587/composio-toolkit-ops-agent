@@ -259,8 +259,25 @@ class LiveViewResponse(StrictApiModel):
     live_url: str | None = None
 
 
+class BrowserLoginInput(StrictApiModel):
+    """Owner-submitted app login credentials for an autonomous HITL resume.
+
+    The values are injected into the Browser Use provider as secure
+    ``sensitive_data`` placeholders for a single resume call and are never
+    persisted to run state, checkpoints, audit events, logs, or the
+    IntegratorBundle. OTP/CAPTCHA/passkey/billing still require a human.
+    """
+
+    email: SecretStr
+    password: SecretStr
+
+
 class ResumeRequest(StrictApiModel):
     signal: Literal["completed", "cancelled"] = "completed"
+    # Optional owner-only login credentials. When present the agent logs in
+    # autonomously with injected secure placeholders instead of the human driving
+    # the live browser. Accepted only on an opted-in, loopback-only request.
+    browser_login: BrowserLoginInput | None = None
 
 
 class RetryRequest(StrictApiModel):
@@ -304,6 +321,21 @@ class IntegratorBundleView(StrictApiModel):
 class RunOutputResponse(StrictApiModel):
     run_id: str
     integrator_bundle: IntegratorBundleView
+
+
+class RevealCredentialsResponse(StrictApiModel):
+    """Owner-only, loopback-only raw credential reveal.
+
+    This is the single, deliberate boundary where obtained credential VALUES
+    cross the API, for the authenticated owner who initiated the run to use
+    directly in their own application. The values are resolved live from the
+    encrypted vault via the run's ``vault://`` references; they are never
+    persisted to run state, checkpoints, the ledger, logs, or Git. Everywhere
+    else in the contract credentials remain reference-only.
+    """
+
+    run_id: str
+    credentials: dict[CredentialFieldName, str] = Field(min_length=1, max_length=20)
 
 
 class SnapshotHealth(StrictApiModel):

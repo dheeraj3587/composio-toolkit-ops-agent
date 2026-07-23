@@ -33,7 +33,9 @@ from api.models import (
     LiveViewResponse,
     PhaseUnavailableResponse,
     ResourceNotFoundResponse,
+    ResumeRequest,
     RetryRequest,
+    RevealCredentialsResponse,
     RunConflictResponse,
     RunDetailResponse,
     RunListResponse,
@@ -460,8 +462,20 @@ def create_app(
         response_model_exclude_none=True,
         responses=common_responses,
     )
-    async def resume_run(run_id: RunId, run_service: ServiceDependency) -> ActionReceipt:
-        return await run_service.resume(run_id)
+    async def resume_run(
+        run_id: RunId,
+        request: Request,
+        run_service: ServiceDependency,
+        payload: ResumeRequest | None = None,
+    ) -> ActionReceipt:
+        browser_login = payload.browser_login if payload is not None else None
+        signal = payload.signal if payload is not None else "completed"
+        if browser_login is not None:
+            # Submitting app login credentials for autonomous injection is an
+            # owner-only, loopback-only action, gated exactly like credential
+            # submission and the live-view URL.
+            _require_local_owner_submission(request)
+        return await run_service.resume(run_id, browser_login=browser_login, signal=signal)
 
     @application.get(
         "/api/runs/{run_id}/live-view",
@@ -509,6 +523,22 @@ def create_app(
     )
     async def get_output(run_id: RunId, run_service: ServiceDependency) -> RunOutputResponse:
         return await run_service.get_output(run_id)
+
+    @application.post(
+        "/api/runs/{run_id}/credentials/reveal",
+        response_model=RevealCredentialsResponse,
+        responses=common_responses,
+    )
+    async def reveal_credentials(
+        run_id: RunId,
+        request: Request,
+        run_service: ServiceDependency,
+    ) -> RevealCredentialsResponse:
+        # Owner-only, loopback-only. This is the single deliberate boundary where
+        # obtained raw credential values cross the API, for the owner who
+        # initiated the run to use directly in their application.
+        _require_local_owner_submission(request)
+        return await run_service.reveal_credentials(run_id)
 
     @application.get(
         "/api/apps/search",

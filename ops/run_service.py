@@ -65,7 +65,7 @@ from ops.p1_adapter import (
 from ops.provider_errors import ConfigurationRequiredError
 from ops.redaction import redact_data, redact_text
 from ops.routing import RoutingDecision, decide_access
-from ops.secret_store import SQLiteSecretStore
+from ops.secret_store import SecretStoreError, SQLiteSecretStore
 from ops.state import AccessRoute, RunStatus, validate_status_transition
 from ops.storage import OperationsStorage, OperationsUnitOfWork
 
@@ -484,6 +484,7 @@ class RunService:
             browser=browser,
             gmail=gmail,
             effect_store=self._effect_store,
+            outreach_recipient=settings.outreach_recipient_override,
         )
 
     def _record_wiring(
@@ -1313,6 +1314,46 @@ class RunService:
             raise RuntimeError("output response could not be sanitized")
         return cast(dict[str, Any], sanitized)
 
+    def reveal_credentials(self, run_id: str) -> dict[str, str] | None:
+        """Owner-only raw credential reveal resolved live from the encrypted vault.
+
+        This is the single, deliberate boundary that returns obtained credential
+        VALUES, for the authenticated owner to use directly in their own app. The
+        run's ``vault://`` references are resolved in-memory and returned; the raw
+        values are never written to run state, checkpoints, the ledger, or logs.
+        Only a sanitized ``credentials_revealed`` audit event (kinds only) is
+        recorded. Returns ``None`` when the run is absent and ``{}`` when no
+        credential references exist yet.
+        """
+
+        record = self.storage.get_run(run_id)
+        if record is None:
+            return None
+        store = self._secret_store
+        if store is None:
+            raise CredentialSubmissionError("credential_boundary_not_configured")
+        bundle = record.get("integrator_bundle")
+        if not isinstance(bundle, Mapping):
+            return {}
+        references = bundle.get("credential_refs")
+        if not isinstance(references, Mapping) or not references:
+            return {}
+        revealed: dict[str, str] = {}
+        try:
+            for kind, reference in references.items():
+                validated_reference = validate_vault_reference(str(reference))
+                revealed[str(kind)] = store.get(validated_reference)
+        except SecretStoreError:
+            raise CredentialSubmissionError("credential_reference_unresolved") from None
+        with self.storage.unit_of_work() as transaction:
+            if transaction.get_run(run_id) is not None:
+                transaction.append_audit_event(
+                    run_id=run_id,
+                    event_type="credentials_revealed",
+                    payload={"kinds": sorted(revealed), "external_actions": False},
+                )
+        return revealed
+
     def project(
         self,
         run_id: str,
@@ -1446,13 +1487,26 @@ class RunService:
             return None
         return worker.live_url(session_id)
 
-    def resume_run(self, run_id: str, *, signal: str = "completed") -> dict[str, Any]:
+    def resume_run(
+        self,
+        run_id: str,
+        *,
+        signal: str = "completed",
+        browser_login: Mapping[str, SecretStr] | None = None,
+    ) -> dict[str, Any]:
         """Resume a waiting_for_hitl run on the SAME browser session/thread.
 
         Continues the durable workflow through the existing thread id (no new
         session is created), then projects the resumed state. A repeated
         interrupt keeps the run at waiting_for_hitl with a refreshed instruction;
         a cleared path advances toward the credential page.
+
+        When ``browser_login`` is supplied (owner-only, loopback), its raw values
+        are resolved in-memory ONLY for the single ``workflow.resume`` call and
+        injected into Browser Use as secure ``sensitive_data`` placeholders so the
+        agent logs in autonomously. The raw values are never written to run state,
+        checkpoints, audit events, or logs, and are dropped as soon as resume
+        returns; only the non-secret field names are recorded.
         """
 
         if self._workflow is None:
@@ -1467,7 +1521,19 @@ class RunService:
             if current["status"] != "waiting_for_hitl":
                 raise CredentialSubmissionError("run_not_waiting_for_hitl")
             thread_id = str(current.get("thread_id") or run_id)
-            state = self._workflow.resume(thread_id, signal)
+            injected_login_fields: list[str] = sorted(browser_login) if browser_login else []
+            sensitive_data: dict[str, str] | None = None
+            if browser_login:
+                sensitive_data = {
+                    name: secret.get_secret_value() for name, secret in browser_login.items()
+                }
+            try:
+                state = self._workflow.resume(thread_id, signal, sensitive_data=sensitive_data)
+            finally:
+                # Drop the resolved raw values as soon as resume returns.
+                if sensitive_data is not None:
+                    sensitive_data.clear()
+                    sensitive_data = None
             interrupts = self._workflow.get_interrupts(thread_id)
 
             observation = state.get("browser_observation")
@@ -1506,6 +1572,17 @@ class RunService:
                     event_type="hitl_resumed",
                     payload={"signal": signal, "external_actions": True},
                 )
+                if injected_login_fields:
+                    # Record ONLY the non-secret field names that were injected;
+                    # the values never touch the ledger, state, or logs.
+                    transaction.append_audit_event(
+                        run_id=run_id,
+                        event_type="login_credentials_injected",
+                        payload={
+                            "fields": injected_login_fields,
+                            "external_actions": True,
+                        },
+                    )
                 if next_status == "waiting_for_hitl":
                     transaction.append_audit_event(
                         run_id=run_id,
