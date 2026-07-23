@@ -283,7 +283,7 @@ class AssignmentBrowserWorker(BrowserWorker):
         client = self._get_client()
 
         run_kwargs: dict[str, Any] = {
-            "schema": BrowserTaskOutput,
+            "output_schema": BrowserTaskOutput,
             "model": self._settings.browser_use_model,
             "keep_alive": True,
             "max_cost_usd": self._settings.browser_use_max_cost_usd,
@@ -394,6 +394,13 @@ def install_assignment_runtime() -> None:
     composio_module.ComposioCapabilityPreflight = (  # type: ignore[misc]
         AssignmentComposioCapabilityPreflight
     )
+
+    # ops.run_service imports these classes directly, so updating only their
+    # defining modules does not replace already-bound runtime aliases.
+    run_service_module = cast(Any, importlib.import_module("ops.run_service"))
+    run_service_module.BrowserWorker = AssignmentBrowserWorker
+    run_service_module.ComposioCapabilityPreflight = AssignmentComposioCapabilityPreflight
+
     graph_module = importlib.import_module("ops.graph")
     workflow_type = cast(Any, graph_module).DurableOperationsWorkflow
     workflow_type._after_route = _assignment_after_route
