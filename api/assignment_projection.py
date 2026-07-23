@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import Any, cast
 
 from api.models import PhaseState
 from api.service import LocalRunService
@@ -30,8 +31,7 @@ def _browser_is_wired(service: LocalRunService) -> bool:
     except Exception:
         return False
     return any(
-        row.get("dependency") == "browser" and row.get("runtime_wired") is True
-        for row in rows
+        row.get("dependency") == "browser" and row.get("runtime_wired") is True for row in rows
     )
 
 
@@ -183,7 +183,8 @@ def install_assignment_projection() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
-    LocalRunService._phases = _assignment_phases  # type: ignore[method-assign]
+    service_type = cast(Any, LocalRunService)
+    service_type._phases = _assignment_phases
     _INSTALLED = True
 
 

@@ -11,15 +11,15 @@ Tests that import ``api.app`` continue to exercise the conservative core runtime
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import ops.browser_host_policy as browser_policy_module
 import ops.browser_worker as browser_worker_module
 import ops.composio_capability as composio_module
-import ops.graph as graph_module
 from ops.browser_host_policy import (
     BrowserAllowedHosts,
     BrowserHostPolicy,
@@ -394,9 +394,9 @@ def install_assignment_runtime() -> None:
     composio_module.ComposioCapabilityPreflight = (  # type: ignore[misc]
         AssignmentComposioCapabilityPreflight
     )
-    graph_module.DurableOperationsWorkflow._after_route = (  # type: ignore[method-assign]
-        _assignment_after_route
-    )
+    graph_module = importlib.import_module("ops.graph")
+    workflow_type = cast(Any, graph_module).DurableOperationsWorkflow
+    workflow_type._after_route = _assignment_after_route
     _INSTALLED = True
 
 
