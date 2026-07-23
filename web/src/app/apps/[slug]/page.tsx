@@ -31,7 +31,7 @@ export default async function AppResearchPage({ params }: { params: Promise<{ sl
   const { app, research } = result
 
   return (
-    <div className="page-enter space-y-7">
+    <div className="page-enter page-stack">
       <Button asChild variant="ghost" size="sm" className="-ml-2 font-mono text-[10px] uppercase tracking-[0.1em]">
         <Link href="/#app-catalog"><ArrowLeft aria-hidden="true" /> App catalog</Link>
       </Button>
@@ -57,15 +57,15 @@ export default async function AppResearchPage({ params }: { params: Promise<{ sl
         <Summary icon={FileCheck2} label="Research confidence" value={app.confidence == null ? "Not reported" : `${Math.round(app.confidence * 100)}%`} />
       </section>
 
-      <Alert className="rounded-md border-violet-200 bg-violet-50/60">
-        <FileCheck2 className="text-violet-600" aria-hidden="true" />
+      <Alert className="rounded-md border-brand-200 bg-brand-50/60">
+        <FileCheck2 className="text-brand-600" aria-hidden="true" />
         <AlertTitle>Evidence-derived, not routing authority</AlertTitle>
         <AlertDescription>
           This profile reflects the verified P1 snapshot and operational enrichment. A run’s deterministic router remains the final authority.
         </AlertDescription>
       </Alert>
 
-      <section className="grid gap-5 xl:grid-cols-[1.3fr_0.7fr]">
+      <section className="grid items-stretch gap-6 xl:grid-cols-2">
         <ResearchPanel research={research} />
         <ProvenanceCard snapshot={result.provenance ?? null} />
       </section>
@@ -86,7 +86,7 @@ export default async function AppResearchPage({ params }: { params: Promise<{ sl
 function Summary({ icon: Icon, label, value }: { icon: typeof Boxes; label: string; value: string }) {
   return (
     <div className="bg-card p-5 [&:not(:last-child)]:border-b [&:not(:last-child)]:border-border sm:[&:not(:last-child)]:border-b-0 sm:[&:not(:last-child)]:border-r">
-      <span className="flex items-center gap-2 data-label"><Icon className="size-3.5 text-violet-500" aria-hidden="true" />{label}</span>
+      <span className="flex items-center gap-2 data-label"><Icon className="size-3.5 text-brand-500" aria-hidden="true" />{label}</span>
       <p className="mt-4 text-sm font-medium">{value}</p>
     </div>
   )

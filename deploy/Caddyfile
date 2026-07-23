@@ -21,6 +21,12 @@
 	email {$ACME_EMAIL:admin@example.com}
 }
 
+# Internal container-health listener. It is bound only inside the Caddy
+# container and avoids the public site's automatic HTTP-to-HTTPS redirect.
+http://127.0.0.1:8080 {
+	respond /healthz "ok" 200
+}
+
 {$DOMAIN} {
 	# Compress text responses.
 	encode zstd gzip

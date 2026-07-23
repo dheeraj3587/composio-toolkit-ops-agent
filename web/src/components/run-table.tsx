@@ -42,7 +42,7 @@ export function RunTable({ runs }: { runs: RunSummary[] }) {
         </TableHeader>
         <TableBody>
           {runs.map((run) => (
-            <TableRow key={run.run_id} className="border-border hover:bg-violet-50/35">
+            <TableRow key={run.run_id} className="border-border hover:bg-brand-50/35">
               <TableCell>
                 <span className="block text-sm font-semibold leading-tight">{run.app_name}</span>
                 <span className="mt-1 block max-w-48 truncate font-mono text-[10px] text-muted-foreground">

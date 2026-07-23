@@ -35,7 +35,7 @@ function tone(status: string): string {
   if (status === "configuration_required") return "border-orange-300 bg-orange-50 text-orange-800"
   if (status === "waiting_for_reply" || status === "outreach_sent") return "border-sky-300 bg-sky-50 text-sky-800"
   if (status === "waiting_for_hitl" || status === "waiting") return "border-amber-300 bg-amber-50 text-amber-800"
-  if (gated.has(status)) return "border-violet-300 bg-violet-50 text-violet-800"
+  if (gated.has(status)) return "border-brand-300 bg-brand-50 text-brand-800"
   if (positive.has(status)) return "border-emerald-300 bg-emerald-50 text-emerald-800"
   if (negative.has(status)) return "border-red-300 bg-red-50 text-red-800"
   if (running.has(status)) return "border-blue-300 bg-blue-50 text-blue-800"

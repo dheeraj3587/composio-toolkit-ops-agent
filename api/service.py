@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, Protocol
 
+from pydantic import SecretStr
 from starlette.concurrency import run_in_threadpool
 
 from api.models import (
@@ -14,6 +16,7 @@ from api.models import (
     AppResearchResponse,
     AppSearchResponse,
     AppSummary,
+    BrowserLoginInput,
     CreateRunRequest,
     CredentialSubmissionRequest,
     HealthCheck,
@@ -22,6 +25,7 @@ from api.models import (
     LiveViewResponse,
     PhaseState,
     ProviderState,
+    RevealCredentialsResponse,
     RouteDecisionView,
     RunDetailResponse,
     RunListResponse,
@@ -94,13 +98,21 @@ class RunService(Protocol):
 
     async def get_timeline(self, run_id: str) -> TimelineResponse: ...
 
-    async def resume(self, run_id: str) -> ActionReceipt: ...
+    async def resume(
+        self,
+        run_id: str,
+        *,
+        browser_login: BrowserLoginInput | None = None,
+        signal: str = "completed",
+    ) -> ActionReceipt: ...
 
     async def get_live_view(self, run_id: str) -> LiveViewResponse: ...
 
     async def poll_email(self, run_id: str) -> ActionReceipt: ...
 
     async def get_output(self, run_id: str) -> RunOutputResponse: ...
+
+    async def reveal_credentials(self, run_id: str) -> RevealCredentialsResponse: ...
 
     async def retry(self, run_id: str, capability: str) -> ActionReceipt: ...
 
@@ -413,11 +425,13 @@ class LocalRunService:
         operation: OperationsRequest,
         idempotency_key: str | None,
         execution_mode: Literal["plan_only", "execute_when_configured"],
+        browser_login: Mapping[str, SecretStr] | None = None,
     ) -> RunDetailResponse:
         record = self._service.create_run(
             operation,
             idempotency_key=idempotency_key,
             execution_mode=execution_mode,
+            browser_login=browser_login,
         )
         return self._detail(self._summary(record))
 
@@ -565,11 +579,21 @@ class LocalRunService:
             dry_run=True,
             outreach_recipient_override=request.outreach_recipient_override,
         )
+        # Autonomous sign-in credentials (if provided) are mapped to the Browser
+        # Use secure-placeholder key names and injected at session creation. The
+        # raw values never enter run state, checkpoints, the ledger, or logs.
+        browser_login: dict[str, SecretStr] | None = None
+        if request.browser_login is not None:
+            browser_login = {
+                "login_email": request.browser_login.email,
+                "login_password": request.browser_login.password,
+            }
         return await run_in_threadpool(
             self._create_sync,
             operation,
             idempotency_key,
             request.execution_mode,
+            browser_login,
         )
 
     def _submit_credentials_sync(
@@ -615,9 +639,15 @@ class LocalRunService:
         self._require_started()
         return await run_in_threadpool(self._timeline_sync, run_id)
 
-    def _resume_sync(self, run_id: str) -> ActionReceipt:
+    def _resume_sync(
+        self,
+        run_id: str,
+        *,
+        browser_login: Mapping[str, SecretStr] | None = None,
+        signal: str = "completed",
+    ) -> ActionReceipt:
         try:
-            record = self._service.resume_run(run_id, signal="completed")
+            record = self._service.resume_run(run_id, signal=signal, browser_login=browser_login)
         except KeyError:
             raise RunNotFoundError(run_id) from None
         except CredentialSubmissionError:
@@ -629,8 +659,14 @@ class LocalRunService:
                 detail="Run is not waiting for a human action.",
             )
         status = str(record.get("status"))
+        logged_in = browser_login is not None
         detail = (
-            "Resumed on the same browser session; the credential page is ready."
+            (
+                "Logged in autonomously with the submitted credentials; the credential page "
+                "is ready."
+                if logged_in
+                else "Resumed on the same browser session; the credential page is ready."
+            )
             if status == "browser_running"
             else "Resumed on the same browser session; another human action is required."
             if status == "waiting_for_hitl"
@@ -638,7 +674,13 @@ class LocalRunService:
         )
         return ActionReceipt(run_id=run_id, action="resume", status="accepted", detail=detail)
 
-    async def resume(self, run_id: str) -> ActionReceipt:
+    async def resume(
+        self,
+        run_id: str,
+        *,
+        browser_login: BrowserLoginInput | None = None,
+        signal: str = "completed",
+    ) -> ActionReceipt:
         await self.get_run(run_id)
         if self._settings.langgraph_aes_key is None:
             raise PhaseUnavailableError(
@@ -647,7 +689,18 @@ class LocalRunService:
                 available_in=("phase_3",),
                 error="configuration_required",
             )
-        return await run_in_threadpool(self._resume_sync, run_id)
+        # Map the owner login input onto the Browser Use secure-placeholder names.
+        # SecretStr keeps values wrapped until the core service resolves them in
+        # memory for the single resume call.
+        login_map: dict[str, SecretStr] | None = None
+        if browser_login is not None:
+            login_map = {
+                "login_email": browser_login.email,
+                "login_password": browser_login.password,
+            }
+        return await run_in_threadpool(
+            self._resume_sync, run_id, browser_login=login_map, signal=signal
+        )
 
     def _live_view_sync(self, run_id: str) -> LiveViewResponse:
         if self._service.get_run(run_id) is None:
@@ -664,7 +717,7 @@ class LocalRunService:
         if not (
             self._settings.composio_api_key
             and self._settings.composio_gmail_connected_account_id
-            and self._settings.allow_live_vendor_email
+            and self._settings.outreach_recipient_override
         ):
             raise PhaseUnavailableError(
                 run_id=run_id,
@@ -672,7 +725,32 @@ class LocalRunService:
                 available_in=("phase_4",),
                 error="configuration_required",
             )
-        raise PhaseUnavailableError(run_id=run_id, action="poll_email", available_in=("email",))
+        return await run_in_threadpool(self._poll_email_sync, run_id)
+
+    def _poll_email_sync(self, run_id: str) -> ActionReceipt:
+        try:
+            record = self._service.poll_email(run_id)
+        except KeyError:
+            raise RunNotFoundError(run_id) from None
+        except CredentialSubmissionError as exc:
+            return ActionReceipt(
+                run_id=run_id,
+                action="poll_email",
+                status="no_change",
+                detail=f"No reply action taken ({exc.reason_code.replace('_', ' ')}).",
+            )
+        status = str(record.get("status"))
+        reply_class = str(record.get("latest_reply_class") or "no_reply")
+        detail = (
+            "Provider reply received and classified as "
+            f"{reply_class.replace('_', ' ')}; run status: {status.replace('_', ' ')}."
+        )
+        return ActionReceipt(
+            run_id=run_id,
+            action="poll_email",
+            status="no_change" if reply_class == "no_reply" else "accepted",
+            detail=detail,
+        )
 
     async def retry(self, run_id: str, capability: str) -> ActionReceipt:
         await self.get_run(run_id)
@@ -723,6 +801,22 @@ class LocalRunService:
             action="output",
             available_in=("output",),
         )
+
+    def _reveal_credentials_sync(self, run_id: str) -> RevealCredentialsResponse:
+        revealed = self._service.reveal_credentials(run_id)
+        if revealed is None:
+            raise RunNotFoundError(run_id)
+        if not revealed:
+            raise PhaseUnavailableError(
+                run_id=run_id,
+                action="reveal_credentials",
+                available_in=("output",),
+            )
+        return RevealCredentialsResponse(run_id=run_id, credentials=dict(revealed))
+
+    async def reveal_credentials(self, run_id: str) -> RevealCredentialsResponse:
+        self._require_started()
+        return await run_in_threadpool(self._reveal_credentials_sync, run_id)
 
     async def health(self) -> HealthResponse:
         self._require_started()

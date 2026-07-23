@@ -20,6 +20,7 @@ from uuid import uuid4
 import ops.browser_host_policy as browser_policy_module
 import ops.browser_worker as browser_worker_module
 import ops.composio_capability as composio_module
+from ops.browser_api_trace_catalog import get_browser_api_trace
 from ops.browser_host_policy import (
     BrowserAllowedHosts,
     BrowserHostPolicy,
@@ -118,7 +119,66 @@ _ASSIGNMENT_POLICIES: dict[str, BrowserHostPolicy] = {
         active=True,
         exact_hosts=("app.close.com", "developer.close.com"),
     ),
+    # Additive live-demo app. Hubstaff is NOT part of the immutable P1 snapshot;
+    # it is seeded only in this production assignment layer so its self-serve
+    # sign-in (password-first, with email-OTP fallback) can be demonstrated
+    # end to end in the live browser. The P1 files remain untouched.
+    "hubstaff": BrowserHostPolicy(
+        app_slug="hubstaff",
+        active=True,
+        exact_hosts=(
+            "account.hubstaff.com",
+            "app.hubstaff.com",
+            "hubstaff.com",
+            "developer.hubstaff.com",
+        ),
+        vendor_wildcard_domains=("hubstaff.com",),
+    ),
     "sherlock": BrowserHostPolicy(app_slug="sherlock", active=False),
+}
+
+
+# Reviewed live-matrix apps with no self-serve credential path: even though they
+# expose a browser surface, obtaining production API access requires vendor
+# approval, so the run sends a single controlled Composio Gmail outreach instead
+# of attempting autonomous browser onboarding + credential capture.
+_GATED_OUTREACH_APPS: frozenset[str] = frozenset({"google-ads", "whatsapp-business", "close"})
+
+
+# Additive live-demo app records. These are NOT part of the verified P1
+# snapshot and never claim to be: every field is a truthful, hand-authored
+# demo seed used only so an additional self-serve app can be onboarded live.
+# When the immutable P1 lookup misses one of these apps, the production
+# assignment layer supplies this record so the normal self-serve -> browser
+# path runs. The P1 files, their hashes, and their provenance are untouched.
+_DEMO_APP_RECORDS: dict[str, dict[str, Any]] = {
+    "hubstaff": {
+        "app": "Hubstaff",
+        "category": "Time Tracking & Workforce",
+        "one_liner": (
+            "Time tracking and workforce management. Live-demo seed (not part of the "
+            "verified P1 snapshot)."
+        ),
+        "auth_methods": ["Email + Password", "Email OTP"],
+        "access_model": {
+            "kind": "Self-Serve",
+            "note": "Public self-serve sign-up and sign-in at account.hubstaff.com.",
+        },
+        "api_type": "REST",
+        "api_breadth": "Moderate",
+        "existing_mcp": "None",
+        "composio_toolkit": "No",
+        "buildability": "Moderate",
+        "main_blocker": "None known for the browser onboarding demo.",
+        "recommended_next_action": "Build Now",
+        "evidence_urls": ["https://account.hubstaff.com/signin"],
+        "confidence": 0.5,
+        "verification_status": "Auto",
+        "slug": "hubstaff",
+        "primary_docs_url": "https://developer.hubstaff.com/",
+        "rate_limit_note": "Not characterized (live-demo seed).",
+        "last_verified": "2026-07-24",
+    },
 }
 
 
@@ -126,6 +186,21 @@ def assignment_policy(app_slug: str) -> BrowserHostPolicy | None:
     """Return the assignment matrix policy without mutating global state."""
 
     return _ASSIGNMENT_POLICIES.get(app_slug)
+
+
+def _demo_seed_record(normalized_query: str) -> Any | None:
+    """Return a synthesized P1 record for an additive live-demo app, if any.
+
+    The lookup key is the same normalized (NFKC + casefolded) app/slug key the
+    P1 adapter uses, so either the display name or the slug resolves.
+    """
+
+    from ops.p1_adapter import P1AppRecord
+
+    payload = _DEMO_APP_RECORDS.get(normalized_query)
+    if payload is None:
+        return None
+    return P1AppRecord.model_validate(payload)
 
 
 def assignment_allowed_hosts(research: OperationalResearch) -> BrowserAllowedHosts:
@@ -217,12 +292,15 @@ class AssignmentBrowserWorker(BrowserWorker):
         self,
         context: BrowserSessionContext,
         research: OperationalResearch,
+        *,
+        sensitive_data: Mapping[str, str] | None = None,
     ) -> BrowserObservation:
         self._assignment_research[context.session_id] = research
         return await self._run_assignment_task(
             context=context,
             research=research,
             resume_signal=None,
+            sensitive_data=sensitive_data,
         )
 
     async def resume_after_hitl(
@@ -230,6 +308,9 @@ class AssignmentBrowserWorker(BrowserWorker):
         context: BrowserSessionContext,
         signal: str,
         research: OperationalResearch | None = None,
+        *,
+        sensitive_data: Mapping[str, str] | None = None,
+        provider_session_id: str | None = None,
     ) -> BrowserObservation:
         resolved = research or self._assignment_research.get(context.session_id)
         if resolved is None:
@@ -237,6 +318,13 @@ class AssignmentBrowserWorker(BrowserWorker):
                 capability="browser HITL resume",
                 reason_code="verified_research_required",
             )
+        # Reconnect to the live provider session. The in-memory maps are lost on
+        # an API restart, so rebuild them from the durable state the caller
+        # supplies (the provider session id and verified research) instead of
+        # failing closed. The session itself keeps running on Browser Use.
+        self._assignment_research.setdefault(context.session_id, resolved)
+        if context.session_id not in self._provider_sessions and provider_session_id:
+            self._provider_sessions[context.session_id] = provider_session_id
         if context.session_id not in self._provider_sessions:
             raise ProviderOperationError(
                 capability="browser HITL resume",
@@ -246,10 +334,41 @@ class AssignmentBrowserWorker(BrowserWorker):
             context=context,
             research=resolved,
             resume_signal=signal,
+            sensitive_data=sensitive_data,
         )
+
+    def provider_session_id(self, handle: str) -> str | None:
+        """Return the live provider session id bound to a local handle, if any."""
+
+        return self._provider_sessions.get(handle)
 
     def live_url(self, session_id: str) -> str | None:
         return self._assignment_live_urls.get(session_id)
+
+    async def recover_live_url(self, handle: str, provider_session_id: str) -> str | None:
+        """Best-effort refresh of the signed live URL from the running session.
+
+        Used after an API restart cleared the in-memory URL: the provider session
+        is still alive, so re-derive its live URL from Browser Use and re-cache
+        it. Never persisted; owner-only, ephemeral.
+        """
+
+        cached = self._assignment_live_urls.get(handle)
+        if cached:
+            return cached
+        if not provider_session_id:
+            return None
+        self._provider_sessions.setdefault(handle, provider_session_id)
+        try:
+            client = self._get_client()
+            session = await _await_if_needed(client.sessions.get(provider_session_id))
+        except Exception:
+            return None
+        live_url = _string(_dump(session).get("live_url"))
+        if live_url:
+            self._assignment_live_urls[handle] = live_url
+            return live_url
+        return None
 
     async def stop(self, context: BrowserSessionContext) -> None:
         await self._safe_stop_handle(context.session_id)
@@ -274,12 +393,20 @@ class AssignmentBrowserWorker(BrowserWorker):
         context: BrowserSessionContext,
         research: OperationalResearch,
         resume_signal: str | None,
+        sensitive_data: Mapping[str, str] | None = None,
     ) -> BrowserObservation:
         self._require_configuration()
         allowed = assignment_allowed_hosts(research)
         patterns = validate_allowed_domains(allowed.patterns())
-        target_url = _official_target_url(research, patterns)
-        task = _render_browser_task(target_url, patterns, resume_signal)
+        trace = get_browser_api_trace(research.app_slug)
+        target_url = _official_target_url(
+            research, patterns, preferred_url=trace.start_url if trace is not None else None
+        )
+        # Owner-submitted login credentials (if any) are injected as Browser Use v3
+        # secure ``sensitive_data`` placeholders; only their key names reach the
+        # task text, never their values.
+        login_fields = tuple(sensitive_data) if sensitive_data else ()
+        task = _render_browser_task(target_url, patterns, resume_signal, login_fields, trace=trace)
         client = self._get_client()
 
         run_kwargs: dict[str, Any] = {
@@ -290,6 +417,8 @@ class AssignmentBrowserWorker(BrowserWorker):
             "enable_recording": False,
             "allowed_domains": list(patterns),
         }
+        if sensitive_data:
+            run_kwargs["sensitive_data"] = dict(sensitive_data)
         provider_session = self._provider_sessions.get(context.session_id)
         if provider_session:
             run_kwargs["session_id"] = provider_session
@@ -373,10 +502,48 @@ def _assignment_after_route(
     if state.get("access_route") in {"blocked", "unknown"}:
         return "finalize"
     slug = str(state.get("app_slug") or "")
+    # Gated live-matrix apps go straight to controlled outreach; the human cannot
+    # self-serve a credential in the browser, so a vendor email is the honest path.
+    if slug in _GATED_OUTREACH_APPS:
+        return "outreach_send"
     policy = assignment_policy(slug)
     if policy is not None and policy.active:
         return "browser_start"
     return "outreach_send"
+
+
+def _install_demo_aware_lookup() -> None:
+    """Make the P1 adapter additively resolve live-demo apps on a snapshot miss.
+
+    The immutable snapshot is still loaded and verified first; only when it
+    reports ``not_found`` for an allowlisted demo app do we return a synthesized
+    ``found`` result. The real snapshot provenance is reused unchanged, and the
+    P1 files are never modified.
+    """
+
+    p1_module = cast(Any, importlib.import_module("ops.p1_adapter"))
+    if getattr(p1_module.P1OperationalAdapter, "_demo_aware_installed", False):
+        return
+    original_lookup = p1_module.P1OperationalAdapter.lookup
+    p1_lookup_found = p1_module.P1LookupFound
+    p1_lookup_not_found = p1_module.P1LookupNotFound
+
+    def _demo_aware_lookup(self: Any, app_name_or_slug: str) -> Any:
+        result = original_lookup(self, app_name_or_slug)
+        if isinstance(result, p1_lookup_not_found):
+            seed = _demo_seed_record(result.normalized_query)
+            if seed is not None:
+                return p1_lookup_found(
+                    query=result.query,
+                    normalized_query=result.normalized_query,
+                    matched_by="slug",
+                    record=seed,
+                    provenance=result.provenance,
+                )
+        return result
+
+    p1_module.P1OperationalAdapter.lookup = _demo_aware_lookup
+    p1_module.P1OperationalAdapter._demo_aware_installed = True
 
 
 _INSTALLED = False
@@ -390,6 +557,7 @@ def install_assignment_runtime() -> None:
         return
 
     browser_policy_module._BROWSER_POLICIES.update(_ASSIGNMENT_POLICIES)
+    _install_demo_aware_lookup()
     browser_worker_module.BrowserWorker = AssignmentBrowserWorker  # type: ignore[misc]
     composio_module.ComposioCapabilityPreflight = (  # type: ignore[misc]
         AssignmentComposioCapabilityPreflight

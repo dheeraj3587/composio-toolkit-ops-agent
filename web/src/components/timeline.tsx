@@ -24,11 +24,11 @@ export function Timeline({ items }: { items: TimelineItem[] }) {
           </time>
           <span className="relative hidden justify-center sm:flex" aria-hidden="true">
             <span className="absolute bottom-[-21px] top-5 w-px bg-border last:hidden" />
-            <Circle className="size-3 fill-violet-500 text-violet-500" />
+            <Circle className="size-3 fill-brand-500 text-brand-500" />
           </span>
           <div>
             <p className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.12em]">
-              <TerminalSquare className="size-3.5 text-violet-600" aria-hidden="true" />
+              <TerminalSquare className="size-3.5 text-brand-600" aria-hidden="true" />
               {item.event_type.replaceAll("_", " ")}
             </p>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">{summary(item)}</p>

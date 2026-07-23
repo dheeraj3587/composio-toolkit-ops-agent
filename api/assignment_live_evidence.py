@@ -16,6 +16,7 @@ import ops.operational_research as operational_research_module
 from api.assignment_runtime import AssignmentBrowserWorker, assignment_allowed_hosts
 from api.models import ProviderState
 from api.service import LocalRunService
+from ops.browser_api_trace_catalog import get_browser_api_trace
 from ops.browser_host_policy import evaluate_navigation
 from ops.browser_worker import BrowserObservation, BrowserSessionContext, BrowserTaskOutput
 from ops.models import OperationalResearch
@@ -32,15 +33,22 @@ async def _retained_run_assignment_task(
     context: BrowserSessionContext,
     research: OperationalResearch,
     resume_signal: str | None,
+    sensitive_data: Mapping[str, str] | None = None,
 ) -> BrowserObservation:
     """Run a bounded task and retain successful sessions for evaluator inspection."""
 
     worker._require_configuration()
     allowed = assignment_allowed_hosts(research)
     patterns = browser_worker_module.validate_allowed_domains(allowed.patterns())
-    target_url = browser_worker_module._official_target_url(research, patterns)
+    trace = get_browser_api_trace(research.app_slug)
+    target_url = browser_worker_module._official_target_url(
+        research, patterns, preferred_url=trace.start_url if trace is not None else None
+    )
+    login_fields = tuple(sensitive_data) if sensitive_data else ()
     task = (
-        browser_worker_module._render_browser_task(target_url, patterns, resume_signal)
+        browser_worker_module._render_browser_task(
+            target_url, patterns, resume_signal, login_fields, trace=trace
+        )
         + "\n\nASSIGNMENT VERIFICATION: A documentation page or developer landing page alone is "
         "not the credential page. Continue to the provider sign-in/account settings flow. If a "
         "password, OTP, CAPTCHA, consent, billing, or account-owner action is required, stop there "
@@ -56,6 +64,8 @@ async def _retained_run_assignment_task(
         "enable_recording": False,
         "allowed_domains": list(patterns),
     }
+    if sensitive_data:
+        run_kwargs["sensitive_data"] = dict(sensitive_data)
     provider_session = worker._provider_sessions.get(context.session_id)
     if provider_session:
         run_kwargs["session_id"] = provider_session

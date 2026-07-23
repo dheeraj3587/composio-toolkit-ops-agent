@@ -55,7 +55,7 @@ export function PhaseGrid({ phases }: { phases: PhaseCollection }) {
         return (
           <article key={key} className="flex min-h-44 flex-col justify-between bg-card p-4 [&:not(:last-child)]:border-b [&:not(:last-child)]:border-border sm:[&:not(:last-child)]:border-b-0 sm:[&:not(:last-child)]:border-r">
             <div className="flex items-start justify-between gap-3">
-              <span className="grid size-8 place-items-center rounded-md bg-secondary"><Icon className="size-4 text-violet-600" aria-hidden="true" /></span>
+              <span className="grid size-8 place-items-center rounded-md bg-secondary"><Icon className="size-4 text-brand-600" aria-hidden="true" /></span>
               <StatusBadge status={phase?.status ?? "unavailable"} />
             </div>
             <div>
@@ -89,7 +89,7 @@ export function ResearchPanel({ research }: { research: OperationalResearch | nu
   if (!research) return <UnavailablePanel title="Operational research" copy="No sanitized research payload has been reported for this run." />
 
   return (
-    <Card className="rounded-md border-border bg-card py-0 shadow-none">
+    <Card className="h-full rounded-lg border-border bg-card py-0 shadow-none">
       <CardHeader className="border-b border-border px-5 py-4">
         <div className="flex items-center justify-between gap-3">
           <div><p className="eyebrow">Evidence record</p><CardTitle className="mt-1 text-lg font-semibold">Operational research</CardTitle></div>
@@ -129,15 +129,15 @@ export function SecurityPanel({ security }: { security: SecurityState | null }) 
   ]
 
   return (
-    <Card className="rounded-md border-white/10 bg-rail py-0 text-white shadow-none">
+    <Card className="h-full rounded-lg border-white/10 bg-rail py-0 text-white shadow-none">
       <CardHeader className="border-b border-white/10 px-5 py-4">
-        <p className="font-mono text-[9px] uppercase tracking-[0.14em] text-violet-300">Security boundary</p>
+        <p className="font-mono text-[9px] uppercase tracking-[0.14em] text-brand-300">Security boundary</p>
         <CardTitle className="mt-1 text-lg font-semibold text-white">Reference-only credential handling</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3 px-5 py-5">
         {safeguards.map(({ label, value, icon: Icon }) => (
           <div key={label} className="flex items-center justify-between gap-4 border-b border-white/10 pb-3 last:border-0 last:pb-0">
-            <span className="flex items-center gap-2 text-xs text-white/65"><Icon className="size-3.5 text-violet-300" aria-hidden="true" />{label}</span>
+            <span className="flex items-center gap-2 text-xs text-white/65"><Icon className="size-3.5 text-brand-300" aria-hidden="true" />{label}</span>
             <span className="text-right font-mono text-[9px] uppercase tracking-[0.1em] text-white/85">{controlValue(value)}</span>
           </div>
         ))}
@@ -164,9 +164,9 @@ export function CapabilityPanel({
   children?: React.ReactNode
 }) {
   return (
-    <Card className="rounded-md border-border bg-card py-0 shadow-none">
+    <Card className="h-full rounded-lg border-border bg-card py-0 shadow-none">
       <CardContent className="flex min-h-52 flex-col justify-between px-5 py-5">
-        <div className="flex items-start justify-between gap-3"><span className="grid size-8 place-items-center rounded-md bg-secondary"><Icon className="size-4 text-violet-600" aria-hidden="true" /></span><StatusBadge status={phase?.status ?? "unavailable"} /></div>
+        <div className="flex items-start justify-between gap-3"><span className="grid size-8 place-items-center rounded-md bg-secondary"><Icon className="size-4 text-brand-600" aria-hidden="true" /></span><StatusBadge status={phase?.status ?? "unavailable"} /></div>
         <div>
           <h3 className="text-base font-semibold">{title}</h3>
           <p className="mt-2 text-xs leading-5 text-muted-foreground">{phase?.detail ?? "The backend has not reported this capability state."}</p>
@@ -183,7 +183,7 @@ export function HitlPanel({ request, action }: { request: HitlRequest | null | u
   }
 
   return (
-    <Card className="rounded-md border-amber-300 bg-amber-50 py-0 shadow-none">
+    <Card className="h-full rounded-lg border-amber-300 bg-amber-50 py-0 shadow-none">
       <CardContent className="flex min-h-52 flex-col justify-between px-5 py-5">
         <div className="flex items-start justify-between gap-3"><span className="grid size-8 place-items-center rounded-md bg-amber-100"><UserRoundCheck className="size-4 text-amber-700" aria-hidden="true" /></span><StatusBadge status="waiting_for_hitl" /></div>
         <div>
@@ -205,7 +205,7 @@ export function OutputPanel({ output }: { output: IntegratorOutput | null }) {
 
   const referenceCount = Object.keys(output.credential_refs).length
   return (
-    <Card className="rounded-md border-emerald-300 bg-emerald-50/60 py-0 shadow-none">
+    <Card className="h-full rounded-lg border-emerald-300 bg-emerald-50/60 py-0 shadow-none">
       <CardHeader className="border-b border-emerald-200 px-5 py-4">
         <p className="font-mono text-[9px] uppercase tracking-[0.13em] text-emerald-700">Output · references only</p>
         <CardTitle className="mt-1 text-lg font-semibold">Integrator bundle</CardTitle>
@@ -227,7 +227,7 @@ function DataPoint({ label, value }: { label: string; value: string }) {
 
 function UnavailablePanel({ title, copy }: { title: string; copy: string }) {
   return (
-    <Card className="rounded-md border-dashed border-border bg-card/55 shadow-none">
+    <Card className="h-full rounded-lg border-dashed border-border bg-card/55 shadow-none">
       <CardContent className="flex min-h-52 flex-col justify-between px-5 py-5">
         <CircleDashed className="size-5 text-muted-foreground" aria-hidden="true" />
         <div><p className="data-label">Backend state · unavailable</p><h3 className="mt-1 text-base font-semibold">{title}</h3><p className="mt-2 text-xs leading-5 text-muted-foreground">{copy}</p></div>

@@ -14,7 +14,7 @@ describe("StatusBadge", () => {
 
   it.each([
     ["self_serve", "text-emerald-800"],
-    ["partner_gated", "text-violet-800"],
+    ["partner_gated", "text-brand-800"],
     ["unknown", "text-slate-600"],
     ["configuration_required", "text-orange-800"],
     ["waiting_for_reply", "text-sky-800"],

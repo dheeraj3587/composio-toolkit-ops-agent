@@ -123,12 +123,15 @@ def test_first_browser_operation_contains_task_and_provider_allowlist() -> None:
 
     assert client.sessions.create_calls == 0
     assert len(client.calls) == 1
-    _, kwargs = client.calls[0]
-    assert kwargs["start_url"] == "https://developers.hubspot.com/"
+    task, kwargs = client.calls[0]
+    assert kwargs["start_url"] == "https://app.hubspot.com/login"
     assert kwargs["allowed_domains"] == [
         "developers.hubspot.com",
         "app.hubspot.com",
     ]
+    assert "STRICT APP TRACE: HubSpot" in task
+    assert "Development" in task
+    assert "DIVERGENCE:" in task
     assert "session_id" not in kwargs
     assert observation.status == "credential_page_ready"
     assert client.sessions.stopped == ["provider-session-1"]

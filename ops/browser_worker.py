@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import ipaddress
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol, TypeVar
@@ -12,6 +13,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ops.browser_api_trace_catalog import BrowserApiTrace, render_browser_api_trace
 from ops.browser_host_policy import (
     BrowserHostDecision,
     BrowserPolicyInactiveError,
@@ -222,6 +224,8 @@ class BrowserWorker:
         self,
         context: BrowserSessionContext,
         research: OperationalResearch,
+        *,
+        sensitive_data: Mapping[str, str] | None = None,
     ) -> BrowserObservation:
         self._require_configuration()
         if context.session_id:
@@ -230,6 +234,7 @@ class BrowserWorker:
             context=context,
             research=research,
             resume_signal=None,
+            sensitive_data=sensitive_data,
         )
 
     async def resume_after_hitl(
@@ -237,6 +242,9 @@ class BrowserWorker:
         context: BrowserSessionContext,
         signal: str,
         research: OperationalResearch | None = None,
+        *,
+        sensitive_data: Mapping[str, str] | None = None,
+        provider_session_id: str | None = None,
     ) -> BrowserObservation:
         self._require_configuration()
         resolved = research or self._research.get(context.session_id)
@@ -245,11 +253,22 @@ class BrowserWorker:
                 capability="browser HITL resume",
                 reason_code="verified_research_required",
             )
+        # The base worker's session_id IS the provider session, so reconnection is
+        # inherent; just re-seed the verified research if the in-memory cache was
+        # cleared by an API restart.
+        if context.session_id:
+            self._research.setdefault(context.session_id, resolved)
         return await self._run_bounded_task(
             context=context,
             research=resolved,
             resume_signal=signal,
+            sensitive_data=sensitive_data,
         )
+
+    def provider_session_id(self, handle: str) -> str | None:
+        """The base worker's session id is the provider session id."""
+
+        return handle or None
 
     def live_url(self, session_id: str) -> str | None:
         """Owner-only, in-memory accessor for the ephemeral signed live URL.
@@ -291,6 +310,7 @@ class BrowserWorker:
         context: BrowserSessionContext,
         research: OperationalResearch,
         resume_signal: str | None,
+        sensitive_data: Mapping[str, str] | None = None,
     ) -> BrowserObservation:
         try:
             allowed = build_browser_allowed_hosts(
@@ -307,18 +327,24 @@ class BrowserWorker:
             ) from None
         patterns = validate_allowed_domains(allowed.patterns())
         target_url = _official_target_url(research, patterns)
-        task = _render_browser_task(target_url, patterns, resume_signal)
+        # Login placeholder keys (never values) are surfaced to the task text; the
+        # Browser Use v3 provider injects the values via secure ``sensitive_data``
+        # placeholders the agent can type but never read.
+        login_fields = tuple(sensitive_data) if sensitive_data else ()
+        task = _render_browser_task(target_url, patterns, resume_signal, login_fields)
         client = self._get_client()
+        run_kwargs: dict[str, Any] = {
+            "schema": BrowserTaskOutput,
+            "session_id": context.session_id,
+            "model": self._settings.browser_use_model,
+            "keep_alive": True,
+            "max_cost_usd": self._settings.browser_use_max_cost_usd,
+            "enable_recording": False,
+        }
+        if sensitive_data:
+            run_kwargs["sensitive_data"] = dict(sensitive_data)
         try:
-            run_handle = client.run(
-                task,
-                schema=BrowserTaskOutput,
-                session_id=context.session_id,
-                model=self._settings.browser_use_model,
-                keep_alive=True,
-                max_cost_usd=self._settings.browser_use_max_cost_usd,
-                enable_recording=False,
-            )
+            run_handle = client.run(task, **run_kwargs)
             result = await _await_if_needed(run_handle)
         except Exception:
             # Reclaim the session so a failed run never lingers idle burning credit.
@@ -622,6 +648,8 @@ def _blocked_observation(decision: BrowserHostDecision) -> BrowserObservation:
 def _official_target_url(
     research: OperationalResearch,
     allowed_domains: tuple[str, ...],
+    *,
+    preferred_url: str | None = None,
 ) -> str:
     """Select the verified official entry URL within the app's allowlist.
 
@@ -631,6 +659,7 @@ def _official_target_url(
     """
 
     for candidate in (
+        preferred_url,
         research.developer_portal_url,
         research.signup_url,
         research.api_base_url,
@@ -653,7 +682,19 @@ def _render_browser_task(
     target_url: str,
     allowed_domains: tuple[str, ...],
     resume_signal: str | None,
+    login_fields: tuple[str, ...] = (),
+    trace: BrowserApiTrace | None = None,
 ) -> str:  # pragma: no cover - live only
+    """Render the bounded onboarding task.
+
+    When ``login_fields`` is non-empty the owner has submitted login credentials
+    that the Browser Use provider injects as secure placeholders (v3
+    ``sensitive_data``). The agent enters them via ``<secret>key</secret>``
+    placeholders it can never read; plain password entry is therefore no longer a
+    hard stop, but every other human-only gate (CAPTCHA, OTP/MFA, passkey,
+    device approval, billing, legal consent) still pauses for HITL.
+    """
+
     allowlist = ", ".join(allowed_domains)
     resume_note = (
         f"A human just completed a step and reported: '{resume_signal}'. Do NOT restart from "
@@ -661,11 +702,39 @@ def _render_browser_task(
         if resume_signal
         else ""
     )
+    trace_note = f"{render_browser_api_trace(trace)}\n\n" if trace is not None else ""
+    has_login = "login_email" in login_fields or "login_password" in login_fields
+    has_otp = "login_otp" in login_fields
+    login_note = ""
+    password_hard_stop = "entering a password, "  # pragma: allowlist secret
+    otp_hard_stop = "any MFA/OTP/2FA code, email or phone verification, "
+    if has_login:
+        password_hard_stop = ""
+        login_note += (
+            "LOGIN CREDENTIALS: The account owner has provided sign-in credentials as secure "
+            "placeholders. When you reach a sign-in form, type the account email/username using "
+            "the placeholder <secret>login_email</secret> and the password using the placeholder "
+            "<secret>login_password</secret>, then submit to log in. Use these placeholders ONLY "
+            "inside the app's own login form on the allowlisted hostnames. You cannot see their "
+            "real values and must never print, echo, or report them.\n\n"
+        )
+    if has_otp:
+        otp_hard_stop = ""
+        login_note += (
+            "ONE-TIME CODE: A verification/OTP code sent to the owner's email is available as the "
+            "secure placeholder <secret>login_otp</secret>. When the site asks for the emailed "
+            "sign-in/verification code, type <secret>login_otp</secret> into the code field and "
+            "submit. Use it ONLY in the app's own verification form on the allowlisted hostnames. "
+            "You cannot see its real value and must never print, echo, or report it. If the code "
+            "is rejected as expired/invalid, stop with hitl_required=true.\n\n"
+        )
     return (
         "ROLE: You are an autonomous web agent helping an authorized account owner reach the "
         "page where they can create or view their developer API credentials. Act decisively and "
         "take real navigation steps; do not stop after only opening the first page.\n\n"
         f"{resume_note}"
+        f"{trace_note}"
+        f"{login_note}"
         f"START: Open {target_url}. Stay strictly within these hostnames: {allowlist}. Never "
         "navigate to any other domain.\n\n"
         "GOAL: Reach the account's API credentials / developer-app / API-token page (for example "
@@ -678,14 +747,15 @@ def _render_browser_task(
         "settings, dismiss cookie banners, and fill clearly non-secret fields (name, company, "
         "website, work email, use case) ONLY when their values are already visibly present on the "
         "page. Never invent values.\n\n"
-        "HARD STOPS — set hitl_required=true and STOP (do not attempt these yourself): entering a "
-        "password, solving a CAPTCHA, any MFA/OTP/2FA code, email or phone verification, passkey "
-        "or security-key prompts, device approval, accepting legal/terms/consent, confirming "
-        "account ownership, entering billing/payment details, or any 'reveal/copy your API token' "
-        "step. In hitl_reason, name the single specific action the human must take (e.g. "
-        "'Enter your Pipedrive password to log in').\n\n"
+        "HARD STOPS — set hitl_required=true and STOP (do not attempt these yourself): "
+        f"{password_hard_stop}solving a CAPTCHA, {otp_hard_stop}"
+        "passkey or security-key prompts, device approval, accepting "
+        "legal/terms/consent, confirming account ownership, entering billing/payment details, or "
+        "any 'reveal/copy your API token' step. In hitl_reason, name the single specific action "
+        "the human must take (e.g. 'Enter the email verification code sent to your inbox').\n\n"
         "NEVER read, type, copy, transcribe, or report any password, secret, API token, cookie, "
-        "or credential value, even if it is visible.\n\n"
+        "or credential value, even if it is visible. The login placeholders are the only "
+        "exception, and only for typing into the app's own login form.\n\n"
         "OUTPUT: When you stop (goal reached or a hard stop), return the structured fields: "
         "current_url (the exact current page URL), reached_official_setup_page (true only if the "
         "API credentials/token page is actually visible), hitl_required, hitl_reason (specific "

@@ -13,7 +13,6 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Separator } from "@/components/ui/separator"
 import { Textarea } from "@/components/ui/textarea"
 
 const vaultReference = /^vault:\/\/[a-z0-9-]+\/[a-z0-9_-]+\/[A-Za-z0-9_-]+$/
@@ -33,6 +32,8 @@ const runFormSchema = z.object({
   work_email_ref: z.string().regex(vaultReference, "Use an exact vault:// reference."),
   use_case: z.string().trim().min(12, "Describe the authorized workflow in at least 12 characters.").max(2_000),
   expected_volume: z.string().max(180),
+  app_login_email: z.string().max(320),
+  app_login_password: z.string().max(400),
 })
 
 type RunFormValues = z.input<typeof runFormSchema>
@@ -59,7 +60,7 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
     defaultValues: {
       app_name: defaultAppName,
       requested_scope_policy: "maximum",
-      execution_mode: "plan_only",
+      execution_mode: "execute_when_configured",
       callback_urls: "",
       outreach_recipient_override: "",
       legal_name: "",
@@ -67,6 +68,8 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
       work_email_ref: "",
       use_case: "",
       expected_volume: "",
+      app_login_email: "",
+      app_login_password: "",
     },
   })
   // eslint-disable-next-line react-hooks/incompatible-library
@@ -88,6 +91,8 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
     data.set("work_email_ref", values.work_email_ref)
     data.set("use_case", values.use_case)
     data.set("expected_volume", values.expected_volume)
+    data.set("app_login_email", values.app_login_email)
+    data.set("app_login_password", values.app_login_password)
     startTransition(() => formAction(data))
   }
 
@@ -95,19 +100,19 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
   const invalid = (name: keyof RunFormValues) => Boolean(errors[name]) || serverInvalid.has(name)
 
   return (
-    <form onSubmit={handleSubmit(submit)} noValidate className="panel overflow-hidden rounded-md">
+    <form onSubmit={handleSubmit(submit)} noValidate className="panel overflow-hidden rounded-lg">
       <div className="flex flex-col gap-4 border-b border-border bg-white px-5 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-6">
         <div>
           <p className="eyebrow">OperationsRequest</p>
           <h2 className="mt-1 text-lg font-semibold">Define the operating envelope</h2>
         </div>
-        <Badge variant="outline" className="w-fit rounded-md border-violet-300 bg-violet-50 text-violet-800">
+        <Badge variant="outline" className="w-fit rounded-md border-brand-300 bg-brand-50 text-brand-800">
           <ShieldCheck aria-hidden="true" /> Backend-gated execution
         </Badge>
       </div>
 
-      <div className="grid gap-8 px-5 py-7 sm:px-6 xl:grid-cols-[1fr_1px_1fr]">
-        <fieldset className="space-y-5">
+      <div className="grid divide-y divide-border xl:grid-cols-2 xl:divide-x xl:divide-y-0">
+        <fieldset className="space-y-5 px-5 py-7 sm:px-6 xl:px-8">
           <legend className="mb-5 font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
             01 · Target and policy
           </legend>
@@ -163,9 +168,7 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
           </Field>
         </fieldset>
 
-        <Separator orientation="vertical" className="hidden h-full bg-border xl:block" />
-
-        <fieldset className="space-y-5">
+        <fieldset className="space-y-5 px-5 py-7 sm:px-6 xl:px-8">
           <legend className="mb-5 font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
             02 · Company profile
           </legend>
@@ -177,7 +180,7 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
           </Field>
           <Field label="Work email profile reference" htmlFor="work_email_ref" error={fieldError(errors.work_email_ref?.message, serverInvalid.has("work_email_ref"))} hint="An opaque profile reference only. Never enter a password, token, key, cookie, or client secret.">
             <div className="relative">
-              <LockKeyhole className="pointer-events-none absolute left-3 top-2.5 size-4 text-violet-500" aria-hidden="true" />
+              <LockKeyhole className="pointer-events-none absolute left-3 top-2.5 size-4 text-brand-500" aria-hidden="true" />
               <Input id="work_email_ref" className="pl-10 font-mono text-xs" placeholder="vault://company/work_email/profile_1" aria-invalid={invalid("work_email_ref")} autoComplete="off" spellCheck={false} {...register("work_email_ref")} />
             </div>
           </Field>
@@ -186,6 +189,15 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
           </Field>
           <Field label="Expected volume" htmlFor="expected_volume" error={errors.expected_volume?.message} hint="Optional; use an honest range rather than an invented forecast.">
             <Input id="expected_volume" maxLength={180} placeholder="e.g. 1,000 authorized requests / month" aria-invalid={invalid("expected_volume")} {...register("expected_volume")} />
+          </Field>
+          <Field label="App sign-in email / username" htmlFor="app_login_email" error={errors.app_login_email?.message} hint="Optional. Provide the account sign-in so the agent logs in autonomously. Injected into the browser as a secure placeholder at session start; never stored or shown to the model.">
+            <Input id="app_login_email" autoComplete="off" spellCheck={false} placeholder="you@example.com" aria-invalid={invalid("app_login_email")} {...register("app_login_email")} />
+          </Field>
+          <Field label="App sign-in password" htmlFor="app_login_password" error={errors.app_login_password?.message} hint="Optional. Required only if the email above is set. Injected as a secure placeholder; the agent types it without ever reading it. CAPTCHA/OTP still pause for you.">
+            <div className="relative">
+              <LockKeyhole className="pointer-events-none absolute left-3 top-2.5 size-4 text-brand-500" aria-hidden="true" />
+              <Input id="app_login_password" type="password" autoComplete="off" spellCheck={false} className="pl-10 font-mono text-xs" placeholder="Provided once for autonomous sign-in" aria-invalid={invalid("app_login_password")} {...register("app_login_password")} />
+            </div>
           </Field>
         </fieldset>
       </div>

@@ -62,10 +62,14 @@ from ops.p1_adapter import (
     load_verified_snapshot,
     to_operational_research,
 )
-from ops.provider_errors import ConfigurationRequiredError
+from ops.provider_errors import (
+    ConfigurationRequiredError,
+    ProviderContractError,
+    ProviderOperationError,
+)
 from ops.redaction import redact_data, redact_text
 from ops.routing import RoutingDecision, decide_access
-from ops.secret_store import SQLiteSecretStore
+from ops.secret_store import SecretStoreError, SQLiteSecretStore
 from ops.state import AccessRoute, RunStatus, validate_status_transition
 from ops.storage import OperationsStorage, OperationsUnitOfWork
 
@@ -215,6 +219,14 @@ def _slugify(app_name: str) -> str:
     return slug or "app"
 
 
+def _strip_quoted_reply(body: str) -> str:
+    """Keep only the new reply text, dropping quoted history ('On ... wrote:')."""
+
+    trimmed = re.split(r"(?im)^\s*On .*wrote:\s*$", body)[0]
+    lines = [line for line in trimmed.splitlines() if not line.lstrip().startswith(">")]
+    return "\n".join(lines).strip()
+
+
 def _public_run(record: Mapping[str, object]) -> dict[str, Any]:
     public = {
         field: record.get(field) for field in _PUBLIC_RUN_FIELDS if record.get(field) is not None
@@ -290,6 +302,15 @@ class RunService:
         self._http_client: httpx.AsyncClient | None = None
         self._validation_http_client: httpx.AsyncClient | None = None
         self._browser_worker: BrowserWorker | None = None
+        self._gmail_worker: GmailWorker | None = None
+        # In-memory marker of the last inbound reply id handled per run, so the
+        # autonomous poller acts once per new reply (no reprocessing/resend).
+        self._last_processed_reply: dict[str, str] = {}
+        # Bounded per-run count of autonomous email-OTP resume attempts.
+        self._otp_attempts: dict[str, int] = {}
+        # Background email poller (autonomous "listen for replies").
+        self._email_poller_thread: threading.Thread | None = None
+        self._email_poller_stop = threading.Event()
         self._secret_store: SQLiteSecretStore | None = None
         self._effect_store: SQLiteEffectStore | None = None
         # Sanitized startup wiring audit rows; never contains secrets.
@@ -396,6 +417,139 @@ class RunService:
         except ConfigurationRequiredError:
             self._workflow = None
         self._record_wiring("workflow", self._workflow, configured=True)
+        # Start the autonomous email poller so the agent listens for and answers
+        # provider replies on its own, with no manual polling.
+        self._start_email_poller()
+
+    def _start_email_poller(self) -> None:
+        """Start the background thread that polls waiting runs for new replies."""
+
+        if self._gmail_worker is None:
+            return
+        if self._email_poller_thread is not None and self._email_poller_thread.is_alive():
+            return
+        settings = self._settings or Settings.from_env()
+        interval = max(10, int(settings.email_poll_interval_seconds))
+        self._email_poller_stop.clear()
+        thread = threading.Thread(
+            target=self._email_poller_loop,
+            args=(interval,),
+            name="email-poller",
+            daemon=True,
+        )
+        self._email_poller_thread = thread
+        thread.start()
+
+    def _email_poller_loop(self, interval: int) -> None:
+        while not self._email_poller_stop.wait(interval):
+            try:
+                self.poll_waiting_runs()
+            except Exception:  # pragma: no cover - the loop must never die
+                pass
+            try:
+                self.resolve_pending_otps()
+            except Exception:  # pragma: no cover - the loop must never die
+                pass
+
+    def _hitl_action_type(self, record: Mapping[str, object]) -> str | None:
+        """Return the pending HITL action type from the record or checkpoint."""
+
+        hitl = record.get("hitl_request")
+        if isinstance(hitl, Mapping) and hitl.get("type"):
+            return str(hitl.get("type"))
+        if self._workflow is None:
+            return None
+        thread_id = str(record.get("thread_id") or "")
+        if not thread_id:
+            return None
+        try:
+            state = self._workflow.get_state(thread_id)
+        except Exception:
+            return None
+        observation = state.get("browser_observation")
+        if isinstance(observation, Mapping):
+            action = observation.get("human_action_type")
+            return str(action) if action else None
+        return None
+
+    def resolve_pending_otps(self, *, limit: int = 100) -> int:
+        """Autonomously resolve every run waiting on an emailed login code."""
+
+        if self._gmail_worker is None:
+            return 0
+        resolved = 0
+        for record in self.storage.list_runs(limit=limit, offset=0):
+            if record.get("status") != "waiting_for_hitl":
+                continue
+            if self._hitl_action_type(record) != "email_otp":
+                continue
+            run_id = str(record.get("run_id") or "")
+            if not run_id:
+                continue
+            try:
+                if self.resolve_email_otp(run_id) is not None:
+                    resolved += 1
+            except Exception:
+                continue
+        return resolved
+
+    def resolve_email_otp(self, run_id: str) -> dict[str, Any] | None:
+        """Fetch the emailed OTP from Gmail and resume the browser with it injected.
+
+        Keeps the whole login in one autonomous task: the code is read from the
+        connected inbox, wrapped as a Browser Use ``sensitive_data`` placeholder
+        (never logged/persisted), and the same browser session is resumed so the
+        agent types the code and continues. Bounded per run to avoid loops.
+        """
+
+        if self._gmail_worker is None:
+            return None
+        record = self.storage.get_run(run_id)
+        if record is None or record.get("status") != "waiting_for_hitl":
+            return None
+        if self._hitl_action_type(record) != "email_otp":
+            return None
+        if self._otp_attempts.get(run_id, 0) >= 3:
+            return None
+        self._otp_attempts[run_id] = self._otp_attempts.get(run_id, 0) + 1
+
+        # The OTP email may lag the browser request; retry briefly (interruptible).
+        code: str | None = None
+        for _attempt in range(3):
+            try:
+                code = asyncio.run(self._gmail_worker.fetch_latest_otp())
+            except Exception:
+                code = None
+            if code or self._email_poller_stop.wait(5):
+                break
+        if not code:
+            return None
+        return self.resume_run(
+            run_id, signal="completed", browser_login={"login_otp": SecretStr(code)}
+        )
+
+    def poll_waiting_runs(self, *, limit: int = 100) -> int:
+        """Poll every run awaiting a provider reply; returns how many were polled.
+
+        Idempotent: poll_email acts only on a genuinely new inbound reply, so
+        repeated cycles over the same runs are safe no-ops.
+        """
+
+        if self._gmail_worker is None:
+            return 0
+        polled = 0
+        for record in self.storage.list_runs(limit=limit, offset=0):
+            if record.get("status") not in {"waiting_for_reply", "outreach_sent"}:
+                continue
+            run_id = str(record.get("run_id") or "")
+            if not run_id:
+                continue
+            try:
+                self.poll_email(run_id)
+                polled += 1
+            except Exception:
+                continue
+        return polled
 
     def _build_research_enricher(self, settings: Settings) -> ResearchEnricher | None:
         """Build the enricher only when Gemini is configured; own its HTTP client."""
@@ -468,6 +622,9 @@ class RunService:
             and settings.outreach_recipient_override is not None
         ):
             gmail = GmailWorker(settings=settings)
+            # Retain the Gmail worker so the poll-email action can fetch and
+            # classify replies on the same controlled account.
+            self._gmail_worker = gmail
         self._record_wiring("gmail", gmail, configured=gmail is not None)
 
         browser: BrowserWorker | None = None
@@ -484,6 +641,7 @@ class RunService:
             browser=browser,
             gmail=gmail,
             effect_store=self._effect_store,
+            outreach_recipient=settings.outreach_recipient_override,
         )
 
     def _record_wiring(
@@ -515,6 +673,10 @@ class RunService:
     def shutdown(self) -> None:
         """Close the durable workflow, owned provider clients, and connections."""
 
+        self._email_poller_stop.set()
+        if self._email_poller_thread is not None:
+            self._email_poller_thread.join(timeout=5)
+            self._email_poller_thread = None
         workflow = self._workflow
         self._workflow = None
         if workflow is not None:
@@ -540,6 +702,7 @@ class RunService:
         *,
         idempotency_key: str | None = None,
         execution_mode: Literal["plan_only", "execute_when_configured"] = "plan_only",
+        browser_login: Mapping[str, SecretStr] | None = None,
     ) -> dict[str, Any]:
         """Create and route one run without invoking an external provider.
 
@@ -788,9 +951,21 @@ class RunService:
                     # routes run the workflow plan-only (routing only). The workflow
                     # performs the legal internal transitions and this projection
                     # records its truthful result.
+                    # Autonomous sign-in credentials (if any) are injected into
+                    # Browser Use as secure ``sensitive_data`` placeholders at
+                    # session creation, so the agent signs in on its own. The raw
+                    # values are passed to the workflow only as a call argument and
+                    # never persisted to state, checkpoints, the ledger, or logs.
+                    start_sensitive_data: dict[str, str] | None = None
+                    if browser_login and run_provider_action:
+                        start_sensitive_data = {
+                            name: secret.get_secret_value()
+                            for name, secret in browser_login.items()
+                        }
                     workflow_state = self._workflow.start(
                         request.model_copy(update={"dry_run": not run_provider_action}),
                         thread_id=thread_id,
+                        sensitive_data=start_sensitive_data,
                     )
                     persisted_status = str(workflow_state.get("status") or routed_status)
                     persisted_route = workflow_state.get("access_route") or decision.route
@@ -1313,6 +1488,46 @@ class RunService:
             raise RuntimeError("output response could not be sanitized")
         return cast(dict[str, Any], sanitized)
 
+    def reveal_credentials(self, run_id: str) -> dict[str, str] | None:
+        """Owner-only raw credential reveal resolved live from the encrypted vault.
+
+        This is the single, deliberate boundary that returns obtained credential
+        VALUES, for the authenticated owner to use directly in their own app. The
+        run's ``vault://`` references are resolved in-memory and returned; the raw
+        values are never written to run state, checkpoints, the ledger, or logs.
+        Only a sanitized ``credentials_revealed`` audit event (kinds only) is
+        recorded. Returns ``None`` when the run is absent and ``{}`` when no
+        credential references exist yet.
+        """
+
+        record = self.storage.get_run(run_id)
+        if record is None:
+            return None
+        store = self._secret_store
+        if store is None:
+            raise CredentialSubmissionError("credential_boundary_not_configured")
+        bundle = record.get("integrator_bundle")
+        if not isinstance(bundle, Mapping):
+            return {}
+        references = bundle.get("credential_refs")
+        if not isinstance(references, Mapping) or not references:
+            return {}
+        revealed: dict[str, str] = {}
+        try:
+            for kind, reference in references.items():
+                validated_reference = validate_vault_reference(str(reference))
+                revealed[str(kind)] = store.get(validated_reference)
+        except SecretStoreError:
+            raise CredentialSubmissionError("credential_reference_unresolved") from None
+        with self.storage.unit_of_work() as transaction:
+            if transaction.get_run(run_id) is not None:
+                transaction.append_audit_event(
+                    run_id=run_id,
+                    event_type="credentials_revealed",
+                    payload={"kinds": sorted(revealed), "external_actions": False},
+                )
+        return revealed
+
     def project(
         self,
         run_id: str,
@@ -1444,15 +1659,225 @@ class RunService:
         session_id = record.get("browser_session_id")
         if not isinstance(session_id, str) or not session_id:
             return None
-        return worker.live_url(session_id)
+        live_url = worker.live_url(session_id)
+        if live_url:
+            return live_url
+        # After an API restart the in-memory URL is gone but the provider session
+        # may still be running. Recover the signed URL from the durable
+        # checkpoint's (non-secret) provider session id so the embedded live view
+        # reconnects. The signed URL itself is never persisted.
+        recover = getattr(worker, "recover_live_url", None)
+        if not callable(recover) or self._workflow is None:
+            return None
+        thread_id = record.get("thread_id")
+        if not isinstance(thread_id, str) or not thread_id:
+            return None
+        try:
+            checkpoint_state = self._workflow.get_state(thread_id)
+        except Exception:
+            return None
+        provider_session = checkpoint_state.get("browser_provider_session_id")
+        if not isinstance(provider_session, str) or not provider_session:
+            return None
+        try:
+            return asyncio.run(recover(session_id, provider_session))
+        except Exception:
+            return None
 
-    def resume_run(self, run_id: str, *, signal: str = "completed") -> dict[str, Any]:
+    def _public_no_reply(self, record: Mapping[str, object]) -> dict[str, Any]:
+        """Return the current run projection with a no-op reply marker."""
+
+        public = _public_run(record)
+        public["latest_reply_class"] = "no_reply"
+        public["follow_up_sent"] = False
+        return public
+
+    def _company_from_checkpoint(self, thread_id: str) -> CompanyProfile | None:
+        """Read the run's company profile from the durable workflow checkpoint.
+
+        Used to give the Gemini reply assistant the real, non-secret company
+        facts. Returns None when the checkpoint is unavailable, in which case the
+        loop falls back to the deterministic classifier.
+        """
+
+        if self._workflow is None or not thread_id:
+            return None
+        try:
+            state = self._workflow.get_state(thread_id)
+        except Exception:
+            return None
+        request_payload = state.get("request")
+        if not isinstance(request_payload, Mapping):
+            return None
+        try:
+            return OperationsRequest.model_validate(dict(request_payload)).company
+        except Exception:
+            return None
+
+    def poll_email(self, run_id: str) -> dict[str, Any]:
+        """Fetch the outreach thread, classify the latest reply, and advance.
+
+        Closes the gated-outreach loop: reads the Gmail thread by its persisted
+        thread id, sanitizes and classifies the latest reply (offline), records a
+        sanitized reply event, and moves the run forward. For a "more information
+        required" reply it sends one bounded follow-up reply (up to
+        ``max_outreach_rounds``) so the back-and-forth continues. Credentials in a
+        reply are stored as vault references only; rejections block the run.
+        """
+
+        from ops.reply_classifier import ReplyClassifier
+
+        if self._gmail_worker is None:
+            raise CredentialSubmissionError("gmail_not_configured")
+        settings = self._settings or Settings.from_env()
+        lock = self._run_lock(run_id)
+        if not lock.acquire(blocking=False):
+            raise RunConflictError(run_id, "poll_email")
+        try:
+            current = self.storage.get_run(run_id)
+            if current is None:
+                raise KeyError("run was not found")
+            if current["status"] not in {"waiting_for_reply", "outreach_sent"}:
+                raise CredentialSubmissionError("run_not_awaiting_reply")
+            thread_id = current.get("gmail_thread_id")
+            if not isinstance(thread_id, str) or not thread_id:
+                raise CredentialSubmissionError("gmail_thread_missing")
+            app_name = str(current.get("app_name") or "")
+
+            from ops.email_ai import build_email_assistant
+
+            thread = asyncio.run(self._gmail_worker.fetch_thread(thread_id))
+            # The vendor (inbound) messages come from the address we correspond
+            # with (the controlled recipient); our own outreach/follow-ups do not.
+            # Act only on the latest, not-yet-processed inbound reply so repeated
+            # background polling is a safe no-op (no timeline spam, no resend).
+            counterpart = (settings.outreach_recipient_override or "").casefold()
+            inbound = None
+            rounds = 0
+            for message in thread.messages:
+                if counterpart and counterpart in message.sender.casefold():
+                    inbound = message
+                    rounds += 1
+            if inbound is None or self._last_processed_reply.get(run_id) == inbound.message_id:
+                return self._public_no_reply(current)
+            reply_text = _strip_quoted_reply(inbound.sanitized_body)
+
+            heuristic = asyncio.run(
+                ReplyClassifier().classify(app_name=app_name, sanitized_thread=thread)
+            )
+            cls = heuristic.classification
+            ai_reply_body: str | None = None
+            classified_by = "heuristic"
+            assistant = build_email_assistant(settings)
+            company = self._company_from_checkpoint(str(current.get("thread_id") or ""))
+            if reply_text and assistant is not None and company is not None:
+                try:
+                    ai = assistant.analyze_reply(
+                        app_name=app_name, company=company, reply_text=reply_text
+                    )
+                    cls = ai.classification
+                    ai_reply_body = (ai.reply_body or "").strip() or None
+                    classified_by = "llm"
+                except Exception:
+                    classified_by = "heuristic"
+
+            next_status: RunStatus = "waiting_for_reply"
+            follow_up_sent = False
+            credential_refs = {
+                f"email_secret_{index + 1}": reference
+                for index, reference in enumerate(thread.credential_refs)
+            }
+            if cls == "credentials_received" and credential_refs:
+                next_status = "credentials_ready"
+            elif cls == "rejected":
+                next_status = "blocked"
+            elif cls in {"more_information_required", "meeting_requested"} and (
+                rounds <= settings.max_outreach_rounds
+            ):
+                follow_up_body = ai_reply_body or (
+                    "Thank you for the quick response. To help us proceed with the API "
+                    "integration, we have shared the requested details above and remain "
+                    "available for any further information. Could you confirm the developer "
+                    "access and credential issuance steps for production?"
+                )
+                try:
+                    asyncio.run(
+                        self._gmail_worker.reply(
+                            thread_id,
+                            follow_up_body,
+                            idempotency_key=f"{run_id}:followup-{inbound.message_id}",
+                        )
+                    )
+                    follow_up_sent = True
+                except (ProviderContractError, ProviderOperationError):
+                    follow_up_sent = False
+
+            # Mark this inbound reply handled so subsequent polls do not reprocess.
+            self._last_processed_reply[run_id] = inbound.message_id
+
+            with self.storage.unit_of_work() as transaction:
+                record = transaction.get_run(run_id)
+                if record is None:  # pragma: no cover - re-checked under lock
+                    raise KeyError("run was not found")
+                revision = int(record.get("state_revision", 0) or 0) + 1
+                previous_status = cast(RunStatus, record["status"])
+                validate_status_transition(previous_status, next_status, "poll_email")
+                changes: dict[str, object] = {
+                    "status": next_status,
+                    "state_revision": revision,
+                    "last_projected_revision": revision,
+                    "external_actions": True,
+                }
+                if next_status == "credentials_ready" and credential_refs:
+                    bundle = dict(record.get("integrator_bundle") or {})
+                    existing_refs = dict(bundle.get("credential_refs") or {})
+                    existing_refs.update(credential_refs)
+                    if bundle:
+                        bundle["credential_refs"] = existing_refs
+                        changes["integrator_bundle"] = bundle
+                updated = transaction.update_run(run_id, **changes)
+                transaction.append_audit_event(
+                    run_id=run_id,
+                    event_type="reply_received",
+                    payload={
+                        "classification": cls,
+                        "classified_by": classified_by,
+                        "message_count": len(thread.messages),
+                        "official_setup_urls": list(heuristic.official_setup_urls),
+                        "required_next_action": heuristic.required_next_action,
+                        "follow_up_sent": follow_up_sent,
+                        "rounds": rounds,
+                        "external_actions": True,
+                    },
+                )
+                public = _public_run(updated)
+                # Non-persisted, non-secret classification for the caller's receipt.
+                public["latest_reply_class"] = cls
+                public["follow_up_sent"] = follow_up_sent
+                return public
+        finally:
+            lock.release()
+
+    def resume_run(
+        self,
+        run_id: str,
+        *,
+        signal: str = "completed",
+        browser_login: Mapping[str, SecretStr] | None = None,
+    ) -> dict[str, Any]:
         """Resume a waiting_for_hitl run on the SAME browser session/thread.
 
         Continues the durable workflow through the existing thread id (no new
         session is created), then projects the resumed state. A repeated
         interrupt keeps the run at waiting_for_hitl with a refreshed instruction;
         a cleared path advances toward the credential page.
+
+        When ``browser_login`` is supplied (owner-only, loopback), its raw values
+        are resolved in-memory ONLY for the single ``workflow.resume`` call and
+        injected into Browser Use as secure ``sensitive_data`` placeholders so the
+        agent logs in autonomously. The raw values are never written to run state,
+        checkpoints, audit events, or logs, and are dropped as soon as resume
+        returns; only the non-secret field names are recorded.
         """
 
         if self._workflow is None:
@@ -1467,7 +1892,19 @@ class RunService:
             if current["status"] != "waiting_for_hitl":
                 raise CredentialSubmissionError("run_not_waiting_for_hitl")
             thread_id = str(current.get("thread_id") or run_id)
-            state = self._workflow.resume(thread_id, signal)
+            injected_login_fields: list[str] = sorted(browser_login) if browser_login else []
+            sensitive_data: dict[str, str] | None = None
+            if browser_login:
+                sensitive_data = {
+                    name: secret.get_secret_value() for name, secret in browser_login.items()
+                }
+            try:
+                state = self._workflow.resume(thread_id, signal, sensitive_data=sensitive_data)
+            finally:
+                # Drop the resolved raw values as soon as resume returns.
+                if sensitive_data is not None:
+                    sensitive_data.clear()
+                    sensitive_data = None
             interrupts = self._workflow.get_interrupts(thread_id)
 
             observation = state.get("browser_observation")
@@ -1506,6 +1943,17 @@ class RunService:
                     event_type="hitl_resumed",
                     payload={"signal": signal, "external_actions": True},
                 )
+                if injected_login_fields:
+                    # Record ONLY the non-secret field names that were injected;
+                    # the values never touch the ledger, state, or logs.
+                    transaction.append_audit_event(
+                        run_id=run_id,
+                        event_type="login_credentials_injected",
+                        payload={
+                            "fields": injected_login_fields,
+                            "external_actions": True,
+                        },
+                    )
                 if next_status == "waiting_for_hitl":
                     transaction.append_audit_event(
                         run_id=run_id,

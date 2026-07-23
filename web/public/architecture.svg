@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="900" viewBox="0 0 1800 900" role="img" aria-labelledby="title description">
+  <title id="title">Autonomous API Onboarding Pipeline</title>
+  <desc id="description">An app name enters a research layer, is routed into either a self-serve browser flow or a gated email and human flow, and both produce a normalized toolkit integration bundle.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#d7d7d7"/>
+    </marker>
+    <style>
+      .title { fill:#f7f7f7; font:700 32px Inter,Arial,sans-serif }
+      .heading { fill:#f7f7f7; font:600 18px Inter,Arial,sans-serif }
+      .label { fill:#f1f1f1; font:500 14px Inter,Arial,sans-serif }
+      .small { fill:#e4e4e4; font:500 12px Inter,Arial,sans-serif }
+      .muted { fill:#c4c4c4; font:400 13px Inter,Arial,sans-serif }
+      .line { fill:none; stroke:#d7d7d7; stroke-width:2; marker-end:url(#arrow) }
+      .icon { fill:none; stroke:#ededed; stroke-width:2; stroke-linecap:round; stroke-linejoin:round }
+    </style>
+  </defs>
+  <rect width="1800" height="900" fill="#171717"/>
+  <text x="28" y="56" class="title">Autonomous API Onboarding Pipeline</text>
+
+  <!-- Input -->
+  <g transform="translate(55 230)">
+    <path class="icon" d="M0 0h27l14 14v50H0z M27 0v15h14 M12 34h16 M22 27l7 7-7 7"/>
+    <text x="-2" y="88" class="label">App Name</text>
+  </g>
+  <path class="line" d="M98 264 H170 Q180 264 180 274 V315 Q180 325 190 325 H230"/>
+
+  <!-- Research -->
+  <g>
+    <rect x="230" y="145" width="320" height="265" rx="8" fill="#2c2537" stroke="#614a91" stroke-width="2"/>
+    <rect x="238" y="153" width="304" height="42" rx="4" fill="#3c3150"/>
+    <circle cx="257" cy="174" r="7" fill="none" stroke="#ddd" stroke-width="1.5"/>
+    <path d="M262 179l6 6" stroke="#ddd" stroke-width="1.5"/>
+    <text x="278" y="180" class="heading">Research Layer (Prior Output)</text>
+    <rect x="275" y="235" width="235" height="135" rx="8" fill="#181818" stroke="#7454aa" stroke-width="2"/>
+    <text x="308" y="272" class="label">• API details &amp; endpoints</text>
+    <text x="308" y="297" class="label">• Auth type</text>
+    <text x="308" y="322" class="label">• Required scopes</text>
+    <text x="308" y="347" class="label">• Developer portal URL</text>
+    <text x="308" y="372" class="label">• Self-serve vs Gated</text>
+  </g>
+  <path class="line" d="M550 325 H595 Q610 325 610 340 V350"/>
+
+  <!-- Decision -->
+  <g>
+    <path d="M680 235 L770 325 L680 415 L590 325 Z" fill="#282616" stroke="#d2a900" stroke-width="3"/>
+    <text x="641" y="330" class="heading">Self-serve?</text>
+  </g>
+
+  <!-- Self-serve flow -->
+  <g>
+    <rect x="850" y="95" width="495" height="325" rx="8" fill="#25372f" stroke="#56aa83" stroke-width="2"/>
+    <rect x="858" y="103" width="185" height="40" rx="4" fill="#29483a"/>
+    <text x="878" y="130" class="heading">Self-Serve Flow</text>
+
+    <g transform="translate(900 188)">
+      <circle cx="18" cy="15" r="10" class="icon"/><path d="M2 52v-13q0-12 16-12t16 12v13 M43 25h34 M66 17l11 8-11 8" class="icon"/>
+      <text x="-6" y="78" class="small">Create / Login</text>
+    </g>
+    <g transform="translate(1035 188)">
+      <circle cx="20" cy="20" r="20" class="icon"/><path d="M10 30l8-15 13-6-6 13z" class="icon"/>
+      <text x="-16" y="78" class="small">Navigate Portal</text>
+    </g>
+    <g transform="translate(1170 188)">
+      <path d="M0 5h47v39H0z M0 14h47 M8 10h1 M16 10h1" class="icon"/>
+      <text x="-16" y="78" class="small">Create Auth App</text>
+    </g>
+    <g transform="translate(1295 188)">
+      <path d="M0 11l6 6 10-13 M25 10h24 M0 31l6 6 10-13 M25 30h24" class="icon"/>
+      <text x="-16" y="78" class="small">Select Scopes</text>
+    </g>
+    <path d="M918 203H1034 M1076 203h93 M1218 203h76" class="line"/>
+    <path d="M1320 268v32q0 12-12 12h-210v25" class="line"/>
+    <rect x="885" y="330" width="425" height="70" rx="10" fill="#171b19" stroke="#43bd8d" stroke-width="2"/>
+    <path d="M930 375l14-14m-8-2a9 9 0 1113 13l-4 4-5-5-5 5-5-5z" class="icon"/>
+    <text x="990" y="372" class="heading">Retrieve Client ID / Secret / API Key</text>
+  </g>
+  <path class="line" d="M770 325 H815 Q830 325 830 310 V245 Q830 230 845 230 H850"/>
+  <text x="805" y="218" class="label">Yes</text>
+
+  <!-- Gated flow -->
+  <g>
+    <rect x="850" y="500" width="495" height="285" rx="8" fill="#3b2321" stroke="#a94842" stroke-width="2"/>
+    <rect x="858" y="508" width="142" height="40" rx="4" fill="#54312e"/>
+    <text x="878" y="535" class="heading">Gated Flow</text>
+    <g transform="translate(905 590)">
+      <circle cx="18" cy="15" r="10" class="icon"/><path d="M2 52v-13q0-12 16-12t16 12v13 M29 38h20 M42 30l7 8-7 8" class="icon"/>
+      <text x="-10" y="78" class="small">Find Contact</text>
+    </g>
+    <g transform="translate(1075 590)">
+      <rect x="0" y="4" width="48" height="36" rx="5" class="icon"/><path d="M2 9l22 17L46 9" class="icon"/>
+      <text x="-9" y="78" class="small">Composio Gmail</text>
+    </g>
+    <g transform="translate(1240 590)">
+      <rect x="4" y="0" width="34" height="43" rx="4" class="icon"/><path d="M0 15h-13v29h35 M-9 22h24 M-9 29h17" class="icon"/>
+      <text x="-17" y="78" class="small">Manage Convo</text>
+    </g>
+    <path d="M947 605h126 M1125 605h112" class="line"/>
+    <path d="M1262 668v24q0 12-12 12h-165v18" class="line"/>
+    <rect x="885" y="710" width="425" height="60" rx="10" fill="#171717" stroke="#d14a43" stroke-width="2"/>
+    <path d="M935 735h22v15h-22z M940 735v-5q0-6 6-6t6 6v5" class="icon"/>
+    <text x="990" y="746" class="heading">Receive Access / Credentials</text>
+  </g>
+  <path class="line" d="M680 415 V575 Q680 590 695 590 H850"/>
+  <text x="756" y="579" class="label">No</text>
+
+  <!-- Normalizer and output -->
+  <path class="line" d="M1345 265 H1485 Q1500 265 1500 280 V345"/>
+  <path class="line" d="M1345 640 H1485 Q1500 640 1500 625 V485"/>
+  <g transform="translate(1400 345)">
+    <path d="M40 0h90l45 70-45 70H40L-5 70z" fill="#203746" stroke="#287db2" stroke-width="2"/>
+    <path d="M28 61l8-8m-5-5l10 10m-6 5l9 9m5-26l8-8m-5-5l10 10" class="icon"/>
+    <text x="50" y="66" class="heading">Structured Output</text>
+    <text x="75" y="89" class="muted">Normalizer</text>
+  </g>
+  <path class="line" d="M1575 415 H1630"/>
+  <g transform="translate(1640 390)">
+    <path d="M0 20q10-16 25-5l10-10q15-13 28 0t0 28l-10 10q11 15-5 25t-25-5L13 73Q0 86-13 73t0-28z" class="icon"/>
+    <text x="-8" y="105" class="heading">Toolkit Integrator</text>
+  </g>
+</svg>

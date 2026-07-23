@@ -24,7 +24,7 @@ export default async function SystemPage() {
   }
 
   return (
-    <div className="page-enter space-y-8">
+    <div className="page-enter page-stack">
       <header className="flex flex-col gap-5 border-b border-border pb-7 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <div className="flex flex-wrap items-center gap-3"><p className="eyebrow">System status</p><StatusBadge status={health?.status ?? "unavailable"} /></div>
@@ -74,10 +74,10 @@ export default async function SystemPage() {
         )}
       </section>
 
-      <section className="grid gap-5 xl:grid-cols-[0.85fr_1.15fr]">
+      <section className="grid items-stretch gap-6 xl:grid-cols-2">
         <ProvenanceCard snapshot={health?.snapshot ?? null} />
         <div className="panel rounded-md bg-rail p-6 text-white">
-          <div className="flex items-center gap-2 text-sm font-semibold"><ShieldCheck className="size-4 text-violet-300" aria-hidden="true" /> Frontend security contract</div>
+          <div className="flex items-center gap-2 text-sm font-semibold"><ShieldCheck className="size-4 text-brand-300" aria-hidden="true" /> Frontend security contract</div>
           <div className="mt-6 grid gap-4 sm:grid-cols-2">
             <Boundary label="Data transfer" value="Sanitized DTOs" />
             <Boundary label="Browser storage" value="Not used" />
