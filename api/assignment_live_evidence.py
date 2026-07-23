@@ -10,30 +10,16 @@ import importlib
 from collections.abc import Mapping
 from typing import Any, cast
 
-from api.assignment_runtime import (
-    AssignmentBrowserWorker,
-    _await_if_needed,
-    _blocked_observation,
-    _classify_human_action,
-    _coerce_task_output,
-    _dump,
-    _official_target_url,
-    _render_browser_task,
-    _string,
-    assignment_allowed_hosts,
-    sanitize_browser_url,
-    validate_allowed_domains,
-)
+import api.service as service_module
+import ops.browser_worker as browser_worker_module
+import ops.operational_research as operational_research_module
+from api.assignment_runtime import AssignmentBrowserWorker, assignment_allowed_hosts
 from api.models import ProviderState
-from api.service import LocalRunService, _EVENT_SUMMARIES
+from api.service import LocalRunService
 from ops.browser_host_policy import evaluate_navigation
 from ops.browser_worker import BrowserObservation, BrowserSessionContext, BrowserTaskOutput
 from ops.models import OperationalResearch
-from ops.operational_research import (
-    EvidenceDocument,
-    GeminiStructuredExtractor,
-    _render_extraction_prompt,
-)
+from ops.operational_research import EvidenceDocument, GeminiStructuredExtractor
 from ops.provider_errors import ProviderContractError, ProviderOperationError
 
 _ORIGINAL_PROVIDER_STATES = LocalRunService._provider_states
@@ -51,10 +37,10 @@ async def _retained_run_assignment_task(
 
     worker._require_configuration()
     allowed = assignment_allowed_hosts(research)
-    patterns = validate_allowed_domains(allowed.patterns())
-    target_url = _official_target_url(research, patterns)
+    patterns = browser_worker_module.validate_allowed_domains(allowed.patterns())
+    target_url = browser_worker_module._official_target_url(research, patterns)
     task = (
-        _render_browser_task(target_url, patterns, resume_signal)
+        browser_worker_module._render_browser_task(target_url, patterns, resume_signal)
         + "\n\nASSIGNMENT VERIFICATION: A documentation page or developer landing page alone is "
         "not the credential page. Continue to the provider sign-in/account settings flow. If a "
         "password, OTP, CAPTCHA, consent, billing, or account-owner action is required, stop there "
@@ -77,7 +63,7 @@ async def _retained_run_assignment_task(
         run_kwargs["start_url"] = target_url
 
     try:
-        result = await _await_if_needed(client.run(task, **run_kwargs))
+        result = await browser_worker_module._await_if_needed(client.run(task, **run_kwargs))
     except Exception:
         await worker._safe_stop_handle(context.session_id)
         raise ProviderOperationError(
@@ -85,11 +71,11 @@ async def _retained_run_assignment_task(
             reason_code="provider_request_failed",
         ) from None
 
-    data = _dump(result)
+    data = browser_worker_module._dump(result)
     returned_session = (
-        _string(data.get("session_id"))
-        or _string(data.get("browser_session_id"))
-        or _string(data.get("id"))
+        browser_worker_module._string(data.get("session_id"))
+        or browser_worker_module._string(data.get("browser_session_id"))
+        or browser_worker_module._string(data.get("id"))
     )
     if provider_session and returned_session and returned_session != provider_session:
         await worker._safe_stop_handle(context.session_id)
@@ -107,25 +93,27 @@ async def _retained_run_assignment_task(
         worker._provider_sessions[context.session_id] = returned_session
         provider_session = returned_session
 
-    live_url = _string(data.get("live_url"))
+    live_url = browser_worker_module._string(data.get("live_url"))
     if not live_url and provider_session:
         sessions = cast(Any, client).sessions
         getter = cast(Any, sessions).get
         try:
-            session = await _await_if_needed(getter(provider_session))
+            session = await browser_worker_module._await_if_needed(getter(provider_session))
         except Exception:
             session = None
         if session is not None:
-            live_url = _string(_dump(session).get("live_url"))
+            live_url = browser_worker_module._string(
+                browser_worker_module._dump(session).get("live_url")
+            )
     if live_url:
         worker._assignment_live_urls[context.session_id] = live_url
 
-    output = _coerce_task_output(result)
-    current_url = sanitize_browser_url(output.current_url)
+    output = browser_worker_module._coerce_task_output(result)
+    current_url = browser_worker_module.sanitize_browser_url(output.current_url)
     decision = evaluate_navigation(current_url, allowed)
     if not decision.allowed:
         await worker._safe_stop_handle(context.session_id)
-        return _blocked_observation(decision)
+        return browser_worker_module._blocked_observation(decision)
 
     title = (output.safe_summary or "Official developer setup page")[:500]
     if output.hitl_required:
@@ -134,7 +122,7 @@ async def _retained_run_assignment_task(
             status="human_action_required",
             current_url=current_url,
             page_title=title,
-            human_action_type=_classify_human_action(reason),
+            human_action_type=browser_worker_module._classify_human_action(reason),
             human_instruction=reason[:1_000],
         )
 
@@ -161,7 +149,11 @@ async def _compatible_gemini_extract(
 ) -> OperationalResearch:
     """Use current Gemini structured output without deprecated sampling fields."""
 
-    prompt = _render_extraction_prompt(app_name, p1_record, documents)
+    prompt = operational_research_module._render_extraction_prompt(
+        app_name,
+        p1_record,
+        documents,
+    )
     genai = importlib.import_module("google.genai")
     types = importlib.import_module("google.genai.types")
     client = genai.Client(api_key=extractor._api_key.get_secret_value())
@@ -258,7 +250,7 @@ def install_assignment_live_evidence() -> None:
     extractor_type.extract = _compatible_gemini_extract
     service_type = cast(Any, LocalRunService)
     service_type._provider_states = _assignment_provider_states
-    _EVENT_SUMMARIES["operational_research_enriched"] = (
+    service_module._EVENT_SUMMARIES["operational_research_enriched"] = (
         "Perplexity discovery and Gemini structured extraction returned a sanitized enrichment result."
     )
     _INSTALLED = True
