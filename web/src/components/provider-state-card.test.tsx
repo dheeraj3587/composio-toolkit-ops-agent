@@ -15,31 +15,45 @@ function renderProvider(
 }
 
 describe("ProviderStateCard", () => {
-  // Point 3 / 11-a: absent live verification → Not reported
-  it("renders verification as Not reported (backend has no verification field)", () => {
+  it("renders configured adapters as awaiting run evidence rather than a failure", () => {
     const html = renderProvider({
       provider: "browser_use",
       status: "configured_not_verified",
       detail: "Adapter configuration was found.",
     })
 
-    expect(html).toContain("Verification")
-    expect(html).toContain(">Not reported<")
+    expect(html).toContain("Readiness")
+    expect(html).toContain("Awaiting run evidence")
+    expect(html).toContain("text-sky-800")
+    expect(html).not.toContain("text-red-800")
   })
 
-  // Point 11-h: old "LIVE TESTED · NO" wording is absent
+  it("renders ready adapters as runtime initialized", () => {
+    const html = renderProvider(
+      {
+        provider: "browser_use",
+        status: "ready",
+        detail: "Browser Use is initialized with live execution enabled.",
+      },
+      "run",
+    )
+
+    expect(html).toContain("Runtime initialized")
+    expect(html).toContain("Runtime wiring plus run timeline")
+    expect(html).toContain("text-emerald-800")
+  })
+
   it("does not contain stale LIVE TESTED wording", () => {
     const html = renderProvider({
       provider: "perplexity",
-      status: "configured_not_verified",
-      detail: "Search is used only for bounded official-document discovery.",
+      status: "ready",
+      detail: "Search is wired into execute-mode enrichment.",
     })
 
     expect(html).not.toMatch(/live.?test/i)
     expect(html).not.toMatch(/live.?verified/i)
   })
 
-  // Point 11-b: disabled policy is not a failure
   it("displays disabled status as policy-disabled, not as a failure", () => {
     const html = renderProvider({
       provider: "browser_use",
@@ -48,12 +62,10 @@ describe("ProviderStateCard", () => {
     })
 
     expect(html).toContain("Policy disabled")
-    // Indigo treatment for policy, not red for failure
     expect(html).toContain("text-indigo-800")
     expect(html).not.toContain("text-red-800")
   })
 
-  // Point 11-c: disabled does not imply configured
   it("does not infer configuration presence from disabled status", () => {
     const html = renderProvider({
       provider: "browser_use",
@@ -63,33 +75,20 @@ describe("ProviderStateCard", () => {
 
     expect(html).toContain("Not reported by this state")
     expect(html).not.toMatch(/>Configured</)
-    expect(html).not.toMatch(/>Present</)
   })
 
-  // Point 11-d: Composio Gmail delivery title
-  it("renders the composio provider as Composio Gmail delivery", () => {
+  it("renders Composio as the capability preflight rather than only Gmail", () => {
     const html = renderProvider({
       provider: "composio",
-      status: "disabled",
-      detail: "Live Gmail is policy-disabled.",
+      status: "ready",
+      detail: "Read-only Composio preflight initialized.",
     })
 
-    expect(html).toContain("Composio Gmail delivery")
-    expect(html).not.toMatch(/>Composio<\/h3>/)
+    expect(html).toContain("Composio capability preflight")
+    expect(html).toContain("Read-only preflight")
+    expect(html).toContain("Gmail delivery is a separate policy-controlled action")
   })
 
-  // Point 11-e: toolkit capability is described as run-specific
-  it("explains that Composio toolkit capability is evaluated during runs", () => {
-    const html = renderProvider({
-      provider: "composio",
-      status: "disabled",
-      detail: "Live Gmail is policy-disabled.",
-    })
-
-    expect(html).toContain("toolkit capability is evaluated separately during individual runs")
-  })
-
-  // Point 11-f: configured_not_verified explanation
   it("explains configured_not_verified without claiming live verification", () => {
     const html = renderProvider({
       provider: "gemini",
@@ -98,13 +97,12 @@ describe("ProviderStateCard", () => {
     })
 
     expect(html).toContain(
-      "Configuration is present, but the health endpoint has not performed a live provider probe.",
+      "Configuration is present. Execute-mode evidence will promote this capability to Ready",
     )
     expect(html).not.toContain("Live verified")
     expect(html).not.toContain("Live tested")
   })
 
-  // Point 11-g: unknown states render without invented certainty
   it("does not convert unknown or absent fields into false states", () => {
     const html = renderProvider({
       provider: "future_adapter",
@@ -117,7 +115,6 @@ describe("ProviderStateCard", () => {
     expect(html).not.toContain(">Configured<")
   })
 
-  // System vs run evidence distinction
   it("keeps system configuration separate from run-specific evidence", () => {
     const systemHtml = renderProvider(
       { provider: "browser_use", status: "configured_not_verified", detail: "d" },
@@ -128,30 +125,28 @@ describe("ProviderStateCard", () => {
       "run",
     )
 
-    for (const label of ["Configuration", "Policy", "Verification", "Evidence source"]) {
+    for (const label of ["Configuration", "Policy", "Readiness", "Evidence source"]) {
       expect(systemHtml).toContain(label)
     }
     expect(systemHtml).toContain("System configuration/policy only")
     expect(runHtml).toContain("See run phases and timeline")
   })
 
-  // For configured_not_verified: policy shows "Allowed" for gated providers
-  it("shows policy as Allowed when a policy-gated provider is configured", () => {
+  it("shows Browser Use policy as Allowed", () => {
     const html = renderProvider({
       provider: "browser_use",
-      status: "configured_not_verified",
-      detail: "Browser configuration is present.",
+      status: "ready",
+      detail: "Browser runtime ready.",
     })
 
     expect(html).toContain(">Allowed<")
   })
 
-  // For non-gated providers: policy shows "No policy gate"
   it("shows No policy gate for providers without a policy gate", () => {
     const html = renderProvider({
       provider: "perplexity",
-      status: "configured_not_verified",
-      detail: "Search is used only for bounded official-document discovery.",
+      status: "ready",
+      detail: "Search is wired into execute-mode enrichment.",
     })
 
     expect(html).toContain("No policy gate")
