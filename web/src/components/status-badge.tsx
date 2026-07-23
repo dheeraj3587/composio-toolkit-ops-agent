@@ -19,7 +19,7 @@ const gated = new Set(["gated", "approval_required", "partner_gated", "hybrid"])
 const unknown = new Set(["unknown", "not_reported", "unavailable", "not_available", "not_started", "not_attempted"])
 // Policy — intentionally disabled or unavailable by reviewed runtime policy
 const policy = new Set(["disabled", "policy_unavailable"])
-// Configuration — present but not verified through a live probe
+// Configuration — present but awaiting runtime evidence
 const configPresent = new Set(["configured_not_verified"])
 // Configuration — missing
 const configMissing = new Set(["not_configured"])
@@ -27,8 +27,8 @@ const configMissing = new Set(["not_configured"])
 function tone(status: string): string {
   // Policy: distinct indigo treatment — not a failure, not neutral
   if (policy.has(status)) return "border-indigo-300 bg-indigo-50 text-indigo-800"
-  // Configuration present but unverified: distinct amber treatment
-  if (configPresent.has(status)) return "border-amber-300 bg-amber-50 text-amber-800"
+  // Configuration present: informational blue rather than warning amber
+  if (configPresent.has(status)) return "border-sky-300 bg-sky-50 text-sky-800"
   // Configuration missing: distinct slate/orange treatment
   if (configMissing.has(status)) return "border-orange-300 bg-orange-50 text-orange-800"
   // Run-specific states
