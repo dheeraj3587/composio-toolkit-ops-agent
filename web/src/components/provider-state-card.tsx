@@ -12,7 +12,7 @@ const PROVIDER_TITLES: Record<string, string> = {
   vault: "Secret vault",
   perplexity: "Perplexity search",
   gemini: "Gemini extraction",
-  composio: "Composio Gmail delivery",
+  composio: "Composio capability preflight",
   browser_use: "Browser Use agent",
 }
 
@@ -22,16 +22,12 @@ const PROVIDER_DESCRIPTIONS: Record<string, string> = {
   perplexity: "Bounded official-document discovery via Perplexity search API.",
   gemini: "Structured extraction against fetched official evidence.",
   composio:
-    "Controlled Gmail outreach and reply polling via Composio. Composio toolkit capability is evaluated separately during individual runs.",
-  browser_use: "Cloud browser agent for onboarding navigation.",
+    "Read-only toolkit and connected-account capability evaluation. Gmail delivery is a separate policy-controlled action.",
+  browser_use: "Cloud browser agent for onboarding navigation and live evaluator inspection.",
 }
 
 // ---------------------------------------------------------------------------
-// Fact derivation — four distinct concepts
-//
-// Configuration, policy, verification, and run evidence are kept separate.
-// Facts are derived from the provider status token only — provider.detail is
-// displayed as authored by the backend and never parsed for structured data.
+// Fact derivation — configuration, policy, readiness, and evidence stay separate.
 // ---------------------------------------------------------------------------
 
 const CONFIGURED_STATUSES = new Set([
@@ -42,8 +38,6 @@ const CONFIGURED_STATUSES = new Set([
 const POLICY_GATED_PROVIDERS = new Set(["composio", "browser_use"])
 
 function configurationFact(status: string): string {
-  // disabled proves only that runtime policy is disabled — it says nothing
-  // about whether configuration is present.
   if (status === "disabled") return "Not reported by this state"
   if (status === "not_configured") return "Missing"
   if (status === "schema_incompatible") return "Schema incompatible"
@@ -53,36 +47,32 @@ function configurationFact(status: string): string {
 
 function policyFact(provider: string, status: string): string {
   if (status === "disabled") return "Policy disabled"
+  if (provider === "composio") return "Read-only preflight"
+  if (provider === "browser_use") return "Allowed"
   if (POLICY_GATED_PROVIDERS.has(provider)) return "Allowed"
   return "No policy gate"
 }
 
-function verificationFact(): string {
-  // The backend ProviderState model does not include a verification field.
-  // The system health endpoint checks configuration presence and policy only;
-  // it does not perform live provider probes.
+function verificationFact(status: string): string {
+  if (status === "ready") return "Runtime initialized"
+  if (status === "configured_not_verified") return "Awaiting run evidence"
+  if (status === "disabled") return "Not applicable"
   return "Not reported"
 }
 
-function evidenceFact(evidenceScope: "system" | "run"): string {
+function evidenceFact(evidenceScope: "system" | "run", status: string): string {
+  if (status === "ready" && evidenceScope === "run") return "Runtime wiring plus run timeline"
   return evidenceScope === "system"
     ? "System configuration/policy only"
     : "See run phases and timeline"
 }
 
-// ---------------------------------------------------------------------------
-// Provider-specific explanation — NOT parsed from provider.detail
-// ---------------------------------------------------------------------------
-
 function providerExplanation(provider: ProviderStatus): string {
   if (provider.status === "configured_not_verified") {
-    return "Configuration is present, but the health endpoint has not performed a live provider probe."
+    return "Configuration is present. Execute-mode evidence will promote this capability to Ready when its runtime adapter is initialized."
   }
-  if (
-    provider.status === "disabled" &&
-    /composio/i.test(provider.provider)
-  ) {
-    return "Live Gmail delivery is intentionally disabled by runtime policy. Composio toolkit capability is evaluated separately during individual runs."
+  if (provider.status === "disabled" && /composio/i.test(provider.provider)) {
+    return "Live Gmail delivery is disabled, while the read-only Composio capability preflight remains a separate run step."
   }
   if (provider.status === "disabled") {
     return "This capability is intentionally disabled by runtime policy. Configuration and run-specific evidence are separate states."
@@ -92,10 +82,6 @@ function providerExplanation(provider: ProviderStatus): string {
   }
   return provider.detail
 }
-
-// ---------------------------------------------------------------------------
-// Component
-// ---------------------------------------------------------------------------
 
 export function ProviderStateCard({
   provider,
@@ -114,8 +100,8 @@ export function ProviderStateCard({
   const facts = [
     ["Configuration", configurationFact(provider.status)],
     ["Policy", policyFact(provider.provider, provider.status)],
-    ["Verification", verificationFact()],
-    ["Evidence source", evidenceFact(evidenceScope)],
+    ["Readiness", verificationFact(provider.status)],
+    ["Evidence source", evidenceFact(evidenceScope, provider.status)],
   ] as const
 
   return (
