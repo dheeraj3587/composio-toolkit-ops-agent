@@ -96,8 +96,9 @@ def _output(*, hitl: bool = False) -> dict[str, object]:
     }
 
 
-def test_assignment_matrix_activates_nine_browser_apps_and_keeps_sherlock_blocked() -> None:
+def test_assignment_matrix_activates_expected_browser_apps_and_keeps_sherlock_blocked() -> None:
     active = {
+        # Original live matrix.
         "hubspot",
         "pipedrive",
         "attio",
@@ -107,6 +108,17 @@ def test_assignment_matrix_activates_nine_browser_apps_and_keeps_sherlock_blocke
         "whatsapp-business",
         "salesforce",
         "close",
+        "hubstaff",
+        # Self-serve batch activated for autonomous navigation (Level A).
+        "podio",
+        "zoho-crm",
+        "intercom",
+        "pylon",
+        "liveagent",
+        "slack",
+        "twilio",
+        "zoho-cliq",
+        "pumble",
     }
     for slug in active:
         policy = assignment_policy(slug)
@@ -117,6 +129,37 @@ def test_assignment_matrix_activates_nine_browser_apps_and_keeps_sherlock_blocke
     sherlock = assignment_policy("sherlock")
     assert sherlock is not None
     assert sherlock.active is False
+
+
+def test_self_serve_batch_hosts_validate_and_carry_traces() -> None:
+    """The newly activated self-serve apps must have policy hosts that pass the
+    browser allowlist validator and already ship STRICT APP TRACE steering."""
+
+    from ops.browser_api_trace_catalog import get_browser_api_trace
+    from ops.browser_worker import validate_allowed_domains
+
+    batch = (
+        "podio",
+        "zoho-crm",
+        "intercom",
+        "pylon",
+        "liveagent",
+        "slack",
+        "twilio",
+        "zoho-cliq",
+        "pumble",
+    )
+    for slug in batch:
+        policy = assignment_policy(slug)
+        assert policy is not None and policy.active is True
+        patterns = (
+            *policy.exact_hosts,
+            *(f"*.{domain}" for domain in policy.vendor_wildcard_domains),
+        )
+        # Fails closed with a clear error if any host is malformed.
+        assert validate_allowed_domains(patterns) == patterns
+        # Steering already exists so the agent is guided to the credential page.
+        assert get_browser_api_trace(slug) is not None
 
 
 def test_first_browser_operation_contains_task_and_provider_allowlist() -> None:

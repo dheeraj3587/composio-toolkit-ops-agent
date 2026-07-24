@@ -436,6 +436,15 @@ autonomous login injection; they differ in how far the credential is then carrie
 | **Zendesk** | self‑serve (browser) | ✓ | manual submit | — | Browser onboarding; owner submits the credential |
 | **Salesforce** | approval (browser) | ✓ | manual submit | — | Browser onboarding; owner submits the credential |
 | **Hubstaff** *(live‑demo seed)* | self‑serve (browser) | ✓ | manual submit | — | Browser onboarding; owner submits the credential |
+| **Podio** | self‑serve (browser) | ✓ | manual submit | — | Level A newly activated — pending first live verification |
+| **Zoho CRM** | self‑serve (browser) | ✓ | manual submit | — | Level A; US data center (add other `zoho.<dc>` hosts for non‑US accounts) |
+| **Zoho Cliq** | self‑serve (browser) | ✓ | manual submit | — | Level A; same Zoho multi‑DC caveat |
+| **Intercom** | self‑serve (browser) | ✓ | manual submit | — | Level A; access token issued per app in the Developer Hub |
+| **Pylon** | self‑serve (browser) | ✓ | manual submit | — | Level A newly activated — pending first live verification |
+| **LiveAgent** | self‑serve (browser) | ✓ | manual submit | — | Level A; per‑tenant `*.ladesk.com` accounts |
+| **Slack** | self‑serve (browser) | ✓ | manual submit | — | Level A; requires creating a Slack app to mint the token |
+| **Twilio** | self‑serve (browser) | ✓ | manual submit | — | Level A; Account SID + Auth Token on the console |
+| **Pumble** | self‑serve (browser) | ✓ | manual submit | — | Level A; CAKE.com sign‑in, install the API add‑on |
 | **Google Ads** | gated | n/a | n/a | n/a | Controlled Composio Gmail outreach |
 | **WhatsApp Business** | gated | n/a | n/a | n/a | Controlled Composio Gmail outreach |
 | **Close** | gated | n/a | n/a | n/a | Controlled Composio Gmail outreach |
@@ -446,6 +455,14 @@ autonomous login injection; they differ in how far the credential is then carrie
 > owner‑only credential endpoint, which stores it as a `vault://` reference and builds the same
 > reference‑only bundle. Auto‑capture + validation are being extended app‑by‑app; Pipedrive is the
 > reference end‑to‑end path.
+>
+> **"Level A"** marks the nine self‑serve apps activated for **autonomous navigation**: each ships
+> verified STRICT APP TRACE steering and a reviewed host policy (`_ASSIGNMENT_POLICIES` in
+> `api/assignment_runtime.py`), so the agent drives itself to the credential page and the owner
+> submits the value. Their host allowlists were confirmed by following each app's live sign‑in →
+> API‑settings redirect chain, but they have **not** yet had a first end‑to‑end run with the test
+> account — do that before relying on them, and add a hands‑off capture spec (**Level B**) only after
+> confirming the live token format (see `ops/credential_capture_specs.py`).
 
 ### Test account for browser onboarding
 

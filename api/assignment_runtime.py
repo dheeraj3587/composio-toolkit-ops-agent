@@ -56,7 +56,9 @@ from ops.provider_errors import ProviderContractError, ProviderOperationError
 _INACTIVITY_WINDOW = timedelta(minutes=15)
 _MAXIMUM_WINDOW = timedelta(hours=4)
 
-# Nine apps have a real official browser surface. Sherlock remains blocked by
+# Reviewed apps with a real official browser surface, keyed by canonical slug.
+# The first block is the original live matrix; the self-serve batch below it was
+# activated for autonomous navigation (Level A). Sherlock remains blocked by
 # verified P1 evidence and is still processed end to end without launching a
 # browser session.
 _ASSIGNMENT_POLICIES: dict[str, BrowserHostPolicy] = {
@@ -123,6 +125,95 @@ _ASSIGNMENT_POLICIES: dict[str, BrowserHostPolicy] = {
         app_slug="close",
         active=True,
         exact_hosts=("app.close.com", "developer.close.com"),
+    ),
+    # --- Self-serve batch activated for autonomous navigation (Level A) ---
+    # These nine apps already ship verified STRICT APP TRACE steering (see
+    # ops/browser_api_traces.json) and are classified self_serve by verified P1
+    # evidence. Hosts below were confirmed on 2026-07-24 by following each app's
+    # live sign-in -> developer/API-settings -> credential-page redirect chain.
+    # The agent navigates to the credential page and the owner submits the value;
+    # hands-off capture (Level B) is added per app only after a live token-format
+    # verification (see credential_capture_specs.py).
+    "podio": BrowserHostPolicy(
+        app_slug="podio",
+        active=True,
+        # Sign-in and the API-client page both live on podio.com/settings/api;
+        # orgs are path-based, so no per-tenant subdomain.
+        exact_hosts=("podio.com", "developers.podio.com"),
+    ),
+    "zoho-crm": BrowserHostPolicy(
+        app_slug="zoho-crm",
+        active=True,
+        # US data center. Zoho is multi-DC (accounts/api-console.zoho.{eu,in,
+        # com.au,jp,...} and zohocloud.ca for Canada); non-US accounts need their
+        # DC host added. Self Client OAuth credentials at api-console.zoho.com.
+        exact_hosts=("accounts.zoho.com", "api-console.zoho.com"),
+    ),
+    "intercom": BrowserHostPolicy(
+        app_slug="intercom",
+        active=True,
+        # Access token issued per app in the Developer Hub at app.intercom.com;
+        # app.eu/app.au are the fixed regional data-hosting variants.
+        exact_hosts=(
+            "app.intercom.com",
+            "app.eu.intercom.com",
+            "app.au.intercom.com",
+            "developers.intercom.com",
+        ),
+    ),
+    "pylon": BrowserHostPolicy(
+        app_slug="pylon",
+        active=True,
+        # Direct token generation at app.usepylon.com/settings/api-tokens.
+        exact_hosts=("app.usepylon.com", "docs.usepylon.com"),
+    ),
+    "liveagent": BrowserHostPolicy(
+        app_slug="liveagent",
+        active=True,
+        # Accounts are per-tenant <account>.ladesk.com; the API v3 key lives in
+        # the tenant admin panel. www.liveagent.com is the login launcher.
+        exact_hosts=("www.liveagent.com", "support.liveagent.com"),
+        vendor_wildcard_domains=("ladesk.com",),
+    ),
+    "slack": BrowserHostPolicy(
+        app_slug="slack",
+        active=True,
+        # Tokens live on api.slack.com/apps (app creation required). Workspaces
+        # are <workspace>.slack.com and Enterprise Grid <org>.enterprise.slack.com,
+        # all covered by the vendor wildcard; slack.com root serves sign-in.
+        exact_hosts=("slack.com",),
+        vendor_wildcard_domains=("slack.com",),
+    ),
+    "twilio": BrowserHostPolicy(
+        app_slug="twilio",
+        active=True,
+        # Login form on www.twilio.com/login; Account SID + Auth Token and API
+        # keys on console.twilio.com. login.twilio.com is Twilio's unified login.
+        exact_hosts=(
+            "console.twilio.com",
+            "www.twilio.com",
+            "login.twilio.com",
+            "twilio.com",
+        ),
+    ),
+    "zoho-cliq": BrowserHostPolicy(
+        app_slug="zoho-cliq",
+        active=True,
+        # Same Zoho OAuth surface as CRM (US DC; multi-DC caveat applies).
+        exact_hosts=("accounts.zoho.com", "api-console.zoho.com"),
+    ),
+    "pumble": BrowserHostPolicy(
+        app_slug="pumble",
+        active=True,
+        # Pumble is a CAKE.com product: sign-in federates through
+        # account.cake.com, the API add-on is installed via marketplace.cake.com,
+        # and keys are generated inside the app at app.pumble.com.
+        exact_hosts=(
+            "app.pumble.com",
+            "pumble.com",
+            "account.cake.com",
+            "marketplace.cake.com",
+        ),
     ),
     # Additive live-demo app. Hubstaff is NOT part of the immutable P1 snapshot;
     # it is seeded only in this production assignment layer so its self-serve

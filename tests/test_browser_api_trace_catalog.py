@@ -152,6 +152,7 @@ def test_catalog_start_urls_fit_every_already_active_host_policy() -> None:
 
     assert checked_core == {"pipedrive", "twenty"}
     assert checked_assignment == {
+        # Original live matrix (catalog apps that are active).
         "attio",
         "close",
         "hubspot",
@@ -159,6 +160,17 @@ def test_catalog_start_urls_fit_every_already_active_host_policy() -> None:
         "salesforce",
         "twenty",
         "zendesk",
+        # Self-serve batch activated for autonomous navigation (Level A). Each
+        # app's trace start_url must fall inside its reviewed host policy.
+        "podio",
+        "zoho-crm",
+        "intercom",
+        "pylon",
+        "liveagent",
+        "slack",
+        "twilio",
+        "zoho-cliq",
+        "pumble",
     }
 
 
