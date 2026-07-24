@@ -14,6 +14,7 @@ import hashlib
 import json
 import re
 import threading
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -218,6 +219,20 @@ def _slugify(app_name: str) -> str:
     safe_name = redact_text(app_name)
     slug = re.sub(r"[^a-z0-9]+", "-", safe_name.strip().lower()).strip("-")
     return slug or "app"
+
+
+def _clean_credential_value(value: str) -> str:
+    """Strip surrounding whitespace and invisible formatting characters.
+
+    Credentials copied or read from a rendered page can pick up zero-width or
+    directional Unicode marks (e.g. U+200E LEFT-TO-RIGHT MARK, U+200B ZERO WIDTH
+    SPACE, U+FEFF BYTE ORDER MARK). These corrupt the stored token and break
+    ASCII encoding when the read-only validator sends it in an HTTP header. They
+    are never part of a real API key, so they are removed before storage.
+    """
+
+    without_format = "".join(ch for ch in value if unicodedata.category(ch) != "Cf")
+    return without_format.strip()
 
 
 def _strip_quoted_reply(body: str) -> str:
@@ -2428,10 +2443,13 @@ class RunService:
                 references: dict[str, str] = {}
                 try:
                     for kind, secret in fields.items():
+                        cleaned = _clean_credential_value(secret.get_secret_value())
+                        if not cleaned:
+                            raise CredentialSubmissionError("empty_credential_value")
                         reference = store.put(
                             app_slug=app_slug,
                             kind=kind,
-                            value=secret.get_secret_value(),
+                            value=cleaned,
                         )
                         references[kind] = validate_vault_reference(reference)
                 except Exception:
