@@ -784,10 +784,11 @@ class RunService:
         gated to environments where the harness is importable (see the factory).
         """
 
-        provider = getattr(settings, "browser_provider", "browser_use")
-        if provider == "playwright":
-            return settings.allow_live_browser
-        return settings.allow_live_browser and settings.browser_use_api_key is not None
+        from ops.browser_readiness import browser_configuration_state
+
+        # One shared, provider-aware helper (also used by health + retry eligibility)
+        # so a Playwright deployment is never judged by a Browser Use key.
+        return browser_configuration_state(settings)
 
     def _build_browser_worker(self, settings: Settings) -> BrowserWorker:
         """Select the browser backend. Default resolves the (possibly assignment-

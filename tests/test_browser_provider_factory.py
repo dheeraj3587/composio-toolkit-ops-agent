@@ -25,12 +25,21 @@ def test_default_provider_is_browser_use() -> None:
     assert Settings().browser_provider == "browser_use"
 
 
-def test_from_env_parses_provider_and_fails_closed() -> None:
+def test_from_env_parses_provider_and_rejects_typos() -> None:
+    import pytest
+
     assert Settings.from_env(env={}).browser_provider == "browser_use"
-    assert Settings.from_env(env={"BROWSER_PROVIDER": "playwright"}).browser_provider == "playwright"
-    assert Settings.from_env(env={"BROWSER_PROVIDER": "PLAYWRIGHT"}).browser_provider == "playwright"
-    # An unknown value must not crash and must not silently enable a new backend.
-    assert Settings.from_env(env={"BROWSER_PROVIDER": "garbage"}).browser_provider == "browser_use"
+    assert (
+        Settings.from_env(env={"BROWSER_PROVIDER": "playwright"}).browser_provider == "playwright"
+    )
+    assert (
+        Settings.from_env(env={"BROWSER_PROVIDER": "PLAYWRIGHT"}).browser_provider == "playwright"
+    )
+    # Hardened after audit: a present-but-invalid value must RAISE, not silently
+    # select a different backend than the operator intended (e.g. "playwrite"
+    # quietly falling back to the paid provider).
+    with pytest.raises(ValueError):
+        Settings.from_env(env={"BROWSER_PROVIDER": "garbage"})
 
 
 # --- wiring condition parity --------------------------------------------------

@@ -29,6 +29,10 @@ class BrowserLoopClosedError(RuntimeError):
     """Raised when work is submitted to an already-closed loop."""
 
 
+class BrowserOperationTimeout(TimeoutError):
+    """Raised when a browser operation exceeded its bounded timeout."""
+
+
 class BrowserLoop:
     """A process-wide, lazily started event loop on a daemon thread."""
 
@@ -75,8 +79,15 @@ class BrowserLoop:
 
         loop = self._ensure_started()
         future = asyncio.run_coroutine_threadsafe(coro, loop)
+        wrapped = asyncio.wrap_future(future)
         try:
-            return await asyncio.wrap_future(future)
+            # The timeout MUST be enforced: a hung page operation would otherwise
+            # block the caller forever. On expiry the underlying task is cancelled
+            # on the browser loop so it cannot keep running detached.
+            return await asyncio.wait_for(wrapped, timeout)
+        except TimeoutError:
+            future.cancel()
+            raise BrowserOperationTimeout("browser_operation_timeout") from None
         except asyncio.CancelledError:  # pragma: no cover - cooperative cancel
             future.cancel()
             raise
@@ -88,21 +99,40 @@ class BrowserLoop:
         return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout)
 
     def close(self) -> None:
-        """Stop the loop and join its thread. Idempotent."""
+        """Reject new work, drain the loop, then join its thread. Idempotent.
+
+        Shutdown order matters: pending tasks are cancelled and async generators
+        are shut down ON the loop before it stops, so a half-finished Playwright
+        operation cannot leave a wedged task or an unclosed generator behind.
+        """
 
         with self._lock:
             loop, thread = self._loop, self._thread
             self._loop = self._thread = None
-            self._closed = True
-        if loop is not None:
-            loop.call_soon_threadsafe(loop.stop)
+            self._closed = True  # new submissions are refused from here on
+        if loop is None:
+            return
+
+        async def _drain() -> None:
+            current = asyncio.current_task()
+            pending = [task for task in asyncio.all_tasks() if task is not current]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            await loop.shutdown_asyncgens()
+
+        try:
+            asyncio.run_coroutine_threadsafe(_drain(), loop).result(timeout=15.0)
+        except Exception:  # pragma: no cover - loop already unhealthy
+            pass
+        loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
             thread.join(timeout=10.0)
-        if loop is not None:
-            try:
-                loop.close()
-            except Exception:  # pragma: no cover - already closed
-                pass
+        try:
+            loop.close()
+        except Exception:  # pragma: no cover - already closed
+            pass
 
 
 _SHARED = BrowserLoop()
@@ -114,4 +144,9 @@ def shared_browser_loop() -> BrowserLoop:
     return _SHARED
 
 
-__all__ = ["BrowserLoop", "BrowserLoopClosedError", "shared_browser_loop"]
+__all__ = [
+    "BrowserLoop",
+    "BrowserLoopClosedError",
+    "BrowserOperationTimeout",
+    "shared_browser_loop",
+]

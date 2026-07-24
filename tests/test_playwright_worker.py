@@ -74,10 +74,18 @@ def test_route_allows_onlist_document_navigation() -> None:
     assert route.continued is True and route.aborted is False
 
 
-def test_route_allows_offlist_subresource() -> None:
-    # A script/font from a CDN is a subresource, not a navigation: allowed so real
-    # pages render. Only the agent LEAVING the app is blocked.
+def test_route_blocks_offlist_active_script() -> None:
+    # Hardened after audit: an off-allowlist SCRIPT is an active/exfiltration-capable
+    # request, not a harmless asset — credentials are typed into the DOM, so a
+    # third-party script must not be able to load and beacon them out.
     route = _run_route("https://cdn.evil-but-asset.example/app.js", "script", False)
+    assert route.aborted is True and route.continued is False
+
+
+def test_route_allows_offlist_passive_asset() -> None:
+    # Render-only assets (images/fonts/stylesheets/media) still load off-allowlist
+    # so real vendor pages display correctly.
+    route = _run_route("https://cdn.example/logo.png", "image", False)
     assert route.continued is True and route.aborted is False
 
 

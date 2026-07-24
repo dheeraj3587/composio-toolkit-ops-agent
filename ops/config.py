@@ -58,11 +58,20 @@ def _float(value: str | None, *, default: float) -> float:
 
 
 def _choice(value: str | None, allowed: tuple[str, ...], *, default: str) -> str:
-    """Return a normalized enum value, failing closed to ``default`` when unknown."""
+    """Return a normalized enum value.
+
+    An ABSENT value uses ``default``, but a present-and-invalid value raises: a typo
+    like ``BROWSER_PROVIDER=playwrite`` must not silently select a different backend
+    than the operator intended.
+    """
 
     normalized = _optional(value)
-    lowered = normalized.casefold() if normalized else ""
-    return lowered if lowered in allowed else default
+    if normalized is None:
+        return default
+    lowered = normalized.casefold()
+    if lowered not in allowed:
+        raise ValueError(f"value must be one of {', '.join(allowed)}")
+    return lowered
 
 
 def _csv(value: str | None) -> tuple[str, ...]:
@@ -84,6 +93,8 @@ class Settings(BaseModel):
     perplexity_api_key: SecretStr | None = Field(default=None, repr=False)
     google_genai_api_key: SecretStr | None = Field(default=None, repr=False)
     openrouter_api_key: SecretStr | None = Field(default=None, repr=False)
+    groq_api_key: SecretStr | None = Field(default=None, repr=False)
+    cerebras_api_key: SecretStr | None = Field(default=None, repr=False)
     composio_api_key: SecretStr | None = Field(default=None, repr=False)
     browser_use_api_key: SecretStr | None = Field(default=None, repr=False)
     langgraph_aes_key: SecretStr | None = Field(default=None, repr=False)
@@ -110,6 +121,12 @@ class Settings(BaseModel):
     # Gemini is the fallback. The model is a free OpenRouter model by default.
     openrouter_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
+    # Free-tier browser-decision models. Both providers are OpenAI-compatible but
+    # differ: strict json_schema requires a gpt-oss model, and Groq prefixes it
+    # with "openai/" while Cerebras does not (verified against both vendors' docs).
+    groq_model: str = "openai/gpt-oss-120b"
+    cerebras_model: str = "gpt-oss-120b"
+
     # Session count is the real quota (not dollars), so use the most capable
     # Browser Use model for reliable multi-step onboarding navigation. The latest
     # Opus available on Browser Use Cloud is claude-opus-4.7 (there is no 4.8).
@@ -120,6 +137,10 @@ class Settings(BaseModel):
     # cloud (prod-proven); "playwright" selects the self-hosted harness. This is the
     # single switch behind the gradual migration — the default keeps prod unchanged.
     browser_provider: Literal["browser_use", "playwright"] = "browser_use"
+    # Self-hosted Playwright limits. Each session is a real Chromium process, so the
+    # cap is sized for a small VPS. --no-sandbox is opt-in (see _launch_args).
+    playwright_max_sessions: int = Field(default=2, ge=1, le=10)
+    playwright_disable_sandbox: bool = False
     # Owner-only local credential submission is opt-in and loopback-only.
     allow_local_credential_submission: bool = False
 
@@ -176,6 +197,10 @@ class Settings(BaseModel):
             "perplexity_api_key": _secret(source.get("PERPLEXITY_API_KEY")),
             "google_genai_api_key": _secret(source.get("GOOGLE_GENAI_API_KEY")),
             "openrouter_api_key": _secret(source.get("OPENROUTER_API_KEY")),
+            "groq_api_key": _secret(source.get("GROQ_API_KEY")),
+            "cerebras_api_key": _secret(source.get("CEREBRAS_API_KEY")),
+            "groq_model": _optional(source.get("GROQ_MODEL")) or "openai/gpt-oss-120b",
+            "cerebras_model": _optional(source.get("CEREBRAS_MODEL")) or "gpt-oss-120b",
             "openrouter_model": _optional(source.get("OPENROUTER_MODEL"))
             or "nvidia/nemotron-3-ultra-550b-a55b:free",
             "composio_api_key": _secret(source.get("COMPOSIO_API_KEY")),
@@ -199,6 +224,10 @@ class Settings(BaseModel):
                 source.get("BROWSER_PROVIDER"),
                 ("browser_use", "playwright"),
                 default="browser_use",
+            ),
+            "playwright_max_sessions": _integer(source.get("PLAYWRIGHT_MAX_SESSIONS"), default=2),
+            "playwright_disable_sandbox": _boolean(
+                source.get("PLAYWRIGHT_DISABLE_SANDBOX"), default=False
             ),
             "allow_local_credential_submission": _boolean(
                 source.get("ALLOW_LOCAL_CREDENTIAL_SUBMISSION"), default=False

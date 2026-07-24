@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1
+#
+# Browser worker image: Chromium + Playwright, deliberately SEPARATE from the API.
+#
+# The hardened API image (Dockerfile.api) intentionally does NOT contain Chromium:
+# installing the `playwright` Python package does not install a browser binary, and
+# putting a browser inside the control-plane container means a Chromium crash or
+# memory spike can take down the API. Keeping them separate is the whole point.
+#
+# Build:  docker build -f Dockerfile.browser -t composio-ops-browser .
+# Compose (see compose.prod.yaml notes) should run this with:
+#   init: true          # reap zombie Chromium children
+#   ipc: host           # Chromium needs a real IPC namespace
+#   shm_size: 1gb       # avoids --disable-dev-shm-usage crashes
+#   pids_limit: 512
+#
+# This image is NOT wired into the production stack yet: the Playwright provider
+# remains opt-in (BROWSER_PROVIDER=playwright) and the browser service RPC is a
+# later phase. The image exists so Chromium availability is a build-time fact
+# rather than a runtime surprise.
+
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    BROWSER_PROVIDER=playwright \
+    ALLOW_LIVE_BROWSER=false
+
+RUN addgroup --system ops && adduser --system --ingroup ops --home /app ops
+
+WORKDIR /app
+
+COPY requirements-api.txt requirements-providers.txt ./
+RUN python -m pip install --no-cache-dir \
+    --requirement requirements-api.txt \
+    --requirement requirements-providers.txt
+
+# Install the Chromium binary AND its OS dependencies. `pip install playwright`
+# alone does not do this — omitting it is why a Playwright launch fails inside a
+# plain Python image.
+RUN python -m playwright install --with-deps chromium \
+    && chmod -R a+rx /ms-playwright
+
+COPY --chown=root:root api ./api
+COPY --chown=root:root ops ./ops
+COPY --chown=root:root data/p1 ./data/p1
+
+RUN find /app/api /app/ops /app/data/p1 -type d -exec chmod 0555 {} + \
+    && find /app/api /app/ops /app/data/p1 -type f -exec chmod 0444 {} + \
+    && install -d -o ops -g ops -m 0700 /browser-data
+
+# Non-root: Chromium's own sandbox stays ENABLED by default. Set
+# PLAYWRIGHT_DISABLE_SANDBOX=true only where the host cannot support it.
+USER ops
+
+# Readiness probe: proves Chromium can actually LAUNCH in this image, which a
+# Python-only import check would not catch.
+HEALTHCHECK --interval=60s --timeout=40s --start-period=30s --retries=3 \
+    CMD ["python", "-m", "ops.browser_readiness"]

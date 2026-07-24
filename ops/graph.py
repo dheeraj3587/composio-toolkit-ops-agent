@@ -328,6 +328,16 @@ class DurableOperationsWorkflow:
             return "browser_start"
         return "outreach_send"
 
+    def _browser_provider_name(self) -> str:
+        """The effect-ledger provider identity of the wired browser backend.
+
+        Recording a Playwright run as a ``browser_use`` effect would corrupt audit,
+        reconciliation, and metrics, so the backend declares its own name and the
+        Browser Use worker keeps the historical default.
+        """
+
+        return str(getattr(self._dependencies.browser, "provider_name", "browser_use"))
+
     def _browser_start(self, state: OperationsState) -> dict[str, object]:
         if state.get("browser_session_id"):
             return {}
@@ -344,7 +354,7 @@ class DurableOperationsWorkflow:
         store = self._dependencies.effect_store
         if store is not None:
             reservation = store.reserve(
-                provider="browser_use",
+                provider=self._browser_provider_name(),
                 action="start_session",
                 idempotency_key=effect_key,
             )
@@ -364,14 +374,14 @@ class DurableOperationsWorkflow:
             # is required before any further attempt.
             if store is not None:
                 store.mark_outcome_unknown(
-                    provider="browser_use",
+                    provider=self._browser_provider_name(),
                     action="start_session",
                     idempotency_key=effect_key,
                 )
             return _outcome_unknown_update(state, "Browser Use session")
         if store is not None:
             store.complete(
-                provider="browser_use",
+                provider=self._browser_provider_name(),
                 action="start_session",
                 idempotency_key=effect_key,
                 receipt={"session_id": context.session_id},
