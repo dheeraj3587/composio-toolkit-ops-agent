@@ -84,6 +84,19 @@ class SanitizedGmailThread:
     credential_refs: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class InboxSearchResult:
+    """A sanitized, non-vaulted summary of one inbox message for general reads."""
+
+    message_id: str
+    thread_id: str
+    sender: str
+    sanitized_subject: str
+    sanitized_preview: str
+    sent_at: str
+    has_attachments: bool
+
+
 class GmailWorker:
     """Least-privilege Composio adapter.
 
@@ -249,6 +262,67 @@ class GmailWorker:
                 capability="Composio Gmail thread fetch",
                 reason_code="provider_response_incompatible",
             ) from None
+
+    async def search_inbox(
+        self,
+        *,
+        query: str = "in:anywhere",
+        max_results: int = 10,
+        trusted_domains: tuple[str, ...] = (),
+    ) -> tuple[InboxSearchResult, ...]:
+        """Read sanitized summaries of recent inbox messages matching a query.
+
+        General-purpose inbox read for the email agent: it returns redacted,
+        non-vaulted summaries (sender, subject, preview, attachment flag) so the
+        caller can find and reason about ANY recent mail, not only an outreach
+        thread. Secrets in the preview are redacted for display; unlike the
+        outreach-thread path this never vaults, so a general read cannot pollute
+        the credential vault. Senders on a trusted domain are surfaced first. Build
+        ``query`` with :func:`build_inbox_query` to stay injection-safe.
+        """
+
+        if not 1 <= max_results <= 50:
+            raise ValueError("max_results must be between 1 and 50")
+        await self.ensure_connected()
+        try:
+            data = await asyncio.to_thread(
+                self._execute_checked,
+                "GMAIL_FETCH_EMAILS",
+                {"max_results": max_results, "query": query},
+            )
+        except (ConfigurationRequiredError, ProviderContractError, ProviderOperationError):
+            raise
+        except Exception:
+            raise ProviderOperationError(
+                capability="Composio Gmail inbox search",
+                reason_code="provider_response_incompatible",
+            ) from None
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return ()
+        results: list[InboxSearchResult] = []
+        for message in _order_messages_by_trust(messages, trusted_domains):
+            message_id = _first_string(message, ("message_id", "messageId", "id")) or ""
+            thread_id = _first_string(message, ("thread_id", "threadId")) or ""
+            sender = _first_string(message, ("sender", "from", "from_email")) or "unknown"
+            subject = _first_string(message, ("subject",)) or ""
+            preview = _first_string(message, ("preview", "snippet", "messageText", "body")) or ""
+            sent_at = (
+                _first_string(message, ("sent_at", "messageTimestamp", "date", "internal_date"))
+                or "unknown"
+            )
+            results.append(
+                InboxSearchResult(
+                    message_id=message_id[:200],
+                    thread_id=thread_id[:200],
+                    sender=redact_text(sender)[:320],
+                    sanitized_subject=redact_text(subject)[:998],
+                    sanitized_preview=redact_text(preview)[:2_000],
+                    sent_at=redact_text(sent_at)[:100],
+                    has_attachments=_has_attachments(message),
+                )
+            )
+        return tuple(results)
 
     async def fetch_latest_otp(
         self,
@@ -863,6 +937,64 @@ def _order_messages_by_trust(
     return sorted(by_recency, key=_is_trusted)  # stable: keeps recency within groups
 
 
+_INBOX_DOMAIN_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
+_INBOX_AGE_RE = re.compile(r"^\d{1,4}[dhmy]$")
+
+
+def build_inbox_query(
+    *,
+    sender_domain: str | None = None,
+    subject: str | None = None,
+    newer_than: str | None = None,
+    unread: bool = False,
+    extra: str | None = None,
+) -> str:
+    """Build a safe Gmail search query from bounded, validated parts.
+
+    Every part is validated and stripped of newlines/quotes so neither a caller
+    nor untrusted upstream text can inject extra operators into the provider
+    query. Returns ``in:anywhere`` when no part is supplied.
+    """
+
+    parts: list[str] = []
+    if sender_domain:
+        domain = sender_domain.strip().lstrip("@").rstrip(".").casefold()
+        if not _INBOX_DOMAIN_RE.match(domain):
+            raise ValueError("sender_domain is not a valid domain")
+        parts.append(f"from:{domain}")
+    if subject:
+        cleaned = re.sub(r'[\r\n"]', " ", subject).strip()[:200]
+        if cleaned:
+            parts.append(f"subject:({cleaned})")
+    if newer_than:
+        age = newer_than.strip().casefold()
+        if not _INBOX_AGE_RE.match(age):
+            raise ValueError("newer_than must look like 7d, 24h, 30m, or 1y")
+        parts.append(f"newer_than:{age}")
+    if unread:
+        parts.append("is:unread")
+    if extra:
+        cleaned_extra = re.sub(r"[\r\n]", " ", extra).strip()[:200]
+        if cleaned_extra:
+            parts.append(cleaned_extra)
+    return " ".join(parts) or "in:anywhere"
+
+
+def _has_attachments(message: Mapping[str, object]) -> bool:
+    """Best-effort detection of attachments across known provider payload shapes."""
+
+    for key in ("attachments", "attachment_list", "attachmentList", "attachmentIds"):
+        value = message.get(key)
+        if isinstance(value, (list, tuple)) and value:
+            return True
+    payload = message.get("payload")
+    if isinstance(payload, Mapping):
+        parts = payload.get("parts")
+        if isinstance(parts, list):
+            return any(isinstance(part, Mapping) and part.get("filename") for part in parts)
+    return False
+
+
 # A sign-in email is one whose subject/body is about confirming a login/device.
 _LOGIN_EMAIL_KEYWORDS = (
     "verify",
@@ -1031,7 +1163,9 @@ __all__ = [
     "GMAIL_TOOL_ALLOWLIST",
     "GmailSendResult",
     "GmailWorker",
+    "InboxSearchResult",
     "PhaseUnavailableError",
     "SanitizedGmailMessage",
     "SanitizedGmailThread",
+    "build_inbox_query",
 ]

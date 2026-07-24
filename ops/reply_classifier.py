@@ -23,6 +23,9 @@ ReplyClass = Literal[
     "credentials_received",
     "rejected",
     "automated_response",
+    "verify_email_first",
+    "rate_limited",
+    "wrong_contact",
     "unclear",
 ]
 
@@ -125,6 +128,53 @@ class ReplyClassifier:
             classification = "approved_setup_required"
             action = "Follow the official setup link via the browser flow."
             start_browser = True
+        elif has(
+            "verify your email",
+            "confirm your email",
+            "verify your account",
+            "confirm your account",
+            "activate your account",
+            "email verification",
+            "verification link",
+            "confirmation link",
+            "before we can proceed",
+            "first confirm",
+            "verify to continue",
+        ):
+            classification = "verify_email_first"
+            action = "Complete the emailed email/account verification, then continue."
+            start_browser = False
+        elif has(
+            "try again later",
+            "rate limit",
+            "too many requests",
+            "get back to you",
+            "we'll be in touch",
+            "under review",
+            "reviewing your request",
+            "please be patient",
+            "in the queue",
+            "currently experiencing",
+            "high volume of requests",
+        ):
+            classification = "rate_limited"
+            action = "Provider is busy or reviewing; wait and do not resend."
+            start_browser = False
+        elif has(
+            "wrong department",
+            "not the right",
+            "reach out to",
+            "contact our",
+            "i've cc'd",
+            "i have cc'd",
+            "looping in",
+            "forwarded your",
+            "not my area",
+            "wrong team",
+        ):
+            classification = "wrong_contact"
+            action = "Provider redirected us to another contact; needs human routing."
+            start_browser = False
         elif has("meeting", "schedule a call", "book a call", "calendar", "hop on a call"):
             classification = "meeting_requested"
             action = "Offer availability from the configured company profile."
