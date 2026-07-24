@@ -798,10 +798,7 @@ class RunService:
         provider = getattr(settings, "browser_provider", "browser_use")
         if provider == "playwright":
             try:
-                # Added in the Playwright harness phase; forward reference here.
-                from ops.playwright_worker import (  # type: ignore[import-not-found]
-                    PlaywrightBrowserWorker,
-                )
+                from ops.playwright_worker import PlaywrightBrowserWorker
             except ImportError:
                 raise ConfigurationRequiredError(
                     phase=5,
