@@ -52,6 +52,8 @@ _TOOL_SCHEMAS: dict[str, dict[str, object]] = {
 class _Resp:
     def __init__(self, successful: bool, data: dict[str, object]) -> None:
         self.successful = successful
+        # The installed SDK reports failure via a truthy ``error`` attribute.
+        self.error = None if successful else "provider reported failure"
         self.data = data
 
 
@@ -61,14 +63,42 @@ class _RawTool:
 
 
 class _Session:
-    def __init__(self, session_id: str) -> None:
+    """Fake ToolRouterSession: exposes ``session_id`` and ``execute`` like the SDK."""
+
+    def __init__(
+        self, session_id: str, sends: list[dict[str, object]], *, send_successful: bool = True
+    ) -> None:
+        self.session_id = session_id
         self.id = session_id
+        self._sends = sends
+        self._send_successful = send_successful
+
+    def execute(
+        self, slug: str, arguments: dict[str, object] | None = None, **kwargs: object
+    ) -> _Resp:
+        del kwargs
+        args = dict(arguments or {})
+        if slug == "GMAIL_GET_PROFILE":
+            return _Resp(True, {"email": "ops-bot@example.test"})
+        if slug in ("GMAIL_SEND_EMAIL", "GMAIL_REPLY_TO_THREAD"):
+            self._sends.append(args)
+            if not self._send_successful:
+                return _Resp(False, {})
+            return _Resp(
+                True,
+                {"message_id": "msg-1", "thread_id": args.get("thread_id", "thread-xyz")},
+            )
+        return _Resp(True, {})
 
 
 class _Sessions:
+    def __init__(self, sends: list[dict[str, object]], *, send_successful: bool = True) -> None:
+        self._sends = sends
+        self._send_successful = send_successful
+
     def create(self, **kwargs: object) -> _Session:
         del kwargs
-        return _Session("session-abc123")
+        return _Session("session-abc123", self._sends, send_successful=self._send_successful)
 
 
 class _Tools:
@@ -79,21 +109,10 @@ class _Tools:
     def get_raw_composio_tool_by_slug(self, slug: str) -> _RawTool:
         return _RawTool(_TOOL_SCHEMAS[slug])
 
-    def execute(self, slug: str, arguments: dict[str, object], **kwargs: object) -> _Resp:
-        del kwargs
-        if slug == "GMAIL_GET_PROFILE":
-            return _Resp(True, {"email": "ops-bot@example.test"})
-        if slug == "GMAIL_SEND_EMAIL":
-            self._sends.append(dict(arguments))
-            if not self._send_successful:
-                return _Resp(False, {})
-            return _Resp(True, {"message_id": "msg-1", "thread_id": "thread-xyz"})
-        return _Resp(True, {})
-
 
 class _FakeComposio:
     def __init__(self, sends: list[dict[str, object]], *, send_successful: bool = True) -> None:
-        self.sessions = _Sessions()
+        self.sessions = _Sessions(sends, send_successful=send_successful)
         self.tools = _Tools(sends, send_successful=send_successful)
 
     def close(self) -> None:  # pragma: no cover - parity with the real client
