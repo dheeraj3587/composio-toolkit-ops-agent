@@ -1496,16 +1496,60 @@ class RunService:
                         },
                     )
                 )
-                if (
-                    self._credential_capturer is not None
-                    and self._credential_validator is not None
-                    and "operational_research" in workflow_state
-                ):
+                research_obj: OperationalResearch | None = None
+                if "operational_research" in workflow_state:
                     try:
-                        research = OperationalResearch.model_validate(
+                        research_obj = OperationalResearch.model_validate(
                             workflow_state["operational_research"]
                         )
-                        outcome = self._run_m6_credentials(research, request)
+                    except Exception:
+                        research_obj = None
+
+                # Hands-off deterministic capture: open a logged-in standalone
+                # browser from the session profile and read the API token over
+                # CDP (no human copy, no LLM read). Falls back to owner paste.
+                captured_refs: dict[str, str] | None = None
+                auto_capture = getattr(self._browser_worker, "auto_capture_credentials", None)
+                if (
+                    research_obj is not None
+                    and callable(auto_capture)
+                    and self._credential_validator is not None
+                    and self._secret_store is not None
+                ):
+                    handle = str(workflow_state.get("browser_session_id") or "")
+                    try:
+                        captured_refs = asyncio.run(
+                            auto_capture(handle, research_obj.app_slug, self._secret_store)
+                        )
+                    except Exception as exc:
+                        log_event(
+                            "browser.async.autocapture_error",
+                            level=40,
+                            run_id=run_id,
+                            error=type(exc).__name__,
+                        )
+                        captured_refs = None
+
+                if (
+                    captured_refs
+                    and research_obj is not None
+                    and self._credential_validator is not None
+                ):
+                    outcome = self._finalize_captured_credentials(
+                        research_obj, request, captured_refs
+                    )
+                    next_status = cast(RunStatus, outcome.status)
+                    provider_browser = "credential_page_ready"
+                    if outcome.bundle is not None:
+                        extra_updates["integrator_bundle"] = outcome.bundle
+                    events.extend(outcome.events)
+                elif (
+                    self._credential_capturer is not None
+                    and self._credential_validator is not None
+                    and research_obj is not None
+                ):
+                    try:
+                        outcome = self._run_m6_credentials(research_obj, request)
                         next_status = cast(RunStatus, outcome.status)
                         provider_browser = "credential_page_ready"
                         if outcome.bundle is not None:
@@ -1737,6 +1781,99 @@ class RunService:
             # unavailable / failed: the true credential state is ambiguous. There is
             # no outcome_unknown RunStatus, so the run rests at configuration_required
             # with a truthful reason while the ambiguous validation status is recorded.
+            status = "configuration_required"
+            reason_code = "validation_outcome_unknown"
+        return _CredentialOutcome(
+            status=status,
+            reason_code=reason_code,
+            validation_status=result.status,
+            bundle=bundle.model_dump(mode="json"),
+            external_actions=True,
+            events=events,
+        )
+
+    def _finalize_captured_credentials(
+        self,
+        research: OperationalResearch,
+        request: OperationsRequest,
+        captured: Mapping[str, str],
+    ) -> _CredentialOutcome:
+        """Validate deterministically-captured vault refs and build the bundle.
+
+        The raw credential was read over CDP and vaulted by the browser worker;
+        here only the ``vault://`` references, read-only validation metadata, and
+        the reference-only bundle are handled — never a raw value.
+        """
+
+        validator = self._credential_validator
+        if validator is None:  # pragma: no cover - guarded by caller
+            raise RuntimeError("credential validator is not configured")
+        references = {kind: validate_vault_reference(ref) for kind, ref in captured.items()}
+        events: list[tuple[str, dict[str, object]]] = [
+            (
+                "credentials_stored",
+                {
+                    "kinds": sorted(references),
+                    "references": dict(sorted(references.items())),
+                    "external_actions": True,
+                },
+            ),
+            (
+                "credential_validation_started",
+                {"app_slug": research.app_slug, "external_actions": True},
+            ),
+        ]
+        try:
+            result = asyncio.run(
+                validator.validate(app_slug=research.app_slug, credential_refs=references)
+            )
+        except ConfigurationRequiredError as exc:
+            return _CredentialOutcome(
+                status="configuration_required",
+                reason_code=exc.reason_code,
+                validation_status=None,
+                bundle=None,
+                external_actions=True,
+                events=events,
+            )
+        events.append(
+            (
+                "credentials_validated",
+                {
+                    "validation_status": result.status,
+                    "reason_code": result.reason_code,
+                    "http_status": result.http_status,
+                    "endpoint": result.endpoint,
+                    "external_actions": True,
+                },
+            )
+        )
+        bundle = build_integrator_bundle(
+            research=research,
+            company=request.company,
+            credential_refs=references,
+            validation=result,
+            stage="normal",
+        )
+        events.append(
+            (
+                "integrator_bundle_generated",
+                {
+                    "readiness": bundle.readiness,
+                    "auth_scheme": bundle.auth_scheme,
+                    "scopes": list(bundle.scopes),
+                    "credential_ref_count": len(bundle.credential_refs),
+                    "external_actions": True,
+                },
+            )
+        )
+        if result.status == "valid":
+            status: RunStatus = "completed"
+            reason_code = result.reason_code
+        elif result.status == "invalid":
+            status = "configuration_required"
+            reason_code = result.reason_code
+        else:
             status = "configuration_required"
             reason_code = "validation_outcome_unknown"
         return _CredentialOutcome(

@@ -213,4 +213,4 @@ def test_unknown_app_keeps_generic_browser_behavior() -> None:
         None,
     )
     assert "STRICT APP TRACE" not in task
-    assert "GOAL: Reach the account's API credentials" in task
+    assert "GOAL: Reach the page where the account's API credentials" in task

@@ -275,6 +275,8 @@ class AssignmentBrowserWorker(BrowserWorker):
         self._provider_sessions: dict[str, str] = {}
         self._assignment_live_urls: dict[str, str] = {}
         self._assignment_research: dict[str, OperationalResearch] = {}
+        # handle -> Browser Use profile id (carries the persisted login state).
+        self._profile_ids: dict[str, str] = {}
 
     def _get_client(self) -> Any:
         """Return a Browser Use client bound to the CURRENT event loop.
@@ -310,6 +312,20 @@ class AssignmentBrowserWorker(BrowserWorker):
 
         self._require_configuration()
         client = self._get_client()
+        # Attach a fresh Browser Use profile so the autonomous login state
+        # (cookies/localStorage) persists. After sign-in, a standalone browser
+        # opened from this profile is already logged in, which lets a
+        # deterministic Playwright/CDP read capture the API token with no human
+        # copy and without the LLM ever reading the secret.
+        if not profile_id:
+            try:
+                profile = await _await_if_needed(
+                    client.profiles.create(name=f"ops-{uuid4().hex[:12]}")
+                )
+                profile_id = _string(_dump(profile).get("id")) or None
+            except Exception as exc:
+                log_event("browser.profile.create_error", level=30, error=type(exc).__name__)
+                profile_id = None
         create_kwargs: dict[str, Any] = {
             "keep_alive": True,
             "enable_recording": False,
@@ -335,6 +351,8 @@ class AssignmentBrowserWorker(BrowserWorker):
             )
         # The real provider session id is the durable handle from here on.
         self._provider_sessions[session_id] = session_id
+        if profile_id:
+            self._profile_ids[session_id] = profile_id
         live_url = _string(data.get("live_url"))
         if live_url:
             self._assignment_live_urls[session_id] = live_url
@@ -462,6 +480,106 @@ class AssignmentBrowserWorker(BrowserWorker):
             return live_url
         log_event("browser.recover.miss", level=30, handle=handle)
         return None
+
+    async def auto_capture_credentials(
+        self, handle: str, app_slug: str, secret_store: Any
+    ) -> dict[str, str] | None:
+        """Deterministically read the app's API credential over CDP and vault it.
+
+        Opens a standalone browser from the session's logged-in profile, goes to
+        the app's token settings page, reads the credential value by strict
+        pattern (never via the LLM), writes it to the encrypted vault, and
+        returns only the ``vault://`` reference. Returns None when capture is not
+        possible so the caller can fall back to owner submission.
+        """
+
+        import importlib
+        import re
+        from urllib.parse import urlsplit
+
+        from ops.credential_capture_specs import get_capture_spec
+
+        spec = get_capture_spec(app_slug)
+        if spec is None:
+            log_event("capture.no_spec", handle=handle, app_slug=app_slug)
+            return None
+        profile_id = self._profile_ids.get(handle)
+        if not profile_id or secret_store is None:
+            log_event("capture.no_profile", level=30, handle=handle, app_slug=app_slug)
+            return None
+
+        client = self._get_client()
+        try:
+            browser = await _await_if_needed(client.browsers.create(profile_id=profile_id))
+        except Exception as exc:
+            log_event("capture.browser_create_error", level=40, handle=handle, error=type(exc).__name__)
+            return None
+        bdata = _dump(browser)
+        cdp_url = _string(bdata.get("cdp_url"))
+        browser_id = _string(bdata.get("id"))
+        if not cdp_url:
+            log_event("capture.no_cdp_url", level=40, handle=handle)
+            await self._stop_standalone_browser(client, browser_id)
+            return None
+
+        pattern = re.compile(spec.value_pattern)
+        log_event("capture.begin", handle=handle, app_slug=app_slug, target_host=url_host(spec.url))
+        try:
+            pw_module = importlib.import_module("playwright.async_api")
+            async with pw_module.async_playwright() as pw:
+                pw_browser = await pw.chromium.connect_over_cdp(cdp_url, timeout=30_000)
+                try:
+                    context = (
+                        pw_browser.contexts[0]
+                        if pw_browser.contexts
+                        else await pw_browser.new_context()
+                    )
+                    page = context.pages[0] if context.pages else await context.new_page()
+                    await page.goto(spec.url, wait_until="domcontentloaded", timeout=45_000)
+                    await page.wait_for_timeout(2_500)
+                    host = urlsplit(page.url).hostname or ""
+                    if not (host == spec.vendor_domain or host.endswith("." + spec.vendor_domain)):
+                        log_event("capture.off_domain", level=40, handle=handle, current_host=host)
+                        return None
+                    inputs = page.locator("input")
+                    total = await inputs.count()
+                    token: str | None = None
+                    for index in range(min(total, 60)):
+                        try:
+                            value = await inputs.nth(index).input_value(timeout=2_000)
+                        except Exception:
+                            continue
+                        candidate = value.strip() if isinstance(value, str) else ""
+                        if candidate and pattern.match(candidate):
+                            token = candidate
+                            break
+                    if token is None:
+                        log_event("capture.value_not_found", level=30, handle=handle, inputs=total)
+                        return None
+                    reference = secret_store.put(
+                        app_slug=app_slug, kind=spec.field_kind, value=token
+                    )
+                    del token
+                    log_event("capture.stored", handle=handle, app_slug=app_slug)
+                    return {spec.field_kind: reference}
+                finally:
+                    try:
+                        await pw_browser.close()
+                    except Exception:
+                        pass
+        except Exception as exc:
+            log_event("capture.error", level=40, handle=handle, error=type(exc).__name__)
+            return None
+        finally:
+            await self._stop_standalone_browser(client, browser_id)
+
+    async def _stop_standalone_browser(self, client: Any, browser_id: str | None) -> None:
+        if not browser_id:
+            return
+        try:
+            await _await_if_needed(client.browsers.stop(browser_id))
+        except Exception:
+            pass
 
     async def stop(self, context: BrowserSessionContext) -> None:
         await self._safe_stop_handle(context.session_id)
