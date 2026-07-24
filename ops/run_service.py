@@ -33,6 +33,7 @@ from ops.credential_validator import (
     hubspot_validation_policy,
     pipedrive_validation_policy,
 )
+from ops.browser_link_log import log_event
 from ops.effect_ledger import SQLiteEffectStore
 from ops.gmail_worker import GmailWorker
 from ops.graph import DurableOperationsWorkflow, WorkflowDependencies, build_graph
@@ -962,10 +963,42 @@ class RunService:
                             name: secret.get_secret_value()
                             for name, secret in browser_login.items()
                         }
-                    workflow_state = self._workflow.start(
-                        request.model_copy(update={"dry_run": not run_provider_action}),
+                    log_event(
+                        "run.dispatch.begin",
+                        run_id=run_id,
                         thread_id=thread_id,
-                        sensitive_data=start_sensitive_data,
+                        app_slug=_slugify(request.app_name),
+                        route=decision.route,
+                        run_provider_action=run_provider_action,
+                        has_login=bool(browser_login),
+                    )
+                    try:
+                        workflow_state = self._workflow.start(
+                            request.model_copy(update={"dry_run": not run_provider_action}),
+                            thread_id=thread_id,
+                            sensitive_data=start_sensitive_data,
+                        )
+                    except Exception as exc:
+                        log_event(
+                            "run.dispatch.error",
+                            level=40,
+                            run_id=run_id,
+                            thread_id=thread_id,
+                            error=type(exc).__name__,
+                        )
+                        raise
+                    log_event(
+                        "run.dispatch.result",
+                        run_id=run_id,
+                        thread_id=thread_id,
+                        status=str(workflow_state.get("status") or routed_status),
+                        access_route=workflow_state.get("access_route"),
+                        has_browser_session=bool(workflow_state.get("browser_session_id")),
+                        observation_status=(
+                            str(workflow_state.get("browser_observation", {}).get("status"))
+                            if isinstance(workflow_state.get("browser_observation"), Mapping)
+                            else None
+                        ),
                     )
                     persisted_status = str(workflow_state.get("status") or routed_status)
                     persisted_route = workflow_state.get("access_route") or decision.route
@@ -1652,15 +1685,23 @@ class RunService:
 
         worker = self._browser_worker
         if worker is None:
+            log_event("liveview.resolve.no_worker", level=30, run_id=run_id)
             return None
         record = self.storage.get_run(run_id)
         if record is None:
+            log_event("liveview.resolve.no_run", level=30, run_id=run_id)
             return None
         session_id = record.get("browser_session_id")
         if not isinstance(session_id, str) or not session_id:
+            log_event(
+                "liveview.resolve.no_session",
+                run_id=run_id,
+                run_status=record.get("status"),
+            )
             return None
         live_url = worker.live_url(session_id)
         if live_url:
+            log_event("liveview.resolve.cached", run_id=run_id, handle=session_id)
             return live_url
         # After an API restart the in-memory URL is gone but the provider session
         # may still be running. Recover the signed URL from the durable
@@ -1668,6 +1709,7 @@ class RunService:
         # reconnects. The signed URL itself is never persisted.
         recover = getattr(worker, "recover_live_url", None)
         if not callable(recover) or self._workflow is None:
+            log_event("liveview.resolve.no_recover", level=30, run_id=run_id, handle=session_id)
             return None
         thread_id = record.get("thread_id")
         if not isinstance(thread_id, str) or not thread_id:
@@ -1675,14 +1717,35 @@ class RunService:
         try:
             checkpoint_state = self._workflow.get_state(thread_id)
         except Exception:
+            log_event("liveview.resolve.checkpoint_error", level=30, run_id=run_id)
             return None
         provider_session = checkpoint_state.get("browser_provider_session_id")
         if not isinstance(provider_session, str) or not provider_session:
+            log_event(
+                "liveview.resolve.no_provider_session",
+                level=30,
+                run_id=run_id,
+                handle=session_id,
+            )
             return None
+        log_event("liveview.resolve.recover_attempt", run_id=run_id, handle=session_id)
         try:
-            return asyncio.run(recover(session_id, provider_session))
-        except Exception:
+            recovered = asyncio.run(recover(session_id, provider_session))
+        except Exception as exc:
+            log_event(
+                "liveview.resolve.recover_error",
+                level=30,
+                run_id=run_id,
+                error=type(exc).__name__,
+            )
             return None
+        log_event(
+            "liveview.resolve.recover_result",
+            run_id=run_id,
+            handle=session_id,
+            recovered=bool(recovered),
+        )
+        return recovered
 
     def _public_no_reply(self, record: Mapping[str, object]) -> dict[str, Any]:
         """Return the current run projection with a no-op reply marker."""

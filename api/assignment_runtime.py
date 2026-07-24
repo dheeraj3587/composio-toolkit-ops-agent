@@ -21,6 +21,7 @@ import ops.browser_host_policy as browser_policy_module
 import ops.browser_worker as browser_worker_module
 import ops.composio_capability as composio_module
 from ops.browser_api_trace_catalog import get_browser_api_trace
+from ops.browser_link_log import log_event, url_host
 from ops.browser_host_policy import (
     BrowserAllowedHosts,
     BrowserHostPolicy,
@@ -278,6 +279,7 @@ class AssignmentBrowserWorker(BrowserWorker):
         self._require_configuration()
         now = datetime.now(UTC)
         handle = f"pending_{uuid4().hex}"
+        log_event("browser.session.handle_created", handle=handle)
         return BrowserSessionContext(
             profile_id=profile_id or handle,
             session_id=handle,
@@ -312,8 +314,21 @@ class AssignmentBrowserWorker(BrowserWorker):
         sensitive_data: Mapping[str, str] | None = None,
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
+        log_event(
+            "browser.resume.begin",
+            handle=context.session_id,
+            signal=signal,
+            has_research=bool(research or self._assignment_research.get(context.session_id)),
+            provider_session_cached=context.session_id in self._provider_sessions,
+            provider_session_supplied=bool(provider_session_id),
+        )
         resolved = research or self._assignment_research.get(context.session_id)
         if resolved is None:
+            log_event(
+                "browser.resume.no_research",
+                level=40,
+                handle=context.session_id,
+            )
             raise ProviderOperationError(
                 capability="browser HITL resume",
                 reason_code="verified_research_required",
@@ -326,6 +341,11 @@ class AssignmentBrowserWorker(BrowserWorker):
         if context.session_id not in self._provider_sessions and provider_session_id:
             self._provider_sessions[context.session_id] = provider_session_id
         if context.session_id not in self._provider_sessions:
+            log_event(
+                "browser.resume.no_provider_session",
+                level=40,
+                handle=context.session_id,
+            )
             raise ProviderOperationError(
                 capability="browser HITL resume",
                 reason_code="provider_session_missing",
@@ -355,19 +375,27 @@ class AssignmentBrowserWorker(BrowserWorker):
 
         cached = self._assignment_live_urls.get(handle)
         if cached:
+            log_event("browser.recover.cached", handle=handle)
             return cached
         if not provider_session_id:
+            log_event("browser.recover.no_provider_session", level=30, handle=handle)
             return None
         self._provider_sessions.setdefault(handle, provider_session_id)
+        log_event("browser.recover.fetch", handle=handle)
         try:
             client = self._get_client()
             session = await _await_if_needed(client.sessions.get(provider_session_id))
-        except Exception:
+        except Exception as exc:
+            log_event(
+                "browser.recover.error", level=30, handle=handle, error=type(exc).__name__
+            )
             return None
         live_url = _string(_dump(session).get("live_url"))
         if live_url:
             self._assignment_live_urls[handle] = live_url
+            log_event("browser.recover.ok", handle=handle, live_url_host=url_host(live_url))
             return live_url
+        log_event("browser.recover.miss", level=30, handle=handle)
         return None
 
     async def stop(self, context: BrowserSessionContext) -> None:

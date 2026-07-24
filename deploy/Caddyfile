@@ -60,7 +60,12 @@ http://127.0.0.1:8080 {
 				header_up -Authorization
 				transport http {
 					dial_timeout 5s
-					response_header_timeout 30s
+					# execute_when_configured run creation and same-session resume
+					# drive a real Browser Use session synchronously on the backend,
+					# which routinely exceeds 30s. Match the Next.js API client's
+					# 180s run-action budget (plus headroom) so the browser receives
+					# the real result instead of a premature 504.
+					response_header_timeout 200s
 				}
 			}
 		}
