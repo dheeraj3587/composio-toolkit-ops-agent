@@ -128,6 +128,11 @@ class Settings(BaseModel):
     max_unclear_retries: int = Field(default=1, ge=0)
     max_browser_attempts: int = Field(default=2, ge=1)
     max_hitl_count: int = Field(default=3, ge=0)
+    # Bounded retry for transient Composio Gmail READ failures only (sends are
+    # guarded by the effect ledger and never retried here). The per-attempt delay
+    # grows exponentially from the base; set the base to 0 to disable waiting.
+    gmail_retry_max_attempts: int = Field(default=3, ge=1, le=6)
+    gmail_retry_base_delay_seconds: float = Field(default=0.5, ge=0.0, le=10.0)
 
     ops_db_path: Path = Path("./private/ops.db")
     checkpoint_db_path: Path = Path("./private/checkpoints.db")
@@ -199,6 +204,10 @@ class Settings(BaseModel):
             "max_unclear_retries": _integer(source.get("MAX_UNCLEAR_RETRIES"), default=1),
             "max_browser_attempts": _integer(source.get("MAX_BROWSER_ATTEMPTS"), default=2),
             "max_hitl_count": _integer(source.get("MAX_HITL_COUNT"), default=3),
+            "gmail_retry_max_attempts": _integer(source.get("GMAIL_RETRY_MAX_ATTEMPTS"), default=3),
+            "gmail_retry_base_delay_seconds": _float(
+                source.get("GMAIL_RETRY_BASE_DELAY_SECONDS"), default=0.5
+            ),
             "ops_db_path": Path(source.get("OPS_DB_PATH", "./private/ops.db")),
             "checkpoint_db_path": Path(
                 source.get("CHECKPOINT_DB_PATH", "./private/checkpoints.db")

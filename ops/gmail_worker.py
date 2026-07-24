@@ -247,21 +247,12 @@ class GmailWorker:
 
     async def fetch_thread(self, thread_id: str) -> SanitizedGmailThread:
         safe_thread_id = _validate_identifier(thread_id, "thread_id")
-        await self.ensure_connected()
-        try:
-            result = await asyncio.to_thread(
-                self._execute_checked,
-                "GMAIL_FETCH_MESSAGE_BY_THREAD_ID",
-                {"thread_id": safe_thread_id},
-            )
-            return self._sanitize_thread_payload(safe_thread_id, result)
-        except (ConfigurationRequiredError, ProviderContractError, ProviderOperationError):
-            raise
-        except Exception:
-            raise ProviderOperationError(
-                capability="Composio Gmail thread fetch",
-                reason_code="provider_response_incompatible",
-            ) from None
+        result = await self._execute_read(
+            "GMAIL_FETCH_MESSAGE_BY_THREAD_ID",
+            {"thread_id": safe_thread_id},
+            capability="Composio Gmail thread fetch",
+        )
+        return self._sanitize_thread_payload(safe_thread_id, result)
 
     async def search_inbox(
         self,
@@ -283,20 +274,11 @@ class GmailWorker:
 
         if not 1 <= max_results <= 50:
             raise ValueError("max_results must be between 1 and 50")
-        await self.ensure_connected()
-        try:
-            data = await asyncio.to_thread(
-                self._execute_checked,
-                "GMAIL_FETCH_EMAILS",
-                {"max_results": max_results, "query": query},
-            )
-        except (ConfigurationRequiredError, ProviderContractError, ProviderOperationError):
-            raise
-        except Exception:
-            raise ProviderOperationError(
-                capability="Composio Gmail inbox search",
-                reason_code="provider_response_incompatible",
-            ) from None
+        data = await self._execute_read(
+            "GMAIL_FETCH_EMAILS",
+            {"max_results": max_results, "query": query},
+            capability="Composio Gmail inbox search",
+        )
         messages = data.get("messages")
         if not isinstance(messages, list):
             return ()
@@ -340,20 +322,11 @@ class GmailWorker:
         placeholder and is never persisted, logged, or sent to an LLM.
         """
 
-        await self.ensure_connected()
-        try:
-            data = await asyncio.to_thread(
-                self._execute_checked,
-                "GMAIL_FETCH_EMAILS",
-                {"max_results": 8, "query": query},
-            )
-        except (ConfigurationRequiredError, ProviderContractError, ProviderOperationError):
-            raise
-        except Exception:
-            raise ProviderOperationError(
-                capability="Composio Gmail OTP fetch",
-                reason_code="provider_response_incompatible",
-            ) from None
+        data = await self._execute_read(
+            "GMAIL_FETCH_EMAILS",
+            {"max_results": 8, "query": query},
+            capability="Composio Gmail OTP fetch",
+        )
         messages = data.get("messages")
         if not isinstance(messages, list):
             return None
@@ -382,20 +355,11 @@ class GmailWorker:
         placeholder; it is never persisted or logged.
         """
 
-        await self.ensure_connected()
-        try:
-            data = await asyncio.to_thread(
-                self._execute_checked,
-                "GMAIL_FETCH_EMAILS",
-                {"max_results": 8, "query": query},
-            )
-        except (ConfigurationRequiredError, ProviderContractError, ProviderOperationError):
-            raise
-        except Exception:
-            raise ProviderOperationError(
-                capability="Composio Gmail verification-link fetch",
-                reason_code="provider_response_incompatible",
-            ) from None
+        data = await self._execute_read(
+            "GMAIL_FETCH_EMAILS",
+            {"max_results": 8, "query": query},
+            capability="Composio Gmail verification-link fetch",
+        )
         messages = data.get("messages")
         if not isinstance(messages, list):
             return None
@@ -594,6 +558,47 @@ class GmailWorker:
                 reason_code="response_data_incompatible",
             )
         return data
+
+    async def _execute_read(
+        self, slug: str, arguments: Mapping[str, object], *, capability: str
+    ) -> Mapping[str, object]:
+        """Run an idempotent READ tool with bounded retry + reconnect.
+
+        Retries only transient provider/operation failures (never a contract or
+        misconfiguration error) with exponential backoff, dropping the cached
+        session between attempts so a stale connection is re-established. Sends and
+        replies never use this path — their exactly-once guarantee is owned by the
+        effect ledger, so they must not be blindly retried.
+        """
+
+        attempts = max(1, self._settings.gmail_retry_max_attempts)
+        base = max(0.0, self._settings.gmail_retry_base_delay_seconds)
+        for attempt in range(attempts):
+            await self.ensure_connected()
+            try:
+                return await asyncio.to_thread(self._execute_checked, slug, dict(arguments))
+            except (ConfigurationRequiredError, ProviderContractError):
+                raise  # permanent: misconfiguration, allowlist, or schema/contract
+            except Exception as exc:
+                self._reset_session()  # force a fresh connection on the next attempt
+                if attempt >= attempts - 1:
+                    if isinstance(exc, ProviderOperationError):
+                        raise
+                    raise ProviderOperationError(
+                        capability=capability,
+                        reason_code="provider_response_incompatible",
+                    ) from None
+                if base:
+                    await asyncio.sleep(base * (2**attempt))
+        raise ProviderOperationError(  # pragma: no cover - loop returns or raises above
+            capability=capability, reason_code="provider_response_incompatible"
+        )
+
+    def _reset_session(self) -> None:
+        """Drop the cached tool-router session so the next call reconnects."""
+
+        self._session = None
+        self._session_id = None
 
     def _actual_recipient(self, intended: str) -> str:
         override = self._settings.outreach_recipient_override
