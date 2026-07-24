@@ -69,9 +69,33 @@ describe("createRunAction", () => {
     expect(request).not.toHaveProperty("dry_run")
   })
 
-  it("falls back to execute-when-configured when the submitted mode is not supported", async () => {
+  it("fails closed to plan_only when the submitted mode is not supported", async () => {
     await expect(createRunAction(initialState, validForm("unbounded_execution"))).rejects.toThrow("NEXT_REDIRECT")
 
-    expect(mocks.createRun.mock.calls[0]?.[0]).toMatchObject({ execution_mode: "execute_when_configured" })
+    expect(mocks.createRun.mock.calls[0]?.[0]).toMatchObject({ execution_mode: "plan_only" })
+  })
+
+  it("preserves the login password verbatim (no trim or truncation)", async () => {
+    const form = validForm("execute_when_configured")
+    form.set("app_login_email", "ops@example.com")
+    form.set("app_login_password", "  s p a c e d secret  ")
+
+    await expect(createRunAction(initialState, form)).rejects.toThrow("NEXT_REDIRECT")
+
+    const request = mocks.createRun.mock.calls[0]?.[0]
+    expect(request.browser_login).toEqual({
+      email: "ops@example.com",
+      password: "  s p a c e d secret  ",
+    })
+  })
+
+  it("rejects a partial credential pair instead of dropping the login payload", async () => {
+    const form = validForm("execute_when_configured")
+    form.set("app_login_email", "ops@example.com") // password intentionally omitted
+
+    const state = await createRunAction(initialState, form)
+
+    expect(mocks.createRun).not.toHaveBeenCalled()
+    expect(state.fields).toContain("app_login_password")
   })
 })

@@ -19,6 +19,13 @@ function value(formData: FormData, name: string, maxLength = 500): string {
   return typeof entry === "string" ? entry.trim().slice(0, maxLength) : ""
 }
 
+// A secret must never be silently altered: no trim, no truncation. Over-long
+// input is rejected by the caller's validation rather than quietly cut.
+function rawSecret(formData: FormData, name: string): string {
+  const entry = formData.get(name)
+  return typeof entry === "string" ? entry : ""
+}
+
 function validWebUrl(candidate: string): boolean {
   try {
     return ["http:", "https:"].includes(new URL(candidate).protocol)
@@ -49,15 +56,19 @@ export async function createRunAction(
   const callbacks = callbackUrls(value(formData, "callback_urls", 2_000))
   const outreachOverride = value(formData, "outreach_recipient_override", 320)
   const appLoginEmail = value(formData, "app_login_email", 320)
-  const appLoginPassword = value(formData, "app_login_password", 400)
+  // Password is captured verbatim (leading/trailing spaces are legitimate and
+  // must survive); it is validated for length below, never trimmed or truncated.
+  const appLoginPassword = rawSecret(formData, "app_login_password")
   const requestedPolicy = value(formData, "requested_scope_policy", 20)
   const policy = ["minimum", "recommended", "maximum"].includes(requestedPolicy)
     ? (requestedPolicy as OperationsRequestInput["requested_scope_policy"])
     : "maximum"
   const requestedExecutionMode = value(formData, "execution_mode", 40)
+  // Fail CLOSED: a missing/invalid execution mode defaults to plan_only (no
+  // provider side effects), never to live execution.
   const executionMode = ["plan_only", "execute_when_configured"].includes(requestedExecutionMode)
     ? (requestedExecutionMode as OperationsRequestInput["execution_mode"])
-    : "execute_when_configured"
+    : "plan_only"
 
   const invalid: string[] = []
   if (appName.length < 2) invalid.push("app_name")
@@ -68,6 +79,14 @@ export async function createRunAction(
   }
   if (useCase.length < 12) invalid.push("use_case")
   if (callbacks === null) invalid.push("callback_urls")
+  // Reject a partial login credential pair (one field without the other) instead
+  // of silently dropping the whole login payload; require both or neither.
+  if (appLoginEmail.length > 0 !== appLoginPassword.length > 0) {
+    invalid.push("app_login_password")
+  }
+  // A password this long is almost certainly an error/abuse; reject rather than
+  // truncate (which would submit a wrong secret).
+  if (appLoginPassword.length > 512) invalid.push("app_login_password")
 
   if (invalid.length > 0) {
     return {

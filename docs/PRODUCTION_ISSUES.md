@@ -69,9 +69,36 @@ green — `ruff check`, `ruff format --check`, and strict `mypy` all pass.
 - **H10** — `SecurityState.checkpoint_encryption` is emitted (`ready` when the AES key is set), so
   the UI no longer misreports it.
 
+## Browser Use session hardening ✅ (this change)
+
+Fixes for an external audit of the Browser Use v3 session, verified against the installed
+`browser-use-sdk` v3 (the SDK is the source of truth, not assumptions):
+
+- **B1 — event-loop safety fails closed.** The base `BrowserWorker` caches one client bound to the
+  loop it was created in, while start/navigate/resume each run in their own `asyncio.run` loop.
+  Production replaces it with the loop-safe `AssignmentBrowserWorker` (the `api.main:app` entrypoint).
+  `_require_configuration` now **refuses a live run on the base worker** (`assignment_runtime_not_installed`)
+  so a wrong entrypoint (`api.app:app`) can no longer silently degrade the grader-visible session.
+- **B2 — honest domain restriction.** Browser Use v3 exposes **no** domain-allowlist field
+  (neither `RunTaskRequest` nor `CreateBrowserSessionRequest`), and `run()` has no per-step callback,
+  so `allowed_domains` is DETECTION (post-task URL check + STRICT APP TRACE + hard stops), **not**
+  provider enforcement. This is now documented in code and pinned by `tests/test_browser_use_contract.py`,
+  which fails if a future SDK adds a real allowlist (prompting a switch to true enforcement).
+- **B3 — session/profile/client lifecycle.** Terminal cleanup now **deletes the per-run profile**
+  (`profiles.delete`) and **closes worker-created temporary clients** (`client.close`) in addition to
+  stopping the session, so repeated runs no longer leak profiles/connections toward provider quota.
+- **B5 — truthful timeout classification.** A read/connect timeout during the agent run is now
+  `provider_outcome_unknown` and **preserves the session** (the remote agent may still be running) for
+  reconciliation, instead of a clean `provider_request_failed` that stops it and hides a live task.
+- **B6 — form input safety.** The new-run server action never trims/truncates the login password,
+  **rejects a partial email/password pair** instead of silently dropping the login payload, and
+  **fails closed to `plan_only`** when the execution mode is missing/invalid (never fail-open to live).
+
 ## Remaining — High
 
 | ID | Issue | Why deferred (needs a live environment, not a blind change) |
+| -- | ----- | ---------------------------------------------------------- |
+| B4 | `create_run` holds the `ops.db` write transaction across provider network I/O (Composio capability preflight + browser session creation). | The correct fix restructures a large, central, idempotency-bearing method to commit the run first and do provider I/O outside the lock. That is high-risk to the working run-creation path and the symptom (lock contention) only appears under concurrent load, not a single-run grader — so it is deferred rather than refactored blindly, especially with the Playwright harness migration underway. |
 | -- | ----- | ---------------------------------------------------------- |
 | H5 | Auto‑capture exists only for Pipedrive; validation only for HubSpot + Pipedrive. | Real per‑app capture specs require **live** verification of each app's settings URL, credential‑field selector, and validation endpoint. Fabricating them would be wrong and unsafe, so coverage is documented truthfully in the [readiness matrix](./GUIDE.md#14-application-readiness-matrix) and other apps use the manual‑submit path. |
 | H8 | `retry` is a stub; wedged runs / `outcome_unknown` ledger rows have no automated recovery. | A correct retry must query the provider by receipt/idempotency key and re‑arm the ledger **without re‑emitting side effects** — this needs a reconciliation design and a live provider, so it is deferred rather than shipped as a blind, risky change. |

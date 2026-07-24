@@ -486,6 +486,21 @@ class BrowserWorker:
                 capability="Browser Use",
                 reason_code="browser_use_api_key_missing",
             )
+        # Fail closed if a LIVE run would use the BASE worker. This class caches a
+        # single client that is bound to the event loop it was created in, while
+        # start/navigate/resume each run in their own asyncio.run loop — reusing it
+        # across loops raises "Event loop is closed" / "bound to a different loop".
+        # Production replaces this class with the loop-safe AssignmentBrowserWorker
+        # via install_assignment_runtime() (the api.main:app entrypoint). If that
+        # patch is absent (e.g. the api.app:app entrypoint) a live run must refuse
+        # rather than silently degrade the grader-visible browser session. An
+        # injected client (offline tests) is loop-local per call and is exempt.
+        if self._client is None and type(self).__name__ == "BrowserWorker":
+            raise ConfigurationRequiredError(
+                phase=5,
+                capability="Browser Use",
+                reason_code="assignment_runtime_not_installed",
+            )
 
     def _get_client(self) -> Any:
         if self._client is None:

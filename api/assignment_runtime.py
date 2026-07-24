@@ -17,6 +17,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import uuid4
 
+import httpx
+
 import ops.browser_host_policy as browser_policy_module
 import ops.browser_worker as browser_worker_module
 import ops.composio_capability as composio_module
@@ -393,6 +395,19 @@ class AssignmentBrowserWorker(BrowserWorker):
             timeout=120.0,
         )
 
+    async def _close_if_owned(self, client: Any) -> None:
+        """Close a per-call temporary client to release its HTTP connections.
+
+        An injected client (offline tests, ``self._client`` set) is owned by the
+        caller and left open; only a client this worker created is closed.
+        """
+
+        if self._client is None and callable(getattr(client, "close", None)):
+            try:
+                await client.close()
+            except Exception:
+                pass
+
     async def start(self, profile_id: str | None) -> BrowserSessionContext:
         """Create the real Browser Use session up front and capture its live URL.
 
@@ -682,16 +697,28 @@ class AssignmentBrowserWorker(BrowserWorker):
         provider_session = self._provider_sessions.pop(handle, None)
         self._assignment_live_urls.pop(handle, None)
         self._assignment_research.pop(handle, None)
-        if not provider_session:
+        profile_id = self._profile_ids.pop(handle, None)
+        if not provider_session and not profile_id:
             return
         try:
             client = self._get_client()
         except Exception:
             return
         try:
-            await client.sessions.stop(provider_session)
-        except Exception:
-            pass
+            if provider_session:
+                try:
+                    await client.sessions.stop(provider_session)
+                except Exception:
+                    pass
+            # Delete the per-run profile so accumulated login state cannot exhaust
+            # the provider profile quota over repeated runs.
+            if profile_id:
+                try:
+                    await client.profiles.delete(profile_id)
+                except Exception:
+                    pass
+        finally:
+            await self._close_if_owned(client)
 
     async def _run_assignment_task(
         self,
@@ -721,6 +748,12 @@ class AssignmentBrowserWorker(BrowserWorker):
             "keep_alive": True,
             "max_cost_usd": self._settings.browser_use_max_cost_usd,
             "enable_recording": False,
+            # DETECTION, NOT PROVIDER ENFORCEMENT. Browser Use v3 has no domain
+            # allowlist field (neither RunTaskRequest nor CreateBrowserSessionRequest
+            # declares one); this passes through the SDK's **extra and may be ignored
+            # server-side. Real host restriction is the post-task evaluate_navigation
+            # check below plus the STRICT APP TRACE + global hard stops in the task.
+            # test_browser_use_contract.py guards this SDK reality against drift.
             "allowed_domains": list(patterns),
         }
         browser_secrets = to_browser_sensitive_data(sensitive_data)
@@ -734,6 +767,21 @@ class AssignmentBrowserWorker(BrowserWorker):
 
         try:
             result = await _await_if_needed(client.run(task, **run_kwargs))
+        except (httpx.TimeoutException, httpx.TransportError, TimeoutError) as exc:
+            # Ambiguous: a read/connect timeout means the remote agent MAY still be
+            # running. Do NOT stop the session or record a clean failure — preserve
+            # the session so a caller can reconcile it by id before any retry
+            # re-executes a side effect. (Fixes: timeouts recorded as clean fails.)
+            log_event(
+                "browser.run.outcome_unknown",
+                level=40,
+                handle=context.session_id,
+                error=type(exc).__name__,
+            )
+            raise ProviderOperationError(
+                capability="browser onboarding",
+                reason_code="provider_outcome_unknown",
+            ) from None
         except Exception:
             await self._safe_stop_handle(context.session_id)
             raise ProviderOperationError(
