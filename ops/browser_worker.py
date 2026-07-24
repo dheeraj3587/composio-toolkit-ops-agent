@@ -807,6 +807,47 @@ def _render_browser_task(
     )
 
 
+def build_login_secrets(
+    sensitive_data: Mapping[str, str] | None,
+    allowed_domains: tuple[str, ...],
+) -> dict[str, str] | None:
+    """Map owner login credentials to Browser Use domain-scoped ``secrets``.
+
+    The Cloud SDK fills login forms from ``secrets={domain: "user:pass"}`` and
+    the model never sees the values. The same credential pair is scoped to every
+    allowlisted domain so a redirect within the vendor still authenticates.
+    """
+
+    if not sensitive_data or not allowed_domains:
+        return None
+    email = sensitive_data.get("login_email")
+    password = sensitive_data.get("login_password")
+    if not email or not password:
+        return None
+    pair = f"{email}:{password}"
+    return {domain: pair for domain in allowed_domains}
+
+
+def otp_task_suffix(sensitive_data: Mapping[str, str] | None) -> str:
+    """Return a transient task instruction carrying an emailed one-time code.
+
+    The Cloud ``secrets`` mechanism only models user:password pairs, so a fetched
+    one-time code is passed as a bounded task instruction. It is short-lived,
+    single-use, and never written to run state, checkpoints, or logs.
+    """
+
+    if not sensitive_data:
+        return ""
+    code = sensitive_data.get("login_otp")
+    if not code:
+        return ""
+    return (
+        "\n\nONE-TIME CODE: When the site asks for the emailed sign-in/verification code, enter "
+        f"exactly {code} into the code field and submit. If it is rejected as expired or invalid, "
+        "stop with hitl_required=true."
+    )
+
+
 def _classify_human_action(reason: str) -> HumanActionType:
     lowered = reason.casefold()
     mapping: tuple[tuple[tuple[str, ...], HumanActionType], ...] = (
