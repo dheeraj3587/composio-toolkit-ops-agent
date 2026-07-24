@@ -312,6 +312,15 @@ class RunService:
         # Background email poller (autonomous "listen for replies").
         self._email_poller_thread: threading.Thread | None = None
         self._email_poller_stop = threading.Event()
+        # Asynchronous browser execution: when enabled (production live mode), a
+        # self-serve browser run commits at browser_running with the live view
+        # available immediately, and the bounded onboarding task runs in a
+        # background thread that applies the terminal observation to the run.
+        # This keeps the run creation request fast and the embedded live view /
+        # HITL available for the entire duration of the autonomous task, instead
+        # of blocking the request until the multi-minute task finishes.
+        self._async_browser_enabled = False
+        self._browser_threads: list[threading.Thread] = []
         self._secret_store: SQLiteSecretStore | None = None
         self._effect_store: SQLiteEffectStore | None = None
         # Sanitized startup wiring audit rows; never contains secrets.
@@ -885,6 +894,10 @@ class RunService:
             capability_report: ComposioCapabilityReport | None = None
             capability_event: dict[str, object] | None = None
             browser_events: list[tuple[str, dict[str, object]]] = []
+            # Set when the self-serve browser run is dispatched asynchronously
+            # (Option A). Carries the pre-created live session so the background
+            # navigate can be started once the creation transaction commits.
+            pending_async_navigate: tuple[Any, dict[str, str] | None] | None = None
 
             if (
                 execution_mode == "execute_when_configured"
@@ -963,30 +976,68 @@ class RunService:
                             name: secret.get_secret_value()
                             for name, secret in browser_login.items()
                         }
-                    log_event(
-                        "run.dispatch.begin",
-                        run_id=run_id,
-                        thread_id=thread_id,
-                        app_slug=_slugify(request.app_name),
-                        route=decision.route,
-                        run_provider_action=run_provider_action,
-                        has_login=bool(browser_login),
-                    )
-                    try:
-                        workflow_state = self._workflow.start(
-                            request.model_copy(update={"dry_run": not run_provider_action}),
-                            thread_id=thread_id,
-                            sensitive_data=start_sensitive_data,
-                        )
-                    except Exception as exc:
+                    if (
+                        self._async_browser_enabled
+                        and is_self_serve
+                        and run_provider_action
+                        and self._browser_worker is not None
+                    ):
+                        # OPTION A: pre-create the live Browser Use session so the
+                        # embedded live view is available immediately, commit the
+                        # run at browser_running now, and run the durable navigate
+                        # in a background thread. Run creation stays fast (no 504)
+                        # and the live stream is available for the entire task.
+                        try:
+                            context = asyncio.run(self._browser_worker.start(None))
+                        except Exception as exc:
+                            log_event(
+                                "run.dispatch.session_error",
+                                level=40,
+                                run_id=run_id,
+                                thread_id=thread_id,
+                                error=type(exc).__name__,
+                            )
+                            raise
+                        pending_async_navigate = (context, start_sensitive_data)
+                        workflow_state = {
+                            "status": "browser_running",
+                            "access_route": "self_serve",
+                            "route_reason_code": decision.reason_code,
+                            "route_reason": decision.explanation,
+                            "browser_session_id": context.session_id,
+                        }
                         log_event(
-                            "run.dispatch.error",
-                            level=40,
+                            "run.dispatch.async_begin",
                             run_id=run_id,
                             thread_id=thread_id,
-                            error=type(exc).__name__,
+                            handle=context.session_id,
+                            live_view_available=context.live_view_available,
                         )
-                        raise
+                    else:
+                        log_event(
+                            "run.dispatch.begin",
+                            run_id=run_id,
+                            thread_id=thread_id,
+                            app_slug=_slugify(request.app_name),
+                            route=decision.route,
+                            run_provider_action=run_provider_action,
+                            has_login=bool(browser_login),
+                        )
+                        try:
+                            workflow_state = self._workflow.start(
+                                request.model_copy(update={"dry_run": not run_provider_action}),
+                                thread_id=thread_id,
+                                sensitive_data=start_sensitive_data,
+                            )
+                        except Exception as exc:
+                            log_event(
+                                "run.dispatch.error",
+                                level=40,
+                                run_id=run_id,
+                                thread_id=thread_id,
+                                error=type(exc).__name__,
+                            )
+                            raise
                     log_event(
                         "run.dispatch.result",
                         run_id=run_id,
@@ -1014,7 +1065,32 @@ class RunService:
                     observation_status = (
                         str(observation.get("status")) if isinstance(observation, Mapping) else None
                     )
-                    if isinstance(thread, str) and thread:
+                    if pending_async_navigate is not None:
+                        # Async browser dispatch: commit browser_running with the
+                        # live session; the background navigate advances the run.
+                        decision_event = "route_selected"
+                        persisted_status = "browser_running"
+                        outreach_updates = {
+                            "browser_session_id": browser_session,
+                            "external_actions": True,
+                            "provider_status": {
+                                "research": "baseline_ready",
+                                "browser": "running",
+                                "email": "not_started",
+                                "validation": "not_started",
+                            },
+                        }
+                        browser_events = [
+                            (
+                                "browser_session_started",
+                                {
+                                    "session_id": browser_session,
+                                    "status": "browser_running",
+                                    "external_actions": True,
+                                },
+                            ),
+                        ]
+                    elif isinstance(thread, str) and thread:
                         outreach_updates = {
                             "gmail_session_id": workflow_state.get("gmail_session_id"),
                             "gmail_thread_id": thread,
@@ -1224,7 +1300,254 @@ class RunService:
             created = transaction.get_run(run_id)
             if created is None:  # pragma: no cover - persistence invariant
                 raise RuntimeError("created run could not be read")
-            return _public_run(created)
+        # The creation transaction has committed here. Only now start the
+        # background browser task, so its own transaction never races the
+        # creation write and the run row is already queryable + streamable.
+        if pending_async_navigate is not None:
+            context, async_sensitive = pending_async_navigate
+            self._spawn_async_browser(run_id, thread_id, request, context, async_sensitive)
+        return _public_run(created)
+
+    def _spawn_async_browser(
+        self,
+        run_id: str,
+        thread_id: str,
+        request: OperationsRequest,
+        context: Any,
+        sensitive_data: dict[str, str] | None,
+    ) -> None:
+        """Run the durable browser navigate for a run in a background thread."""
+
+        thread = threading.Thread(
+            target=self._run_async_browser,
+            args=(run_id, thread_id, request, context, sensitive_data),
+            name=f"browser-{run_id[:16]}",
+            daemon=True,
+        )
+        self._browser_threads = [t for t in self._browser_threads if t.is_alive()]
+        self._browser_threads.append(thread)
+        thread.start()
+
+    def _run_async_browser(
+        self,
+        run_id: str,
+        thread_id: str,
+        request: OperationsRequest,
+        context: Any,
+        sensitive_data: dict[str, str] | None,
+    ) -> None:
+        """Background worker: drive the durable navigate on the pre-created session.
+
+        The session already exists (seeded into the workflow), so ``_browser_start``
+        is a no-op and the bounded onboarding task runs against the live session.
+        When the task pauses (HITL) or finishes, the terminal state is applied to
+        the run so the frontend transitions from browser_running.
+        """
+
+        if self._workflow is None:  # pragma: no cover - guarded by caller
+            return
+        try:
+            seed = {
+                "browser_profile_id": context.profile_id,
+                "browser_session_id": context.session_id,
+                "browser_live_view_available": context.live_view_available,
+                "browser_session_started_at": context.created_at,
+                "browser_session_last_active_at": context.created_at,
+                "browser_session_inactivity_expires_at": context.inactivity_expires_at,
+                "browser_session_max_expires_at": context.maximum_expires_at,
+            }
+            workflow_state = self._workflow.start(
+                request.model_copy(update={"dry_run": False}),
+                thread_id=thread_id,
+                sensitive_data=sensitive_data,
+                seed=seed,
+            )
+        except Exception as exc:
+            log_event(
+                "browser.async.workflow_error",
+                level=40,
+                run_id=run_id,
+                thread_id=thread_id,
+                error=type(exc).__name__,
+            )
+            self._mark_async_browser_failed(run_id)
+            return
+        finally:
+            if sensitive_data is not None:
+                sensitive_data.clear()
+        try:
+            self._apply_async_browser_result(run_id, thread_id, request, workflow_state)
+        except Exception as exc:  # pragma: no cover - defensive
+            log_event(
+                "browser.async.apply_error",
+                level=40,
+                run_id=run_id,
+                error=type(exc).__name__,
+            )
+
+    def _apply_async_browser_result(
+        self,
+        run_id: str,
+        thread_id: str,
+        request: OperationsRequest,
+        workflow_state: Mapping[str, object],
+    ) -> None:
+        """Transition a browser_running run based on the completed navigate."""
+
+        observation = workflow_state.get("browser_observation")
+        observation_status = (
+            str(observation.get("status")) if isinstance(observation, Mapping) else None
+        )
+        wf_status = str(workflow_state.get("status") or "")
+        current_url = workflow_state.get("current_url")
+        try:
+            interrupts = self._workflow.get_interrupts(thread_id) if self._workflow else ()
+        except Exception:
+            interrupts = ()
+        waiting = (
+            bool(interrupts)
+            or observation_status == "human_action_required"
+            or wf_status == "waiting_for_hitl"
+        )
+
+        lock = self._run_lock(run_id)
+        with lock:
+            record = self.storage.get_run(run_id)
+            if record is None:
+                return
+            previous = str(record.get("status") or "browser_running")
+            if previous != "browser_running":
+                # A resume or another writer already advanced the run; do not
+                # clobber its state.
+                log_event("browser.async.apply_skip", run_id=run_id, prev_status=previous)
+                return
+
+            events: list[tuple[str, dict[str, object]]] = []
+            extra_updates: dict[str, object] = {}
+            hitl_payload: dict[str, object] | None = None
+            provider_browser = "running"
+
+            if waiting:
+                next_status: RunStatus = "waiting_for_hitl"
+                source = interrupts[0] if interrupts else workflow_state.get("hitl_request")
+                if isinstance(source, Mapping):
+                    hitl_payload = {str(k): v for k, v in source.items()}
+                events.append(
+                    (
+                        "browser_hitl_required",
+                        {
+                            "status": "waiting_for_hitl",
+                            "current_url": current_url,
+                            "required_human_action": (
+                                hitl_payload.get("type") if hitl_payload else None
+                            ),
+                            "external_actions": True,
+                        },
+                    )
+                )
+            elif wf_status == "blocked":
+                next_status = "blocked"
+                provider_browser = "blocked"
+                events.append(
+                    ("browser_navigation_blocked", {"status": "blocked", "external_actions": True})
+                )
+            elif wf_status == "failed":
+                next_status = "failed"
+                provider_browser = "failed"
+            elif observation_status in {"credential_page_ready", "developer_console_ready"}:
+                events.append(
+                    (
+                        "credential_page_ready",
+                        {
+                            "current_url": current_url,
+                            "status": "browser_running",
+                            "external_actions": True,
+                        },
+                    )
+                )
+                if (
+                    self._credential_capturer is not None
+                    and self._credential_validator is not None
+                    and "operational_research" in workflow_state
+                ):
+                    try:
+                        research = OperationalResearch.model_validate(
+                            workflow_state["operational_research"]
+                        )
+                        outcome = self._run_m6_credentials(research, request)
+                        next_status = cast(RunStatus, outcome.status)
+                        provider_browser = "credential_page_ready"
+                        if outcome.bundle is not None:
+                            extra_updates["integrator_bundle"] = outcome.bundle
+                        events.extend(outcome.events)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        log_event(
+                            "browser.async.m6_error", level=40, run_id=run_id,
+                            error=type(exc).__name__,
+                        )
+                        next_status = "browser_running"
+                else:
+                    next_status = "browser_running"
+            else:
+                next_status = "browser_running"
+
+            with self.storage.unit_of_work() as transaction:
+                rec = transaction.get_run(run_id)
+                if rec is None:  # pragma: no cover
+                    return
+                revision = int(rec.get("state_revision", 0) or 0) + 1
+                if previous != next_status:
+                    validate_status_transition(previous, next_status, "browser")
+                changes: dict[str, object] = {
+                    "status": next_status,
+                    "state_revision": revision,
+                    "last_projected_revision": revision,
+                    "external_actions": True,
+                    "hitl_request": hitl_payload,
+                    "provider_status": {
+                        "research": "baseline_ready",
+                        "browser": provider_browser,
+                        "email": "not_started",
+                        "validation": "not_started",
+                    },
+                    **extra_updates,
+                }
+                transaction.update_run(run_id, **changes)
+                for event_type, payload in events:
+                    transaction.append_audit_event(
+                        run_id=run_id, event_type=event_type, payload=payload
+                    )
+        log_event("browser.async.applied", run_id=run_id, status=next_status)
+
+    def _mark_async_browser_failed(self, run_id: str) -> None:
+        """Best-effort transition of a stuck browser_running run to failed."""
+
+        try:
+            lock = self._run_lock(run_id)
+            with lock:
+                record = self.storage.get_run(run_id)
+                if record is None or str(record.get("status")) != "browser_running":
+                    return
+                with self.storage.unit_of_work() as transaction:
+                    rec = transaction.get_run(run_id)
+                    if rec is None:
+                        return
+                    revision = int(rec.get("state_revision", 0) or 0) + 1
+                    validate_status_transition("browser_running", "failed", "browser")
+                    transaction.update_run(
+                        run_id,
+                        status="failed",
+                        state_revision=revision,
+                        last_projected_revision=revision,
+                        external_actions=True,
+                    )
+                    transaction.append_audit_event(
+                        run_id=run_id,
+                        event_type="browser_failed",
+                        payload={"status": "failed", "external_actions": True},
+                    )
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     def _run_enrichment_probe(
         self,

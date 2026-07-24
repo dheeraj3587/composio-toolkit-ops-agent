@@ -139,6 +139,7 @@ class DurableOperationsWorkflow:
         *,
         thread_id: str | None = None,
         sensitive_data: Mapping[str, str] | None = None,
+        seed: Mapping[str, object] | None = None,
     ) -> OperationsState:
         stable_thread_id = thread_id or str(uuid.uuid4())
         _validate_thread_id(stable_thread_id)
@@ -168,6 +169,13 @@ class DurableOperationsWorkflow:
                 "capability_statuses": [],
                 "side_effect_keys": {},
             }
+            # A caller may seed a pre-created browser session (session id + live
+            # view metadata). When present, ``_browser_start`` is a no-op and the
+            # bounded onboarding task runs against the already-live session, so the
+            # embedded live view is available for the entire task instead of only
+            # after it finishes.
+            if seed:
+                initial.update(cast("dict[str, object]", dict(seed)))
             try:
                 result = self._graph.invoke(initial, config=config, durability="sync")
             finally:

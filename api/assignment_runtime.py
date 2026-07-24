@@ -274,16 +274,57 @@ class AssignmentBrowserWorker(BrowserWorker):
         self._assignment_research: dict[str, OperationalResearch] = {}
 
     async def start(self, profile_id: str | None) -> BrowserSessionContext:
-        """Create only a local handle; the provider session starts with the task."""
+        """Create the real Browser Use session up front and capture its live URL.
+
+        The provider session (and its signed live-view URL) exists the moment the
+        session is created, before any task runs. Creating it here, instead of
+        deferring to the first ``client.run`` call, means the embedded live view
+        and HITL are available for the entire duration of the autonomous task
+        rather than only after it finishes. The bounded onboarding task is then
+        run against this same ``session_id``.
+        """
 
         self._require_configuration()
+        client = self._get_client()
+        create_kwargs: dict[str, Any] = {
+            "keep_alive": True,
+            "enable_recording": False,
+            "max_cost_usd": self._settings.browser_use_max_cost_usd,
+        }
+        if profile_id:
+            create_kwargs["profile_id"] = profile_id
+        try:
+            session = await _await_if_needed(client.sessions.create(**create_kwargs))
+        except Exception as exc:
+            log_event("browser.session.create_error", level=40, error=type(exc).__name__)
+            raise ProviderOperationError(
+                capability="Browser Use session",
+                reason_code="provider_outcome_unknown",
+            ) from None
+        data = _dump(session)
+        session_id = _string(data.get("id"))
+        if not session_id:
+            log_event("browser.session.create_no_id", level=40)
+            raise ProviderOperationError(
+                capability="Browser Use session",
+                reason_code="provider_outcome_unknown",
+            )
+        # The real provider session id is the durable handle from here on.
+        self._provider_sessions[session_id] = session_id
+        live_url = _string(data.get("live_url"))
+        if live_url:
+            self._assignment_live_urls[session_id] = live_url
+        log_event(
+            "browser.session.created",
+            handle=session_id,
+            live_view_available=bool(live_url),
+            live_url_host=url_host(live_url),
+        )
         now = datetime.now(UTC)
-        handle = f"pending_{uuid4().hex}"
-        log_event("browser.session.handle_created", handle=handle)
         return BrowserSessionContext(
-            profile_id=profile_id or handle,
-            session_id=handle,
-            live_view_available=False,
+            profile_id=profile_id or session_id,
+            session_id=session_id,
+            live_view_available=bool(live_url),
             allowed_domains=(),
             created_at=_isoformat(now),
             inactivity_expires_at=_isoformat(now + _INACTIVITY_WINDOW),

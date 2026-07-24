@@ -26,6 +26,7 @@ from ops.operational_research import EvidenceDocument, GeminiStructuredExtractor
 from ops.provider_errors import ProviderContractError, ProviderOperationError
 
 _ORIGINAL_PROVIDER_STATES = LocalRunService._provider_states
+_ORIGINAL_STARTUP = LocalRunService.startup
 _INSTALLED = False
 
 
@@ -356,6 +357,20 @@ def _assignment_provider_states(service: LocalRunService) -> list[ProviderState]
     return result
 
 
+async def _startup_with_async_browser(self: LocalRunService) -> None:
+    """Enable asynchronous browser execution for the live production service.
+
+    A self-serve browser run then commits at browser_running immediately (with
+    the live view available) and drives the autonomous navigate in a background
+    thread, instead of blocking the creation request for the whole task.
+    """
+
+    await _ORIGINAL_STARTUP(self)
+    inner = getattr(self, "_service", None)
+    if inner is not None:
+        inner._async_browser_enabled = True
+
+
 def install_assignment_live_evidence() -> None:
     """Install live-session retention, current Gemini config, and readiness projection."""
 
@@ -368,6 +383,7 @@ def install_assignment_live_evidence() -> None:
     extractor_type.extract = _compatible_gemini_extract
     service_type = cast(Any, LocalRunService)
     service_type._provider_states = _assignment_provider_states
+    service_type.startup = _startup_with_async_browser
     service_module._EVENT_SUMMARIES["operational_research_enriched"] = (
         "Perplexity discovery and Gemini structured extraction returned a sanitized enrichment result."
     )
