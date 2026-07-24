@@ -117,6 +117,8 @@ def test_gmail_boundary_is_unavailable_and_allowlist_is_least_privilege() -> Non
         "GMAIL_LIST_THREADS",
         "GMAIL_REPLY_TO_THREAD",
         "GMAIL_GET_PROFILE",
+        # Reviewed addition: read-only attachment fetch for credential harvest.
+        "GMAIL_GET_ATTACHMENT",
     )
     with pytest.raises(PhaseUnavailableError, match="Phase 4"):
         asyncio.run(GmailWorker().ensure_connected())

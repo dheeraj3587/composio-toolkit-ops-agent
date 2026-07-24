@@ -9,6 +9,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
+import httpx
+
+from ops.attachment_extract import AttachmentRef, extract_secret_pairs, is_text_like
 from ops.config import Settings
 from ops.effect_ledger import EffectStore, SQLiteEffectStore
 from ops.provider_errors import (
@@ -30,6 +33,7 @@ GMAIL_TOOL_ALLOWLIST: tuple[str, ...] = (
     "GMAIL_LIST_THREADS",
     "GMAIL_REPLY_TO_THREAD",
     "GMAIL_GET_PROFILE",
+    "GMAIL_GET_ATTACHMENT",
 )
 _TOOL_FIELD_TYPES: dict[str, dict[str, frozenset[str]]] = {
     "GMAIL_SEND_EMAIL": {
@@ -45,12 +49,19 @@ _TOOL_FIELD_TYPES: dict[str, dict[str, frozenset[str]]] = {
     },
     "GMAIL_FETCH_MESSAGE_BY_THREAD_ID": {"thread_id": frozenset({"string"})},
     "GMAIL_GET_PROFILE": {"user_id": frozenset({"string"})},
+    "GMAIL_GET_ATTACHMENT": {
+        "message_id": frozenset({"string"}),
+        "attachment_id": frozenset({"string"}),
+        "file_name": frozenset({"string"}),
+        "user_id": frozenset({"string"}),
+    },
 }
 _TOOL_REQUIRED_FIELDS: dict[str, frozenset[str]] = {
     "GMAIL_SEND_EMAIL": frozenset({"recipient_email", "subject", "body"}),
     "GMAIL_REPLY_TO_THREAD": frozenset({"thread_id", "recipient_email", "message_body"}),
     "GMAIL_FETCH_MESSAGE_BY_THREAD_ID": frozenset({"thread_id"}),
     "GMAIL_GET_PROFILE": frozenset({"user_id"}),
+    "GMAIL_GET_ATTACHMENT": frozenset({"message_id", "attachment_id", "file_name"}),
 }
 _SECRET_LINE = re.compile(
     r"(?im)\b(?P<kind>client[_ -]?secret|api[_ -]?key|access[_ -]?token|"
@@ -305,6 +316,84 @@ class GmailWorker:
                 )
             )
         return tuple(results)
+
+    async def harvest_attachment_credentials(
+        self,
+        *,
+        message_id: str,
+        attachments: Sequence[AttachmentRef],
+        max_bytes: int = 262_144,
+    ) -> dict[str, str]:
+        """Fetch text-like attachments, extract credentials, and vault them.
+
+        For each text-like attachment within the size cap, the bytes are fetched
+        from the provider, decoded as UTF-8, scanned for credential (kind, value)
+        pairs, and written to the encrypted vault; only ``vault://`` references are
+        returned (a raw value never leaves this boundary). Binary attachments
+        (PDF/zip/images) are skipped by design rather than parsed. Requires a
+        secret store; without one it raises ConfigurationRequiredError.
+        """
+
+        if self._secret_store is None:
+            raise ConfigurationRequiredError(
+                phase=4,
+                capability="Gmail attachment credential extraction",
+                reason_code="secret_store_missing",
+            )
+        safe_message_id = _validate_identifier(message_id, "message_id")
+        references: dict[str, str] = {}
+        index = 0
+        for ref in attachments:
+            if not ref.attachment_id or not is_text_like(ref.filename, ref.mime_type):
+                continue
+            if ref.size and ref.size > max_bytes:
+                continue
+            raw = await self._fetch_attachment_bytes(safe_message_id, ref, max_bytes)
+            if raw is None:
+                continue
+            try:
+                text = raw.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                continue  # not genuinely text; skip rather than guess an encoding
+            for kind, value in extract_secret_pairs(text):
+                index += 1
+                reference = self._secret_store.put(
+                    app_slug="email-attachment", kind=kind, value=value
+                )
+                references[f"attachment_{index}_{kind}"[:120]] = reference
+                del value
+        return references
+
+    async def _fetch_attachment_bytes(
+        self, message_id: str, ref: AttachmentRef, max_bytes: int
+    ) -> bytes | None:
+        """Fetch one attachment's raw bytes via GMAIL_GET_ATTACHMENT, size-bounded.
+
+        Composio returns the content indirectly: ``data.file.s3url`` is a presigned
+        URL that is downloaded here under the cap. A local file path (SDK
+        auto-download) or a Drive/other indirection is not fetched here and yields
+        None. Fails closed (None) on any unexpected response shape.
+        """
+
+        data = await self._execute_read(
+            "GMAIL_GET_ATTACHMENT",
+            {
+                "message_id": message_id,
+                "attachment_id": ref.attachment_id,
+                "file_name": ref.filename or "attachment",
+            },
+            capability="Composio Gmail attachment fetch",
+        )
+        file_obj = data.get("file")
+        if not isinstance(file_obj, Mapping):
+            return None
+        url = file_obj.get("s3url") or file_obj.get("url")
+        if not isinstance(url, str) or not url.casefold().startswith("https://"):
+            return None  # local path or Drive indirection: not downloaded here
+        try:
+            return await asyncio.to_thread(_download_bounded, url, max_bytes)
+        except Exception:
+            return None
 
     async def fetch_latest_otp(
         self,
@@ -983,6 +1072,22 @@ def build_inbox_query(
         if cleaned_extra:
             parts.append(cleaned_extra)
     return " ".join(parts) or "in:anywhere"
+
+
+def _download_bounded(url: str, max_bytes: int) -> bytes | None:
+    """Stream a presigned attachment URL, refusing anything over the size cap."""
+
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        with client.stream("GET", url) as response:
+            response.raise_for_status()
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    return None  # exceeds cap: refuse rather than load unbounded bytes
+                chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _has_attachments(message: Mapping[str, object]) -> bool:
