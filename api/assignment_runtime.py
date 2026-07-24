@@ -276,6 +276,27 @@ class AssignmentBrowserWorker(BrowserWorker):
         self._assignment_live_urls: dict[str, str] = {}
         self._assignment_research: dict[str, OperationalResearch] = {}
 
+    def _get_client(self) -> Any:
+        """Return a Browser Use client bound to the CURRENT event loop.
+
+        The SDK's async HTTP client is bound to the event loop it was created in.
+        Session creation, navigation, and HITL resume each run in their own
+        ``asyncio.run`` loop (one per graph node / worker call), so a cached
+        client would be reused across loops and raise a RuntimeError on the next
+        request. Reuse only an explicitly injected client (offline tests); in
+        production create a fresh client for each call. The live provider session
+        is server-side and is referenced across clients by its ``session_id``.
+        """
+
+        if self._client is not None:
+            return self._client
+        self._require_configuration()
+        module = importlib.import_module("browser_use_sdk.v3")
+        return module.AsyncBrowserUse(
+            api_key=self._settings.browser_use_api_key.get_secret_value(),
+            timeout=120.0,
+        )
+
     async def start(self, profile_id: str | None) -> BrowserSessionContext:
         """Create the real Browser Use session up front and capture its live URL.
 
@@ -451,8 +472,9 @@ class AssignmentBrowserWorker(BrowserWorker):
         self._assignment_research.pop(handle, None)
         if not provider_session:
             return
-        client = self._client
-        if client is None:
+        try:
+            client = self._get_client()
+        except Exception:
             return
         try:
             await client.sessions.stop(provider_session)
