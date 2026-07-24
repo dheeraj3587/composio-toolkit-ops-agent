@@ -250,7 +250,7 @@ class GmailWorker:
                 reason_code="provider_response_incompatible",
             ) from None
 
-    async def fetch_latest_otp(self, *, query: str = "newer_than:1h") -> str | None:
+    async def fetch_latest_otp(self, *, query: str = "newer_than:1h in:anywhere") -> str | None:
         """Return the most recent one-time login code from the connected inbox.
 
         Reads recent messages (raw, never logged), finds the newest one whose
@@ -293,7 +293,9 @@ class GmailWorker:
                 return code
         return None
 
-    async def fetch_latest_login_link(self, *, query: str = "newer_than:1h") -> str | None:
+    async def fetch_latest_login_link(
+        self, *, query: str = "newer_than:1h in:anywhere"
+    ) -> str | None:
         """Return the most recent emailed sign-in verification LINK, if any.
 
         Some providers (e.g. HubSpot device verification) send a magic link rather
