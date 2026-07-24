@@ -75,6 +75,7 @@ class Settings(BaseModel):
 
     perplexity_api_key: SecretStr | None = Field(default=None, repr=False)
     google_genai_api_key: SecretStr | None = Field(default=None, repr=False)
+    openrouter_api_key: SecretStr | None = Field(default=None, repr=False)
     composio_api_key: SecretStr | None = Field(default=None, repr=False)
     browser_use_api_key: SecretStr | None = Field(default=None, repr=False)
     langgraph_aes_key: SecretStr | None = Field(default=None, repr=False)
@@ -97,6 +98,10 @@ class Settings(BaseModel):
         ordered = [self.gemini_model, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"]
         return tuple(dict.fromkeys(model for model in ordered if model))
 
+    # OpenRouter is the primary LLM for the email loop (compose/classify/reply);
+    # Gemini is the fallback. The model is a free OpenRouter model by default.
+    openrouter_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
+
     # Session count is the real quota (not dollars), so use the most capable
     # Browser Use model for reliable multi-step onboarding navigation. The latest
     # Opus available on Browser Use Cloud is claude-opus-4.7 (there is no 4.8).
@@ -117,6 +122,9 @@ class Settings(BaseModel):
     allow_live_vendor_email: bool = False
     allow_live_browser: bool = False
     max_outreach_rounds: int = Field(default=5, ge=1)
+    # Autonomous email poller cadence (seconds). The agent checks every
+    # waiting_for_reply run for new provider replies on this interval.
+    email_poll_interval_seconds: int = Field(default=45, ge=10)
     max_unclear_retries: int = Field(default=1, ge=0)
     max_browser_attempts: int = Field(default=2, ge=1)
     max_hitl_count: int = Field(default=3, ge=0)
@@ -150,6 +158,9 @@ class Settings(BaseModel):
         values: dict[str, Any] = {
             "perplexity_api_key": _secret(source.get("PERPLEXITY_API_KEY")),
             "google_genai_api_key": _secret(source.get("GOOGLE_GENAI_API_KEY")),
+            "openrouter_api_key": _secret(source.get("OPENROUTER_API_KEY")),
+            "openrouter_model": _optional(source.get("OPENROUTER_MODEL"))
+            or "nvidia/nemotron-3-ultra-550b-a55b:free",
             "composio_api_key": _secret(source.get("COMPOSIO_API_KEY")),
             "browser_use_api_key": _secret(source.get("BROWSER_USE_API_KEY")),
             "langgraph_aes_key": _secret(source.get("LANGGRAPH_AES_KEY")),
@@ -180,6 +191,9 @@ class Settings(BaseModel):
             ),
             "allow_live_browser": _boolean(source.get("ALLOW_LIVE_BROWSER"), default=False),
             "max_outreach_rounds": _integer(source.get("MAX_OUTREACH_ROUNDS"), default=5),
+            "email_poll_interval_seconds": _integer(
+                source.get("EMAIL_POLL_INTERVAL_SECONDS"), default=45
+            ),
             "max_unclear_retries": _integer(source.get("MAX_UNCLEAR_RETRIES"), default=1),
             "max_browser_attempts": _integer(source.get("MAX_BROWSER_ATTEMPTS"), default=2),
             "max_hitl_count": _integer(source.get("MAX_HITL_COUNT"), default=3),

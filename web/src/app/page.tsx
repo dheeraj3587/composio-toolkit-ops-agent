@@ -37,7 +37,7 @@ export default async function DashboardPage() {
   ).length ?? null
 
   return (
-    <div className="page-enter space-y-8">
+    <div className="page-enter page-stack">
       <header className="flex flex-col gap-5 border-b border-border pb-7 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <div className="flex flex-wrap items-center gap-3">
@@ -79,7 +79,7 @@ export default async function DashboardPage() {
 
       <AppSearch />
 
-      <section className="grid gap-5 xl:grid-cols-[0.9fr_1.1fr]">
+      <section className="grid items-stretch gap-6 xl:grid-cols-2">
         <ProvenanceCard snapshot={health?.snapshot ?? null} />
         <div className="panel grid sm:grid-cols-3">
           <PostureCard icon={Boxes} title="Research" status={health ? `phase_${health.phase}` : "unavailable"} copy="P1 evidence remains immutable; enrichment is stored separately." />
@@ -117,7 +117,7 @@ function Metric({ icon: Icon, label, value, note }: { icon: typeof Database; lab
     <article className="min-h-32 bg-card p-5 [&:not(:last-child)]:border-b [&:not(:last-child)]:border-border sm:[&:not(:last-child)]:border-b-0 sm:[&:not(:last-child)]:border-r">
       <div className="flex items-center justify-between">
         <span className="data-label">{label}</span>
-        <Icon className="size-4 text-violet-500" aria-hidden="true" />
+        <Icon className="size-4 text-brand-500" aria-hidden="true" />
       </div>
       <p className="metric-value mt-6">{value}</p>
       <p className="mt-1 text-xs text-muted-foreground">{note}</p>

@@ -425,11 +425,13 @@ class LocalRunService:
         operation: OperationsRequest,
         idempotency_key: str | None,
         execution_mode: Literal["plan_only", "execute_when_configured"],
+        browser_login: Mapping[str, SecretStr] | None = None,
     ) -> RunDetailResponse:
         record = self._service.create_run(
             operation,
             idempotency_key=idempotency_key,
             execution_mode=execution_mode,
+            browser_login=browser_login,
         )
         return self._detail(self._summary(record))
 
@@ -577,11 +579,21 @@ class LocalRunService:
             dry_run=True,
             outreach_recipient_override=request.outreach_recipient_override,
         )
+        # Autonomous sign-in credentials (if provided) are mapped to the Browser
+        # Use secure-placeholder key names and injected at session creation. The
+        # raw values never enter run state, checkpoints, the ledger, or logs.
+        browser_login: dict[str, SecretStr] | None = None
+        if request.browser_login is not None:
+            browser_login = {
+                "login_email": request.browser_login.email,
+                "login_password": request.browser_login.password,
+            }
         return await run_in_threadpool(
             self._create_sync,
             operation,
             idempotency_key,
             request.execution_mode,
+            browser_login,
         )
 
     def _submit_credentials_sync(
@@ -705,7 +717,7 @@ class LocalRunService:
         if not (
             self._settings.composio_api_key
             and self._settings.composio_gmail_connected_account_id
-            and self._settings.allow_live_vendor_email
+            and self._settings.outreach_recipient_override
         ):
             raise PhaseUnavailableError(
                 run_id=run_id,
@@ -713,7 +725,32 @@ class LocalRunService:
                 available_in=("phase_4",),
                 error="configuration_required",
             )
-        raise PhaseUnavailableError(run_id=run_id, action="poll_email", available_in=("email",))
+        return await run_in_threadpool(self._poll_email_sync, run_id)
+
+    def _poll_email_sync(self, run_id: str) -> ActionReceipt:
+        try:
+            record = self._service.poll_email(run_id)
+        except KeyError:
+            raise RunNotFoundError(run_id) from None
+        except CredentialSubmissionError as exc:
+            return ActionReceipt(
+                run_id=run_id,
+                action="poll_email",
+                status="no_change",
+                detail=f"No reply action taken ({exc.reason_code.replace('_', ' ')}).",
+            )
+        status = str(record.get("status"))
+        reply_class = str(record.get("latest_reply_class") or "no_reply")
+        detail = (
+            "Provider reply received and classified as "
+            f"{reply_class.replace('_', ' ')}; run status: {status.replace('_', ' ')}."
+        )
+        return ActionReceipt(
+            run_id=run_id,
+            action="poll_email",
+            status="no_change" if reply_class == "no_reply" else "accepted",
+            detail=detail,
+        )
 
     async def retry(self, run_id: str, capability: str) -> ActionReceipt:
         await self.get_run(run_id)

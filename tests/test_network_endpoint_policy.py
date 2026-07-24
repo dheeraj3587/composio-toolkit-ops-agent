@@ -49,7 +49,9 @@ def test_normalize_endpoint_rejects_malformed() -> None:
     with pytest.raises(NetworkEndpointError):
         normalize_endpoint("https://api.pipedrive.com/v1/users/me?x=1")
     with pytest.raises(NetworkEndpointError):
-        normalize_endpoint("https://user:pass@api.pipedrive.com/v1/users/me")
+        normalize_endpoint(
+            "https://user:pass@api.pipedrive.com/v1/users/me",  # pragma: allowlist secret
+        )
 
 
 def test_network_policy_endpoints_are_all_normalizable() -> None:

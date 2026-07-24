@@ -17,6 +17,9 @@ const contentSecurityPolicy = [
   "base-uri 'self'",
   "form-action 'self'",
   "frame-ancestors 'none'",
+  // Allow embedding the Browser Use live session viewer so the operator can
+  // watch and interact (CAPTCHA/OTP) inline without leaving the run page.
+  "frame-src 'self' https://live.browser-use.com https://*.browser-use.com",
   "manifest-src 'self'",
 ].join("; ");
 

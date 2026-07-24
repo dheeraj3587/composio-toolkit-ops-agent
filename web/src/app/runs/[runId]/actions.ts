@@ -7,6 +7,7 @@ import {
   getLiveView,
   performPhaseAction,
   PhaseConflictError,
+  resumeWithBrowserLogin,
   submitCredentials,
 } from "@/lib/api"
 import type { RetryCapability, RunPhaseAction } from "@/lib/types"
@@ -92,6 +93,47 @@ export async function openLiveView(
         ? "Live view is restricted to the owner on localhost."
         : "The live browser URL could not be retrieved."
     return { liveUrl: null, message, tone: "error" }
+  }
+}
+
+export interface BrowserLoginState {
+  message: string | null
+  tone: "neutral" | "error"
+}
+
+export async function submitBrowserLoginAction(
+  _previousState: BrowserLoginState,
+  formData: FormData,
+): Promise<BrowserLoginState> {
+  const runId = String(formData.get("run_id") ?? "").slice(0, 180)
+  const email = String(formData.get("login_email") ?? "")
+  const password = String(formData.get("login_password") ?? "")
+  if (!runId || !email || !password) {
+    return { message: "Enter both the account email/username and the password.", tone: "error" }
+  }
+  try {
+    const receipt = await resumeWithBrowserLogin(runId, email, password)
+    revalidatePath(`/runs/${encodeURIComponent(runId)}`)
+    return {
+      message:
+        receipt.detail ??
+        "Credentials handed to the agent. It is signing in autonomously; watch the live browser.",
+      tone: receipt.status === "configuration_required" ? "error" : "neutral",
+    }
+  } catch (error) {
+    if (error instanceof PhaseConflictError) {
+      return { message: "This run is not waiting for a sign-in right now.", tone: "error" }
+    }
+    if (error instanceof ApiError) {
+      return {
+        message:
+          error.status === 403
+            ? "Autonomous sign-in is disabled on this server (owner opt-in required)."
+            : "The sign-in credentials could not be submitted.",
+        tone: "error",
+      }
+    }
+    return { message: "The sign-in submission failed.", tone: "error" }
   }
 }
 

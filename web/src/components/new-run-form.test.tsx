@@ -7,7 +7,7 @@ vi.mock("@/app/runs/new/actions", () => ({
 }))
 
 describe("NewRunForm", () => {
-  it("shows the required company fields and makes plan-only behavior explicit", () => {
+  it("shows the required company fields and makes execute-mode boundaries explicit", () => {
     render(<NewRunForm defaultAppName="Pipedrive" />)
 
     expect(screen.getByRole("textbox", { name: "Application name" })).toHaveValue("Pipedrive")
@@ -16,8 +16,8 @@ describe("NewRunForm", () => {
     expect(screen.getByRole("textbox", { name: "Integration use case" })).toBeInTheDocument()
 
     const mode = screen.getByRole("combobox", { name: "Execution mode" })
-    expect(mode).toHaveTextContent("Plan only")
-    expect(screen.getByText(/browser, email, hitl, validation, and other external actions are not attempted/i)).toBeInTheDocument()
-    expect(screen.getByText(/choose execute when configured to request an approved live path/i)).toBeInTheDocument()
+    expect(mode).toHaveTextContent("Execute when configured")
+    expect(screen.getByText(/may perform approved provider actions only when backend policy/i)).toBeInTheDocument()
+    expect(screen.getByText(/execution can proceed only when backend policy and provider configuration permit each action/i)).toBeInTheDocument()
   })
 })

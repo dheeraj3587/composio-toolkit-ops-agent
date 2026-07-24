@@ -253,6 +253,25 @@ export function getLiveView(runId: string): Promise<LiveViewResponse> {
   return apiRequest(runPath(runId, "/live-view"), liveViewResponseSchema)
 }
 
+export function resumeWithBrowserLogin(
+  runId: string,
+  email: string,
+  password: string,
+): Promise<ActionReceipt> {
+  // Owner-submitted app login credentials. They leave this server-only client
+  // immediately for the API, are injected into Browser Use as secure
+  // placeholders for a single resume, and are never persisted or returned.
+  return apiRequest(
+    runPath(runId, "/resume"),
+    actionReceiptSchema,
+    {
+      method: "POST",
+      body: JSON.stringify({ signal: "completed", browser_login: { email, password } }),
+    },
+    RUN_ACTION_TIMEOUT_MS,
+  )
+}
+
 export function submitCredentials(
   runId: string,
   credentials: Record<string, string>,

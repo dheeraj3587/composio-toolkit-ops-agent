@@ -51,12 +51,9 @@ class SuccessfulActionService(TrackingRunService):
     """Test double for the stable success contract of future phase actions."""
 
     async def resume(
-        self,
-        run_id: str,
-        *,
-        browser_login: object = None,
-        signal: str = "completed",
+        self, run_id: str, *, browser_login: object = None, signal: str = "completed"
     ) -> ActionReceipt:
+        del browser_login, signal
         await self.get_run(run_id)
         return ActionReceipt(run_id=run_id, action="resume")
 

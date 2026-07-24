@@ -1,0 +1,826 @@
+{
+  "schema_version": "1.0",
+  "catalog_id": "p1-snapshot-first-25-api-access-traces",
+  "selection_source": "data/p1/results.json",
+  "selection_basis": "The first 25 records in the immutable P1 snapshot order. This is a reproducible project selection, not a popularity ranking.",
+  "navigation_mode": "strict_ordered_checkpoints",
+  "divergence_action": "If a named checkpoint is absent, the account or workspace is ambiguous, or the next action would leave the approved host allowlist, stop with human_action_required for provider_verification. Do not explore unrelated settings, use a search engine, or guess another route.",
+  "global_hard_stops": [
+    "Stop before entering or reading a password, credential value, cookie, API key, token, client secret, authorization code, OTP, TOTP, passkey, or private key.",
+    "Stop for CAPTCHA, email or phone verification, MFA, passkey, security key, device approval, account selection, legal consent, billing, provider review, or an irreversible confirmation.",
+    "Search for an existing developer application before opening a creation flow, and never create, modify, or delete an application unless the run supplies an exact idempotent name and explicit authorization.",
+    "Stop when the credential page or credential field labels are visible; never reveal, generate, copy, transcribe, summarize, or return a credential value."
+  ],
+  "apps": [
+    {
+      "position": 1,
+      "app_slug": "salesforce",
+      "app_name": "Salesforce",
+      "access_model": "gated",
+      "start_url": "https://login.salesforce.com/",
+      "evidence_url": "https://developer.salesforce.com/docs/platform/connect-rest-api/guide/intro_using_oauth.html",
+      "credential_goal": "OAuth connected-app or external-client-app credential page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open the Salesforce sign-in page. If authentication or account selection is required, stop for the owner and resume this same page after completion.",
+          "expected_signals": ["Salesforce sign-in", "authenticated Salesforce home"]
+        },
+        {
+          "order": 2,
+          "instruction": "From the authenticated account, open the gear menu and choose Setup.",
+          "expected_signals": ["Setup Home", "Quick Find"]
+        },
+        {
+          "order": 3,
+          "instruction": "Use Quick Find for App Manager and open App Manager; do not browse unrelated Setup sections.",
+          "expected_signals": ["App Manager", "application list"]
+        },
+        {
+          "order": 4,
+          "instruction": "Search the application list for the exact run-provided developer application name. Open it if found; otherwise stop at the New External Client App or New Connected App entry point without submitting it.",
+          "expected_signals": ["existing application detail", "New External Client App", "New Connected App"]
+        },
+        {
+          "order": 5,
+          "instruction": "Open the OAuth settings or consumer credentials section and stop before any reveal, copy, generation, consent, or save action.",
+          "expected_signals": ["OAuth settings", "Consumer Key", "Consumer Secret"]
+        }
+      ],
+      "success_signals": ["App Manager is visible", "OAuth credential field labels are visible"]
+    },
+    {
+      "position": 2,
+      "app_slug": "hubspot",
+      "app_name": "HubSpot",
+      "access_model": "self_serve",
+      "start_url": "https://app.hubspot.com/login",
+      "evidence_url": "https://developers.hubspot.com/docs/api-reference/latest/authentication/manage-oauth-tokens",
+      "credential_goal": "HubSpot developer-app authentication page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open HubSpot login. Stop for authentication, CAPTCHA, verification, or account selection; a developer account must not be guessed from multiple accounts.",
+          "expected_signals": ["HubSpot login", "account chooser", "authenticated account home"]
+        },
+        {
+          "order": 2,
+          "instruction": "After the owner selects a developer account, open Development and then Apps.",
+          "expected_signals": ["Development", "Apps", "developer projects"]
+        },
+        {
+          "order": 3,
+          "instruction": "Search for the exact run-provided app name. Open the existing app; if absent, stop at the Create app entry point without creating one.",
+          "expected_signals": ["app list", "existing app", "Create app"]
+        },
+        {
+          "order": 4,
+          "instruction": "Open the app Auth tab or authentication settings and stop when the client credential labels are visible.",
+          "expected_signals": ["Auth", "Client ID", "Client secret"]
+        }
+      ],
+      "success_signals": ["developer app Auth page is visible", "credential field labels are visible"]
+    },
+    {
+      "position": 3,
+      "app_slug": "pipedrive",
+      "app_name": "Pipedrive",
+      "access_model": "self_serve",
+      "start_url": "https://app.pipedrive.com/settings/api",
+      "evidence_url": "https://developers.pipedrive.com/docs/api/v1/Oauth",
+      "credential_goal": "personal API token settings page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open the Pipedrive API settings URL. If redirected to login, account selection, CAPTCHA, or verification, stop for the owner.",
+          "expected_signals": ["Pipedrive login", "Personal preferences", "API"]
+        },
+        {
+          "order": 2,
+          "instruction": "If the direct URL did not open the API section, use the account menu, choose Personal preferences, and then choose API. Do not open marketplace or billing settings.",
+          "expected_signals": ["Personal preferences", "API tab"]
+        },
+        {
+          "order": 3,
+          "instruction": "Stop as soon as the API token section and its field label are visible; do not click show, copy, regenerate, or revoke.",
+          "expected_signals": ["API token", "token field label"]
+        }
+      ],
+      "success_signals": ["API settings page is visible", "API token field label is visible"]
+    },
+    {
+      "position": 4,
+      "app_slug": "attio",
+      "app_name": "Attio",
+      "access_model": "self_serve",
+      "start_url": "https://app.attio.com/",
+      "evidence_url": "https://docs.attio.com/rest-api/guides/authentication",
+      "credential_goal": "Attio developer app or workspace API-key page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open Attio and stop if login, workspace selection, CAPTCHA, or verification is required.",
+          "expected_signals": ["Attio login", "workspace home"]
+        },
+        {
+          "order": 2,
+          "instruction": "Open Workspace settings and choose Developers. If Developers is not present, stop rather than searching unrelated settings.",
+          "expected_signals": ["Workspace settings", "Developers"]
+        },
+        {
+          "order": 3,
+          "instruction": "Choose Apps for OAuth or API keys for single-workspace access according to the run's requested auth method.",
+          "expected_signals": ["Apps", "API keys"]
+        },
+        {
+          "order": 4,
+          "instruction": "Search for the exact run-provided app name before creation. Open the existing record, or stop at the new-app or new-key form without submitting it.",
+          "expected_signals": ["existing app", "New app", "New API key"]
+        },
+        {
+          "order": 5,
+          "instruction": "Stop when authentication settings or credential field labels are visible; do not generate, reveal, or copy a value.",
+          "expected_signals": ["OAuth", "Client ID", "Client secret", "API key"]
+        }
+      ],
+      "success_signals": ["Developers section is visible", "credential field labels are visible"]
+    },
+    {
+      "position": 5,
+      "app_slug": "twenty",
+      "app_name": "Twenty",
+      "access_model": "self_serve",
+      "start_url": "https://app.twenty.com/",
+      "evidence_url": "https://docs.twenty.com/developers/extend/api",
+      "credential_goal": "Twenty workspace API-key page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open the Twenty workspace. Stop for login, workspace selection, or verification.",
+          "expected_signals": ["Twenty login", "workspace home"]
+        },
+        {
+          "order": 2,
+          "instruction": "Open Settings and choose Developers, then API keys.",
+          "expected_signals": ["Settings", "Developers", "API keys"]
+        },
+        {
+          "order": 3,
+          "instruction": "Review the existing API-key list. Do not revoke or replace any key, and stop at the Create key entry point if no authorized existing record is available.",
+          "expected_signals": ["API key list", "Create key"]
+        },
+        {
+          "order": 4,
+          "instruction": "Stop before the action that creates or displays a key because the value may be shown only once.",
+          "expected_signals": ["Create API key form", "API key field label"]
+        }
+      ],
+      "success_signals": ["API keys settings page is visible", "Create API key entry point is visible"]
+    },
+    {
+      "position": 6,
+      "app_slug": "podio",
+      "app_name": "Podio",
+      "access_model": "self_serve",
+      "start_url": "https://podio.com/settings/api",
+      "evidence_url": "https://developers.podio.com/doc/oauth-authorization",
+      "credential_goal": "Podio API client registration page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open Podio API settings. Stop if login, identity-provider redirection, account selection, or verification is required.",
+          "expected_signals": ["Podio login", "API keys", "API clients"]
+        },
+        {
+          "order": 2,
+          "instruction": "If needed, open Account settings and choose API keys or API clients; do not enter unrelated extension or marketplace areas.",
+          "expected_signals": ["Account settings", "API keys", "API clients"]
+        },
+        {
+          "order": 3,
+          "instruction": "Search registered clients for the exact run-provided application name and open it. If absent, stop at the Register application form without submission.",
+          "expected_signals": ["registered applications", "Register application"]
+        },
+        {
+          "order": 4,
+          "instruction": "Stop when client identifier and secret field labels are visible; do not reveal, copy, or regenerate them.",
+          "expected_signals": ["Client ID", "Client secret"]
+        }
+      ],
+      "success_signals": ["API client page is visible", "client credential labels are visible"]
+    },
+    {
+      "position": 7,
+      "app_slug": "zoho-crm",
+      "app_name": "Zoho CRM",
+      "access_model": "self_serve",
+      "start_url": "https://api-console.zoho.com/",
+      "evidence_url": "https://www.zoho.com/crm/developer/docs/api/v8/auth-request.html",
+      "credential_goal": "Zoho OAuth client credential page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open the Zoho API Console. Stop for Zoho login, regional account redirection, MFA, CAPTCHA, or account selection.",
+          "expected_signals": ["Zoho Accounts login", "API Console"]
+        },
+        {
+          "order": 2,
+          "instruction": "Open Client Secret or the client list and search for the exact run-provided application name.",
+          "expected_signals": ["client list", "Client Secret", "Add Client"]
+        },
+        {
+          "order": 3,
+          "instruction": "Open the existing client. If absent, stop before choosing Add Client or a client type because that choice must come from the authorized integration design.",
+          "expected_signals": ["existing client detail", "Add Client", "client type selection"]
+        },
+        {
+          "order": 4,
+          "instruction": "Stop when Client ID and Client Secret labels are visible; do not reveal, copy, regenerate, or download values.",
+          "expected_signals": ["Client ID", "Client Secret"]
+        }
+      ],
+      "success_signals": ["Zoho API Console client page is visible", "credential labels are visible"]
+    },
+    {
+      "position": 8,
+      "app_slug": "close",
+      "app_name": "Close",
+      "access_model": "gated",
+      "start_url": "https://app.close.com/",
+      "evidence_url": "https://developer.close.com/api/overview/api-key-authentication",
+      "credential_goal": "Close API-key settings page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open Close and stop for login, organization selection, CAPTCHA, or verification.",
+          "expected_signals": ["Close login", "organization home"]
+        },
+        {
+          "order": 2,
+          "instruction": "Open Settings and choose Developer, API, or API Keys only when one of those exact navigation labels is present.",
+          "expected_signals": ["Settings", "Developer", "API Keys"]
+        },
+        {
+          "order": 3,
+          "instruction": "Review the existing API-key list without opening, revoking, or editing a key. Stop at the Create API key entry point if creation would be needed.",
+          "expected_signals": ["API key list", "Create API key"]
+        },
+        {
+          "order": 4,
+          "instruction": "Stop before generating or displaying a credential value.",
+          "expected_signals": ["API key form", "API key field label"]
+        }
+      ],
+      "success_signals": ["API Keys settings page is visible", "credential entry point is visible"]
+    },
+    {
+      "position": 9,
+      "app_slug": "copper",
+      "app_name": "Copper",
+      "access_model": "gated",
+      "start_url": "https://app.copper.com/",
+      "evidence_url": "https://developer.copper.com/introduction/oauth/index.html",
+      "credential_goal": "Copper API-key or OAuth application settings page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open Copper and stop for Google sign-in, password entry, account selection, MFA, or verification.",
+          "expected_signals": ["Copper login", "authenticated workspace"]
+        },
+        {
+          "order": 2,
+          "instruction": "Open Settings and choose Integrations, then API Keys or Developer Apps according to the run's requested auth method.",
+          "expected_signals": ["Settings", "Integrations", "API Keys", "Developer Apps"]
+        },
+        {
+          "order": 3,
+          "instruction": "If an admin-role or paid-plan gate appears, stop for provider_verification. Otherwise search for the exact run-provided app name before creation.",
+          "expected_signals": ["admin requirement", "application list", "API key list"]
+        },
+        {
+          "order": 4,
+          "instruction": "Open an existing authorized record or stop at the create form, then stop before any credential reveal, generation, or copy action.",
+          "expected_signals": ["Client ID", "Client secret", "API key"]
+        }
+      ],
+      "success_signals": ["developer or API-key settings are visible", "credential labels are visible"]
+    },
+    {
+      "position": 10,
+      "app_slug": "dealcloud",
+      "app_name": "DealCloud",
+      "access_model": "gated",
+      "start_url": "https://api.docs.dealcloud.com/docs/apikeys",
+      "evidence_url": "https://api.docs.dealcloud.com/docs/apikeys",
+      "credential_goal": "DealCloud tenant API-key administration page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open the official API-key documentation and verify that the run has an existing DealCloud tenant plus an authorized administrator.",
+          "expected_signals": ["DealCloud API documentation", "API keys"]
+        },
+        {
+          "order": 2,
+          "instruction": "Stop for provider_verification unless the exact tenant URL is already present in verified run data and approved by the browser host policy; never guess a tenant hostname.",
+          "expected_signals": ["verified tenant URL", "administrator confirmation"]
+        },
+        {
+          "order": 3,
+          "instruction": "Within the approved tenant, open API management and then API keys only if those exact labels are present.",
+          "expected_signals": ["API management", "API keys"]
+        },
+        {
+          "order": 4,
+          "instruction": "Stop at the existing-key detail or create-key entry point before revealing, generating, copying, or changing a credential.",
+          "expected_signals": ["API key list", "Create API key", "API key field label"]
+        }
+      ],
+      "success_signals": ["tenant API-key administration page is visible", "credential entry point is visible"]
+    },
+    {
+      "position": 11,
+      "app_slug": "zendesk",
+      "app_name": "Zendesk",
+      "access_model": "gated",
+      "start_url": "https://www.zendesk.com/login/",
+      "evidence_url": "https://developer.zendesk.com/documentation/api-basics/authentication/creating-and-using-oauth-tokens-with-the-api/",
+      "credential_goal": "Zendesk API token or OAuth client settings page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open Zendesk login and stop for tenant selection, password entry, CAPTCHA, MFA, or verification. Resume only in the owner-selected tenant.",
+          "expected_signals": ["Zendesk login", "authenticated tenant"]
+        },
+        {
+          "order": 2,
+          "instruction": "Open Admin Center, choose Apps and integrations, then APIs, then Zendesk API.",
+          "expected_signals": ["Admin Center", "Apps and integrations", "APIs", "Zendesk API"]
+        },
+        {
+          "order": 3,
+          "instruction": "Choose OAuth clients when OAuth is requested, or remain on Settings for token access when API-token auth is requested.",
+          "expected_signals": ["OAuth clients", "Settings", "Token access"]
+        },
+        {
+          "order": 4,
+          "instruction": "Search OAuth clients for the exact run-provided app name. Open an existing client or stop at Add OAuth client; for token access, stop before Add API token or any reveal action.",
+          "expected_signals": ["existing OAuth client", "Add OAuth client", "Add API token"]
+        },
+        {
+          "order": 5,
+          "instruction": "Stop when credential field labels are visible; do not create, reveal, copy, regenerate, or revoke a value.",
+          "expected_signals": ["Client ID", "Client secret", "API token"]
+        }
+      ],
+      "success_signals": ["Zendesk API settings are visible", "credential field labels are visible"]
+    },
+    {
+      "position": 12,
+      "app_slug": "intercom",
+      "app_name": "Intercom",
+      "access_model": "self_serve",
+      "start_url": "https://app.intercom.com/",
+      "evidence_url": "https://developers.intercom.com/docs/build-an-integration/learn-more/authentication",
+      "credential_goal": "Intercom Developer Hub app authentication page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open Intercom and stop for login, workspace selection, CAPTCHA, MFA, or verification.",
+          "expected_signals": ["Intercom login", "workspace home"]
+        },
+        {
+          "order": 2,
+          "instruction": "Open Settings, choose Integrations, and then Developer Hub only when those labels are present.",
+          "expected_signals": ["Settings", "Integrations", "Developer Hub"]
+        },
+        {
+          "order": 3,
+          "instruction": "Search apps for the exact run-provided application name. Open it if present; otherwise stop at New app without creating one.",
+          "expected_signals": ["app list", "existing app", "New app"]
+        },
+        {
+          "order": 4,
+          "instruction": "Open Authentication or Basic information and stop when client credential labels or the access-token section is visible.",
+          "expected_signals": ["Authentication", "Client ID", "Client secret", "Access token"]
+        }
+      ],
+      "success_signals": ["Developer Hub app page is visible", "authentication credential labels are visible"]
+    },
+    {
+      "position": 13,
+      "app_slug": "freshdesk",
+      "app_name": "Freshdesk",
+      "access_model": "gated",
+      "start_url": "https://freshdesk.com/login",
+      "evidence_url": "https://developers.freshdesk.com/api/",
+      "credential_goal": "Freshdesk profile API-key page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open Freshdesk login and stop for account or tenant selection, password entry, CAPTCHA, MFA, or verification.",
+          "expected_signals": ["Freshdesk login", "authenticated support portal"]
+        },
+        {
+          "order": 2,
+          "instruction": "Open the profile menu and choose Profile settings. Do not open ticket, billing, or marketplace areas.",
+          "expected_signals": ["profile menu", "Profile settings"]
+        },
+        {
+          "order": 3,
+          "instruction": "Locate the Your API Key section and stop before any view, copy, reset, or regeneration action.",
+          "expected_signals": ["Your API Key", "API key field label"]
+        },
+        {
+          "order": 4,
+          "instruction": "If the key section is absent or the plan reports zero API calls, stop for provider_verification rather than changing the subscription.",
+          "expected_signals": ["plan restriction", "API unavailable"]
+        }
+      ],
+      "success_signals": ["Profile settings are visible", "Your API Key label is visible"]
+    },
+    {
+      "position": 14,
+      "app_slug": "front",
+      "app_name": "Front",
+      "access_model": "gated",
+      "start_url": "https://app.frontapp.com/",
+      "evidence_url": "https://dev.frontapp.com/docs/authentication",
+      "credential_goal": "Front API token or OAuth application page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open Front and stop for login, workspace selection, SSO, MFA, CAPTCHA, or verification.",
+          "expected_signals": ["Front login", "workspace home"]
+        },
+        {
+          "order": 2,
+          "instruction": "Open Settings and choose Developers. If Developers is unavailable, stop for provider_verification because admin or plan access may be required.",
+          "expected_signals": ["Settings", "Developers"]
+        },
+        {
+          "order": 3,
+          "instruction": "Choose API tokens or OAuth apps according to the run's requested auth method, then search for the exact run-provided app name before creation.",
+          "expected_signals": ["API tokens", "OAuth apps", "application list"]
+        },
+        {
+          "order": 4,
+          "instruction": "Open an existing authorized app or stop at the creation entry point, then stop before generating, revealing, or copying credentials.",
+          "expected_signals": ["Client ID", "Client secret", "API token"]
+        }
+      ],
+      "success_signals": ["Developers settings are visible", "credential field labels are visible"]
+    },
+    {
+      "position": 15,
+      "app_slug": "pylon",
+      "app_name": "Pylon",
+      "access_model": "self_serve",
+      "start_url": "https://app.usepylon.com/",
+      "evidence_url": "https://docs.usepylon.com/pylon-docs/developer/api/authentication",
+      "credential_goal": "Pylon API token or OAuth application page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open Pylon and stop for login, workspace selection, SSO, MFA, CAPTCHA, or verification.",
+          "expected_signals": ["Pylon login", "workspace home"]
+        },
+        {
+          "order": 2,
+          "instruction": "Open Settings and use only an exact Developers, API keys, API tokens, or Integrations navigation label; if none is present, stop rather than exploring.",
+          "expected_signals": ["Settings", "Developers", "API keys", "API tokens", "Integrations"]
+        },
+        {
+          "order": 3,
+          "instruction": "Search existing app or token records for the exact run-provided name. Open a matching record or stop at the create entry point.",
+          "expected_signals": ["existing credential record", "Create API token", "New app"]
+        },
+        {
+          "order": 4,
+          "instruction": "Stop before generating, revealing, copying, or changing a credential value.",
+          "expected_signals": ["API token field label", "Client ID", "Client secret"]
+        }
+      ],
+      "success_signals": ["developer credential settings are visible", "credential labels are visible"]
+    },
+    {
+      "position": 16,
+      "app_slug": "liveagent",
+      "app_name": "LiveAgent",
+      "access_model": "self_serve",
+      "start_url": "https://support.liveagent.com/802463-REST-API",
+      "evidence_url": "https://support.liveagent.com/802463-REST-API",
+      "credential_goal": "LiveAgent API v3 key administration page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open the official REST API instructions. Continue to a tenant only when its exact URL is already verified by the run and approved by browser host policy; never guess a tenant hostname.",
+          "expected_signals": ["LiveAgent REST API documentation", "verified tenant URL"]
+        },
+        {
+          "order": 2,
+          "instruction": "Stop for login, tenant selection, password entry, CAPTCHA, MFA, or verification.",
+          "expected_signals": ["LiveAgent login", "authenticated tenant"]
+        },
+        {
+          "order": 3,
+          "instruction": "In the tenant, open Configuration, then System, then API, and select API v3 only when those exact labels are present.",
+          "expected_signals": ["Configuration", "System", "API", "API v3"]
+        },
+        {
+          "order": 4,
+          "instruction": "Review the existing key list and stop at Add API key or the credential field label before any create, reveal, copy, edit, or delete action.",
+          "expected_signals": ["API key list", "Add API key", "API key field label"]
+        }
+      ],
+      "success_signals": ["API v3 key administration is visible", "credential entry point is visible"]
+    },
+    {
+      "position": 17,
+      "app_slug": "plain",
+      "app_name": "Plain",
+      "access_model": "gated",
+      "start_url": "https://help.plain.com/article/api-quickstart",
+      "evidence_url": "https://help.plain.com/article/api-quickstart",
+      "credential_goal": "Plain workspace API-key page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open the official API quickstart and verify that an existing paid or trial workspace and authorized owner are available.",
+          "expected_signals": ["Plain API quickstart", "API key instructions"]
+        },
+        {
+          "order": 2,
+          "instruction": "Continue to the workspace only through an official link already allowed by host policy, and stop for login, SSO, workspace selection, MFA, CAPTCHA, or verification.",
+          "expected_signals": ["Plain login", "workspace home"]
+        },
+        {
+          "order": 3,
+          "instruction": "Open Settings and choose API keys only when that exact label is present.",
+          "expected_signals": ["Settings", "API keys"]
+        },
+        {
+          "order": 4,
+          "instruction": "Review existing key labels without opening values, and stop at Create API key before generation or display.",
+          "expected_signals": ["API key list", "Create API key"]
+        }
+      ],
+      "success_signals": ["API keys settings are visible", "create-key entry point is visible"]
+    },
+    {
+      "position": 18,
+      "app_slug": "help-scout",
+      "app_name": "Help Scout",
+      "access_model": "gated",
+      "start_url": "https://secure.helpscout.net/",
+      "evidence_url": "https://developer.helpscout.com/mailbox-api/overview/authentication/",
+      "credential_goal": "Help Scout OAuth application page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open Help Scout and stop for login, account selection, SSO, MFA, CAPTCHA, or verification.",
+          "expected_signals": ["Help Scout login", "account home"]
+        },
+        {
+          "order": 2,
+          "instruction": "Open the profile or account menu and choose My Apps or OAuth applications only when that exact navigation item is present.",
+          "expected_signals": ["My Apps", "OAuth applications"]
+        },
+        {
+          "order": 3,
+          "instruction": "Search for the exact run-provided app name. Open the existing app or stop at Create My App without submitting it.",
+          "expected_signals": ["application list", "existing app", "Create My App"]
+        },
+        {
+          "order": 4,
+          "instruction": "Stop when App ID and App Secret or equivalent client credential labels are visible.",
+          "expected_signals": ["App ID", "App Secret", "Client ID", "Client secret"]
+        }
+      ],
+      "success_signals": ["OAuth application page is visible", "credential labels are visible"]
+    },
+    {
+      "position": 19,
+      "app_slug": "gorgias",
+      "app_name": "Gorgias",
+      "access_model": "gated",
+      "start_url": "https://app.gorgias.com/",
+      "evidence_url": "https://developers.gorgias.com/docs/access-tokens-api-keys",
+      "credential_goal": "Gorgias REST API credential settings page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open Gorgias and stop for store or account selection, login, SSO, MFA, CAPTCHA, or verification.",
+          "expected_signals": ["Gorgias login", "helpdesk home"]
+        },
+        {
+          "order": 2,
+          "instruction": "Open Settings, choose Account, and then REST API only when those exact labels are present.",
+          "expected_signals": ["Settings", "Account", "REST API"]
+        },
+        {
+          "order": 3,
+          "instruction": "If the REST API section is unavailable because of role or plan, stop for provider_verification rather than changing access or billing.",
+          "expected_signals": ["role restriction", "plan restriction"]
+        },
+        {
+          "order": 4,
+          "instruction": "Stop as soon as API username, API key, access-token, or OAuth credential labels are visible; never reveal or copy values.",
+          "expected_signals": ["API username", "API key", "Access token", "Client ID"]
+        }
+      ],
+      "success_signals": ["REST API settings are visible", "credential labels are visible"]
+    },
+    {
+      "position": 20,
+      "app_slug": "gladly",
+      "app_name": "Gladly",
+      "access_model": "gated",
+      "start_url": "https://help.gladly.com/developer-tutorials/docs/quickstart",
+      "evidence_url": "https://help.gladly.com/developer-tutorials/docs/quickstart",
+      "credential_goal": "Gladly tenant API credential administration page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open the official developer quickstart and verify that the run has an existing Gladly customer tenant or partner account plus an authorized administrator.",
+          "expected_signals": ["Gladly developer quickstart", "authentication instructions"]
+        },
+        {
+          "order": 2,
+          "instruction": "Stop for provider_verification unless an exact tenant URL is already verified in run data and approved by browser host policy; never guess a Gladly tenant hostname.",
+          "expected_signals": ["verified tenant URL", "administrator confirmation"]
+        },
+        {
+          "order": 3,
+          "instruction": "Inside the approved tenant, open Settings and use only an exact API, Developer, App Platform, or API Tokens navigation label.",
+          "expected_signals": ["Settings", "API", "Developer", "App Platform", "API Tokens"]
+        },
+        {
+          "order": 4,
+          "instruction": "Stop at the existing credential list or create entry point before any reveal, generation, copy, role change, or confirmation.",
+          "expected_signals": ["credential list", "Create API token", "API key field label"]
+        }
+      ],
+      "success_signals": ["tenant developer settings are visible", "credential entry point is visible"]
+    },
+    {
+      "position": 21,
+      "app_slug": "slack",
+      "app_name": "Slack",
+      "access_model": "self_serve",
+      "start_url": "https://api.slack.com/apps",
+      "evidence_url": "https://docs.slack.dev/quickstart/",
+      "credential_goal": "Slack app Basic Information credential page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open Your Apps on Slack API and stop for Slack sign-in, workspace selection, SSO, MFA, CAPTCHA, or verification.",
+          "expected_signals": ["Your Apps", "Slack sign-in", "workspace chooser"]
+        },
+        {
+          "order": 2,
+          "instruction": "Search Your Apps for the exact run-provided app name and open it. If absent, stop at Create New App before choosing a manifest or workspace.",
+          "expected_signals": ["Your Apps", "existing app", "Create New App"]
+        },
+        {
+          "order": 3,
+          "instruction": "Open Basic Information and locate App Credentials without revealing or copying any value.",
+          "expected_signals": ["Basic Information", "App Credentials", "Client ID", "Client Secret"]
+        },
+        {
+          "order": 4,
+          "instruction": "If OAuth installation is required, open OAuth & Permissions but stop before Install to Workspace, consent, permission approval, or token display.",
+          "expected_signals": ["OAuth & Permissions", "Install to Workspace"]
+        }
+      ],
+      "success_signals": ["App Credentials labels are visible", "OAuth configuration page is visible"]
+    },
+    {
+      "position": 22,
+      "app_slug": "twilio",
+      "app_name": "Twilio",
+      "access_model": "self_serve",
+      "start_url": "https://console.twilio.com/",
+      "evidence_url": "https://www.twilio.com/docs/iam/api-keys",
+      "credential_goal": "Twilio API keys and tokens page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open Twilio Console and stop for login, account or project selection, password entry, CAPTCHA, MFA, or verification.",
+          "expected_signals": ["Twilio login", "Console", "project chooser"]
+        },
+        {
+          "order": 2,
+          "instruction": "Open Account or Admin, choose Account management, and then API keys & tokens only when those labels are present.",
+          "expected_signals": ["Account", "Admin", "Account management", "API keys & tokens"]
+        },
+        {
+          "order": 3,
+          "instruction": "Review key names and SIDs without opening secret values. Search for the exact run-provided key name before creation.",
+          "expected_signals": ["API key list", "key friendly name", "SID label"]
+        },
+        {
+          "order": 4,
+          "instruction": "Open an existing authorized key record or stop at Create new API key before submission because a secret may be shown only once.",
+          "expected_signals": ["Create new API key", "API key SID", "secret field label"]
+        }
+      ],
+      "success_signals": ["API keys & tokens page is visible", "credential labels or create entry point are visible"]
+    },
+    {
+      "position": 23,
+      "app_slug": "zoho-cliq",
+      "app_name": "Zoho Cliq",
+      "access_model": "self_serve",
+      "start_url": "https://api-console.zoho.com/",
+      "evidence_url": "https://www.zoho.com/cliq/help/restapi/v3/oauth/",
+      "credential_goal": "Zoho OAuth client page for Cliq",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open Zoho API Console and stop for login, regional account redirection, account selection, CAPTCHA, MFA, or verification.",
+          "expected_signals": ["Zoho Accounts login", "API Console"]
+        },
+        {
+          "order": 2,
+          "instruction": "Search existing clients for the exact run-provided Cliq integration name and open a matching client.",
+          "expected_signals": ["client list", "existing client", "Add Client"]
+        },
+        {
+          "order": 3,
+          "instruction": "If absent, stop before Add Client or client-type selection; the authorized design must determine the correct client type and redirect URLs.",
+          "expected_signals": ["Add Client", "client type selection", "redirect URL form"]
+        },
+        {
+          "order": 4,
+          "instruction": "Stop when Client ID and Client Secret labels are visible; do not reveal, copy, regenerate, or download values.",
+          "expected_signals": ["Client ID", "Client Secret"]
+        }
+      ],
+      "success_signals": ["Zoho client page is visible", "credential labels are visible"]
+    },
+    {
+      "position": 24,
+      "app_slug": "lark",
+      "app_name": "Lark (Larksuite)",
+      "access_model": "gated",
+      "start_url": "https://open.larksuite.com/app",
+      "evidence_url": "https://open.larksuite.com/document/server-docs/getting-started/overview-of-app-scopes",
+      "credential_goal": "Lark developer app credentials and basic information page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open the Lark Developer Console and stop for login, organization selection, QR or device approval, CAPTCHA, MFA, or verification.",
+          "expected_signals": ["Lark Developer Console", "organization chooser", "app list"]
+        },
+        {
+          "order": 2,
+          "instruction": "Search the app list for the exact run-provided app name and open it. If absent, stop at Create Custom App without creating one.",
+          "expected_signals": ["app list", "existing app", "Create Custom App"]
+        },
+        {
+          "order": 3,
+          "instruction": "Open Credentials & Basic Info and stop when App ID and App Secret labels are visible.",
+          "expected_signals": ["Credentials & Basic Info", "App ID", "App Secret"]
+        },
+        {
+          "order": 4,
+          "instruction": "If permissions, version publication, tenant installation, or review is required, stop before requesting scopes, publishing, consent, or approval.",
+          "expected_signals": ["Permissions", "Version management", "Review", "Install"]
+        }
+      ],
+      "success_signals": ["Credentials & Basic Info is visible", "credential labels are visible"]
+    },
+    {
+      "position": 25,
+      "app_slug": "pumble",
+      "app_name": "Pumble",
+      "access_model": "self_serve",
+      "start_url": "https://app.pumble.com/",
+      "evidence_url": "https://pumble.com/help/integrations/automation-workflow-integrations/api-keys-integration/",
+      "credential_goal": "Pumble API add-on key page",
+      "checkpoints": [
+        {
+          "order": 1,
+          "instruction": "Open Pumble and stop for login, workspace selection, SSO, password entry, CAPTCHA, MFA, or verification.",
+          "expected_signals": ["Pumble login", "workspace home"]
+        },
+        {
+          "order": 2,
+          "instruction": "Open the workspace menu, then Apps or Marketplace, and locate the API integration or API add-on only under those labels.",
+          "expected_signals": ["workspace menu", "Apps", "Marketplace", "API integration"]
+        },
+        {
+          "order": 3,
+          "instruction": "Open the API integration page. Stop before Add to Pumble, installation, admin approval, legal consent, or any plan change.",
+          "expected_signals": ["API integration", "Add to Pumble", "admin approval"]
+        },
+        {
+          "order": 4,
+          "instruction": "After owner-approved installation, open the API keys page and stop before generating, displaying, revealing, or copying a key.",
+          "expected_signals": ["API keys", "Generate key", "API key field label"]
+        }
+      ],
+      "success_signals": ["API integration page is visible", "API key entry point is visible"]
+    }
+  ]
+}

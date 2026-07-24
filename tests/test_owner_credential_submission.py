@@ -47,15 +47,25 @@ class _FakeBrowser:
             maximum_expires_at="2026-01-01T04:00:00Z",
         )
 
-    async def navigate_onboarding(self, context: object, research: object) -> BrowserObservation:
-        del context, research
+    async def navigate_onboarding(
+        self, context: object, research: object, *, sensitive_data: object = None
+    ) -> BrowserObservation:
+        del context, research, sensitive_data
         return BrowserObservation(
             status="credential_page_ready",
             current_url="https://developers.hubspot.com/apps/new",
             page_title="Create a developer app",
         )
 
-    async def resume_after_hitl(self, context: object, signal: object) -> BrowserObservation:
+    async def resume_after_hitl(
+        self,
+        context: object,
+        signal: object,
+        research: object = None,
+        *,
+        sensitive_data: object = None,
+        provider_session_id: object = None,
+    ) -> BrowserObservation:
         raise AssertionError("resume is out of scope")
 
 

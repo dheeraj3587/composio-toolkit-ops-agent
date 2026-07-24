@@ -20,6 +20,16 @@ from ops.models import OperationalResearch
 class _FakeSessions:
     def __init__(self) -> None:
         self.stopped: list[str] = []
+        self.create_calls = 0
+
+    async def create(self, **kwargs: object) -> dict[str, object]:
+        # Option A: the live session is created up front, before any task runs.
+        del kwargs
+        self.create_calls += 1
+        return {
+            "id": "provider-session-1",
+            "live_url": "https://live.browser-use.example/session",
+        }
 
     async def get(self, session_id: str) -> dict[str, object]:
         return {

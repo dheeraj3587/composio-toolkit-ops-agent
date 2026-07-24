@@ -7,6 +7,7 @@ classes. Secret values are never printed.
 
 from __future__ import annotations
 
+import secrets
 import tempfile
 from pathlib import Path
 
@@ -19,12 +20,12 @@ from ops.run_service import RunService
 def main() -> None:
     tmp = Path(tempfile.mkdtemp())
     env = {
-        "PERPLEXITY_API_KEY": "pplx-PLACEHOLDER",
-        "GOOGLE_GENAI_API_KEY": "gm-PLACEHOLDER",
-        "COMPOSIO_API_KEY": "comp-PLACEHOLDER",
-        "BROWSER_USE_API_KEY": "bu-PLACEHOLDER",
-        "SECRET_VAULT_KEY": Fernet.generate_key().decode(),
-        "LANGGRAPH_AES_KEY": "0123456789abcdef0123456789abcdef",
+        "PERPLEXITY_API_KEY": "pplx-PLACEHOLDER",  # pragma: allowlist secret
+        "GOOGLE_GENAI_API_KEY": "gm-PLACEHOLDER",  # pragma: allowlist secret
+        "COMPOSIO_API_KEY": "comp-PLACEHOLDER",  # pragma: allowlist secret
+        "BROWSER_USE_API_KEY": "bu-PLACEHOLDER",  # pragma: allowlist secret
+        "SECRET_VAULT_KEY": Fernet.generate_key().decode(),  # pragma: allowlist secret
+        "LANGGRAPH_AES_KEY": secrets.token_hex(16),  # pragma: allowlist secret
         "COMPOSIO_GMAIL_CONNECTED_ACCOUNT_ID": "acct-PLACEHOLDER",
         "OUTREACH_RECIPIENT_OVERRIDE": "owner@example.com",
         "ALLOW_LIVE_BROWSER": "true",

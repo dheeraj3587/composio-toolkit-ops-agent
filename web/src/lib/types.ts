@@ -193,6 +193,9 @@ export interface OperationsRequestInput {
   requested_scope_policy: "minimum" | "recommended" | "maximum"
   execution_mode: ExecutionMode
   outreach_recipient_override: string | null
+  // Optional app sign-in credentials for autonomous login. Injected into
+  // Browser Use as secure placeholders at session creation; never persisted.
+  browser_login?: { email: string; password: string } | null
 }
 
 export interface IntegratorOutput {

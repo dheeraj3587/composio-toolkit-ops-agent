@@ -60,7 +60,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
   ]))
 
   return (
-    <div className="page-enter space-y-8">
+    <div className="page-enter page-stack">
       <RunAutoRefresh status={detail.run.status} />
       <Button asChild variant="ghost" size="sm" className="-ml-2 font-mono text-[10px] uppercase tracking-[0.1em]"><Link href="/"><ArrowLeft aria-hidden="true" /> Overview</Link></Button>
 
@@ -103,9 +103,9 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         <PhaseGrid phases={displayPhases} />
       </section>
 
-      <section className="grid gap-5 xl:grid-cols-[1.25fr_0.75fr]">
+      <section className="grid items-stretch gap-6 xl:grid-cols-2">
         <ResearchPanel research={detail.research} />
-        <div className="space-y-5">
+        <div className="grid gap-6">
           <RouteCard decision={detail.route_decision ?? null} fallbackRoute={detail.run.access_route ?? null} />
           <SecurityPanel security={detail.security} />
         </div>
@@ -113,20 +113,22 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
 
       <section aria-labelledby="execution-surfaces">
         <div className="mb-3"><p className="eyebrow">Execution surfaces</p><h2 id="execution-surfaces" className="mt-1 text-xl font-semibold">Provider and human gates</h2></div>
-        <div className="grid gap-4 lg:grid-cols-3">
-          <CapabilityPanel title="Browser onboarding" icon={Globe2} phase={browserPhase}>
-            {hasBrowserSession ? (
-              <HitlLiveControls
-                runId={runId}
-                fieldName={detail.research?.credential_fields?.[0] ?? "api_token"}
-                fieldLabel={humanize(detail.research?.credential_fields?.[0] ?? "API token")}
-              />
-            ) : isRetryable(browserPhase) ? (
-              <PhaseActionForm runId={runId} action="retry" capability="browser" label="Retry browser phase" />
-            ) : (
-              <ControlUnavailable />
-            )}
-          </CapabilityPanel>
+        <div className={hasBrowserSession ? "grid gap-6 lg:grid-cols-2" : "grid gap-6 lg:grid-cols-3"}>
+          <div className={hasBrowserSession ? "lg:col-span-2" : "h-full"}>
+            <CapabilityPanel title="Browser onboarding" icon={Globe2} phase={browserPhase}>
+              {hasBrowserSession ? (
+                <HitlLiveControls
+                  runId={runId}
+                  fieldName={detail.research?.credential_fields?.[0] ?? "api_token"}
+                  fieldLabel={humanize(detail.research?.credential_fields?.[0] ?? "API token")}
+                />
+              ) : isRetryable(browserPhase) ? (
+                <PhaseActionForm runId={runId} action="retry" capability="browser" label="Retry browser phase" />
+              ) : (
+                <ControlUnavailable />
+              )}
+            </CapabilityPanel>
+          </div>
           <HitlPanel request={isPlanOnly ? null : detail.hitl_request} action={canResume ? <PhaseActionForm runId={runId} action="resume" label="Resume after human action" /> : undefined} />
           <CapabilityPanel title="Provider email" icon={Mail} phase={emailPhase}>
             {canPoll ? <PhaseActionForm runId={runId} action="poll-email" label="Poll controlled inbox" /> : isRetryable(emailPhase) ? <PhaseActionForm runId={runId} action="retry" capability="email" label="Retry email phase" /> : <ControlUnavailable />}
@@ -137,7 +139,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
       {detail.provider_states?.length ? (
         <section aria-labelledby="run-providers">
           <div className="mb-3"><p className="eyebrow">Configuration and policy</p><h2 id="run-providers" className="mt-1 text-xl font-semibold">Run-level configuration and policy</h2></div>
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
             {detail.provider_states.map((provider) => (
               <ProviderStateCard key={provider.provider} provider={provider} evidenceScope="run" />
             ))}
@@ -145,7 +147,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         </section>
       ) : null}
 
-      <section className="grid gap-5 lg:grid-cols-[1fr_0.7fr]">
+      <section className="grid items-stretch gap-6 lg:grid-cols-2">
         <OutputPanel output={output} />
         <div className="panel rounded-md p-5">
           <p className="eyebrow">Bounded controls</p>
@@ -201,7 +203,7 @@ function ControlUnavailable() {
 }
 
 function Meta({ icon: Icon, label, value }: { icon: typeof Fingerprint; label: string; value: string }) {
-  return <div className="bg-card p-4 [&:not(:last-child)]:border-b [&:not(:last-child)]:border-border sm:[&:not(:last-child)]:border-b-0 sm:[&:not(:last-child)]:border-r"><span className="flex items-center gap-1.5 data-label"><Icon className="size-3 text-violet-600" aria-hidden="true" />{label}</span><p className="mt-2 text-xs leading-5">{value}</p></div>
+  return <div className="bg-card p-4 [&:not(:last-child)]:border-b [&:not(:last-child)]:border-border sm:[&:not(:last-child)]:border-b-0 sm:[&:not(:last-child)]:border-r"><span className="flex items-center gap-1.5 data-label"><Icon className="size-3 text-brand-600" aria-hidden="true" />{label}</span><p className="mt-2 text-xs leading-5">{value}</p></div>
 }
 
 function RouteCard({ decision, fallbackRoute }: { decision: { route: string; reason_code: string; explanation: string; is_final?: boolean } | null; fallbackRoute: string | null }) {
@@ -209,7 +211,7 @@ function RouteCard({ decision, fallbackRoute }: { decision: { route: string; rea
   return (
     <div className="panel rounded-md p-5">
       <div className="flex items-start justify-between gap-3">
-        <span className="grid size-8 place-items-center rounded-md bg-secondary"><Route className="size-4 text-violet-600" aria-hidden="true" /></span>
+        <span className="grid size-8 place-items-center rounded-md bg-secondary"><Route className="size-4 text-brand-600" aria-hidden="true" /></span>
         <div className="flex flex-wrap justify-end gap-2">
           <StatusBadge status={reportedRoute} />
           <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">

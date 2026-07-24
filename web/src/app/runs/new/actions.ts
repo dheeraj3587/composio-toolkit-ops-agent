@@ -48,6 +48,8 @@ export async function createRunAction(
   const expectedVolume = value(formData, "expected_volume", 180)
   const callbacks = callbackUrls(value(formData, "callback_urls", 2_000))
   const outreachOverride = value(formData, "outreach_recipient_override", 320)
+  const appLoginEmail = value(formData, "app_login_email", 320)
+  const appLoginPassword = value(formData, "app_login_password", 400)
   const requestedPolicy = value(formData, "requested_scope_policy", 20)
   const policy = ["minimum", "recommended", "maximum"].includes(requestedPolicy)
     ? (requestedPolicy as OperationsRequestInput["requested_scope_policy"])
@@ -55,7 +57,7 @@ export async function createRunAction(
   const requestedExecutionMode = value(formData, "execution_mode", 40)
   const executionMode = ["plan_only", "execute_when_configured"].includes(requestedExecutionMode)
     ? (requestedExecutionMode as OperationsRequestInput["execution_mode"])
-    : "plan_only"
+    : "execute_when_configured"
 
   const invalid: string[] = []
   if (appName.length < 2) invalid.push("app_name")
@@ -89,6 +91,10 @@ export async function createRunAction(
     requested_scope_policy: policy,
     execution_mode: executionMode,
     outreach_recipient_override: outreachOverride || null,
+    browser_login:
+      appLoginEmail && appLoginPassword
+        ? { email: appLoginEmail, password: appLoginPassword }
+        : null,
   }
 
   const requestFingerprint = createHash("sha256")

@@ -47,15 +47,21 @@ class WorkflowBrowser(Protocol):
         self,
         context: BrowserSessionContext,
         research: OperationalResearch,
+        *,
+        sensitive_data: Mapping[str, str] | None = None,
     ) -> BrowserObservation: ...
 
     async def resume_after_hitl(
         self,
         context: BrowserSessionContext,
         signal: str,
+        research: OperationalResearch | None = None,
         *,
         sensitive_data: Mapping[str, str] | None = None,
+        provider_session_id: str | None = None,
     ) -> BrowserObservation: ...
+
+    def provider_session_id(self, handle: str) -> str | None: ...
 
 
 class WorkflowGmail(Protocol):
@@ -115,6 +121,11 @@ class DurableOperationsWorkflow:
         # afterwards so they never enter OperationsState or the encrypted
         # checkpoint. Guarded by the same per-thread lock resume() holds.
         self._resume_sensitive_data: dict[str, Mapping[str, str]] = {}
+        # In-memory, per-thread autonomous sign-in credentials for the first
+        # browser task of a start() invoke. Passed to the worker as a call
+        # argument and cleared immediately; never enters OperationsState or the
+        # encrypted checkpoint.
+        self._initial_sensitive_data: dict[str, Mapping[str, str]] = {}
         try:
             self._saver = _build_saver(self._connection, _key_bytes(encryption_key))
             self._graph = self._compile_graph(self._saver)
@@ -122,7 +133,14 @@ class DurableOperationsWorkflow:
             self._connection.close()
             raise
 
-    def start(self, request: OperationsRequest, *, thread_id: str | None = None) -> OperationsState:
+    def start(
+        self,
+        request: OperationsRequest,
+        *,
+        thread_id: str | None = None,
+        sensitive_data: Mapping[str, str] | None = None,
+        seed: Mapping[str, object] | None = None,
+    ) -> OperationsState:
         stable_thread_id = thread_id or str(uuid.uuid4())
         _validate_thread_id(stable_thread_id)
         config = _config(stable_thread_id)
@@ -130,6 +148,12 @@ class DurableOperationsWorkflow:
             existing = self._graph.get_state(config)
             if existing.values:
                 return cast(OperationsState, dict(existing.values))
+            # Stash autonomous sign-in credentials for the first browser task in
+            # this invoke only. They are read as a call argument by
+            # _browser_navigate and never written to graph state or the encrypted
+            # checkpoint. Always cleared afterwards.
+            if sensitive_data:
+                self._initial_sensitive_data[stable_thread_id] = dict(sensitive_data)
             initial: OperationsState = {
                 "run_id": stable_thread_id,
                 "thread_id": stable_thread_id,
@@ -145,7 +169,17 @@ class DurableOperationsWorkflow:
                 "capability_statuses": [],
                 "side_effect_keys": {},
             }
-            result = self._graph.invoke(initial, config=config, durability="sync")
+            # A caller may seed a pre-created browser session (session id + live
+            # view metadata). When present, ``_browser_start`` is a no-op and the
+            # bounded onboarding task runs against the already-live session, so the
+            # embedded live view is available for the entire task instead of only
+            # after it finishes.
+            if seed:
+                initial.update(cast("dict[str, object]", dict(seed)))
+            try:
+                result = self._graph.invoke(initial, config=config, durability="sync")
+            finally:
+                self._initial_sensitive_data.pop(stable_thread_id, None)
             return cast(OperationsState, dict(result))
 
     def resume(
@@ -365,18 +399,24 @@ class DurableOperationsWorkflow:
         if self._dependencies.browser is None:
             return _failed_update(state, "browser onboarding", "browser_adapter_missing")
         research = OperationalResearch.model_validate(state["operational_research"])
+        # Autonomous sign-in credentials (if the owner supplied any at create
+        # time) are read from the in-memory per-thread stash and injected at
+        # session creation, never from graph state.
+        thread_id = str(state.get("thread_id") or "")
+        sensitive_data = self._initial_sensitive_data.get(thread_id)
         try:
             observation = _run_async(
                 self._dependencies.browser.navigate_onboarding(
                     _browser_context(state),
                     research,
+                    sensitive_data=sensitive_data,
                 )
             )
         except PhaseUnavailableError as exc:
             return _unavailable_update(state, exc)
         except ProviderOperationError as exc:
             return _failed_update(state, exc.capability, exc.reason_code)
-        return _observation_update(state, observation)
+        return self._attach_session_meta(state, _observation_update(state, observation))
 
     def _human_interrupt(self, state: OperationsState) -> dict[str, object]:
         observation = BrowserObservation(**cast(dict[str, Any], state["browser_observation"]))
@@ -408,19 +448,51 @@ class DurableOperationsWorkflow:
         # the worker as a call argument and are cleared by resume() afterwards.
         thread_id = str(state.get("thread_id") or "")
         sensitive_data = self._resume_sensitive_data.get(thread_id)
+        research = OperationalResearch.model_validate(state["operational_research"])
+        provider_session = state.get("browser_provider_session_id")
         try:
             observation = _run_async(
                 self._dependencies.browser.resume_after_hitl(
                     _browser_context(state),
                     state.get("resume_signal", "completed"),
+                    research,
                     sensitive_data=sensitive_data,
+                    provider_session_id=(
+                        provider_session if isinstance(provider_session, str) else None
+                    ),
                 )
             )
         except PhaseUnavailableError as exc:
             return _unavailable_update(state, exc)
         except ProviderOperationError as exc:
             return _failed_update(state, exc.capability, exc.reason_code)
-        return _observation_update(state, observation)
+        return self._attach_session_meta(state, _observation_update(state, observation))
+
+    def _attach_session_meta(
+        self,
+        state: OperationsState,
+        update: dict[str, object],
+    ) -> dict[str, object]:
+        """Persist the live provider session id so resume can reconnect later.
+
+        The provider session id is a non-secret identifier (not a token or signed
+        URL). Persisting it lets a resume reattach to the same running session
+        even after an API restart cleared the worker's in-memory maps. The signed
+        live URL itself is never persisted.
+        """
+
+        browser = self._dependencies.browser
+        handle = str(state.get("browser_session_id") or "")
+        if browser is None or not handle:
+            return update
+        getter = getattr(browser, "provider_session_id", None)
+        provider_session = getter(handle) if callable(getter) else None
+        if isinstance(provider_session, str) and provider_session:
+            update["browser_provider_session_id"] = provider_session
+        live = getattr(browser, "live_url", None)
+        if callable(live):
+            update["browser_live_view_available"] = bool(live(handle))
+        return update
 
     def _after_browser(self, state: OperationsState) -> str:
         observation = state.get("browser_observation")
@@ -775,6 +847,21 @@ def _outreach_message(
     values, browser URLs, prompts, or checkpoint data.
     """
 
+    try:
+        from ops.config import Settings
+        from ops.email_ai import build_email_assistant
+
+        assistant = build_email_assistant(Settings.from_env())
+        if assistant is not None:
+            draft = assistant.compose_outreach(
+                app_name=research.app_name,
+                company=request.company,
+                research=research,
+            )
+            if draft.subject and draft.body:
+                return draft.subject, draft.body
+    except Exception:
+        pass
     short_id = research.app_slug[:40]
     subject = f"API access request for {research.app_name} [{short_id}]"
     scopes = (

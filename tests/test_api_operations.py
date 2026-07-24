@@ -305,7 +305,10 @@ def test_run_conflict_is_mapped_to_http_409(
         created = client.post("/api/runs", json=_payload()).json()
         run_id = created["run"]["run_id"]
 
-        async def _raise_conflict(target_run_id: str, **_: object) -> object:
+        async def _raise_conflict(
+            target_run_id: str, *, browser_login: object = None, signal: str = "completed"
+        ) -> object:
+            del browser_login, signal
             raise RunConflictError(target_run_id, "resume")
 
         monkeypatch.setattr(application.state.run_service, "resume", _raise_conflict)

@@ -18,21 +18,21 @@ export default async function NewRunPage({
     : ""
 
   return (
-    <div className="page-enter mx-auto max-w-6xl space-y-7">
+    <div className="page-enter page-stack mx-auto max-w-7xl">
       <Button asChild variant="ghost" size="sm" className="-ml-2 font-mono text-[10px] uppercase tracking-[0.1em]">
         <Link href="/"><ArrowLeft aria-hidden="true" /> Overview</Link>
       </Button>
-      <header className="grid gap-5 border-b border-border pb-7 lg:grid-cols-[1fr_0.65fr] lg:items-end">
+      <header className="grid gap-6 border-b border-border pb-8 lg:grid-cols-2 lg:items-end">
         <div>
-          <p className="eyebrow">New side-effect-free plan</p>
+          <p className="eyebrow">New operations run</p>
           <h1 className="mt-3 text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">Start with explicit boundaries</h1>
           <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground">
-            Create a durable dry-run workflow from verified company facts. Creation itself performs no browser, email, or provider side effect.
+            Create a durable workflow from verified company facts. Plan-only mode remains offline-safe; execute mode requests only backend-approved provider actions.
           </p>
         </div>
-        <div className="flex gap-3 rounded-md border border-violet-200 bg-violet-50/70 p-4 text-xs leading-5 text-violet-950">
-          <LockKeyhole className="mt-0.5 size-4 shrink-0 text-violet-600" aria-hidden="true" />
-          <p>This interface accepts one profile vault reference. It never asks for passwords, tokens, API keys, cookies, or client secrets.</p>
+        <div className="flex gap-3 rounded-md border border-brand-200 bg-brand-50/70 p-4 text-xs leading-5 text-brand-950">
+          <LockKeyhole className="mt-0.5 size-4 shrink-0 text-brand-600" aria-hidden="true" />
+          <p>Vault material stays reference-only. Optional app sign-in values use a secure owner flow and are never persisted in run state or displayed back to the operator.</p>
         </div>
       </header>
       <NewRunForm defaultAppName={defaultAppName} />

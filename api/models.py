@@ -88,6 +88,20 @@ class CompanyInput(StrictApiModel):
         return [_validate_http_url(value) for value in values]
 
 
+class BrowserLoginInput(StrictApiModel):
+    """Owner-submitted app login credentials for autonomous sign-in.
+
+    The values are injected into the Browser Use provider as secure
+    ``sensitive_data`` placeholders (at session creation for create-time
+    credentials, or for a single resume call) and are never persisted to run
+    state, checkpoints, audit events, logs, or the IntegratorBundle.
+    OTP/CAPTCHA/passkey/billing still require a human.
+    """
+
+    email: SecretStr
+    password: SecretStr
+
+
 class CreateRunRequest(StrictApiModel):
     app_name: str = Field(min_length=1, max_length=200)
     company: CompanyInput
@@ -98,6 +112,11 @@ class CreateRunRequest(StrictApiModel):
     # canonical control and dry_run is never rewritten from it.
     dry_run: bool = True
     outreach_recipient_override: str | None = Field(default=None, max_length=320)
+    # Optional app sign-in credentials for autonomous login. When present they are
+    # injected into Browser Use as secure ``sensitive_data`` placeholders at
+    # session creation so the agent signs in on its own; they are never persisted
+    # to run state, checkpoints, the ledger, logs, or the IntegratorBundle.
+    browser_login: BrowserLoginInput | None = None
 
     @field_validator("outreach_recipient_override")
     @classmethod
@@ -257,19 +276,6 @@ class LiveViewResponse(StrictApiModel):
     run_id: str
     available: bool
     live_url: str | None = None
-
-
-class BrowserLoginInput(StrictApiModel):
-    """Owner-submitted app login credentials for an autonomous HITL resume.
-
-    The values are injected into the Browser Use provider as secure
-    ``sensitive_data`` placeholders for a single resume call and are never
-    persisted to run state, checkpoints, audit events, logs, or the
-    IntegratorBundle. OTP/CAPTCHA/passkey/billing still require a human.
-    """
-
-    email: SecretStr
-    password: SecretStr
 
 
 class ResumeRequest(StrictApiModel):

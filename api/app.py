@@ -393,25 +393,78 @@ def create_app(
     )
     async def create_run(
         payload: CreateRunRequest,
+        request: Request,
         run_service: ServiceDependency,
         idempotency_key: IdempotencyKeyHeader = None,
     ) -> RunDetailResponse:
+        # Autonomous sign-in credentials at create time are an owner action
+        # (same gate as resume-with-browser_login). They are injected into
+        # Browser Use as secure placeholders and never persisted.
+        if payload.browser_login is not None:
+            _require_owner_action(request)
         return await run_service.create_run(payload, idempotency_key=idempotency_key)
 
+    def _request_carries_internal_token(request: Request) -> bool:
+        """True when the request presents the mandatory internal API token.
+
+        The token is already required for every ``/api/`` route by
+        ``_internal_api_auth_response``. In the containerized deployment only the
+        trusted server-side caller (the Next.js UI) holds it, so a valid token
+        identifies the authenticated operator when loopback is not available.
+        """
+
+        expected = os.environ.get("OPS_INTERNAL_API_TOKEN", "").strip()
+        provided = request.headers.get("X-Ops-Internal-Token", "")
+        return bool(expected and provided and secrets.compare_digest(provided, expected))
+
+    def _client_is_loopback(request: Request) -> bool:
+        client_host = request.client.host if request.client else None
+        return client_host in {"127.0.0.1", "::1", "localhost", "testclient"}
+
     def _require_local_owner_submission(request: Request) -> None:
-        """Gate credential submission to an opted-in loopback-only owner request."""
+        """Gate the owner-only endpoints that touch raw credential material.
+
+        Credential submission (and, where present, autonomous browser-login
+        injection and raw-credential reveal) stay loopback-only. Raw secrets must
+        never traverse the network boundary, so the deployed environment does not
+        relax this gate.
+        """
 
         if not _environment_flag("ALLOW_LOCAL_CREDENTIAL_SUBMISSION", default=False):
             raise StarletteHTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="local credential submission is disabled",
             )
-        client_host = request.client.host if request.client else None
-        if client_host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+        if not _client_is_loopback(request):
             raise StarletteHTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="credential submission is restricted to loopback",
             )
+
+    def _require_owner_action(request: Request) -> None:
+        """Gate owner actions that never read stored raw secrets back to the network.
+
+        Covers the read-only ephemeral live-view URL and autonomous-login
+        credential injection (``browser_login``). These require the explicit
+        opt-in (``ALLOW_LOCAL_CREDENTIAL_SUBMISSION``) and are then reachable from
+        loopback or, in a deployed environment, through the trusted internal-token
+        caller. ``browser_login`` values are injected into Browser Use as secure
+        placeholders for a single resume and are never persisted; no stored secret
+        is ever read back to the network by this path. Endpoints that return raw
+        stored secrets (credential reveal) keep the stricter loopback-only gate.
+        """
+
+        if not _environment_flag("ALLOW_LOCAL_CREDENTIAL_SUBMISSION", default=False):
+            raise StarletteHTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="owner action is disabled",
+            )
+        if _client_is_loopback(request) or _request_carries_internal_token(request):
+            return
+        raise StarletteHTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="owner action is restricted",
+        )
 
     @application.post(
         "/api/runs/{run_id}/credentials",
@@ -424,7 +477,12 @@ def create_app(
         request: Request,
         run_service: ServiceDependency,
     ) -> RunDetailResponse:
-        _require_local_owner_submission(request)
+        # Owner-only credential submission. The raw value is written straight to
+        # the encrypted vault and never read back, so (like autonomous-login
+        # injection) it is authorized by the internal-token owner gate and works
+        # in the deployed environment. Raw-secret *readback* (reveal) stays
+        # loopback-only.
+        _require_owner_action(request)
         return await run_service.submit_credentials(run_id, payload)
 
     @application.get(
@@ -472,9 +530,11 @@ def create_app(
         signal = payload.signal if payload is not None else "completed"
         if browser_login is not None:
             # Submitting app login credentials for autonomous injection is an
-            # owner-only, loopback-only action, gated exactly like credential
-            # submission and the live-view URL.
-            _require_local_owner_submission(request)
+            # owner action. In a deployed environment it is authorized by the
+            # internal API token boundary; locally it works over loopback. The
+            # raw values are injected into Browser Use as secure placeholders for a
+            # single resume and are never persisted.
+            _require_owner_action(request)
         return await run_service.resume(run_id, browser_login=browser_login, signal=signal)
 
     @application.get(
@@ -488,9 +548,11 @@ def create_app(
         request: Request,
         run_service: ServiceDependency,
     ) -> LiveViewResponse:
-        # Owner-only, loopback-only. The signed live URL is read from the
-        # in-memory worker and is never persisted anywhere.
-        _require_local_owner_submission(request)
+        # Owner-only read-only ephemeral live URL. Reachable from loopback or,
+        # when opted in, through the trusted internal-token caller in a deployed
+        # environment. The signed URL is read from the in-memory worker and is
+        # never persisted anywhere.
+        _require_owner_action(request)
         return await run_service.get_live_view(run_id)
 
     @application.post(

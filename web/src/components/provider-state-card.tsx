@@ -105,7 +105,7 @@ export function ProviderStateCard({
   ] as const
 
   return (
-    <article className="panel flex min-h-64 flex-col rounded-md p-5">
+    <article className="panel flex h-full min-h-64 flex-col rounded-lg p-5">
       <div className="flex items-start justify-between gap-3">
         <span className="grid size-8 place-items-center rounded-md bg-secondary">
           <ServerCog className="size-4" aria-hidden="true" />

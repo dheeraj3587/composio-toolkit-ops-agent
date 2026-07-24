@@ -32,12 +32,12 @@ export function AppShell({
       </a>
 
       <aside
-        className={`fixed bottom-0 left-0 ${topOffset} z-50 hidden w-[248px] flex-col border-r border-white/10 bg-rail text-white lg:flex`}
+        className={`fixed bottom-0 left-0 ${topOffset} z-50 hidden w-64 flex-col border-r border-white/10 bg-rail text-white lg:flex`}
         aria-label="Application navigation"
       >
         <div className="flex h-20 items-center border-b border-white/10 px-6">
           <Link href="/" className="group flex items-center gap-3" aria-label="Composio Operations home">
-            <span className="grid size-9 place-items-center rounded-md border border-white/15 bg-white/5 font-mono text-[10px] font-semibold tracking-[0.16em] text-white transition-colors group-hover:border-violet-400/60 group-hover:bg-violet-400/10">
+            <span className="grid size-9 place-items-center rounded-md border border-brand-dev bg-brand-dev font-mono text-[10px] font-semibold tracking-[0.16em] text-white transition-colors group-hover:border-brand-400 group-hover:bg-brand-dev/80">
               C/O
             </span>
             <span>
@@ -60,7 +60,7 @@ export function AppShell({
 
         <div className="m-3 border border-white/10 bg-white/[0.035] p-4">
           <div className="flex items-center gap-2 text-xs font-medium text-white/85">
-            <ShieldCheck className="size-4 text-violet-300" aria-hidden="true" />
+            <ShieldCheck className="size-4 text-brand-300" aria-hidden="true" />
             Secure boundary
           </div>
           <p className="mt-2 text-[11px] leading-5 text-white/45">
@@ -96,12 +96,12 @@ export function AppShell({
         </div>
       </header>
 
-      <div className="lg:pl-[248px]">
-        <main id="main-content" className="mx-auto min-h-svh max-w-[1600px] px-4 pb-12 pt-24 sm:px-7 lg:px-9 lg:pt-8 xl:px-12">
+      <div className="lg:pl-64">
+        <main id="main-content" className="mx-auto min-h-svh max-w-[1336px] px-5 pb-16 pt-24 sm:px-8 lg:px-10 lg:pt-10 xl:px-12">
           {children}
         </main>
         <footer className="border-t border-border px-4 py-5 sm:px-7 lg:px-9 xl:px-12">
-          <div className="mx-auto flex max-w-[1504px] flex-col gap-2 font-mono text-[9px] uppercase tracking-[0.13em] text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
+          <div className="mx-auto flex max-w-[1240px] flex-col gap-2 font-mono text-[9px] uppercase tracking-[0.13em] text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
             <p className="flex items-center gap-2"><LockKeyhole className="size-3" aria-hidden="true" /> Private operations surface</p>
             <p>Backend truth · no synthetic provider success</p>
           </div>

@@ -76,7 +76,7 @@ export function AppSearch() {
               <Link
                 key={app.app_slug}
                 href={`/apps/${encodeURIComponent(app.app_slug)}`}
-                className="group flex min-h-32 flex-col justify-between rounded-md border border-border bg-white p-4 transition-colors hover:border-violet-300 hover:bg-violet-50/35"
+                className="group flex min-h-32 flex-col justify-between rounded-md border border-border bg-white p-4 transition-colors hover:border-brand-300 hover:bg-brand-50/35"
               >
                 <div className="flex items-start justify-between gap-3">
                   <div>

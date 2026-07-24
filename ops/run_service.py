@@ -33,6 +33,7 @@ from ops.credential_validator import (
     hubspot_validation_policy,
     pipedrive_validation_policy,
 )
+from ops.browser_link_log import log_event, url_host
 from ops.effect_ledger import SQLiteEffectStore
 from ops.gmail_worker import GmailWorker
 from ops.graph import DurableOperationsWorkflow, WorkflowDependencies, build_graph
@@ -62,7 +63,11 @@ from ops.p1_adapter import (
     load_verified_snapshot,
     to_operational_research,
 )
-from ops.provider_errors import ConfigurationRequiredError
+from ops.provider_errors import (
+    ConfigurationRequiredError,
+    ProviderContractError,
+    ProviderOperationError,
+)
 from ops.redaction import redact_data, redact_text
 from ops.routing import RoutingDecision, decide_access
 from ops.secret_store import SecretStoreError, SQLiteSecretStore
@@ -215,6 +220,14 @@ def _slugify(app_name: str) -> str:
     return slug or "app"
 
 
+def _strip_quoted_reply(body: str) -> str:
+    """Keep only the new reply text, dropping quoted history ('On ... wrote:')."""
+
+    trimmed = re.split(r"(?im)^\s*On .*wrote:\s*$", body)[0]
+    lines = [line for line in trimmed.splitlines() if not line.lstrip().startswith(">")]
+    return "\n".join(lines).strip()
+
+
 def _public_run(record: Mapping[str, object]) -> dict[str, Any]:
     public = {
         field: record.get(field) for field in _PUBLIC_RUN_FIELDS if record.get(field) is not None
@@ -290,6 +303,24 @@ class RunService:
         self._http_client: httpx.AsyncClient | None = None
         self._validation_http_client: httpx.AsyncClient | None = None
         self._browser_worker: BrowserWorker | None = None
+        self._gmail_worker: GmailWorker | None = None
+        # In-memory marker of the last inbound reply id handled per run, so the
+        # autonomous poller acts once per new reply (no reprocessing/resend).
+        self._last_processed_reply: dict[str, str] = {}
+        # Bounded per-run count of autonomous email-OTP resume attempts.
+        self._otp_attempts: dict[str, int] = {}
+        # Background email poller (autonomous "listen for replies").
+        self._email_poller_thread: threading.Thread | None = None
+        self._email_poller_stop = threading.Event()
+        # Asynchronous browser execution: when enabled (production live mode), a
+        # self-serve browser run commits at browser_running with the live view
+        # available immediately, and the bounded onboarding task runs in a
+        # background thread that applies the terminal observation to the run.
+        # This keeps the run creation request fast and the embedded live view /
+        # HITL available for the entire duration of the autonomous task, instead
+        # of blocking the request until the multi-minute task finishes.
+        self._async_browser_enabled = False
+        self._browser_threads: list[threading.Thread] = []
         self._secret_store: SQLiteSecretStore | None = None
         self._effect_store: SQLiteEffectStore | None = None
         # Sanitized startup wiring audit rows; never contains secrets.
@@ -396,6 +427,155 @@ class RunService:
         except ConfigurationRequiredError:
             self._workflow = None
         self._record_wiring("workflow", self._workflow, configured=True)
+        # Start the autonomous email poller so the agent listens for and answers
+        # provider replies on its own, with no manual polling.
+        self._start_email_poller()
+
+    def _start_email_poller(self) -> None:
+        """Start the background thread that polls waiting runs for new replies."""
+
+        if self._gmail_worker is None:
+            return
+        if self._email_poller_thread is not None and self._email_poller_thread.is_alive():
+            return
+        settings = self._settings or Settings.from_env()
+        interval = max(10, int(settings.email_poll_interval_seconds))
+        self._email_poller_stop.clear()
+        thread = threading.Thread(
+            target=self._email_poller_loop,
+            args=(interval,),
+            name="email-poller",
+            daemon=True,
+        )
+        self._email_poller_thread = thread
+        thread.start()
+
+    def _email_poller_loop(self, interval: int) -> None:
+        while not self._email_poller_stop.wait(interval):
+            try:
+                self.poll_waiting_runs()
+            except Exception:  # pragma: no cover - the loop must never die
+                pass
+            try:
+                self.resolve_pending_otps()
+            except Exception:  # pragma: no cover - the loop must never die
+                pass
+
+    def _hitl_action_type(self, record: Mapping[str, object]) -> str | None:
+        """Return the pending HITL action type from the record or checkpoint."""
+
+        hitl = record.get("hitl_request")
+        if isinstance(hitl, Mapping) and hitl.get("type"):
+            return str(hitl.get("type"))
+        if self._workflow is None:
+            return None
+        thread_id = str(record.get("thread_id") or "")
+        if not thread_id:
+            return None
+        try:
+            state = self._workflow.get_state(thread_id)
+        except Exception:
+            return None
+        observation = state.get("browser_observation")
+        if isinstance(observation, Mapping):
+            action = observation.get("human_action_type")
+            return str(action) if action else None
+        return None
+
+    def resolve_pending_otps(self, *, limit: int = 100) -> int:
+        """Autonomously resolve every run waiting on an emailed login code."""
+
+        if self._gmail_worker is None:
+            return 0
+        resolved = 0
+        for record in self.storage.list_runs(limit=limit, offset=0):
+            if record.get("status") != "waiting_for_hitl":
+                continue
+            if self._hitl_action_type(record) != "email_otp":
+                continue
+            run_id = str(record.get("run_id") or "")
+            if not run_id:
+                continue
+            try:
+                if self.resolve_email_otp(run_id) is not None:
+                    resolved += 1
+            except Exception:
+                continue
+        return resolved
+
+    def resolve_email_otp(self, run_id: str) -> dict[str, Any] | None:
+        """Fetch the emailed OTP from Gmail and resume the browser with it injected.
+
+        Keeps the whole login in one autonomous task: the code is read from the
+        connected inbox, wrapped as a Browser Use ``sensitive_data`` placeholder
+        (never logged/persisted), and the same browser session is resumed so the
+        agent types the code and continues. Bounded per run to avoid loops.
+        """
+
+        if self._gmail_worker is None:
+            return None
+        record = self.storage.get_run(run_id)
+        if record is None or record.get("status") != "waiting_for_hitl":
+            return None
+        if self._hitl_action_type(record) != "email_otp":
+            return None
+        if self._otp_attempts.get(run_id, 0) >= 3:
+            return None
+        self._otp_attempts[run_id] = self._otp_attempts.get(run_id, 0) + 1
+
+        # The verification email may lag the browser request; retry briefly
+        # (interruptible). A magic SIGN-IN LINK takes priority over a numeric
+        # code: providers like HubSpot device verification send a one-time link
+        # the agent must open in its own live session to finish signing in.
+        link: str | None = None
+        code: str | None = None
+        for _attempt in range(3):
+            try:
+                link = asyncio.run(self._gmail_worker.fetch_latest_login_link())
+            except Exception:
+                link = None
+            if not link:
+                try:
+                    code = asyncio.run(self._gmail_worker.fetch_latest_otp())
+                except Exception:
+                    code = None
+            if link or code or self._email_poller_stop.wait(5):
+                break
+        if link:
+            log_event("browser.verify_link.fetched", run_id=run_id, link_host=url_host(link))
+            return self.resume_run(
+                run_id,
+                signal="completed",
+                browser_login={"login_verification_url": SecretStr(link)},
+            )
+        if code:
+            return self.resume_run(
+                run_id, signal="completed", browser_login={"login_otp": SecretStr(code)}
+            )
+        return None
+
+    def poll_waiting_runs(self, *, limit: int = 100) -> int:
+        """Poll every run awaiting a provider reply; returns how many were polled.
+
+        Idempotent: poll_email acts only on a genuinely new inbound reply, so
+        repeated cycles over the same runs are safe no-ops.
+        """
+
+        if self._gmail_worker is None:
+            return 0
+        polled = 0
+        for record in self.storage.list_runs(limit=limit, offset=0):
+            if record.get("status") not in {"waiting_for_reply", "outreach_sent"}:
+                continue
+            run_id = str(record.get("run_id") or "")
+            if not run_id:
+                continue
+            try:
+                self.poll_email(run_id)
+                polled += 1
+            except Exception:
+                continue
+        return polled
 
     def _build_research_enricher(self, settings: Settings) -> ResearchEnricher | None:
         """Build the enricher only when Gemini is configured; own its HTTP client."""
@@ -468,6 +648,9 @@ class RunService:
             and settings.outreach_recipient_override is not None
         ):
             gmail = GmailWorker(settings=settings)
+            # Retain the Gmail worker so the poll-email action can fetch and
+            # classify replies on the same controlled account.
+            self._gmail_worker = gmail
         self._record_wiring("gmail", gmail, configured=gmail is not None)
 
         browser: BrowserWorker | None = None
@@ -516,6 +699,10 @@ class RunService:
     def shutdown(self) -> None:
         """Close the durable workflow, owned provider clients, and connections."""
 
+        self._email_poller_stop.set()
+        if self._email_poller_thread is not None:
+            self._email_poller_thread.join(timeout=5)
+            self._email_poller_thread = None
         workflow = self._workflow
         self._workflow = None
         if workflow is not None:
@@ -541,6 +728,7 @@ class RunService:
         *,
         idempotency_key: str | None = None,
         execution_mode: Literal["plan_only", "execute_when_configured"] = "plan_only",
+        browser_login: Mapping[str, SecretStr] | None = None,
     ) -> dict[str, Any]:
         """Create and route one run without invoking an external provider.
 
@@ -722,6 +910,10 @@ class RunService:
             capability_report: ComposioCapabilityReport | None = None
             capability_event: dict[str, object] | None = None
             browser_events: list[tuple[str, dict[str, object]]] = []
+            # Set when the self-serve browser run is dispatched asynchronously
+            # (Option A). Carries the pre-created live session so the background
+            # navigate can be started once the creation transaction commits.
+            pending_async_navigate: tuple[Any, dict[str, str] | None] | None = None
 
             if (
                 execution_mode == "execute_when_configured"
@@ -789,9 +981,91 @@ class RunService:
                     # routes run the workflow plan-only (routing only). The workflow
                     # performs the legal internal transitions and this projection
                     # records its truthful result.
-                    workflow_state = self._workflow.start(
-                        request.model_copy(update={"dry_run": not run_provider_action}),
+                    # Autonomous sign-in credentials (if any) are injected into
+                    # Browser Use as secure ``sensitive_data`` placeholders at
+                    # session creation, so the agent signs in on its own. The raw
+                    # values are passed to the workflow only as a call argument and
+                    # never persisted to state, checkpoints, the ledger, or logs.
+                    start_sensitive_data: dict[str, str] | None = None
+                    if browser_login and run_provider_action:
+                        start_sensitive_data = {
+                            name: secret.get_secret_value()
+                            for name, secret in browser_login.items()
+                        }
+                    if (
+                        self._async_browser_enabled
+                        and is_self_serve
+                        and run_provider_action
+                        and self._browser_worker is not None
+                    ):
+                        # OPTION A: pre-create the live Browser Use session so the
+                        # embedded live view is available immediately, commit the
+                        # run at browser_running now, and run the durable navigate
+                        # in a background thread. Run creation stays fast (no 504)
+                        # and the live stream is available for the entire task.
+                        try:
+                            context = asyncio.run(self._browser_worker.start(None))
+                        except Exception as exc:
+                            log_event(
+                                "run.dispatch.session_error",
+                                level=40,
+                                run_id=run_id,
+                                thread_id=thread_id,
+                                error=type(exc).__name__,
+                            )
+                            raise
+                        pending_async_navigate = (context, start_sensitive_data)
+                        workflow_state = {
+                            "status": "browser_running",
+                            "access_route": "self_serve",
+                            "route_reason_code": decision.reason_code,
+                            "route_reason": decision.explanation,
+                            "browser_session_id": context.session_id,
+                        }
+                        log_event(
+                            "run.dispatch.async_begin",
+                            run_id=run_id,
+                            thread_id=thread_id,
+                            handle=context.session_id,
+                            live_view_available=context.live_view_available,
+                        )
+                    else:
+                        log_event(
+                            "run.dispatch.begin",
+                            run_id=run_id,
+                            thread_id=thread_id,
+                            app_slug=_slugify(request.app_name),
+                            route=decision.route,
+                            run_provider_action=run_provider_action,
+                            has_login=bool(browser_login),
+                        )
+                        try:
+                            workflow_state = self._workflow.start(
+                                request.model_copy(update={"dry_run": not run_provider_action}),
+                                thread_id=thread_id,
+                                sensitive_data=start_sensitive_data,
+                            )
+                        except Exception as exc:
+                            log_event(
+                                "run.dispatch.error",
+                                level=40,
+                                run_id=run_id,
+                                thread_id=thread_id,
+                                error=type(exc).__name__,
+                            )
+                            raise
+                    log_event(
+                        "run.dispatch.result",
+                        run_id=run_id,
                         thread_id=thread_id,
+                        status=str(workflow_state.get("status") or routed_status),
+                        access_route=workflow_state.get("access_route"),
+                        has_browser_session=bool(workflow_state.get("browser_session_id")),
+                        observation_status=(
+                            str(workflow_state.get("browser_observation", {}).get("status"))
+                            if isinstance(workflow_state.get("browser_observation"), Mapping)
+                            else None
+                        ),
                     )
                     persisted_status = str(workflow_state.get("status") or routed_status)
                     persisted_route = workflow_state.get("access_route") or decision.route
@@ -807,7 +1081,32 @@ class RunService:
                     observation_status = (
                         str(observation.get("status")) if isinstance(observation, Mapping) else None
                     )
-                    if isinstance(thread, str) and thread:
+                    if pending_async_navigate is not None:
+                        # Async browser dispatch: commit browser_running with the
+                        # live session; the background navigate advances the run.
+                        decision_event = "route_selected"
+                        persisted_status = "browser_running"
+                        outreach_updates = {
+                            "browser_session_id": browser_session,
+                            "external_actions": True,
+                            "provider_status": {
+                                "research": "baseline_ready",
+                                "browser": "running",
+                                "email": "not_started",
+                                "validation": "not_started",
+                            },
+                        }
+                        browser_events = [
+                            (
+                                "browser_session_started",
+                                {
+                                    "session_id": browser_session,
+                                    "status": "browser_running",
+                                    "external_actions": True,
+                                },
+                            ),
+                        ]
+                    elif isinstance(thread, str) and thread:
                         outreach_updates = {
                             "gmail_session_id": workflow_state.get("gmail_session_id"),
                             "gmail_thread_id": thread,
@@ -1017,7 +1316,254 @@ class RunService:
             created = transaction.get_run(run_id)
             if created is None:  # pragma: no cover - persistence invariant
                 raise RuntimeError("created run could not be read")
-            return _public_run(created)
+        # The creation transaction has committed here. Only now start the
+        # background browser task, so its own transaction never races the
+        # creation write and the run row is already queryable + streamable.
+        if pending_async_navigate is not None:
+            context, async_sensitive = pending_async_navigate
+            self._spawn_async_browser(run_id, thread_id, request, context, async_sensitive)
+        return _public_run(created)
+
+    def _spawn_async_browser(
+        self,
+        run_id: str,
+        thread_id: str,
+        request: OperationsRequest,
+        context: Any,
+        sensitive_data: dict[str, str] | None,
+    ) -> None:
+        """Run the durable browser navigate for a run in a background thread."""
+
+        thread = threading.Thread(
+            target=self._run_async_browser,
+            args=(run_id, thread_id, request, context, sensitive_data),
+            name=f"browser-{run_id[:16]}",
+            daemon=True,
+        )
+        self._browser_threads = [t for t in self._browser_threads if t.is_alive()]
+        self._browser_threads.append(thread)
+        thread.start()
+
+    def _run_async_browser(
+        self,
+        run_id: str,
+        thread_id: str,
+        request: OperationsRequest,
+        context: Any,
+        sensitive_data: dict[str, str] | None,
+    ) -> None:
+        """Background worker: drive the durable navigate on the pre-created session.
+
+        The session already exists (seeded into the workflow), so ``_browser_start``
+        is a no-op and the bounded onboarding task runs against the live session.
+        When the task pauses (HITL) or finishes, the terminal state is applied to
+        the run so the frontend transitions from browser_running.
+        """
+
+        if self._workflow is None:  # pragma: no cover - guarded by caller
+            return
+        try:
+            seed = {
+                "browser_profile_id": context.profile_id,
+                "browser_session_id": context.session_id,
+                "browser_live_view_available": context.live_view_available,
+                "browser_session_started_at": context.created_at,
+                "browser_session_last_active_at": context.created_at,
+                "browser_session_inactivity_expires_at": context.inactivity_expires_at,
+                "browser_session_max_expires_at": context.maximum_expires_at,
+            }
+            workflow_state = self._workflow.start(
+                request.model_copy(update={"dry_run": False}),
+                thread_id=thread_id,
+                sensitive_data=sensitive_data,
+                seed=seed,
+            )
+        except Exception as exc:
+            log_event(
+                "browser.async.workflow_error",
+                level=40,
+                run_id=run_id,
+                thread_id=thread_id,
+                error=type(exc).__name__,
+            )
+            self._mark_async_browser_failed(run_id)
+            return
+        finally:
+            if sensitive_data is not None:
+                sensitive_data.clear()
+        try:
+            self._apply_async_browser_result(run_id, thread_id, request, workflow_state)
+        except Exception as exc:  # pragma: no cover - defensive
+            log_event(
+                "browser.async.apply_error",
+                level=40,
+                run_id=run_id,
+                error=type(exc).__name__,
+            )
+
+    def _apply_async_browser_result(
+        self,
+        run_id: str,
+        thread_id: str,
+        request: OperationsRequest,
+        workflow_state: Mapping[str, object],
+    ) -> None:
+        """Transition a browser_running run based on the completed navigate."""
+
+        observation = workflow_state.get("browser_observation")
+        observation_status = (
+            str(observation.get("status")) if isinstance(observation, Mapping) else None
+        )
+        wf_status = str(workflow_state.get("status") or "")
+        current_url = workflow_state.get("current_url")
+        try:
+            interrupts = self._workflow.get_interrupts(thread_id) if self._workflow else ()
+        except Exception:
+            interrupts = ()
+        waiting = (
+            bool(interrupts)
+            or observation_status == "human_action_required"
+            or wf_status == "waiting_for_hitl"
+        )
+
+        lock = self._run_lock(run_id)
+        with lock:
+            record = self.storage.get_run(run_id)
+            if record is None:
+                return
+            previous = str(record.get("status") or "browser_running")
+            if previous != "browser_running":
+                # A resume or another writer already advanced the run; do not
+                # clobber its state.
+                log_event("browser.async.apply_skip", run_id=run_id, prev_status=previous)
+                return
+
+            events: list[tuple[str, dict[str, object]]] = []
+            extra_updates: dict[str, object] = {}
+            hitl_payload: dict[str, object] | None = None
+            provider_browser = "running"
+
+            if waiting:
+                next_status: RunStatus = "waiting_for_hitl"
+                source = interrupts[0] if interrupts else workflow_state.get("hitl_request")
+                if isinstance(source, Mapping):
+                    hitl_payload = {str(k): v for k, v in source.items()}
+                events.append(
+                    (
+                        "browser_hitl_required",
+                        {
+                            "status": "waiting_for_hitl",
+                            "current_url": current_url,
+                            "required_human_action": (
+                                hitl_payload.get("type") if hitl_payload else None
+                            ),
+                            "external_actions": True,
+                        },
+                    )
+                )
+            elif wf_status == "blocked":
+                next_status = "blocked"
+                provider_browser = "blocked"
+                events.append(
+                    ("browser_navigation_blocked", {"status": "blocked", "external_actions": True})
+                )
+            elif wf_status == "failed":
+                next_status = "failed"
+                provider_browser = "failed"
+            elif observation_status in {"credential_page_ready", "developer_console_ready"}:
+                events.append(
+                    (
+                        "credential_page_ready",
+                        {
+                            "current_url": current_url,
+                            "status": "browser_running",
+                            "external_actions": True,
+                        },
+                    )
+                )
+                if (
+                    self._credential_capturer is not None
+                    and self._credential_validator is not None
+                    and "operational_research" in workflow_state
+                ):
+                    try:
+                        research = OperationalResearch.model_validate(
+                            workflow_state["operational_research"]
+                        )
+                        outcome = self._run_m6_credentials(research, request)
+                        next_status = cast(RunStatus, outcome.status)
+                        provider_browser = "credential_page_ready"
+                        if outcome.bundle is not None:
+                            extra_updates["integrator_bundle"] = outcome.bundle
+                        events.extend(outcome.events)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        log_event(
+                            "browser.async.m6_error", level=40, run_id=run_id,
+                            error=type(exc).__name__,
+                        )
+                        next_status = "browser_running"
+                else:
+                    next_status = "browser_running"
+            else:
+                next_status = "browser_running"
+
+            with self.storage.unit_of_work() as transaction:
+                rec = transaction.get_run(run_id)
+                if rec is None:  # pragma: no cover
+                    return
+                revision = int(rec.get("state_revision", 0) or 0) + 1
+                if previous != next_status:
+                    validate_status_transition(previous, next_status, "browser")
+                changes: dict[str, object] = {
+                    "status": next_status,
+                    "state_revision": revision,
+                    "last_projected_revision": revision,
+                    "external_actions": True,
+                    "hitl_request": hitl_payload,
+                    "provider_status": {
+                        "research": "baseline_ready",
+                        "browser": provider_browser,
+                        "email": "not_started",
+                        "validation": "not_started",
+                    },
+                    **extra_updates,
+                }
+                transaction.update_run(run_id, **changes)
+                for event_type, payload in events:
+                    transaction.append_audit_event(
+                        run_id=run_id, event_type=event_type, payload=payload
+                    )
+        log_event("browser.async.applied", run_id=run_id, status=next_status)
+
+    def _mark_async_browser_failed(self, run_id: str) -> None:
+        """Best-effort transition of a stuck browser_running run to failed."""
+
+        try:
+            lock = self._run_lock(run_id)
+            with lock:
+                record = self.storage.get_run(run_id)
+                if record is None or str(record.get("status")) != "browser_running":
+                    return
+                with self.storage.unit_of_work() as transaction:
+                    rec = transaction.get_run(run_id)
+                    if rec is None:
+                        return
+                    revision = int(rec.get("state_revision", 0) or 0) + 1
+                    validate_status_transition("browser_running", "failed", "browser")
+                    transaction.update_run(
+                        run_id,
+                        status="failed",
+                        state_revision=revision,
+                        last_projected_revision=revision,
+                        external_actions=True,
+                    )
+                    transaction.append_audit_event(
+                        run_id=run_id,
+                        event_type="browser_failed",
+                        payload={"status": "failed", "external_actions": True},
+                    )
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     def _run_enrichment_probe(
         self,
@@ -1478,14 +2024,241 @@ class RunService:
 
         worker = self._browser_worker
         if worker is None:
+            log_event("liveview.resolve.no_worker", level=30, run_id=run_id)
             return None
         record = self.storage.get_run(run_id)
         if record is None:
+            log_event("liveview.resolve.no_run", level=30, run_id=run_id)
             return None
         session_id = record.get("browser_session_id")
         if not isinstance(session_id, str) or not session_id:
+            log_event(
+                "liveview.resolve.no_session",
+                run_id=run_id,
+                run_status=record.get("status"),
+            )
             return None
-        return worker.live_url(session_id)
+        live_url = worker.live_url(session_id)
+        if live_url:
+            log_event("liveview.resolve.cached", run_id=run_id, handle=session_id)
+            return live_url
+        # After an API restart the in-memory URL is gone but the provider session
+        # may still be running. Recover the signed URL from the durable
+        # checkpoint's (non-secret) provider session id so the embedded live view
+        # reconnects. The signed URL itself is never persisted.
+        recover = getattr(worker, "recover_live_url", None)
+        if not callable(recover) or self._workflow is None:
+            log_event("liveview.resolve.no_recover", level=30, run_id=run_id, handle=session_id)
+            return None
+        thread_id = record.get("thread_id")
+        if not isinstance(thread_id, str) or not thread_id:
+            return None
+        try:
+            checkpoint_state = self._workflow.get_state(thread_id)
+        except Exception:
+            log_event("liveview.resolve.checkpoint_error", level=30, run_id=run_id)
+            return None
+        provider_session = checkpoint_state.get("browser_provider_session_id")
+        if not isinstance(provider_session, str) or not provider_session:
+            log_event(
+                "liveview.resolve.no_provider_session",
+                level=30,
+                run_id=run_id,
+                handle=session_id,
+            )
+            return None
+        log_event("liveview.resolve.recover_attempt", run_id=run_id, handle=session_id)
+        try:
+            recovered = asyncio.run(recover(session_id, provider_session))
+        except Exception as exc:
+            log_event(
+                "liveview.resolve.recover_error",
+                level=30,
+                run_id=run_id,
+                error=type(exc).__name__,
+            )
+            return None
+        log_event(
+            "liveview.resolve.recover_result",
+            run_id=run_id,
+            handle=session_id,
+            recovered=bool(recovered),
+        )
+        return recovered
+
+    def _public_no_reply(self, record: Mapping[str, object]) -> dict[str, Any]:
+        """Return the current run projection with a no-op reply marker."""
+
+        public = _public_run(record)
+        public["latest_reply_class"] = "no_reply"
+        public["follow_up_sent"] = False
+        return public
+
+    def _company_from_checkpoint(self, thread_id: str) -> CompanyProfile | None:
+        """Read the run's company profile from the durable workflow checkpoint.
+
+        Used to give the Gemini reply assistant the real, non-secret company
+        facts. Returns None when the checkpoint is unavailable, in which case the
+        loop falls back to the deterministic classifier.
+        """
+
+        if self._workflow is None or not thread_id:
+            return None
+        try:
+            state = self._workflow.get_state(thread_id)
+        except Exception:
+            return None
+        request_payload = state.get("request")
+        if not isinstance(request_payload, Mapping):
+            return None
+        try:
+            return OperationsRequest.model_validate(dict(request_payload)).company
+        except Exception:
+            return None
+
+    def poll_email(self, run_id: str) -> dict[str, Any]:
+        """Fetch the outreach thread, classify the latest reply, and advance.
+
+        Closes the gated-outreach loop: reads the Gmail thread by its persisted
+        thread id, sanitizes and classifies the latest reply (offline), records a
+        sanitized reply event, and moves the run forward. For a "more information
+        required" reply it sends one bounded follow-up reply (up to
+        ``max_outreach_rounds``) so the back-and-forth continues. Credentials in a
+        reply are stored as vault references only; rejections block the run.
+        """
+
+        from ops.reply_classifier import ReplyClassifier
+
+        if self._gmail_worker is None:
+            raise CredentialSubmissionError("gmail_not_configured")
+        settings = self._settings or Settings.from_env()
+        lock = self._run_lock(run_id)
+        if not lock.acquire(blocking=False):
+            raise RunConflictError(run_id, "poll_email")
+        try:
+            current = self.storage.get_run(run_id)
+            if current is None:
+                raise KeyError("run was not found")
+            if current["status"] not in {"waiting_for_reply", "outreach_sent"}:
+                raise CredentialSubmissionError("run_not_awaiting_reply")
+            thread_id = current.get("gmail_thread_id")
+            if not isinstance(thread_id, str) or not thread_id:
+                raise CredentialSubmissionError("gmail_thread_missing")
+            app_name = str(current.get("app_name") or "")
+
+            from ops.email_ai import build_email_assistant
+
+            thread = asyncio.run(self._gmail_worker.fetch_thread(thread_id))
+            # The vendor (inbound) messages come from the address we correspond
+            # with (the controlled recipient); our own outreach/follow-ups do not.
+            # Act only on the latest, not-yet-processed inbound reply so repeated
+            # background polling is a safe no-op (no timeline spam, no resend).
+            counterpart = (settings.outreach_recipient_override or "").casefold()
+            inbound = None
+            rounds = 0
+            for message in thread.messages:
+                if counterpart and counterpart in message.sender.casefold():
+                    inbound = message
+                    rounds += 1
+            if inbound is None or self._last_processed_reply.get(run_id) == inbound.message_id:
+                return self._public_no_reply(current)
+            reply_text = _strip_quoted_reply(inbound.sanitized_body)
+
+            heuristic = asyncio.run(
+                ReplyClassifier().classify(app_name=app_name, sanitized_thread=thread)
+            )
+            cls = heuristic.classification
+            ai_reply_body: str | None = None
+            classified_by = "heuristic"
+            assistant = build_email_assistant(settings)
+            company = self._company_from_checkpoint(str(current.get("thread_id") or ""))
+            if reply_text and assistant is not None and company is not None:
+                try:
+                    ai = assistant.analyze_reply(
+                        app_name=app_name, company=company, reply_text=reply_text
+                    )
+                    cls = ai.classification
+                    ai_reply_body = (ai.reply_body or "").strip() or None
+                    classified_by = "llm"
+                except Exception:
+                    classified_by = "heuristic"
+
+            next_status: RunStatus = "waiting_for_reply"
+            follow_up_sent = False
+            credential_refs = {
+                f"email_secret_{index + 1}": reference
+                for index, reference in enumerate(thread.credential_refs)
+            }
+            if cls == "credentials_received" and credential_refs:
+                next_status = "credentials_ready"
+            elif cls == "rejected":
+                next_status = "blocked"
+            elif cls in {"more_information_required", "meeting_requested"} and (
+                rounds <= settings.max_outreach_rounds
+            ):
+                follow_up_body = ai_reply_body or (
+                    "Thank you for the quick response. To help us proceed with the API "
+                    "integration, we have shared the requested details above and remain "
+                    "available for any further information. Could you confirm the developer "
+                    "access and credential issuance steps for production?"
+                )
+                try:
+                    asyncio.run(
+                        self._gmail_worker.reply(
+                            thread_id,
+                            follow_up_body,
+                            idempotency_key=f"{run_id}:followup-{inbound.message_id}",
+                        )
+                    )
+                    follow_up_sent = True
+                except (ProviderContractError, ProviderOperationError):
+                    follow_up_sent = False
+
+            # Mark this inbound reply handled so subsequent polls do not reprocess.
+            self._last_processed_reply[run_id] = inbound.message_id
+
+            with self.storage.unit_of_work() as transaction:
+                record = transaction.get_run(run_id)
+                if record is None:  # pragma: no cover - re-checked under lock
+                    raise KeyError("run was not found")
+                revision = int(record.get("state_revision", 0) or 0) + 1
+                previous_status = cast(RunStatus, record["status"])
+                validate_status_transition(previous_status, next_status, "poll_email")
+                changes: dict[str, object] = {
+                    "status": next_status,
+                    "state_revision": revision,
+                    "last_projected_revision": revision,
+                    "external_actions": True,
+                }
+                if next_status == "credentials_ready" and credential_refs:
+                    bundle = dict(record.get("integrator_bundle") or {})
+                    existing_refs = dict(bundle.get("credential_refs") or {})
+                    existing_refs.update(credential_refs)
+                    if bundle:
+                        bundle["credential_refs"] = existing_refs
+                        changes["integrator_bundle"] = bundle
+                updated = transaction.update_run(run_id, **changes)
+                transaction.append_audit_event(
+                    run_id=run_id,
+                    event_type="reply_received",
+                    payload={
+                        "classification": cls,
+                        "classified_by": classified_by,
+                        "message_count": len(thread.messages),
+                        "official_setup_urls": list(heuristic.official_setup_urls),
+                        "required_next_action": heuristic.required_next_action,
+                        "follow_up_sent": follow_up_sent,
+                        "rounds": rounds,
+                        "external_actions": True,
+                    },
+                )
+                public = _public_run(updated)
+                # Non-persisted, non-secret classification for the caller's receipt.
+                public["latest_reply_class"] = cls
+                public["follow_up_sent"] = follow_up_sent
+                return public
+        finally:
+            lock.release()
 
     def resume_run(
         self,

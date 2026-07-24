@@ -69,9 +69,9 @@ describe("createRunAction", () => {
     expect(request).not.toHaveProperty("dry_run")
   })
 
-  it("falls back to plan only when the submitted mode is not supported", async () => {
+  it("falls back to execute-when-configured when the submitted mode is not supported", async () => {
     await expect(createRunAction(initialState, validForm("unbounded_execution"))).rejects.toThrow("NEXT_REDIRECT")
 
-    expect(mocks.createRun.mock.calls[0]?.[0]).toMatchObject({ execution_mode: "plan_only" })
+    expect(mocks.createRun.mock.calls[0]?.[0]).toMatchObject({ execution_mode: "execute_when_configured" })
   })
 })

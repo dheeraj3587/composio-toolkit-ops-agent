@@ -22,9 +22,14 @@ class _FakeSessions:
         self.stopped: list[str] = []
 
     async def create(self, **kwargs: object) -> object:
+        # Option A: the session is created up front so its live URL exists for the
+        # whole task; the bounded onboarding task then runs against this session.
         del kwargs
         self.create_calls += 1
-        raise AssertionError("taskless sessions.create must never be called")
+        return {
+            "id": "provider-session-1",
+            "live_url": "https://live.browser-use.example/session",
+        }
 
     async def stop(self, session_id: str) -> None:
         self.stopped.append(session_id)
@@ -121,15 +126,23 @@ def test_first_browser_operation_contains_task_and_provider_allowlist() -> None:
     context = asyncio.run(worker.start(None))
     observation = asyncio.run(worker.navigate_onboarding(context, _research()))
 
-    assert client.sessions.create_calls == 0
+    # The live session is created up front, so the bounded task reuses it via
+    # session_id (navigation target is carried in the task text, not start_url).
+    assert client.sessions.create_calls == 1
+    assert context.session_id == "provider-session-1"
+    assert context.live_view_available is True
     assert len(client.calls) == 1
-    _, kwargs = client.calls[0]
-    assert kwargs["start_url"] == "https://developers.hubspot.com/"
+    task, kwargs = client.calls[0]
+    assert kwargs["session_id"] == "provider-session-1"
     assert kwargs["allowed_domains"] == [
         "developers.hubspot.com",
         "app.hubspot.com",
+        "*.hubspot.com",
     ]
-    assert "session_id" not in kwargs
+    assert "STRICT APP TRACE: HubSpot" in task
+    assert "Development" in task
+    assert "DIVERGENCE:" in task
+    assert "start_url" not in kwargs
     assert observation.status == "credential_page_ready"
     assert client.sessions.stopped == ["provider-session-1"]
 
@@ -144,9 +157,11 @@ def test_hitl_resume_reuses_the_same_provider_session() -> None:
 
     assert first.status == "human_action_required"
     assert second.status == "credential_page_ready"
-    assert client.sessions.create_calls == 0
+    # One up-front session creation; both the first task and the HITL resume run
+    # against that same provider session id.
+    assert client.sessions.create_calls == 1
     assert len(client.calls) == 2
-    assert "session_id" not in client.calls[0][1]
+    assert client.calls[0][1]["session_id"] == "provider-session-1"
     assert client.calls[1][1]["session_id"] == "provider-session-1"
     assert client.sessions.stopped == ["provider-session-1"]
 

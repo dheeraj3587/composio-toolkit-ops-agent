@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next"
-import { Geist, Geist_Mono } from "next/font/google"
+import localFont from "next/font/local"
+import { JetBrains_Mono } from "next/font/google"
 
 import { AppShell } from "@/components/app-shell"
 import { DemoBanner } from "@/components/demo-banner"
@@ -7,15 +8,28 @@ import { Providers } from "@/components/providers"
 
 import "./globals.css"
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
+const diatype = localFont({
+  variable: "--font-abc-diatype",
   display: "swap",
+  fallback: ["Arial", "sans-serif"],
+  src: [
+    {
+      path: "./fonts/ABCDiatype-Regular.woff2",
+      weight: "400",
+      style: "normal",
+    },
+    {
+      path: "./fonts/ABCDiatype-Medium.woff2",
+      weight: "500",
+      style: "normal",
+    },
+  ],
 })
 
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
+const jetBrainsMono = JetBrains_Mono({
+  variable: "--font-jetbrains-mono",
   subsets: ["latin"],
+  weight: ["400", "500", "600"],
   display: "swap",
 })
 
@@ -30,14 +44,14 @@ export const metadata: Metadata = {
 
 export const viewport: Viewport = {
   colorScheme: "light",
-  themeColor: "#0b0b0e",
+  themeColor: "#0f0f0f",
 }
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   const demoMode = process.env.OPS_DEMO_MODE === "true"
 
   return (
-    <html lang="en" className={`${geistSans.variable} ${geistMono.variable}`} suppressHydrationWarning>
+    <html lang="en" className={`${diatype.variable} ${jetBrainsMono.variable}`} suppressHydrationWarning>
       {/* suppressHydrationWarning: browser extensions (password managers, etc.)
           inject attributes like bis_register/__processed_* onto <body> before
           React hydrates. This suppresses that one-level attribute mismatch; it

@@ -12,7 +12,7 @@ function short(value?: string, length = 12): string {
 
 export function ProvenanceCard({ snapshot }: { snapshot: SnapshotHealth | null }) {
   return (
-    <Card className="h-full rounded-md border-border bg-card py-0 shadow-none">
+    <Card className="h-full rounded-lg border-border bg-card py-0 shadow-none">
       <CardHeader className="border-b border-border px-5 py-4">
         <div className="flex items-center justify-between gap-3">
           <div>
@@ -38,7 +38,7 @@ export function ProvenanceCard({ snapshot }: { snapshot: SnapshotHealth | null }
           <div>
             <span className="data-label">Commit</span>
             <p className="mt-1 flex items-center gap-1.5 font-mono text-xs">
-              <GitCommitHorizontal className="size-3.5 text-violet-600" aria-hidden="true" />
+              <GitCommitHorizontal className="size-3.5 text-brand-600" aria-hidden="true" />
               {short(snapshot?.source_commit)}
             </p>
           </div>
@@ -62,7 +62,7 @@ export function ProvenanceCard({ snapshot }: { snapshot: SnapshotHealth | null }
             </p>
           </div>
         </div>
-        <p className="border-l-2 border-violet-400 pl-3 text-xs leading-5 text-muted-foreground">
+        <p className="border-l-2 border-brand-400 pl-3 text-xs leading-5 text-muted-foreground">
           Canonical P1 files remain read-only. Operational enrichment belongs to this ledger.
         </p>
       </CardContent>

@@ -13,6 +13,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ops.browser_api_trace_catalog import BrowserApiTrace, render_browser_api_trace
 from ops.browser_host_policy import (
     BrowserHostDecision,
     BrowserPolicyInactiveError,
@@ -223,6 +224,8 @@ class BrowserWorker:
         self,
         context: BrowserSessionContext,
         research: OperationalResearch,
+        *,
+        sensitive_data: Mapping[str, str] | None = None,
     ) -> BrowserObservation:
         self._require_configuration()
         if context.session_id:
@@ -231,6 +234,7 @@ class BrowserWorker:
             context=context,
             research=research,
             resume_signal=None,
+            sensitive_data=sensitive_data,
         )
 
     async def resume_after_hitl(
@@ -240,6 +244,7 @@ class BrowserWorker:
         research: OperationalResearch | None = None,
         *,
         sensitive_data: Mapping[str, str] | None = None,
+        provider_session_id: str | None = None,
     ) -> BrowserObservation:
         self._require_configuration()
         resolved = research or self._research.get(context.session_id)
@@ -248,12 +253,22 @@ class BrowserWorker:
                 capability="browser HITL resume",
                 reason_code="verified_research_required",
             )
+        # The base worker's session_id IS the provider session, so reconnection is
+        # inherent; just re-seed the verified research if the in-memory cache was
+        # cleared by an API restart.
+        if context.session_id:
+            self._research.setdefault(context.session_id, resolved)
         return await self._run_bounded_task(
             context=context,
             research=resolved,
             resume_signal=signal,
             sensitive_data=sensitive_data,
         )
+
+    def provider_session_id(self, handle: str) -> str | None:
+        """The base worker's session id is the provider session id."""
+
+        return handle or None
 
     def live_url(self, session_id: str) -> str | None:
         """Owner-only, in-memory accessor for the ephemeral signed live URL.
@@ -633,6 +648,8 @@ def _blocked_observation(decision: BrowserHostDecision) -> BrowserObservation:
 def _official_target_url(
     research: OperationalResearch,
     allowed_domains: tuple[str, ...],
+    *,
+    preferred_url: str | None = None,
 ) -> str:
     """Select the verified official entry URL within the app's allowlist.
 
@@ -642,6 +659,7 @@ def _official_target_url(
     """
 
     for candidate in (
+        preferred_url,
         research.developer_portal_url,
         research.signup_url,
         research.api_base_url,
@@ -665,6 +683,7 @@ def _render_browser_task(
     allowed_domains: tuple[str, ...],
     resume_signal: str | None,
     login_fields: tuple[str, ...] = (),
+    trace: BrowserApiTrace | None = None,
 ) -> str:  # pragma: no cover - live only
     """Render the bounded onboarding task.
 
@@ -683,12 +702,28 @@ def _render_browser_task(
         if resume_signal
         else ""
     )
-    has_login = bool(login_fields)
+    trace_note = f"{render_browser_api_trace(trace)}\n\n" if trace is not None else ""
+    has_login = "login_email" in login_fields or "login_password" in login_fields
+    has_otp = "login_otp" in login_fields
+    has_verify_link = "login_verification_url" in login_fields
     login_note = ""
     password_hard_stop = "entering a password, "  # pragma: allowlist secret
+    otp_hard_stop = "any MFA/OTP/2FA code, email or phone verification, "
+    if has_verify_link:
+        # The START url is the one-time sign-in link fetched from the owner's
+        # inbox; opening it completes sign-in, so email verification is no longer
+        # a hard stop for this step.
+        otp_hard_stop = ""
+        login_note += (
+            "SIGN-IN LINK: The START url above is a one-time sign-in link that was emailed to the "
+            "account owner and fetched for you. Opening it in this browser IS the email "
+            "verification. Navigate directly to it now, let it load and finish signing you in, "
+            "then continue to the API credentials page. Do NOT stop for a 'check your email' "
+            "prompt. If the link shows expired or invalid, stop with hitl_required=true.\n\n"
+        )
     if has_login:
         password_hard_stop = ""
-        login_note = (
+        login_note += (
             "LOGIN CREDENTIALS: The account owner has provided sign-in credentials as secure "
             "placeholders. When you reach a sign-in form, type the account email/username using "
             "the placeholder <secret>login_email</secret> and the password using the placeholder "
@@ -696,11 +731,22 @@ def _render_browser_task(
             "inside the app's own login form on the allowlisted hostnames. You cannot see their "
             "real values and must never print, echo, or report them.\n\n"
         )
+    if has_otp:
+        otp_hard_stop = ""
+        login_note += (
+            "ONE-TIME CODE: A verification/OTP code sent to the owner's email is available as the "
+            "secure placeholder <secret>login_otp</secret>. When the site asks for the emailed "
+            "sign-in/verification code, type <secret>login_otp</secret> into the code field and "
+            "submit. Use it ONLY in the app's own verification form on the allowlisted hostnames. "
+            "You cannot see its real value and must never print, echo, or report it. If the code "
+            "is rejected as expired/invalid, stop with hitl_required=true.\n\n"
+        )
     return (
         "ROLE: You are an autonomous web agent helping an authorized account owner reach the "
         "page where they can create or view their developer API credentials. Act decisively and "
         "take real navigation steps; do not stop after only opening the first page.\n\n"
         f"{resume_note}"
+        f"{trace_note}"
         f"{login_note}"
         f"START: Open {target_url}. Stay strictly within these hostnames: {allowlist}. Never "
         "navigate to any other domain.\n\n"
@@ -715,8 +761,8 @@ def _render_browser_task(
         "website, work email, use case) ONLY when their values are already visibly present on the "
         "page. Never invent values.\n\n"
         "HARD STOPS — set hitl_required=true and STOP (do not attempt these yourself): "
-        f"{password_hard_stop}solving a CAPTCHA, any MFA/OTP/2FA code, email or phone "
-        "verification, passkey or security-key prompts, device approval, accepting "
+        f"{password_hard_stop}solving a CAPTCHA, {otp_hard_stop}"
+        "passkey or security-key prompts, device approval, accepting "
         "legal/terms/consent, confirming account ownership, entering billing/payment details, or "
         "any 'reveal/copy your API token' step. In hitl_reason, name the single specific action "
         "the human must take (e.g. 'Enter the email verification code sent to your inbox').\n\n"

@@ -18,7 +18,7 @@ _SENSITIVE_KEY = re.compile(
     r"api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|"
     r"oauth[_-]?(?:client[_-]?)?secret|(?:session|id|auth|oauth)[_-]?token|"
     r"authorization|password|passwd|private[_-]?key|totp(?:[_-]?seed)?|"
-    r"cookie|session[_-]?cookie|credentials?|login[_-]?email|token|secret|key"
+    r"cookie|session[_-]?cookie|credentials?|token|secret|key"
     r")(?:$|[_-])"
 )
 _SENSITIVE_CODE_KEY = re.compile(

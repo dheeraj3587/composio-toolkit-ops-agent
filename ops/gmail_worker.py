@@ -105,6 +105,7 @@ class GmailWorker:
         self._effect_store = effect_store
         self._sdk_client: Any = sdk_client
         self._session_id: str | None = None
+        self._session: Any = None
         self._connection_lock = asyncio.Lock()
 
     async def ensure_connected(self) -> str:
@@ -116,11 +117,6 @@ class GmailWorker:
                 return self._session_id
             try:
                 session_id = await asyncio.to_thread(self._create_scoped_session)
-                await asyncio.to_thread(
-                    self._execute_checked,
-                    "GMAIL_GET_PROFILE",
-                    {"user_id": self._settings.composio_user_id},
-                )
             except (ProviderContractError, ProviderOperationError):
                 raise
             except Exception:
@@ -128,6 +124,17 @@ class GmailWorker:
                     capability="Composio Gmail connection",
                     reason_code="provider_request_failed",
                 ) from None
+            # GMAIL_GET_PROFILE is a best-effort health probe. Some connected
+            # accounts lack the read-only profile scope while still allowing
+            # send/fetch/reply, so a probe failure must not block outreach.
+            try:
+                await asyncio.to_thread(
+                    self._execute_checked,
+                    "GMAIL_GET_PROFILE",
+                    {"user_id": self._settings.composio_user_id},
+                )
+            except Exception:
+                pass
             self._session_id = session_id
             return session_id
 
@@ -242,6 +249,98 @@ class GmailWorker:
                 capability="Composio Gmail thread fetch",
                 reason_code="provider_response_incompatible",
             ) from None
+
+    async def fetch_latest_otp(self, *, query: str = "newer_than:1h in:anywhere") -> str | None:
+        """Return the most recent one-time login code from the connected inbox.
+
+        Reads recent messages (raw, never logged), finds the newest one whose
+        subject/body looks like a verification/OTP email, and extracts the code.
+        The value is a short-lived secret: it is returned only to be injected as a
+        Browser Use ``sensitive_data`` placeholder and is never persisted or logged.
+        """
+
+        await self.ensure_connected()
+        try:
+            data = await asyncio.to_thread(
+                self._execute_checked,
+                "GMAIL_FETCH_EMAILS",
+                {"max_results": 8, "query": query},
+            )
+        except (ConfigurationRequiredError, ProviderContractError, ProviderOperationError):
+            raise
+        except Exception:
+            raise ProviderOperationError(
+                capability="Composio Gmail OTP fetch",
+                reason_code="provider_response_incompatible",
+            ) from None
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return None
+
+        def _ts(message: object) -> str:
+            if isinstance(message, Mapping):
+                value = message.get("messageTimestamp") or message.get("internal_date")
+                return str(value) if value else ""
+            return ""
+
+        for message in sorted(messages, key=_ts, reverse=True):
+            if not isinstance(message, Mapping):
+                continue
+            subject = _first_string(message, ("subject",)) or ""
+            body = _first_string(message, ("messageText", "preview", "snippet", "body")) or ""
+            code = _extract_otp(subject, body)
+            if code:
+                return code
+        return None
+
+    async def fetch_latest_login_link(
+        self, *, query: str = "newer_than:1h in:anywhere"
+    ) -> str | None:
+        """Return the most recent emailed sign-in verification LINK, if any.
+
+        Some providers (e.g. HubSpot device verification) send a magic link rather
+        than a numeric code: the agent must open the link in its own live session
+        to complete sign-in. This reads recent messages, finds the newest sign-in
+        verification email, and extracts the verification URL. The URL is a
+        short-lived secret returned only to be injected as a Browser Use
+        ``sensitive_data`` placeholder; it is never persisted or logged.
+        """
+
+        await self.ensure_connected()
+        try:
+            data = await asyncio.to_thread(
+                self._execute_checked,
+                "GMAIL_FETCH_EMAILS",
+                {"max_results": 8, "query": query},
+            )
+        except (ConfigurationRequiredError, ProviderContractError, ProviderOperationError):
+            raise
+        except Exception:
+            raise ProviderOperationError(
+                capability="Composio Gmail verification-link fetch",
+                reason_code="provider_response_incompatible",
+            ) from None
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return None
+
+        def _ts(message: object) -> str:
+            if isinstance(message, Mapping):
+                value = message.get("messageTimestamp") or message.get("internal_date")
+                return str(value) if value else ""
+            return ""
+
+        for message in sorted(messages, key=_ts, reverse=True):
+            if not isinstance(message, Mapping):
+                continue
+            subject = _first_string(message, ("subject",)) or ""
+            body = (
+                _first_string(message, ("messageText", "body", "preview", "snippet")) or ""
+            )
+            link = _extract_login_link(subject, body)
+            if link:
+                return link
+        return None
 
     async def reply(self, thread_id: str, body: str, idempotency_key: str) -> GmailSendResult:
         safe_thread_id = _validate_identifier(thread_id, "thread_id")
@@ -382,13 +481,16 @@ class GmailWorker:
             sandbox={"enable": False},
             session_preset=module.SESSION_PRESET_DIRECT_TOOLS,
         )
-        session_id = getattr(session, "id", None)
+        # The installed Composio SDK returns a ToolRouterSession whose id is
+        # exposed as ``session_id`` and which executes tools via ``session.execute``.
+        session_id = getattr(session, "session_id", None) or getattr(session, "id", None)
         if not isinstance(session_id, str) or not session_id:
             raise ProviderContractError(
                 phase=4,
                 capability="Composio Gmail connection",
                 reason_code="session_identifier_missing",
             )
+        self._session = session
         return session_id
 
     def _execute_checked(self, slug: str, arguments: Mapping[str, object]) -> Mapping[str, object]:
@@ -398,23 +500,23 @@ class GmailWorker:
                 capability="Composio Gmail tool execution",
                 reason_code="tool_not_allowlisted",
             )
-        expected = _TOOL_FIELD_TYPES.get(slug)
-        if expected is not None:
-            tool = self._client().tools.get_raw_composio_tool_by_slug(slug)
-            _validate_tool_schema(
-                slug,
-                getattr(tool, "input_parameters", None),
-                expected,
-                set(arguments),
+        # Only allowlisted fields are ever sent (built internally), so keep the
+        # least-privilege guarantee without the older raw-tool schema probe that
+        # the tool-router session API no longer exposes.
+        allowed_fields = _TOOL_FIELD_TYPES.get(slug)
+        if allowed_fields is not None and not set(arguments).issubset(allowed_fields):
+            raise ProviderContractError(
+                phase=4,
+                capability="Composio Gmail tool execution",
+                reason_code="tool_schema_incompatible",
             )
-        response = self._client().tools.execute(
-            slug,
-            dict(arguments),
-            connected_account_id=self._settings.composio_gmail_connected_account_id,
-            user_id=self._settings.composio_user_id,
-            version=GMAIL_TOOLKIT_VERSION,
-        )
-        if getattr(response, "successful", False) is not True:
+        if self._session is None:
+            raise ProviderOperationError(
+                capability="Composio Gmail tool execution",
+                reason_code="provider_request_failed",
+            )
+        response = self._session.execute(slug, arguments=dict(arguments))
+        if getattr(response, "error", None):
             raise ProviderOperationError(
                 capability="Composio Gmail tool execution",
                 reason_code="provider_reported_failure",
@@ -454,12 +556,20 @@ class GmailWorker:
         sanitized: list[SanitizedGmailMessage] = []
         credential_refs: list[str] = []
         for index, value in enumerate(raw_messages):
-            message_id = _first_string(value, ("message_id", "id")) or f"message-{index + 1}"
+            message_id = (
+                _first_string(value, ("message_id", "messageId", "id")) or f"message-{index + 1}"
+            )
             sender = _first_string(value, ("sender", "from", "from_email")) or "unknown"
             recipients = _string_sequence(value, ("recipients", "to", "to_email"))
-            sent_at = _first_string(value, ("sent_at", "date", "internal_date")) or "unknown"
+            sent_at = (
+                _first_string(value, ("sent_at", "messageTimestamp", "date", "internal_date"))
+                or "unknown"
+            )
             subject = _first_string(value, ("subject",)) or ""
-            body = _first_string(value, ("body", "message_body", "text", "snippet")) or ""
+            body = (
+                _first_string(value, ("body", "messageText", "message_body", "text", "snippet"))
+                or ""
+            )
             sanitized_body, references = self._store_and_redact_email_secrets(body)
             credential_refs.extend(references)
             sanitized.append(
@@ -649,6 +759,160 @@ def _message_sequence(payload: Mapping[str, object]) -> tuple[Mapping[str, objec
             reason_code="message_list_missing",
         )
     return tuple(candidates)
+
+
+_OTP_KEYWORDS = (
+    "code",
+    "verification",
+    "verify",
+    "otp",
+    "one-time",
+    "one time",
+    "passcode",
+    "security code",
+    "sign in",
+    "sign-in",
+    "log in",
+    "login",
+    "confirm",
+    "authenticate",
+)
+_OTP_NEAR = re.compile(
+    r"(?:code|otp|passcode|verification|pin)[^0-9a-z]{0,25}([0-9]{4,8})", re.IGNORECASE
+)
+_OTP_DIGITS = re.compile(r"\b([0-9]{4,8})\b")
+
+
+def _extract_otp(subject: str, body: str) -> str | None:
+    """Extract a 4-8 digit one-time code from an OTP/verification email."""
+
+    text = f"{subject}\n{body}"
+    lowered = text.casefold()
+    if not any(keyword in lowered for keyword in _OTP_KEYWORDS):
+        return None
+    near = _OTP_NEAR.search(text)
+    if near:
+        return near.group(1)
+    digits = _OTP_DIGITS.findall(text)
+    return digits[0] if digits else None
+
+
+# A sign-in email is one whose subject/body is about confirming a login/device.
+_LOGIN_EMAIL_KEYWORDS = (
+    "verify",
+    "verification",
+    "confirm",
+    "sign in",
+    "sign-in",
+    "log in",
+    "login",
+    "new device",
+    "new login",
+    "activate",
+    "authenticate",
+    "secure your account",
+    "it's you",
+    "it is you",
+)
+# URL tokens that mark the actual sign-in/verification link (not a footer/help link).
+_LOGIN_LINK_HINTS = (
+    "notification-station",
+    "notifications/cta",
+    "/cta/",
+    "deliverymethod",
+    "login-verify",
+    "login_verify",
+    "verify-email",
+    "verify_email",
+    "email-verification",
+    "verification",
+    "verify",
+    "confirm",
+    "secure-login",
+    "signin",
+    "sign-in",
+    "one-time",
+    "onetime",
+    "magiclink",
+    "magic-link",
+    "activate",
+    "sso",
+    "auth",
+    "token",
+)
+_URL_RE = re.compile(r"https?://[^\s\"'<>)\]}]+", re.IGNORECASE)
+# Footer/marketing links to ignore when several URLs are present.
+_LINK_STOPWORDS = (
+    "unsubscribe",
+    "privacy",
+    "/legal",
+    "terms",
+    "help.",
+    "/help",
+    "support.",
+    "cookie",
+    "preferences",
+    "manage-preferences",
+)
+# Static assets and open/click tracking that are never the sign-in link.
+_LINK_ASSET_MARKERS = (
+    "hsappstatic.net",
+    "/emailimages/",
+    "hubspotlinks.com",
+    "/cto/",
+    "sib.googleusercontent",
+    "list-manage",
+    "/track",
+    "/open?",
+    "pixel",
+)
+_ASSET_SUFFIXES = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".css",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".webp",
+)
+
+
+def _extract_login_link(subject: str, body: str) -> str | None:
+    """Extract a sign-in/verification magic link from a login email.
+
+    Returns the most likely verification URL and never a static asset, tracking
+    pixel, or marketing/footer link. Only emails that read like a sign-in
+    confirmation are considered, so ordinary mail is ignored.
+    """
+
+    text = f"{subject}\n{body}"
+    lowered_text = text.casefold()
+    if not any(keyword in lowered_text for keyword in _LOGIN_EMAIL_KEYWORDS):
+        return None
+    # HTML bodies may still be entity-encoded; normalize the common ampersand.
+    normalized = body.replace("&amp;", "&")
+    candidates: list[str] = []
+    for match in _URL_RE.finditer(normalized):
+        url = match.group(0).rstrip(".,);]}'\"")
+        low = url.casefold()
+        if any(stop in low for stop in _LINK_STOPWORDS):
+            continue
+        if any(marker in low for marker in _LINK_ASSET_MARKERS):
+            continue
+        if low.split("?", 1)[0].endswith(_ASSET_SUFFIXES):
+            continue
+        candidates.append(url)
+    if not candidates:
+        return None
+    # Prefer a URL whose path/query clearly marks it as the sign-in link.
+    for url in candidates:
+        if any(hint in url.casefold() for hint in _LOGIN_LINK_HINTS):
+            return url
+    # Otherwise fall back to the first real (non-asset, non-footer) link.
+    return candidates[0]
 
 
 def _validate_email(value: str) -> str:
