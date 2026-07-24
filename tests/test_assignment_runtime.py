@@ -137,6 +137,7 @@ def test_first_browser_operation_contains_task_and_provider_allowlist() -> None:
     assert kwargs["allowed_domains"] == [
         "developers.hubspot.com",
         "app.hubspot.com",
+        "*.hubspot.com",
     ]
     assert "STRICT APP TRACE: HubSpot" in task
     assert "Development" in task

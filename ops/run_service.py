@@ -33,7 +33,7 @@ from ops.credential_validator import (
     hubspot_validation_policy,
     pipedrive_validation_policy,
 )
-from ops.browser_link_log import log_event
+from ops.browser_link_log import log_event, url_host
 from ops.effect_ledger import SQLiteEffectStore
 from ops.gmail_worker import GmailWorker
 from ops.graph import DurableOperationsWorkflow, WorkflowDependencies, build_graph
@@ -523,20 +523,36 @@ class RunService:
             return None
         self._otp_attempts[run_id] = self._otp_attempts.get(run_id, 0) + 1
 
-        # The OTP email may lag the browser request; retry briefly (interruptible).
+        # The verification email may lag the browser request; retry briefly
+        # (interruptible). A magic SIGN-IN LINK takes priority over a numeric
+        # code: providers like HubSpot device verification send a one-time link
+        # the agent must open in its own live session to finish signing in.
+        link: str | None = None
         code: str | None = None
         for _attempt in range(3):
             try:
-                code = asyncio.run(self._gmail_worker.fetch_latest_otp())
+                link = asyncio.run(self._gmail_worker.fetch_latest_login_link())
             except Exception:
-                code = None
-            if code or self._email_poller_stop.wait(5):
+                link = None
+            if not link:
+                try:
+                    code = asyncio.run(self._gmail_worker.fetch_latest_otp())
+                except Exception:
+                    code = None
+            if link or code or self._email_poller_stop.wait(5):
                 break
-        if not code:
-            return None
-        return self.resume_run(
-            run_id, signal="completed", browser_login={"login_otp": SecretStr(code)}
-        )
+        if link:
+            log_event("browser.verify_link.fetched", run_id=run_id, link_host=url_host(link))
+            return self.resume_run(
+                run_id,
+                signal="completed",
+                browser_login={"login_verification_url": SecretStr(link)},
+            )
+        if code:
+            return self.resume_run(
+                run_id, signal="completed", browser_login={"login_otp": SecretStr(code)}
+            )
+        return None
 
     def poll_waiting_runs(self, *, limit: int = 100) -> int:
         """Poll every run awaiting a provider reply; returns how many were polled.

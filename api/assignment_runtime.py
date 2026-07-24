@@ -63,6 +63,9 @@ _ASSIGNMENT_POLICIES: dict[str, BrowserHostPolicy] = {
         app_slug="hubspot",
         active=True,
         exact_hosts=("developers.hubspot.com", "app.hubspot.com"),
+        # Sign-in and regional app subdomains (app-na2, app-eu1, ...) plus the
+        # emailed one-time sign-in link all live under *.hubspot.com.
+        vendor_wildcard_domains=("hubspot.com",),
     ),
     "pipedrive": BrowserHostPolicy(
         app_slug="pipedrive",

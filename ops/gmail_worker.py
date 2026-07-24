@@ -293,6 +293,53 @@ class GmailWorker:
                 return code
         return None
 
+    async def fetch_latest_login_link(self, *, query: str = "newer_than:1h") -> str | None:
+        """Return the most recent emailed sign-in verification LINK, if any.
+
+        Some providers (e.g. HubSpot device verification) send a magic link rather
+        than a numeric code: the agent must open the link in its own live session
+        to complete sign-in. This reads recent messages, finds the newest sign-in
+        verification email, and extracts the verification URL. The URL is a
+        short-lived secret returned only to be injected as a Browser Use
+        ``sensitive_data`` placeholder; it is never persisted or logged.
+        """
+
+        await self.ensure_connected()
+        try:
+            data = await asyncio.to_thread(
+                self._execute_checked,
+                "GMAIL_FETCH_EMAILS",
+                {"max_results": 8, "query": query},
+            )
+        except (ConfigurationRequiredError, ProviderContractError, ProviderOperationError):
+            raise
+        except Exception:
+            raise ProviderOperationError(
+                capability="Composio Gmail verification-link fetch",
+                reason_code="provider_response_incompatible",
+            ) from None
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return None
+
+        def _ts(message: object) -> str:
+            if isinstance(message, Mapping):
+                value = message.get("messageTimestamp") or message.get("internal_date")
+                return str(value) if value else ""
+            return ""
+
+        for message in sorted(messages, key=_ts, reverse=True):
+            if not isinstance(message, Mapping):
+                continue
+            subject = _first_string(message, ("subject",)) or ""
+            body = (
+                _first_string(message, ("messageText", "body", "preview", "snippet")) or ""
+            )
+            link = _extract_login_link(subject, body)
+            if link:
+                return link
+        return None
+
     async def reply(self, thread_id: str, body: str, idempotency_key: str) -> GmailSendResult:
         safe_thread_id = _validate_identifier(thread_id, "thread_id")
         _validate_message("Reply", body)
@@ -746,6 +793,124 @@ def _extract_otp(subject: str, body: str) -> str | None:
         return near.group(1)
     digits = _OTP_DIGITS.findall(text)
     return digits[0] if digits else None
+
+
+# A sign-in email is one whose subject/body is about confirming a login/device.
+_LOGIN_EMAIL_KEYWORDS = (
+    "verify",
+    "verification",
+    "confirm",
+    "sign in",
+    "sign-in",
+    "log in",
+    "login",
+    "new device",
+    "new login",
+    "activate",
+    "authenticate",
+    "secure your account",
+    "it's you",
+    "it is you",
+)
+# URL tokens that mark the actual sign-in/verification link (not a footer/help link).
+_LOGIN_LINK_HINTS = (
+    "notification-station",
+    "notifications/cta",
+    "/cta/",
+    "deliverymethod",
+    "login-verify",
+    "login_verify",
+    "verify-email",
+    "verify_email",
+    "email-verification",
+    "verification",
+    "verify",
+    "confirm",
+    "secure-login",
+    "signin",
+    "sign-in",
+    "one-time",
+    "onetime",
+    "magiclink",
+    "magic-link",
+    "activate",
+    "sso",
+    "auth",
+    "token",
+)
+_URL_RE = re.compile(r"https?://[^\s\"'<>)\]}]+", re.IGNORECASE)
+# Footer/marketing links to ignore when several URLs are present.
+_LINK_STOPWORDS = (
+    "unsubscribe",
+    "privacy",
+    "/legal",
+    "terms",
+    "help.",
+    "/help",
+    "support.",
+    "cookie",
+    "preferences",
+    "manage-preferences",
+)
+# Static assets and open/click tracking that are never the sign-in link.
+_LINK_ASSET_MARKERS = (
+    "hsappstatic.net",
+    "/emailimages/",
+    "hubspotlinks.com",
+    "/cto/",
+    "sib.googleusercontent",
+    "list-manage",
+    "/track",
+    "/open?",
+    "pixel",
+)
+_ASSET_SUFFIXES = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".css",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".webp",
+)
+
+
+def _extract_login_link(subject: str, body: str) -> str | None:
+    """Extract a sign-in/verification magic link from a login email.
+
+    Returns the most likely verification URL and never a static asset, tracking
+    pixel, or marketing/footer link. Only emails that read like a sign-in
+    confirmation are considered, so ordinary mail is ignored.
+    """
+
+    text = f"{subject}\n{body}"
+    lowered_text = text.casefold()
+    if not any(keyword in lowered_text for keyword in _LOGIN_EMAIL_KEYWORDS):
+        return None
+    # HTML bodies may still be entity-encoded; normalize the common ampersand.
+    normalized = body.replace("&amp;", "&")
+    candidates: list[str] = []
+    for match in _URL_RE.finditer(normalized):
+        url = match.group(0).rstrip(".,);]}'\"")
+        low = url.casefold()
+        if any(stop in low for stop in _LINK_STOPWORDS):
+            continue
+        if any(marker in low for marker in _LINK_ASSET_MARKERS):
+            continue
+        if low.split("?", 1)[0].endswith(_ASSET_SUFFIXES):
+            continue
+        candidates.append(url)
+    if not candidates:
+        return None
+    # Prefer a URL whose path/query clearly marks it as the sign-in link.
+    for url in candidates:
+        if any(hint in url.casefold() for hint in _LOGIN_LINK_HINTS):
+            return url
+    # Otherwise fall back to the first real (non-asset, non-footer) link.
+    return candidates[0]
 
 
 def _validate_email(value: str) -> str:

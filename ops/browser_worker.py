@@ -705,9 +705,22 @@ def _render_browser_task(
     trace_note = f"{render_browser_api_trace(trace)}\n\n" if trace is not None else ""
     has_login = "login_email" in login_fields or "login_password" in login_fields
     has_otp = "login_otp" in login_fields
+    has_verify_link = "login_verification_url" in login_fields
     login_note = ""
     password_hard_stop = "entering a password, "  # pragma: allowlist secret
     otp_hard_stop = "any MFA/OTP/2FA code, email or phone verification, "
+    if has_verify_link:
+        # The START url is the one-time sign-in link fetched from the owner's
+        # inbox; opening it completes sign-in, so email verification is no longer
+        # a hard stop for this step.
+        otp_hard_stop = ""
+        login_note += (
+            "SIGN-IN LINK: The START url above is a one-time sign-in link that was emailed to the "
+            "account owner and fetched for you. Opening it in this browser IS the email "
+            "verification. Navigate directly to it now, let it load and finish signing you in, "
+            "then continue to the API credentials page. Do NOT stop for a 'check your email' "
+            "prompt. If the link shows expired or invalid, stop with hitl_required=true.\n\n"
+        )
     if has_login:
         password_hard_stop = ""
         login_note += (

@@ -30,6 +30,36 @@ _ORIGINAL_STARTUP = LocalRunService.startup
 _INSTALLED = False
 
 
+def _verification_target(
+    sensitive_data: Mapping[str, str] | None, patterns: tuple[str, ...]
+) -> str | None:
+    """Return an allowlisted one-time sign-in link to navigate to, if supplied."""
+
+    if not sensitive_data:
+        return None
+    candidate = sensitive_data.get("login_verification_url")
+    if not candidate:
+        return None
+    try:
+        safe = browser_worker_module.sanitize_browser_url(candidate)
+    except Exception:
+        return None
+    if browser_worker_module.is_allowed_browser_url(safe, patterns):
+        return safe
+    return None
+
+
+def _sensitive_without_verify_url(
+    sensitive_data: Mapping[str, str] | None,
+) -> dict[str, str] | None:
+    """Drop the verification URL from the provider form-secret payload."""
+
+    if not sensitive_data:
+        return None
+    filtered = {k: v for k, v in sensitive_data.items() if k != "login_verification_url"}
+    return filtered or None
+
+
 async def _retained_run_assignment_task(
     worker: AssignmentBrowserWorker,
     *,
@@ -56,27 +86,37 @@ async def _retained_run_assignment_task(
     allowed = assignment_allowed_hosts(research)
     patterns = browser_worker_module.validate_allowed_domains(allowed.patterns())
     trace = get_browser_api_trace(research.app_slug)
-    try:
-        target_url = browser_worker_module._official_target_url(
-            research, patterns, preferred_url=trace.start_url if trace is not None else None
-        )
-    except Exception as exc:
+    # A fetched one-time sign-in link (from the owner's inbox) becomes the exact
+    # navigation target so the agent opens it in this same live session to finish
+    # signing in. It is validated against the app's allowlist and is never a form
+    # secret, so it is stripped from the provider sensitive_data payload.
+    verify_url = _verification_target(sensitive_data, patterns)
+    if verify_url is not None:
+        target_url = verify_url
+        log_event("browser.verify_link.navigate", handle=handle, target_host=url_host(verify_url))
+    else:
+        try:
+            target_url = browser_worker_module._official_target_url(
+                research, patterns, preferred_url=trace.start_url if trace is not None else None
+            )
+        except Exception as exc:
+            log_event(
+                "browser.target.unavailable",
+                level=40,
+                handle=handle,
+                app_slug=research.app_slug,
+                allowed_hosts=list(patterns),
+                error=type(exc).__name__,
+            )
+            raise
         log_event(
-            "browser.target.unavailable",
-            level=40,
+            "browser.target.resolved",
             handle=handle,
-            app_slug=research.app_slug,
+            target_host=url_host(target_url),
             allowed_hosts=list(patterns),
-            error=type(exc).__name__,
         )
-        raise
-    log_event(
-        "browser.target.resolved",
-        handle=handle,
-        target_host=url_host(target_url),
-        allowed_hosts=list(patterns),
-    )
     login_fields = tuple(sensitive_data) if sensitive_data else ()
+    run_sensitive_data = _sensitive_without_verify_url(sensitive_data)
     task = (
         browser_worker_module._render_browser_task(
             target_url, patterns, resume_signal, login_fields, trace=trace
@@ -96,8 +136,8 @@ async def _retained_run_assignment_task(
         "enable_recording": False,
         "allowed_domains": list(patterns),
     }
-    if sensitive_data:
-        run_kwargs["sensitive_data"] = dict(sensitive_data)
+    if run_sensitive_data:
+        run_kwargs["sensitive_data"] = run_sensitive_data
     provider_session = worker._provider_sessions.get(context.session_id)
     if provider_session:
         run_kwargs["session_id"] = provider_session
