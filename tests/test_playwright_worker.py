@@ -95,6 +95,10 @@ def _worker() -> PlaywrightBrowserWorker:
 
 
 def test_live_lifecycle_and_secret_injection() -> None:
+    """Page work MUST be submitted to the worker's owning loop (worker._loop.run);
+    touching session.page from a foreign loop would hang, which is exactly the
+    event-loop hazard the BrowserLoop exists to remove."""
+
     async def _flow() -> tuple[bool, bool, str, str]:
         worker = _worker()
         try:
@@ -103,19 +107,25 @@ def test_live_lifecycle_and_secret_injection() -> None:
             pytest.skip(f"Chromium not launchable in this environment: {type(exc).__name__}")
         registered = context.session_id in worker._sessions
         session = worker._sessions[context.session_id]
-        # A controlled local login form (no external network).
-        await session.page.set_content(
-            "<form><input type='email' name='email'>"
-            "<input type='password' name='password'></form>"
-        )
+
         from ops.playwright_worker import _has_password_field, _inject_login
 
-        had_password = await _has_password_field(session.page)
-        await _inject_login(
-            session.page, {"login_email": "ops@example.test", "login_password": "  spaced secret  "}
-        )
-        email_val = await session.page.locator("input[type='email']").input_value()
-        pw_val = await session.page.locator("input[type='password']").input_value()
+        async def _drive() -> tuple[bool, str, str]:
+            # A controlled local login form (no external network).
+            await session.page.set_content(
+                "<form><input type='email' name='email'>"
+                "<input type='password' name='password'></form>"
+            )
+            had_password = await _has_password_field(session.page)
+            await _inject_login(
+                session.page,
+                {"login_email": "ops@example.test", "login_password": "  spaced secret  "},
+            )
+            email_val = await session.page.locator("input[type='email']").input_value()
+            pw_val = await session.page.locator("input[type='password']").input_value()
+            return had_password, email_val, pw_val
+
+        had_password, email_val, pw_val = await worker._loop.run(_drive())
         await worker.stop(context)
         return registered, had_password, email_val, pw_val
 

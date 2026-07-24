@@ -12,20 +12,20 @@ Security parity with the Browser Use path: the same reviewed per-app host policy
 the same bounded ``BrowserObservation`` (no raw-credential container), and secrets
 injected by code and surfaced to guidance only as placeholder key names.
 
-KNOWN FOLLOW-UP before prod wiring (Phase E): Playwright's async objects are bound
-to the event loop that created them. The current orchestrator runs each graph node
-in its own ``asyncio.run`` loop, so a single browser session cannot yet span
-start -> navigate -> resume across those separate loops. The fix is a dedicated
-browser thread owning one persistent loop, with methods submitting coroutines to
-it (``run_coroutine_threadsafe``). This phase is sandbox-only and single-loop, so
-that runner is deliberately deferred and must land before Phase E.
+Event-loop ownership: Playwright's async objects are bound to the loop that
+created them, and the orchestrator runs each graph node in its own
+``asyncio.run`` loop. Every Playwright call here is therefore submitted to the
+one persistent loop owned by ``ops.browser_loop.BrowserLoop``, so a session
+created during ``start`` stays valid through ``navigate`` and ``resume`` no matter
+how many short-lived caller loops come and go.
 """
 
 from __future__ import annotations
 
 import importlib
+import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
@@ -33,6 +33,7 @@ from uuid import uuid4
 
 from ops.browser_api_trace_catalog import get_browser_api_trace
 from ops.browser_host_policy import BrowserPolicyInactiveError, build_browser_allowed_hosts
+from ops.browser_loop import BrowserLoop, shared_browser_loop
 from ops.browser_worker import (
     BrowserObservation,
     BrowserSessionContext,
@@ -41,8 +42,10 @@ from ops.browser_worker import (
     validate_allowed_domains,
 )
 from ops.config import Settings
-from ops.models import OperationalResearch
+from ops.credential_capture_specs import get_capture_spec
+from ops.models import OperationalResearch, validate_vault_reference
 from ops.provider_errors import ConfigurationRequiredError, ProviderOperationError
+from ops.secret_store import SecretStore
 
 _INACTIVITY_WINDOW = timedelta(minutes=15)
 _MAXIMUM_WINDOW = timedelta(hours=4)
@@ -85,13 +88,26 @@ class _PwSession:
     context: Any
     page: Any
     patterns: tuple[str, ...] = ()
+    # Latest sanitized screenshot (PNG bytes) for the HITL live view.
+    screenshot: bytes | None = field(default=None)
+    screenshot_at: str | None = field(default=None)
 
 
 class PlaywrightBrowserWorker:
     """BrowserProvider backed by local Chromium via Playwright."""
 
-    def __init__(self, *, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        settings: Settings | None = None,
+        secret_store: SecretStore | None = None,
+        loop: BrowserLoop | None = None,
+    ) -> None:
         self._settings = settings or Settings.from_env()
+        self._secret_store = secret_store
+        # All Playwright work runs on ONE persistent loop so a session survives
+        # the orchestrator's separate per-node asyncio.run loops.
+        self._loop = loop or shared_browser_loop()
         self._sessions: dict[str, _PwSession] = {}
         self._research: dict[str, OperationalResearch] = {}
 
@@ -114,15 +130,23 @@ class PlaywrightBrowserWorker:
                 capability="Playwright browser",
                 reason_code="playwright_not_installed",
             ) from None
-        playwright = await module.async_playwright().start()
+
+        async def _launch() -> tuple[Any, Any, Any, Any]:
+            playwright = await module.async_playwright().start()
+            try:
+                browser = await playwright.chromium.launch(
+                    headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
+                )
+                context = await browser.new_context()
+                page = await context.new_page()
+            except Exception:
+                await _safe(playwright.stop)
+                raise
+            return playwright, browser, context, page
+
         try:
-            browser = await playwright.chromium.launch(
-                headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
-            )
-            context = await browser.new_context()
-            page = await context.new_page()
+            playwright, browser, context, page = await self._loop.run(_launch())
         except Exception:
-            await _safe(playwright.stop)
             raise ProviderOperationError(
                 capability="Playwright browser", reason_code="provider_request_failed"
             ) from None
@@ -155,17 +179,24 @@ class PlaywrightBrowserWorker:
         self._research[context.session_id] = research
         patterns = self._resolve_patterns(research)
         session.patterns = patterns
-        # REAL enforcement: install the host guard before any navigation.
-        await session.context.route("**/*", make_route_handler(patterns))
 
         trace = get_browser_api_trace(research.app_slug)
         target = trace.start_url if trace is not None else research.developer_portal_url
         if not target or not navigation_allowed(target, patterns):
             return _blocked(target or "https://unknown.invalid/")
 
-        try:
-            await session.page.goto(target, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
-        except Exception:
+        async def _go() -> bool:
+            # REAL enforcement: install the host guard before any navigation.
+            await session.context.route("**/*", make_route_handler(patterns))
+            try:
+                await session.page.goto(
+                    target, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
+                )
+            except Exception:
+                return False
+            return True
+
+        if not await self._loop.run(_go()):
             # A blocked navigation (host guard) or a load failure: fail closed.
             return _blocked(target)
 
@@ -205,15 +236,25 @@ class PlaywrightBrowserWorker:
         for the deterministic/reference apps. The LLM decider will refine this.
         """
 
-        current = sanitize_browser_url(_page_url(session.page))
+        async def _inspect() -> tuple[str, str, bool]:
+            url = _page_url(session.page)
+            try:
+                title = await session.page.title()
+            except Exception:
+                title = ""
+            has_password = await _has_password_field(session.page)
+            if has_password and sensitive_data:
+                await _inject_login(session.page, sensitive_data)
+                has_password = await _has_password_field(session.page)
+            return url, (title if isinstance(title, str) else ""), has_password
+
+        raw_url, raw_title, has_password = await self._loop.run(_inspect())
+        current = sanitize_browser_url(raw_url)
         if not navigation_allowed(current, session.patterns):
             return _blocked(current)
-        title = (_page_title(session.page) or "Onboarding page")[:500]
-
-        has_password = await _has_password_field(session.page)
-        if has_password and sensitive_data:
-            await _inject_login(session.page, sensitive_data)
-            has_password = await _has_password_field(session.page)
+        title = (raw_title or "Onboarding page")[:500]
+        # Refresh the HITL live view for this step (best effort, never fatal).
+        await self.refresh_live_view(session)
 
         if has_password:
             return BrowserObservation(
@@ -241,6 +282,92 @@ class PlaywrightBrowserWorker:
             ) from None
         return validate_allowed_domains(allowed.patterns())
 
+    async def auto_capture_credentials(
+        self, handle: str, app_slug: str, secret_store: SecretStore | None = None
+    ) -> dict[str, str] | None:
+        """Deterministically read the app's credential from the live page and vault it.
+
+        Reuses the same reviewed capture specs as the Browser Use path: navigate to
+        the spec URL (inside the allowlist), verify the page host, then match input
+        values against the spec's strict pattern. The value is never returned, never
+        logged, and never shown to an LLM — only a ``vault://`` reference leaves.
+        Returns None whenever capture is not possible so the caller can fall back to
+        owner submission.
+        """
+
+        store = secret_store or self._secret_store
+        session = self._sessions.get(handle)
+        spec = get_capture_spec(app_slug)
+        if session is None or spec is None or store is None:
+            return None
+        if not navigation_allowed(spec.url, session.patterns):
+            return None
+        pattern = re.compile(spec.value_pattern)
+
+        async def _capture() -> str | None:
+            try:
+                await session.page.goto(
+                    spec.url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
+                )
+                await session.page.wait_for_timeout(1_500)
+            except Exception:
+                return None
+            host = urlsplit(_page_url(session.page)).hostname or ""
+            if not (host == spec.vendor_domain or host.endswith("." + spec.vendor_domain)):
+                return None
+            try:
+                inputs = session.page.locator("input")
+                total = await inputs.count()
+            except Exception:
+                return None
+            for index in range(min(int(total), 60)):
+                try:
+                    value = await inputs.nth(index).input_value(timeout=2_000)
+                except Exception:
+                    continue
+                candidate = value.strip() if isinstance(value, str) else ""
+                if candidate and pattern.match(candidate):
+                    return candidate
+            return None
+
+        token = await self._loop.run(_capture())
+        if token is None:
+            return None
+        reference = store.put(app_slug=app_slug, kind=spec.field_kind, value=token)
+        del token
+        return {spec.field_kind: validate_vault_reference(reference)}
+
+    async def refresh_live_view(self, session: _PwSession) -> bool:
+        """Capture a PNG screenshot of the current page for the HITL live view.
+
+        Self-hosted Playwright has no provider-hosted live URL, so the live view is
+        served from these periodically refreshed screenshots. A screenshot is page
+        pixels only — it can show a credential page, so it is held in memory for the
+        session and never written to disk or logs.
+        """
+
+        async def _shot() -> bytes | None:
+            try:
+                data = await session.page.screenshot(type="png", full_page=False)
+            except Exception:
+                return None
+            return data if isinstance(data, bytes) else None
+
+        image = await self._loop.run(_shot())
+        if image is None:
+            return False
+        session.screenshot = image
+        session.screenshot_at = datetime.now(UTC).isoformat()
+        return True
+
+    def latest_screenshot(self, handle: str) -> tuple[bytes, str] | None:
+        """Return the newest screenshot for a session handle, if any."""
+
+        session = self._sessions.get(handle)
+        if session is None or session.screenshot is None or session.screenshot_at is None:
+            return None
+        return session.screenshot, session.screenshot_at
+
     async def stop(self, context: BrowserSessionContext) -> None:
         session = self._sessions.pop(context.session_id, None)
         if session is not None:
@@ -252,9 +379,17 @@ class PlaywrightBrowserWorker:
         self._sessions.clear()
 
     async def _teardown(self, session: _PwSession) -> None:
-        await _safe(session.context.close)
-        await _safe(session.browser.close)
-        await _safe(session.playwright.stop)
+        async def _shutdown() -> None:
+            await _safe(session.context.close)
+            await _safe(session.browser.close)
+            await _safe(session.playwright.stop)
+
+        # Teardown must also run on the owning loop.
+        try:
+            await self._loop.run(_shutdown())
+        except Exception:
+            pass
+        session.screenshot = None
 
 
 # --- small helpers (kept module-level for unit testing) -----------------------
@@ -270,12 +405,6 @@ async def _safe(coro_fn: Any) -> None:
 def _page_url(page: Any) -> str:
     url = getattr(page, "url", "")
     return url if isinstance(url, str) and url else "https://unknown.invalid/"
-
-
-def _page_title(page: Any) -> str:
-    # Playwright's title() is async; observation uses a best-effort cached value.
-    getter = getattr(page, "_cached_title", None)
-    return getter if isinstance(getter, str) else ""
 
 
 async def _has_password_field(page: Any) -> bool:
