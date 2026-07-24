@@ -250,13 +250,20 @@ class GmailWorker:
                 reason_code="provider_response_incompatible",
             ) from None
 
-    async def fetch_latest_otp(self, *, query: str = "newer_than:1h in:anywhere") -> str | None:
+    async def fetch_latest_otp(
+        self,
+        *,
+        query: str = "newer_than:1h in:anywhere",
+        trusted_domains: tuple[str, ...] = (),
+    ) -> str | None:
         """Return the most recent one-time login code from the connected inbox.
 
-        Reads recent messages (raw, never logged), finds the newest one whose
-        subject/body looks like a verification/OTP email, and extracts the code.
-        The value is a short-lived secret: it is returned only to be injected as a
-        Browser Use ``sensitive_data`` placeholder and is never persisted or logged.
+        Reads recent messages (raw, never logged), prefers senders on a trusted
+        domain when one is supplied, finds the newest message whose subject/body is
+        a verification/OTP email, and extracts the code with hardened, false-
+        positive-resistant heuristics. The value is a short-lived secret: it is
+        returned only to be injected as a Browser Use ``sensitive_data``
+        placeholder and is never persisted, logged, or sent to an LLM.
         """
 
         await self.ensure_connected()
@@ -276,16 +283,7 @@ class GmailWorker:
         messages = data.get("messages")
         if not isinstance(messages, list):
             return None
-
-        def _ts(message: object) -> str:
-            if isinstance(message, Mapping):
-                value = message.get("messageTimestamp") or message.get("internal_date")
-                return str(value) if value else ""
-            return ""
-
-        for message in sorted(messages, key=_ts, reverse=True):
-            if not isinstance(message, Mapping):
-                continue
+        for message in _order_messages_by_trust(messages, trusted_domains):
             subject = _first_string(message, ("subject",)) or ""
             body = _first_string(message, ("messageText", "preview", "snippet", "body")) or ""
             code = _extract_otp(subject, body)
@@ -294,16 +292,20 @@ class GmailWorker:
         return None
 
     async def fetch_latest_login_link(
-        self, *, query: str = "newer_than:1h in:anywhere"
+        self,
+        *,
+        query: str = "newer_than:1h in:anywhere",
+        trusted_domains: tuple[str, ...] = (),
     ) -> str | None:
         """Return the most recent emailed sign-in verification LINK, if any.
 
         Some providers (e.g. HubSpot device verification) send a magic link rather
         than a numeric code: the agent must open the link in its own live session
-        to complete sign-in. This reads recent messages, finds the newest sign-in
-        verification email, and extracts the verification URL. The URL is a
-        short-lived secret returned only to be injected as a Browser Use
-        ``sensitive_data`` placeholder; it is never persisted or logged.
+        to complete sign-in. This reads recent messages, prefers senders on a
+        trusted domain when one is supplied, finds the newest sign-in verification
+        email, and extracts the verification URL. The URL is a short-lived secret
+        returned only to be injected as a Browser Use ``sensitive_data``
+        placeholder; it is never persisted or logged.
         """
 
         await self.ensure_connected()
@@ -323,16 +325,7 @@ class GmailWorker:
         messages = data.get("messages")
         if not isinstance(messages, list):
             return None
-
-        def _ts(message: object) -> str:
-            if isinstance(message, Mapping):
-                value = message.get("messageTimestamp") or message.get("internal_date")
-                return str(value) if value else ""
-            return ""
-
-        for message in sorted(messages, key=_ts, reverse=True):
-            if not isinstance(message, Mapping):
-                continue
+        for message in _order_messages_by_trust(messages, trusted_domains):
             subject = _first_string(message, ("subject",)) or ""
             body = _first_string(message, ("messageText", "body", "preview", "snippet")) or ""
             link = _extract_login_link(subject, body)
@@ -759,40 +752,115 @@ def _message_sequence(payload: Mapping[str, object]) -> tuple[Mapping[str, objec
     return tuple(candidates)
 
 
-_OTP_KEYWORDS = (
-    "code",
-    "verification",
-    "verify",
-    "otp",
-    "one-time",
-    "one time",
-    "passcode",
-    "security code",
-    "sign in",
-    "sign-in",
-    "log in",
-    "login",
-    "confirm",
-    "authenticate",
+# Cue words a genuine one-time code sits next to. Word-bounded so "pin" does not
+# match inside "shipping" and "code" does not match inside "encoded". Used both as
+# the presence gate and for proximity scoring.
+_OTP_CUE = re.compile(
+    r"\b(?:one[\s-]?time|verification|verify|security|confirmation|confirm|access|"
+    r"log[\s-]?in|login|sign[\s-]?in|authentication|auth|passcode|otp|pin|code)\b",
+    re.IGNORECASE,
 )
-_OTP_NEAR = re.compile(
-    r"(?:code|otp|passcode|verification|pin)[^0-9a-z]{0,25}([0-9]{4,8})", re.IGNORECASE
-)
-_OTP_DIGITS = re.compile(r"\b([0-9]{4,8})\b")
+# A numeric code: 4-8 digits, optionally split once by a single space or hyphen
+# ("123-456", "123 456"); never embedded in a longer number, word, URL, path,
+# decimal, or version. A trailing sentence period is allowed (the code may end a
+# sentence), but a "." or "-" or "/" FOLLOWED BY A DIGIT is not (that is a
+# decimal/version/IP/path, not a code).
+_OTP_CANDIDATE = re.compile(r"(?<![\w./-])(\d{3}[\s-]\d{3}|\d{4,8})(?![\w]|[./-]\d)")
+# An alphanumeric code, trusted ONLY when directly attached to an explicit cue word.
+# The cue is case-insensitive; the code stays uppercase-only so it cannot match a
+# lowercase prose word.
+_OTP_ALNUM_NEAR = re.compile(r"(?i:code|otp|passcode|pin)\b[^0-9A-Za-z]{0,12}([A-Z0-9]{5,8})\b")
+_OTP_YEARISH = re.compile(r"^(?:19|20)\d{2}$")
+
+
+def _normalize_code(token: str) -> str:
+    return re.sub(r"[\s-]", "", token)
+
+
+def _plausible_numeric_code(norm: str) -> bool:
+    if not norm.isdigit() or not 4 <= len(norm) <= 8:
+        return False
+    if len(norm) == 4 and _OTP_YEARISH.match(norm):
+        return False  # a bare 4-digit year is almost never an issued one-time code
+    if len(set(norm)) == 1:
+        return False  # 0000 / 111111: implausible as an issued code
+    return True
 
 
 def _extract_otp(subject: str, body: str) -> str | None:
-    """Extract a 4-8 digit one-time code from an OTP/verification email."""
+    """Extract a one-time verification code from an OTP/verification email.
+
+    Deterministic and local by design: a code is a short-lived secret and is never
+    sent to an LLM. Hardened against false positives — a numeric candidate is
+    accepted only when it sits near a verification cue, subject-line codes are
+    strongly preferred, split codes ("123-456") are normalized, and 4-digit years
+    or repeated-digit runs are rejected. Returns None rather than guessing when no
+    candidate is clearly a code.
+    """
 
     text = f"{subject}\n{body}"
-    lowered = text.casefold()
-    if not any(keyword in lowered for keyword in _OTP_KEYWORDS):
+    cue_positions = [match.start() for match in _OTP_CUE.finditer(text)]
+    if not cue_positions:
         return None
-    near = _OTP_NEAR.search(text)
-    if near:
-        return near.group(1)
-    digits = _OTP_DIGITS.findall(text)
-    return digits[0] if digits else None
+    # An alphanumeric code attached to an explicit cue word wins outright.
+    alnum = _OTP_ALNUM_NEAR.search(text)
+    if alnum and not alnum.group(1).isdigit():
+        return alnum.group(1)
+    subject_boundary = len(subject) + 1
+    best: str | None = None
+    best_distance = 10**9
+    for match in _OTP_CANDIDATE.finditer(text):
+        norm = _normalize_code(match.group(1))
+        if not _plausible_numeric_code(norm):
+            continue
+        distance = min(abs(match.start() - pos) for pos in cue_positions)
+        if match.start() < subject_boundary:
+            distance = min(distance, 15)  # subject codes frequently stand alone
+        if distance < best_distance:
+            best, best_distance = norm, distance
+    # Require the winning candidate to be reasonably near a cue; otherwise decline.
+    if best is not None and best_distance <= 60:
+        return best
+    return None
+
+
+def _sender_domain(message: Mapping[str, object]) -> str:
+    """Return the lowercased domain of a raw message's sender, or ''."""
+
+    sender = _first_string(message, ("from", "sender", "fromEmail", "from_email")) or ""
+    match = re.search(r"@([A-Za-z0-9.-]+)", sender)
+    return match.group(1).rstrip(".").casefold() if match else ""
+
+
+def _message_timestamp(message: object) -> str:
+    if isinstance(message, Mapping):
+        value = message.get("messageTimestamp") or message.get("internal_date")
+        return str(value) if value else ""
+    return ""
+
+
+def _order_messages_by_trust(
+    messages: list[object], trusted_domains: tuple[str, ...]
+) -> list[Mapping[str, object]]:
+    """Newest-first, but with senders on a trusted domain preferred (not required).
+
+    Trusted-domain preference guards against a spoofed email injecting a fake code
+    while never hard-excluding a legitimate provider that sends from a different
+    mail subdomain (a common real-world case), so it cannot cause false negatives.
+    """
+
+    valid = [message for message in messages if isinstance(message, Mapping)]
+    by_recency = sorted(valid, key=_message_timestamp, reverse=True)
+    trusted = tuple(domain.rstrip(".").casefold() for domain in trusted_domains if domain)
+    if not trusted:
+        return by_recency
+
+    def _is_trusted(message: Mapping[str, object]) -> int:
+        domain = _sender_domain(message)
+        matched = any(domain == parent or domain.endswith(f".{parent}") for parent in trusted)
+        return 0 if matched else 1
+
+    return sorted(by_recency, key=_is_trusted)  # stable: keeps recency within groups
 
 
 # A sign-in email is one whose subject/body is about confirming a login/device.
