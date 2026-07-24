@@ -24,6 +24,7 @@ from uuid import uuid4
 import httpx
 from pydantic import SecretStr
 
+from ops.browser_link_log import log_event, url_host
 from ops.browser_worker import BrowserWorker
 from ops.composio_capability import ComposioCapabilityPreflight, ComposioCapabilityReport
 from ops.config import Settings
@@ -34,7 +35,6 @@ from ops.credential_validator import (
     hubspot_validation_policy,
     pipedrive_validation_policy,
 )
-from ops.browser_link_log import log_event, url_host
 from ops.effect_ledger import SQLiteEffectStore
 from ops.gmail_worker import GmailWorker
 from ops.graph import DurableOperationsWorkflow, WorkflowDependencies, build_graph

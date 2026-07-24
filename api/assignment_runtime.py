@@ -21,12 +21,12 @@ import ops.browser_host_policy as browser_policy_module
 import ops.browser_worker as browser_worker_module
 import ops.composio_capability as composio_module
 from ops.browser_api_trace_catalog import get_browser_api_trace
-from ops.browser_link_log import log_event, url_host
 from ops.browser_host_policy import (
     BrowserAllowedHosts,
     BrowserHostPolicy,
     evaluate_navigation,
 )
+from ops.browser_link_log import log_event, url_host
 from ops.browser_worker import (
     BrowserObservation,
     BrowserSessionContext,
@@ -42,6 +42,7 @@ from ops.browser_worker import (
     _render_browser_task,
     _string,
     sanitize_browser_url,
+    to_browser_sensitive_data,
     validate_allowed_domains,
 )
 from ops.composio_capability import (
@@ -469,9 +470,7 @@ class AssignmentBrowserWorker(BrowserWorker):
             client = self._get_client()
             session = await _await_if_needed(client.sessions.get(provider_session_id))
         except Exception as exc:
-            log_event(
-                "browser.recover.error", level=30, handle=handle, error=type(exc).__name__
-            )
+            log_event("browser.recover.error", level=30, handle=handle, error=type(exc).__name__)
             return None
         live_url = _string(_dump(session).get("live_url"))
         if live_url:
@@ -512,7 +511,9 @@ class AssignmentBrowserWorker(BrowserWorker):
         try:
             browser = await _await_if_needed(client.browsers.create(profile_id=profile_id))
         except Exception as exc:
-            log_event("capture.browser_create_error", level=40, handle=handle, error=type(exc).__name__)
+            log_event(
+                "capture.browser_create_error", level=40, handle=handle, error=type(exc).__name__
+            )
             return None
         bdata = _dump(browser)
         cdp_url = _string(bdata.get("cdp_url"))
@@ -629,8 +630,9 @@ class AssignmentBrowserWorker(BrowserWorker):
             "enable_recording": False,
             "allowed_domains": list(patterns),
         }
-        if sensitive_data:
-            run_kwargs["sensitive_data"] = dict(sensitive_data)
+        browser_secrets = to_browser_sensitive_data(sensitive_data)
+        if browser_secrets:
+            run_kwargs["sensitive_data"] = browser_secrets
         provider_session = self._provider_sessions.get(context.session_id)
         if provider_session:
             run_kwargs["session_id"] = provider_session

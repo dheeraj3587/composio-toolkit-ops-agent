@@ -19,8 +19,8 @@ from api.models import ProviderState
 from api.service import LocalRunService
 from ops.browser_api_trace_catalog import get_browser_api_trace
 from ops.browser_host_policy import evaluate_navigation
-from ops.browser_worker import BrowserObservation, BrowserSessionContext, BrowserTaskOutput
 from ops.browser_link_log import field_keys, log_event, url_host
+from ops.browser_worker import BrowserObservation, BrowserSessionContext, BrowserTaskOutput
 from ops.models import OperationalResearch
 from ops.operational_research import EvidenceDocument, GeminiStructuredExtractor
 from ops.provider_errors import ProviderContractError, ProviderOperationError
@@ -47,17 +47,6 @@ def _verification_target(
     if browser_worker_module.is_allowed_browser_url(safe, patterns):
         return safe
     return None
-
-
-def _sensitive_without_verify_url(
-    sensitive_data: Mapping[str, str] | None,
-) -> dict[str, str] | None:
-    """Drop the verification URL from the provider form-secret payload."""
-
-    if not sensitive_data:
-        return None
-    filtered = {k: v for k, v in sensitive_data.items() if k != "login_verification_url"}
-    return filtered or None
 
 
 async def _retained_run_assignment_task(
@@ -116,7 +105,10 @@ async def _retained_run_assignment_task(
             allowed_hosts=list(patterns),
         )
     login_fields = tuple(sensitive_data) if sensitive_data else ()
-    run_sensitive_data = _sensitive_without_verify_url(sensitive_data)
+    # Map internal login keys to Browser Use ``x_`` placeholders (and drop the
+    # non-typed one-time sign-in URL) so the Cloud substitutes real values instead
+    # of typing a literal placeholder into the form.
+    run_sensitive_data = browser_worker_module.to_browser_sensitive_data(sensitive_data)
     task = (
         browser_worker_module._render_browser_task(
             target_url, patterns, resume_signal, login_fields, trace=trace
@@ -280,9 +272,7 @@ async def _retained_run_assignment_task(
     # intentionally retained in memory so the evaluator can inspect the completed
     # browser state. Explicit stop/shutdown remains the cleanup boundary.
     final_status = (
-        "credential_page_ready"
-        if output.reached_official_setup_page
-        else "developer_console_ready"
+        "credential_page_ready" if output.reached_official_setup_page else "developer_console_ready"
     )
     log_event(
         "browser.observation.ready",

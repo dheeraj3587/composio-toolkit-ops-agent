@@ -341,8 +341,9 @@ class BrowserWorker:
             "max_cost_usd": self._settings.browser_use_max_cost_usd,
             "enable_recording": False,
         }
-        if sensitive_data:
-            run_kwargs["sensitive_data"] = dict(sensitive_data)
+        browser_secrets = to_browser_sensitive_data(sensitive_data)
+        if browser_secrets:
+            run_kwargs["sensitive_data"] = browser_secrets
         try:
             run_handle = client.run(task, **run_kwargs)
             result = await _await_if_needed(run_handle)
@@ -688,11 +689,12 @@ def _render_browser_task(
     """Render the bounded onboarding task.
 
     When ``login_fields`` is non-empty the owner has submitted login credentials
-    that the Browser Use provider injects as secure placeholders (v3
-    ``sensitive_data``). The agent enters them via ``<secret>key</secret>``
-    placeholders it can never read; plain password entry is therefore no longer a
-    hard stop, but every other human-only gate (CAPTCHA, OTP/MFA, passkey,
-    device approval, billing, legal consent) still pauses for HITL.
+    that the Browser Use provider injects as secure ``sensitive_data``. The agent
+    enters them by typing the bare ``x_``-prefixed placeholder keys (e.g.
+    ``x_login_email``) verbatim; the Cloud replaces each with the real value and
+    the model never sees it. Plain password entry is therefore no longer a hard
+    stop, but every other human-only gate (CAPTCHA, OTP/MFA, passkey, device
+    approval, billing, legal consent) still pauses for HITL.
     """
 
     allowlist = ", ".join(allowed_domains)
@@ -726,13 +728,14 @@ def _render_browser_task(
         login_note += (
             "LOGIN CREDENTIALS: The account owner has provided sign-in credentials as secure "
             "placeholders. When you reach a sign-in form, ALWAYS attempt the sign-in yourself "
-            "first: type the account email/username using the placeholder <secret>login_email</secret> "
-            "and the password using the placeholder <secret>login_password</secret>, tick a "
-            "'Remember me'/'Keep me signed in' checkbox if one is present, then click the "
-            "Log in / Sign in button. Do NOT stop before you have actually filled both fields and "
-            "clicked submit. Use these placeholders ONLY inside the app's own login form on the "
-            "allowlisted hostnames. You cannot see their real values and must never print, echo, "
-            "or report them.\n"
+            "first: into the account email/username field type exactly x_login_email and into the "
+            "password field type exactly x_login_password (type those placeholder tokens verbatim "
+            "with nothing added — the system replaces each with the real value before it is "
+            "entered), tick a 'Remember me'/'Keep me signed in' checkbox if one is present, then "
+            "click the Log in / Sign in button. Do NOT stop before you have actually filled both "
+            "fields and clicked submit. Use these placeholders ONLY inside the app's own login "
+            "form on the allowlisted hostnames. You cannot see their real values and must never "
+            "print, echo, or report them.\n"
             "IMPORTANT: A 'Remember me' checkbox, a 'protected by reCAPTCHA' badge or footer text, "
             "or an invisible/background reCAPTCHA is NOT a CAPTCHA challenge and NOT a reason to "
             "stop — proceed and submit the form. Only treat it as a CAPTCHA hard stop if, after "
@@ -743,11 +746,12 @@ def _render_browser_task(
         otp_hard_stop = ""
         login_note += (
             "ONE-TIME CODE: A verification/OTP code sent to the owner's email is available as the "
-            "secure placeholder <secret>login_otp</secret>. When the site asks for the emailed "
-            "sign-in/verification code, type <secret>login_otp</secret> into the code field and "
-            "submit. Use it ONLY in the app's own verification form on the allowlisted hostnames. "
-            "You cannot see its real value and must never print, echo, or report it. If the code "
-            "is rejected as expired/invalid, stop with hitl_required=true.\n\n"
+            "secure placeholder x_login_otp. When the site asks for the emailed "
+            "sign-in/verification code, type exactly x_login_otp into the code field (type the "
+            "placeholder token verbatim — the system replaces it with the real code) and submit. "
+            "Use it ONLY in the app's own verification form on the allowlisted hostnames. You "
+            "cannot see its real value and must never print, echo, or report it. If the code is "
+            "rejected as expired/invalid, stop with hitl_required=true.\n\n"
         )
     return (
         "ROLE: You are an autonomous web agent helping an authorized account owner reach the "
@@ -807,45 +811,39 @@ def _render_browser_task(
     )
 
 
-def build_login_secrets(
+# Browser Use v3 substitutes a ``sensitive_data`` value ONLY when the agent
+# types the exact placeholder KEY, and the documented convention is a bare
+# ``x_``-prefixed key referenced directly in the task (e.g. ``x_user``) — NOT a
+# ``<secret>key</secret>`` wrapper, which the Cloud types literally into the
+# field. We therefore expose the owner login to Browser Use under ``x_`` keys and
+# reference those bare keys verbatim in the task text.
+_BROWSER_SECRET_KEYS: dict[str, str] = {
+    "login_email": "x_login_email",
+    "login_password": "x_login_password",  # pragma: allowlist secret
+    "login_otp": "x_login_otp",
+}
+
+
+def to_browser_sensitive_data(
     sensitive_data: Mapping[str, str] | None,
-    allowed_domains: tuple[str, ...],
 ) -> dict[str, str] | None:
-    """Map owner login credentials to Browser Use domain-scoped ``secrets``.
+    """Map internal owner-login keys to Browser Use ``sensitive_data`` placeholders.
 
-    The Cloud SDK fills login forms from ``secrets={domain: "user:pass"}`` and
-    the model never sees the values. The same credential pair is scoped to every
-    allowlisted domain so a redirect within the vendor still authenticates.
-    """
-
-    if not sensitive_data or not allowed_domains:
-        return None
-    email = sensitive_data.get("login_email")
-    password = sensitive_data.get("login_password")
-    if not email or not password:
-        return None
-    pair = f"{email}:{password}"
-    return {domain: pair for domain in allowed_domains}
-
-
-def otp_task_suffix(sensitive_data: Mapping[str, str] | None) -> str:
-    """Return a transient task instruction carrying an emailed one-time code.
-
-    The Cloud ``secrets`` mechanism only models user:password pairs, so a fetched
-    one-time code is passed as a bounded task instruction. It is short-lived,
-    single-use, and never written to run state, checkpoints, or logs.
+    Only the typed credential fields are forwarded, each under the ``x_`` key the
+    task references verbatim so the Cloud substitutes the real value. Non-typed
+    internal signals (for example the one-time sign-in URL, which is navigated to
+    rather than typed) are dropped so they never reach the provider as a form
+    secret. Returns ``None`` when there is nothing to inject.
     """
 
     if not sensitive_data:
-        return ""
-    code = sensitive_data.get("login_otp")
-    if not code:
-        return ""
-    return (
-        "\n\nONE-TIME CODE: When the site asks for the emailed sign-in/verification code, enter "
-        f"exactly {code} into the code field and submit. If it is rejected as expired or invalid, "
-        "stop with hitl_required=true."
-    )
+        return None
+    mapped = {
+        placeholder: sensitive_data[internal]
+        for internal, placeholder in _BROWSER_SECRET_KEYS.items()
+        if sensitive_data.get(internal)
+    }
+    return mapped or None
 
 
 def _classify_human_action(reason: str) -> HumanActionType:
