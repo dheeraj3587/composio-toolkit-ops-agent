@@ -27,6 +27,8 @@ operate it, and its security model.**
 11. [Production deployment](#11-production-deployment)
 12. [Testing and quality gates](#12-testing-and-quality-gates)
 13. [Operational notes and limitations](#13-operational-notes-and-limitations)
+14. [Application readiness matrix](#14-application-readiness-matrix)
+15. [Obtaining a captured credential](#15-obtaining-a-captured-credential)
 
 ---
 
@@ -417,4 +419,61 @@ relevant provider configuration.
 - **External providers are best‑effort.** Research enrichment, Composio, and email all degrade
   gracefully to the verified P1 baseline (or `configuration_required`) on outage rather than failing
   a run or fabricating a result.
+
+---
+
+## 14. Application readiness matrix
+
+Readiness reflects what the deployed system does **end‑to‑end today**. All browser apps support
+autonomous login injection; they differ in how far the credential is then carried automatically.
+
+| App | Access route | Autonomous login | Auto‑capture | Read‑only validation | End‑to‑end status |
+| --- | ------------ | :--------------: | :----------: | :------------------: | ----------------- |
+| **Pipedrive** | self‑serve (browser) | ✓ | ✓ | ✓ | **Fully autonomous** — navigate → capture → validate → bundle |
+| **HubSpot** | self‑serve (browser) | ✓ | manual submit | ✓ | Browser onboarding; owner submits, credential validated |
+| **Attio** | self‑serve (browser) | ✓ | manual submit | — | Browser onboarding; owner submits the credential |
+| **Twenty** | self‑serve (browser) | ✓ | manual submit | — | Browser onboarding; owner submits the credential |
+| **Zendesk** | self‑serve (browser) | ✓ | manual submit | — | Browser onboarding; owner submits the credential |
+| **Salesforce** | approval (browser) | ✓ | manual submit | — | Browser onboarding; owner submits the credential |
+| **Hubstaff** *(live‑demo seed)* | self‑serve (browser) | ✓ | manual submit | — | Browser onboarding; owner submits the credential |
+| **Google Ads** | gated | n/a | n/a | n/a | Controlled Composio Gmail outreach |
+| **WhatsApp Business** | gated | n/a | n/a | n/a | Controlled Composio Gmail outreach |
+| **Close** | gated | n/a | n/a | n/a | Controlled Composio Gmail outreach |
+| **Sherlock** | blocked | n/a | n/a | n/a | Blocked — verified to have no API |
+
+> **"Manual submit"** means the agent drives the browser to the credentials page (logging in
+> autonomously when creds are provided), and the owner then submits the obtained value through the
+> owner‑only credential endpoint, which stores it as a `vault://` reference and builds the same
+> reference‑only bundle. Auto‑capture + validation are being extended app‑by‑app; Pipedrive is the
+> reference end‑to‑end path.
+
+### Test account for browser onboarding
+
+Browser onboarding of the self‑serve apps above uses a **shared operator test login**. The account
+email is `anikatyonzon111@gmail.com`; the password is held in the operator's **gitignored**
+`private/TEST_ACCOUNT.md` (never committed) and is submitted at the HITL step (see
+[§8](#8-using-the-api), *resume with autonomous login*). Provision the account on each target app
+before running its onboarding.
+
+---
+
+## 15. Obtaining a captured credential
+
+Once a run has captured (or been submitted) a credential, the value lives **only** in the encrypted
+vault; the API, bundle, timeline, and UI expose `vault://` references, never the raw value. Raw
+values cross the boundary through exactly one deliberate, **owner‑only, loopback** endpoint — so in a
+container deployment the reveal is performed **from the host**, where the request originates on the
+api container's loopback interface:
+
+```bash
+# Requires ALLOW_LOCAL_CREDENTIAL_SUBMISSION=true in .env.production
+./scripts/reveal-credential.sh <run_id>
+# → { "run_id": "...", "credentials": { "access_token": "<raw value>", ... } }
+```
+
+The helper runs the reveal inside the `api` container over `127.0.0.1`, satisfying the loopback owner
+gate without exposing the endpoint to the network. Treat its output as a secret — this is the single
+intentional raw‑secret boundary in the system. (A browser‑UI reveal is intentionally **not**
+provided, to keep raw secrets off the network tier; exposing it there would be an explicit,
+separate security decision.)
 ```

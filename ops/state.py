@@ -131,6 +131,11 @@ class OperationsState(TypedDict, total=False):
 
     browser_profile_id: str
     browser_session_id: str
+    # The Browser Use *provider* session id, distinct from the local session
+    # handle. It MUST be declared here so LangGraph persists it in the encrypted
+    # checkpoint; otherwise an api restart loses it and a paused HITL run can no
+    # longer be resumed (provider_session_missing) and its live view is lost.
+    browser_provider_session_id: str
     browser_live_view_available: bool
     current_url: str
     browser_attempts: int

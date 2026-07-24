@@ -1557,7 +1557,9 @@ class RunService:
                         events.extend(outcome.events)
                     except Exception as exc:  # pragma: no cover - defensive
                         log_event(
-                            "browser.async.m6_error", level=40, run_id=run_id,
+                            "browser.async.m6_error",
+                            level=40,
+                            run_id=run_id,
                             error=type(exc).__name__,
                         )
                         next_status = "browser_running"
@@ -2268,6 +2270,49 @@ class RunService:
         except Exception:
             return None
 
+    def _email_credentials_bundle_change(
+        self,
+        record: Mapping[str, object],
+        company: CompanyProfile | None,
+        credential_refs: dict[str, str],
+    ) -> dict[str, object]:
+        """Merge emailed credential references into the run's reference-only bundle.
+
+        If a bundle already exists, the new ``vault://`` references are merged in.
+        When none exists yet and verified research + company are available, a
+        reference-only IntegratorBundle is built so the developer still receives a
+        usable handoff. Best-effort: any failure leaves the run completed without a
+        bundle rather than breaking the email poll.
+        """
+
+        existing_bundle = record.get("integrator_bundle")
+        if isinstance(existing_bundle, Mapping):
+            merged: dict[str, object] = dict(existing_bundle)
+            current_refs = merged.get("credential_refs")
+            refs: dict[str, str] = (
+                {str(k): str(v) for k, v in current_refs.items()}
+                if isinstance(current_refs, Mapping)
+                else {}
+            )
+            refs.update(credential_refs)
+            merged["credential_refs"] = refs
+            return {"integrator_bundle": merged}
+        research_payload = record.get("operational_research")
+        if company is None or not isinstance(research_payload, Mapping):
+            return {}
+        try:
+            research = OperationalResearch.model_validate(dict(research_payload))
+            bundle = build_integrator_bundle(
+                research=research,
+                company=company,
+                credential_refs=credential_refs,
+                validation=None,
+                stage="awaiting_provider",
+            )
+            return {"integrator_bundle": bundle.model_dump(mode="json")}
+        except Exception:
+            return {}
+
     def poll_email(self, run_id: str) -> dict[str, Any]:
         """Fetch the outreach thread, classify the latest reply, and advance.
 
@@ -2375,20 +2420,27 @@ class RunService:
                     raise KeyError("run was not found")
                 revision = int(record.get("state_revision", 0) or 0) + 1
                 previous_status = cast(RunStatus, record["status"])
-                validate_status_transition(previous_status, next_status, "poll_email")
                 changes: dict[str, object] = {
-                    "status": next_status,
                     "state_revision": revision,
                     "last_projected_revision": revision,
                     "external_actions": True,
                 }
                 if next_status == "credentials_ready" and credential_refs:
-                    bundle = dict(record.get("integrator_bundle") or {})
-                    existing_refs = dict(bundle.get("credential_refs") or {})
-                    existing_refs.update(credential_refs)
-                    if bundle:
-                        bundle["credential_refs"] = existing_refs
-                        changes["integrator_bundle"] = bundle
+                    # Credentials arrived by email. Advance through the two legal
+                    # hops (-> credentials_ready -> completed) so the gated/email
+                    # path terminates instead of dead-ending at credentials_ready
+                    # with no forward action (the only other credentials_ready ->
+                    # completed edge requires a browser_running submit). The emailed
+                    # vault references are merged into the reference-only bundle.
+                    validate_status_transition(previous_status, "credentials_ready", "poll_email")
+                    validate_status_transition("credentials_ready", "completed", "poll_email")
+                    changes["status"] = "completed"
+                    changes.update(
+                        self._email_credentials_bundle_change(record, company, credential_refs)
+                    )
+                else:
+                    validate_status_transition(previous_status, next_status, "poll_email")
+                    changes["status"] = next_status
                 updated = transaction.update_run(run_id, **changes)
                 transaction.append_audit_event(
                     run_id=run_id,
