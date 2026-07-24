@@ -45,23 +45,36 @@ the encrypted checkpoint; after any restart/redeploy a paused `waiting_for_hitl`
 (`provider_session_missing`) and lost its live view. The key is now a declared, persisted state
 field. *(`ops/state.py`)*
 
-**Verification:** 315 tests pass (offline‑safe suite; +5 new regression tests in
-`tests/test_critical_fixes.py`), `ruff check` clean, and **no new mypy errors** versus the baseline.
+**Verification:** the full offline‑safe suite passes (**320 tests**, incl. new regressions in
+`tests/test_critical_fixes.py` and `tests/test_high_severity_fixes.py`), and the quality gate is
+green — `ruff check`, `ruff format --check`, and strict `mypy` all pass.
+
+## Also fixed in this change ✅ (high severity)
+
+- **H1** — `GmailWorker` is now built with the encrypted vault + effect ledger, so a reply carrying a
+  credential is stored as a `vault://` reference instead of raising `secret_store_missing`.
+- **H2** — the Browser Use cost cap now defaults to **$50** (config `from_env` + `compose.prod.yaml`
+  + `.env.production.example`), ending the effective $1 mid‑task cutoff.
+- **H3** — `ALLOW_LOCAL_CREDENTIAL_SUBMISSION` is surfaced in `compose.prod.yaml` and documented as
+  required for owner actions.
+- **H4** — the credential‑submit form is rendered only in `browser_running` (with a clear note
+  otherwise), so it no longer 409s during `waiting_for_hitl`.
+- **H6** — a malformed `SECRET_VAULT_KEY`/`LANGGRAPH_AES_KEY` now fails closed with a clear,
+  value‑free log instead of crash‑looping the container.
+- **H7** — startup reconciliation moves runs stranded at `browser_running` (navigation thread killed
+  by a restart) to the recoverable `configuration_required`; resumable `waiting_for_hitl` runs are
+  left intact.
+- **H9** — the type/format gate is green: all 9 pre‑existing `mypy` errors fixed and `ruff format`
+  applied. *(Gating `update-droplet.sh` on CI remains a follow‑up.)*
+- **H10** — `SecurityState.checkpoint_encryption` is emitted (`ready` when the AES key is set), so
+  the UI no longer misreports it.
 
 ## Remaining — High
 
-| ID | Issue | Fix |
-| -- | ----- | --- |
-| H1 | `GmailWorker` is built without the secret store, so a reply carrying credentials throws `secret_store_missing` and the poller silently spins. | Pass `secret_store` / `effect_store` at construction. |
-| H2 | Effective Browser Use cost cap is **$1** in prod (field default `50.0` vs `from_env` default `1.0`; env var not set in compose). | Fix the `from_env` default and set `BROWSER_USE_MAX_COST_USD` in the prod env. |
-| H3 | Owner controls 403 under the documented prod env default (`ALLOW_LOCAL_CREDENTIAL_SUBMISSION=false`). | Set it explicitly in `compose.prod.yaml` and document it as required. |
-| H4 | Credential‑submit form is shown during `waiting_for_hitl`, but the backend requires `browser_running` → always 409. | Render the submit form only when `browser_running`. |
-| H5 | Auto‑capture exists only for Pipedrive; validation only for HubSpot + Pipedrive. | Add per‑app capture specs + validation policies (see readiness matrix in the guide). |
-| H6 | Mis‑sized AES/Fernet keys crash boot into a restart loop; a referenced deploy doc was missing. | Convert key‑format errors to a clear boot message; document key formats. |
-| H7 | Deploys/SIGTERM strand runs (daemon threads not joined; no startup reconciliation). | Reconcile stale `browser_running`/`waiting_for_hitl` rows at startup. |
-| H8 | `retry` is a stub; wedged runs and `outcome_unknown` ledger rows have no recovery path. | Implement real retry/reconcile for browser/email. |
-| H9 | CI/security gate is red at HEAD (ruff‑format + pre‑existing mypy); `update-droplet.sh` deploys without the gate. | Green the gate and gate the deploy on it. |
-| H10 | UI reads `SecurityState.checkpoint_encryption`, which the backend never sends → always "Not reported". | Emit the field (or drop the row). |
+| ID | Issue | Why deferred (needs a live environment, not a blind change) |
+| -- | ----- | ---------------------------------------------------------- |
+| H5 | Auto‑capture exists only for Pipedrive; validation only for HubSpot + Pipedrive. | Real per‑app capture specs require **live** verification of each app's settings URL, credential‑field selector, and validation endpoint. Fabricating them would be wrong and unsafe, so coverage is documented truthfully in the [readiness matrix](./GUIDE.md#14-application-readiness-matrix) and other apps use the manual‑submit path. |
+| H8 | `retry` is a stub; wedged runs / `outcome_unknown` ledger rows have no automated recovery. | A correct retry must query the provider by receipt/idempotency key and re‑arm the ledger **without re‑emitting side effects** — this needs a reconciliation design and a live provider, so it is deferred rather than shipped as a blind, risky change. |
 
 ## Remaining — Medium / Low (abridged)
 

@@ -40,10 +40,12 @@ export function HitlLiveControls({
   runId,
   fieldName = "api_token",
   fieldLabel = "API token",
+  canSubmitCredential = false,
 }: {
   runId: string
   fieldName?: string
   fieldLabel?: string
+  canSubmitCredential?: boolean
 }) {
   const [liveState, liveAction] = useActionState(openLiveView, initialLiveView)
   const [loginState, loginAction] = useActionState(submitBrowserLoginAction, initialLogin)
@@ -163,6 +165,7 @@ export function HitlLiveControls({
         ) : null}
       </form>
 
+      {canSubmitCredential ? (
       <form
         action={submitFormAction}
         onSubmit={(event) => {
@@ -216,6 +219,12 @@ export function HitlLiveControls({
           </p>
         ) : null}
       </form>
+      ) : (
+        <p className="border-t border-border pt-4 text-[10px] leading-4 text-muted-foreground">
+          Manual credential submission unlocks once the agent has signed in and reached the
+          credentials page (run state <span className="font-mono">browser_running</span>).
+        </p>
+      )}
     </div>
   )
 }

@@ -334,9 +334,7 @@ class GmailWorker:
             if not isinstance(message, Mapping):
                 continue
             subject = _first_string(message, ("subject",)) or ""
-            body = (
-                _first_string(message, ("messageText", "body", "preview", "snippet")) or ""
-            )
+            body = _first_string(message, ("messageText", "body", "preview", "snippet")) or ""
             link = _extract_login_link(subject, body)
             if link:
                 return link

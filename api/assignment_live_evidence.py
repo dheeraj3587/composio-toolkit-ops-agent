@@ -20,7 +20,12 @@ from api.service import LocalRunService
 from ops.browser_api_trace_catalog import get_browser_api_trace
 from ops.browser_host_policy import evaluate_navigation
 from ops.browser_link_log import field_keys, log_event, url_host
-from ops.browser_worker import BrowserObservation, BrowserSessionContext, BrowserTaskOutput
+from ops.browser_worker import (
+    BrowserObservation,
+    BrowserObservationStatus,
+    BrowserSessionContext,
+    BrowserTaskOutput,
+)
 from ops.models import OperationalResearch
 from ops.operational_research import EvidenceDocument, GeminiStructuredExtractor
 from ops.provider_errors import ProviderContractError, ProviderOperationError
@@ -283,7 +288,7 @@ async def _retained_run_assignment_task(
         live_view_available=bool(live_url),
     )
     return BrowserObservation(
-        status=final_status,
+        status=cast("BrowserObservationStatus", final_status),
         current_url=current_url,
         page_title=title,
     )

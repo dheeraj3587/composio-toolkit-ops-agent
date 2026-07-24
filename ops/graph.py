@@ -175,7 +175,7 @@ class DurableOperationsWorkflow:
             # embedded live view is available for the entire task instead of only
             # after it finishes.
             if seed:
-                initial.update(cast("dict[str, object]", dict(seed)))
+                initial.update(cast("OperationsState", dict(seed)))
             try:
                 result = self._graph.invoke(initial, config=config, durability="sync")
             finally:

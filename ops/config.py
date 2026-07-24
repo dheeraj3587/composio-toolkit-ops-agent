@@ -175,7 +175,9 @@ class Settings(BaseModel):
             ),
             "gemini_model": _optional(source.get("GEMINI_MODEL")) or "gemini-3.5-flash",
             "browser_use_model": _optional(source.get("BROWSER_USE_MODEL")) or "claude-opus-4.7",
-            "browser_use_max_cost_usd": _float(source.get("BROWSER_USE_MAX_COST_USD"), default=1.0),
+            "browser_use_max_cost_usd": _float(
+                source.get("BROWSER_USE_MAX_COST_USD"), default=50.0
+            ),
             "allow_local_credential_submission": _boolean(
                 source.get("ALLOW_LOCAL_CREDENTIAL_SUBMISSION"), default=False
             ),

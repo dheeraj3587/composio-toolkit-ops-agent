@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import threading
 import unicodedata
@@ -72,8 +73,10 @@ from ops.provider_errors import (
 from ops.redaction import redact_data, redact_text
 from ops.routing import RoutingDecision, decide_access
 from ops.secret_store import SecretStoreError, SQLiteSecretStore
-from ops.state import AccessRoute, RunStatus, validate_status_transition
+from ops.state import AccessRoute, OperationsState, RunStatus, validate_status_transition
 from ops.storage import OperationsStorage, OperationsUnitOfWork
+
+LOGGER = logging.getLogger("composio_ops.run_service")
 
 IDEMPOTENCY_KEY_PATTERN = re.compile(r"^idem_[0-9a-f]{32}$")
 
@@ -414,10 +417,20 @@ class RunService:
         # at startup: raw credentials are submitted explicitly by the owner, never
         # scraped from the browser.
         if self._secret_store is None and settings.secret_vault_key is not None:
-            self._secret_store = SQLiteSecretStore(
-                settings.secret_vault_db_path,
-                settings.secret_vault_key.get_secret_value(),
-            )
+            try:
+                self._secret_store = SQLiteSecretStore(
+                    settings.secret_vault_db_path,
+                    settings.secret_vault_key.get_secret_value(),
+                )
+            except (ValueError, TypeError) as exc:
+                # A malformed vault key must not crash-loop the container. Fail
+                # closed (no vault) and log a clear, value-free diagnostic.
+                LOGGER.error(
+                    "SECRET_VAULT_KEY is invalid (%s); the credential vault is "
+                    "disabled. Expected a url-safe base64 Fernet key.",
+                    type(exc).__name__,
+                )
+                self._secret_store = None
         self._record_wiring(
             "secret_store", self._secret_store, configured=settings.secret_vault_key is not None
         )
@@ -441,10 +454,77 @@ class RunService:
             )
         except ConfigurationRequiredError:
             self._workflow = None
+        except (ValueError, TypeError) as exc:
+            # A malformed LANGGRAPH_AES_KEY (wrong byte length) must not crash-loop
+            # the container. Fail closed (no durable workflow) with a clear,
+            # value-free diagnostic; runs then report configuration_required.
+            LOGGER.error(
+                "LANGGRAPH_AES_KEY is invalid (%s); the durable workflow is "
+                "disabled. Expected a 16, 24, or 32-byte key.",
+                type(exc).__name__,
+            )
+            self._workflow = None
         self._record_wiring("workflow", self._workflow, configured=True)
+        # Recover any runs stranded by the previous shutdown before serving.
+        self._reconcile_stranded_runs()
         # Start the autonomous email poller so the agent listens for and answers
         # provider replies on its own, with no manual polling.
         self._start_email_poller()
+
+    def _reconcile_stranded_runs(self) -> None:
+        """Recover runs stranded by the previous shutdown.
+
+        A run left at ``browser_running`` cannot progress after an api restart
+        because its in-process navigation thread is gone; move it to the
+        recoverable ``configuration_required`` state so the operator can retry
+        instead of watching it spin forever. ``waiting_for_hitl`` runs are left
+        intact: the provider session id is now persisted, so they can be resumed.
+        Best-effort and never fatal to startup.
+        """
+
+        try:
+            offset = 0
+            while True:
+                batch = self.storage.list_runs(limit=100, offset=offset)
+                if not batch:
+                    break
+                for record in batch:
+                    if record.get("status") == "browser_running":
+                        self._reconcile_one_stranded(str(record.get("run_id") or ""))
+                if len(batch) < 100:
+                    break
+                offset += 100
+        except Exception:  # pragma: no cover - reconciliation must never crash boot
+            LOGGER.warning("startup run reconciliation was skipped after an error")
+
+    def _reconcile_one_stranded(self, run_id: str) -> None:
+        if not run_id:
+            return
+        try:
+            with self.storage.unit_of_work() as transaction:
+                current = transaction.get_run(run_id)
+                if current is None or current.get("status") != "browser_running":
+                    return
+                revision = int(current.get("state_revision", 0) or 0) + 1
+                validate_status_transition("browser_running", "configuration_required", "reconcile")
+                transaction.update_run(
+                    run_id,
+                    status="configuration_required",
+                    state_revision=revision,
+                    last_projected_revision=revision,
+                )
+                transaction.append_audit_event(
+                    run_id=run_id,
+                    event_type="run_reconciled_on_startup",
+                    payload={
+                        "previous_status": "browser_running",
+                        "status": "configuration_required",
+                        "reason": "api_restart_stranded_browser_run",
+                        "external_actions": False,
+                    },
+                )
+        except Exception:  # pragma: no cover - per-run best effort
+            LOGGER.warning("could not reconcile a stranded run on startup")
 
     def _start_email_poller(self) -> None:
         """Start the background thread that polls waiting runs for new replies."""
@@ -656,13 +736,26 @@ class RunService:
         injected only when live browsing is explicitly enabled with a key.
         """
 
+        # Build the effect ledger up front so the Gmail worker can share it for
+        # effectively-once sends.
+        if self._effect_store is None:
+            self._effect_store = SQLiteEffectStore(settings.provider_effects_db_path)
+
         gmail: GmailWorker | None = None
         if (
             settings.composio_api_key is not None
             and settings.composio_gmail_connected_account_id is not None
             and settings.outreach_recipient_override is not None
         ):
-            gmail = GmailWorker(settings=settings)
+            # Wire the encrypted vault + effect ledger: a reply that carries a
+            # credential is then stored as a vault:// reference instead of raising
+            # secret_store_missing (which previously wedged the email path), and
+            # sends stay idempotent.
+            gmail = GmailWorker(
+                settings=settings,
+                secret_store=self._secret_store,
+                effect_store=self._effect_store,
+            )
             # Retain the Gmail worker so the poll-email action can fetch and
             # classify replies on the same controlled account.
             self._gmail_worker = gmail
@@ -674,8 +767,6 @@ class RunService:
             self._browser_worker = browser
         self._record_wiring("browser", browser, configured=browser is not None)
 
-        if self._effect_store is None:
-            self._effect_store = SQLiteEffectStore(settings.provider_effects_db_path)
         self._record_wiring("effect_store", self._effect_store, configured=True)
 
         return WorkflowDependencies(
@@ -1030,7 +1121,7 @@ class RunService:
                             )
                             raise
                         pending_async_navigate = (context, start_sensitive_data)
-                        workflow_state = {
+                        workflow_state: OperationsState = {
                             "status": "browser_running",
                             "access_route": "self_serve",
                             "route_reason_code": decision.reason_code,
@@ -1574,7 +1665,7 @@ class RunService:
                     return
                 revision = int(rec.get("state_revision", 0) or 0) + 1
                 if previous != next_status:
-                    validate_status_transition(previous, next_status, "browser")
+                    validate_status_transition(cast(RunStatus, previous), next_status, "browser")
                 changes: dict[str, object] = {
                     "status": next_status,
                     "state_revision": revision,
@@ -2238,7 +2329,7 @@ class RunService:
             handle=session_id,
             recovered=bool(recovered),
         )
-        return recovered
+        return cast("str | None", recovered)
 
     def _public_no_reply(self, record: Mapping[str, object]) -> dict[str, Any]:
         """Return the current run projection with a no-op reply marker."""

@@ -36,6 +36,13 @@ services:
     environment:
       ALLOW_LIVE_VENDOR_EMAIL: ${ALLOW_LIVE_VENDOR_EMAIL:-false}
       ALLOW_LIVE_BROWSER: ${ALLOW_LIVE_BROWSER:-false}
+      # Owner-only credential submission / autonomous-login / reveal are gated by
+      # this flag. It MUST be true for those operator actions to work; default
+      # false keeps them disabled until explicitly enabled.
+      ALLOW_LOCAL_CREDENTIAL_SUBMISSION: ${ALLOW_LOCAL_CREDENTIAL_SUBMISSION:-false}
+      # Per-session Browser Use cost ceiling. Kept high so a live onboarding task
+      # never stops mid-run on the cap; lower it deliberately if desired.
+      BROWSER_USE_MAX_COST_USD: ${BROWSER_USE_MAX_COST_USD:-50.0}
       OPS_ENABLE_API_DOCS: "false"
       RUN_LIVE_TESTS: "0"
       OPS_INTERNAL_API_TOKEN: ${OPS_INTERNAL_API_TOKEN:?OPS_INTERNAL_API_TOKEN is required}

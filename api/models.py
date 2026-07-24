@@ -215,6 +215,7 @@ class SecurityState(StrictApiModel):
         "ready",
     ] = "not_configured"
     owner_only_storage: Literal["verified_owner_only", "verification_failed"]
+    checkpoint_encryption: Literal["ready", "not_configured"] = "not_configured"
     live_vendor_email: Literal["disabled", "enabled"] = "disabled"
     live_browser: Literal["disabled", "enabled"] = "disabled"
     external_actions: bool = False

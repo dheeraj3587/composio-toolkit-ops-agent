@@ -121,6 +121,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
                   runId={runId}
                   fieldName={detail.research?.credential_fields?.[0] ?? "api_token"}
                   fieldLabel={humanize(detail.research?.credential_fields?.[0] ?? "API token")}
+                  canSubmitCredential={detail.run.status === "browser_running"}
                 />
               ) : isRetryable(browserPhase) ? (
                 <PhaseActionForm runId={runId} action="retry" capability="browser" label="Retry browser phase" />

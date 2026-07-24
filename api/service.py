@@ -391,6 +391,9 @@ class LocalRunService:
                     else "not_configured"
                 ),
                 owner_only_storage=("verified_owner_only" if owner_only else "verification_failed"),
+                checkpoint_encryption=(
+                    "ready" if self._settings.langgraph_aes_key is not None else "not_configured"
+                ),
                 live_vendor_email=(
                     "enabled" if self._settings.allow_live_vendor_email else "disabled"
                 ),

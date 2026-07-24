@@ -294,9 +294,11 @@ class AssignmentBrowserWorker(BrowserWorker):
         if self._client is not None:
             return self._client
         self._require_configuration()
+        api_key = self._settings.browser_use_api_key
+        assert api_key is not None  # guaranteed by _require_configuration above
         module = importlib.import_module("browser_use_sdk.v3")
         return module.AsyncBrowserUse(
-            api_key=self._settings.browser_use_api_key.get_secret_value(),
+            api_key=api_key.get_secret_value(),
             timeout=120.0,
         )
 
