@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
@@ -55,6 +55,14 @@ def _float(value: str | None, *, default: float) -> float:
         return float(normalized)
     except ValueError:
         raise ValueError("float environment value is invalid") from None
+
+
+def _choice(value: str | None, allowed: tuple[str, ...], *, default: str) -> str:
+    """Return a normalized enum value, failing closed to ``default`` when unknown."""
+
+    normalized = _optional(value)
+    lowered = normalized.casefold() if normalized else ""
+    return lowered if lowered in allowed else default
 
 
 def _csv(value: str | None) -> tuple[str, ...]:
@@ -108,6 +116,10 @@ class Settings(BaseModel):
     browser_use_model: str = "claude-opus-4.7"
     # Per-session cost cap set high so a run never stops mid-task on the cap.
     browser_use_max_cost_usd: float = Field(default=50.0, gt=0)
+    # Which browser automation backend a run uses. Default is the paid Browser Use
+    # cloud (prod-proven); "playwright" selects the self-hosted harness. This is the
+    # single switch behind the gradual migration — the default keeps prod unchanged.
+    browser_provider: Literal["browser_use", "playwright"] = "browser_use"
     # Owner-only local credential submission is opt-in and loopback-only.
     allow_local_credential_submission: bool = False
 
@@ -182,6 +194,11 @@ class Settings(BaseModel):
             "browser_use_model": _optional(source.get("BROWSER_USE_MODEL")) or "claude-opus-4.7",
             "browser_use_max_cost_usd": _float(
                 source.get("BROWSER_USE_MAX_COST_USD"), default=50.0
+            ),
+            "browser_provider": _choice(
+                source.get("BROWSER_PROVIDER"),
+                ("browser_use", "playwright"),
+                default="browser_use",
             ),
             "allow_local_credential_submission": _boolean(
                 source.get("ALLOW_LOCAL_CREDENTIAL_SUBMISSION"), default=False

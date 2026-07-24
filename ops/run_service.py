@@ -762,8 +762,8 @@ class RunService:
         self._record_wiring("gmail", gmail, configured=gmail is not None)
 
         browser: BrowserWorker | None = None
-        if settings.allow_live_browser and settings.browser_use_api_key is not None:
-            browser = BrowserWorker(settings=settings)
+        if self._browser_provider_enabled(settings):
+            browser = self._build_browser_worker(settings)
             self._browser_worker = browser
         self._record_wiring("browser", browser, configured=browser is not None)
 
@@ -775,6 +775,41 @@ class RunService:
             effect_store=self._effect_store,
             outreach_recipient=settings.outreach_recipient_override,
         )
+
+    def _browser_provider_enabled(self, settings: Settings) -> bool:
+        """Whether a browser worker should be wired for the selected provider.
+
+        ``browser_use`` keeps the exact prod condition (live opt-in + an API key).
+        ``playwright`` is self-hosted, so it needs only the live opt-in — but is
+        gated to environments where the harness is importable (see the factory).
+        """
+
+        provider = getattr(settings, "browser_provider", "browser_use")
+        if provider == "playwright":
+            return settings.allow_live_browser
+        return settings.allow_live_browser and settings.browser_use_api_key is not None
+
+    def _build_browser_worker(self, settings: Settings) -> BrowserWorker:
+        """Select the browser backend. Default resolves the (possibly assignment-
+        patched) ``BrowserWorker`` in this module's namespace, so the Browser Use
+        path is byte-for-byte unchanged. ``playwright`` selects the self-hosted
+        harness, failing closed with a clear reason if it is not yet available."""
+
+        provider = getattr(settings, "browser_provider", "browser_use")
+        if provider == "playwright":
+            try:
+                # Added in the Playwright harness phase; forward reference here.
+                from ops.playwright_worker import (  # type: ignore[import-not-found]
+                    PlaywrightBrowserWorker,
+                )
+            except ImportError:
+                raise ConfigurationRequiredError(
+                    phase=5,
+                    capability="Playwright browser provider",
+                    reason_code="playwright_provider_unavailable",
+                ) from None
+            return cast("BrowserWorker", PlaywrightBrowserWorker(settings=settings))
+        return BrowserWorker(settings=settings)
 
     def _record_wiring(
         self,
