@@ -1,5 +1,6 @@
 name: Agent autopatch
 
+# Temporary one-shot generator. This file is removed by the follow-up PR.
 on:
   push:
     branches:
