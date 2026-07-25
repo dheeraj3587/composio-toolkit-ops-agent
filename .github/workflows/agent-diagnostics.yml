@@ -1,9 +1,7 @@
 name: Agent diagnostics
 
 on:
-  push:
-    branches:
-      - agent/playwright-demo-frontend-wiring
+  pull_request:
   workflow_dispatch:
 
 permissions:
