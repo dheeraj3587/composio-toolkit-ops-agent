@@ -31,14 +31,18 @@ import type {
 } from "@/lib/types"
 
 const CREDENTIAL_FIELD_PATTERN = /^[a-z0-9][a-z0-9_-]{0,99}$/
+const RUN_ID_PATTERN = /^run_[0-9a-f]{32}$/
 
 const DEFAULT_API_ORIGIN = "http://127.0.0.1:8000"
 const REQUEST_TIMEOUT_MS = 8_000
-// execute_when_configured runs (and same-session resume) drive a real Browser
-// Use session synchronously on the backend, which routinely exceeds 8s.
+// execute_when_configured runs (and same-session resume) can drive a real
+// browser task on the backend, which routinely exceeds the normal API bound.
 const RUN_ACTION_TIMEOUT_MS = 180_000
 const CREDENTIAL_TIMEOUT_MS = 30_000
+const SCREENSHOT_TIMEOUT_MS = 10_000
+const MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024
 const IDEMPOTENCY_KEY_PATTERN = /^idem_[0-9a-f]{32}$/
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] as const
 
 export class ApiError extends Error {
   constructor(
@@ -253,14 +257,73 @@ export function getLiveView(runId: string): Promise<LiveViewResponse> {
   return apiRequest(runPath(runId, "/live-view"), liveViewResponseSchema)
 }
 
+/**
+ * Fetch the newest Playwright screenshot through the private FastAPI boundary.
+ *
+ * This helper is server-only: the internal API token and private API origin never
+ * enter browser JavaScript. The public browser receives the bytes only from a
+ * same-origin Next Route Handler.
+ */
+export async function getLiveScreenshotBinary(
+  runId: string,
+): Promise<{ bytes: Uint8Array; capturedAt: string | null }> {
+  if (!RUN_ID_PATTERN.test(runId)) {
+    throw new ApiError(400, "INVALID_RUN_ID", "The run reference is invalid.")
+  }
+
+  let response: Response
+  try {
+    response = await fetch(`${apiOrigin()}${runPath(runId, "/live-view/screenshot")}`, {
+      method: "GET",
+      cache: "no-store",
+      headers: {
+        Accept: "image/png",
+        "X-Ops-Internal-Token": internalApiToken(),
+      },
+      signal: AbortSignal.timeout(SCREENSHOT_TIMEOUT_MS),
+    })
+  } catch (error) {
+    if (error instanceof ApiError) throw error
+    throw new ApiError(503, "SCREENSHOT_UNREACHABLE", "The browser screenshot is unavailable.")
+  }
+
+  if (!response.ok) {
+    throw new ApiError(response.status, `HTTP_${response.status}`, "The browser screenshot is unavailable.")
+  }
+
+  const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim()
+  if (contentType !== "image/png") {
+    throw new ApiError(502, "INVALID_SCREENSHOT_TYPE", "The browser returned an invalid screenshot.")
+  }
+
+  const declaredSize = Number(response.headers.get("content-length") ?? "0")
+  if (Number.isFinite(declaredSize) && declaredSize > MAX_SCREENSHOT_BYTES) {
+    throw new ApiError(502, "SCREENSHOT_TOO_LARGE", "The browser screenshot is too large.")
+  }
+
+  const bytes = new Uint8Array(await response.arrayBuffer())
+  if (bytes.length === 0 || bytes.length > MAX_SCREENSHOT_BYTES) {
+    throw new ApiError(502, "INVALID_SCREENSHOT_SIZE", "The browser screenshot is invalid.")
+  }
+
+  if (!PNG_SIGNATURE.every((byte, index) => bytes[index] === byte)) {
+    throw new ApiError(502, "INVALID_SCREENSHOT_DATA", "The browser screenshot is invalid.")
+  }
+
+  return {
+    bytes,
+    capturedAt: response.headers.get("x-captured-at"),
+  }
+}
+
 export function resumeWithBrowserLogin(
   runId: string,
   email: string,
   password: string,
 ): Promise<ActionReceipt> {
-  // Owner-submitted app login credentials. They leave this server-only client
-  // immediately for the API, are injected into Browser Use as secure
-  // placeholders for a single resume, and are never persisted or returned.
+  // Owner-submitted app login credentials leave this server-only client
+  // immediately for the API and are consumed by the selected browser provider's
+  // transient secret boundary. They are never persisted or returned.
   return apiRequest(
     runPath(runId, "/resume"),
     actionReceiptSchema,

@@ -10,7 +10,12 @@ import {
   resumeWithBrowserLogin,
   submitCredentials,
 } from "@/lib/api"
-import type { RetryCapability, RunPhaseAction } from "@/lib/types"
+import type {
+  BrowserProvider,
+  LiveViewMode,
+  RetryCapability,
+  RunPhaseAction,
+} from "@/lib/types"
 
 export interface PhaseActionState {
   message: string | null
@@ -64,9 +69,27 @@ export async function runPhaseAction(
 }
 
 export interface LiveViewState {
+  provider: BrowserProvider | null
+  mode: LiveViewMode
   liveUrl: string | null
+  screenshotUrl: string | null
+  capturedAt: string | null
+  interactionAvailable: boolean
   message: string | null
   tone: "neutral" | "error"
+}
+
+function unavailableLiveView(message: string): LiveViewState {
+  return {
+    provider: null,
+    mode: "unavailable",
+    liveUrl: null,
+    screenshotUrl: null,
+    capturedAt: null,
+    interactionAvailable: false,
+    message,
+    tone: "error",
+  }
 }
 
 export async function openLiveView(
@@ -74,25 +97,61 @@ export async function openLiveView(
   formData: FormData,
 ): Promise<LiveViewState> {
   const runId = String(formData.get("run_id") ?? "").slice(0, 180)
-  if (!runId) {
-    return { liveUrl: null, message: "The run reference is invalid.", tone: "error" }
+  if (!/^run_[0-9a-f]{32}$/.test(runId)) {
+    return unavailableLiveView("The run reference is invalid.")
   }
+
   try {
     const result = await getLiveView(runId)
-    if (!result.available || !result.live_url) {
+
+    if (!result.available || result.mode === "unavailable") {
       return {
-        liveUrl: null,
-        message: "No live browser session is currently available for this run.",
-        tone: "error",
+        ...unavailableLiveView("No live browser session is currently available for this run."),
+        provider: result.provider,
       }
     }
-    return { liveUrl: result.live_url, message: "Live browser session ready.", tone: "neutral" }
+
+    if (result.mode === "hosted_url" && result.live_url) {
+      return {
+        provider: result.provider,
+        mode: result.mode,
+        liveUrl: result.live_url,
+        screenshotUrl: null,
+        capturedAt: result.captured_at ?? null,
+        interactionAvailable: result.interaction_available,
+        message: "Interactive hosted browser session ready.",
+        tone: "neutral",
+      }
+    }
+
+    if (result.mode === "screenshot" && result.screenshot_url) {
+      const version = encodeURIComponent(result.captured_at ?? Date.now().toString())
+      return {
+        provider: result.provider,
+        mode: result.mode,
+        liveUrl: null,
+        screenshotUrl:
+          `/api/control/runs/${encodeURIComponent(runId)}/live-view/screenshot?v=${version}`,
+        capturedAt: result.captured_at ?? null,
+        interactionAvailable: false,
+        message: "Latest Playwright browser frame loaded. This view is read-only.",
+        tone: "neutral",
+      }
+    }
+
+    // interactive_remote is deliberately not rendered until the repository exposes
+    // a complete same-origin noVNC client and WebSocket proxy. A private service URL
+    // must never be returned to browser JavaScript.
+    return {
+      ...unavailableLiveView("The selected interactive browser view is not available in this control plane."),
+      provider: result.provider,
+    }
   } catch (error) {
     const message =
       error instanceof ApiError && error.status === 403
-        ? "Live view is restricted to the owner on localhost."
-        : "The live browser URL could not be retrieved."
-    return { liveUrl: null, message, tone: "error" }
+        ? "Live view is restricted to the authorized operator."
+        : "The live browser view could not be retrieved."
+    return unavailableLiveView(message)
   }
 }
 
@@ -117,7 +176,7 @@ export async function submitBrowserLoginAction(
     return {
       message:
         receipt.detail ??
-        "Credentials handed to the agent. It is signing in autonomously; watch the live browser.",
+        "Credentials handed to the selected browser provider for this one resume.",
       tone: receipt.status === "configuration_required" ? "error" : "neutral",
     }
   } catch (error) {
