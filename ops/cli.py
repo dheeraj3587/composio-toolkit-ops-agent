@@ -8,15 +8,18 @@ routing. It does not invoke providers, send email, start browsers, or produce an
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
 import re
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import httpx
 from cryptography.fernet import Fernet
 from pydantic import ValidationError
 
@@ -251,6 +254,188 @@ def doctor(*, db_path: str | Path | None = None) -> tuple[dict[str, Any], bool]:
     )
 
 
+def research_app(app_name: str, *, provider: str = "you") -> dict[str, Any]:
+    """Sanitized research-debug view of the PRODUCTION research pipeline.
+
+    Exercises the same wiring ``RunService`` uses: You.com Search discovery,
+    then You.com Contents for content extraction, with the guarded HTTP fetcher
+    as a per-URL fallback. ``--provider auto`` also adds the Perplexity discovery
+    fallback. Never runs Gemini extraction, never touches the browser, and never
+    displays an API key, full document text, snippets, credentials, vault values,
+    cookies, or a browser session.
+    """
+
+    from ops.config import load_settings
+    from ops.operational_research import (
+        OfficialEvidenceFetcher,
+        PerplexitySearchDiscovery,
+        _missing_fields,  # noqa: SLF001 - internal reuse within the same package
+        _rich_candidate_urls,  # noqa: SLF001 - internal reuse within the same package
+    )
+    from ops.p1_adapter import lookup_p1_record, to_operational_research
+    from ops.research_cache import SqliteResearchCache
+    from ops.you_research import (
+        CompositeEvidenceDiscovery,
+        FallbackEvidenceContentFetcher,
+        GuardedHTTPEvidenceFetcher,
+        LegacyDiscoveryAdapter,
+        ResearchHostPolicy,
+        YouContentsFetcher,
+        YouResearchMetrics,
+        YouSearchDiscovery,
+        use_metrics,
+    )
+
+    lookup = lookup_p1_record(app_name)
+    if lookup.status != "found" or lookup.record is None:
+        return {"error": "app_not_found", "app_name": app_name}
+
+    record = lookup.record
+    p1_record = record.model_dump(mode="json")
+    baseline = to_operational_research(record)
+    settings = load_settings()
+
+    host_policy = ResearchHostPolicy.build(p1_record=p1_record, baseline=baseline)
+    official_domains = host_policy.include_domains
+    cache = SqliteResearchCache(settings.research_cache_db_path)
+
+    providers: list[object] = []
+    if provider in ("you", "auto") and settings.you_search_configured:
+        providers.append(
+            YouSearchDiscovery(
+                settings.you_api_key,  # type: ignore[arg-type]
+                count=settings.you_search_count,
+                timeout_seconds=settings.you_search_timeout_seconds,
+                max_calls=settings.you_max_search_calls_per_enrichment,
+                cache=cache,
+            )
+        )
+    if provider in ("perplexity", "auto") and settings.perplexity_api_key is not None:
+        providers.append(
+            LegacyDiscoveryAdapter(PerplexitySearchDiscovery(settings.perplexity_api_key))
+        )
+
+    if not providers:
+        cache.close()
+        return {
+            "app_name": baseline.app_name,
+            "app_slug": baseline.app_slug,
+            "provider_requested": provider,
+            "official_domains": list(official_domains),
+            "error": "no_discovery_provider_configured",
+        }
+
+    composite = CompositeEvidenceDiscovery(providers)  # type: ignore[arg-type]
+    effective_policy = host_policy.official_url_policy
+    metrics = YouResearchMetrics()
+
+    def _build_content_fetcher() -> object:
+        primary = YouContentsFetcher(
+            settings.you_api_key,  # type: ignore[arg-type]
+            policy=host_policy,
+            max_age=settings.you_contents_max_age_seconds,
+            request_timeout=settings.you_contents_timeout_seconds,
+            max_pages=settings.you_max_contents_pages_per_enrichment,
+            cache=cache,
+        )
+        if effective_policy is None:
+            return primary
+        fallback = GuardedHTTPEvidenceFetcher(
+            OfficialEvidenceFetcher(
+                httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0), follow_redirects=False),
+                effective_policy,
+            )
+        )
+        return FallbackEvidenceContentFetcher(primary=primary, fallback=fallback)
+
+    async def _run() -> tuple[tuple[object, ...], list[dict[str, Any]], dict[str, float]]:
+        latencies: dict[str, float] = {}
+        with use_metrics(metrics):
+            start = time.monotonic()
+            found = await composite.discover(
+                app_name=baseline.app_name,
+                p1_record=p1_record,
+                baseline=baseline,
+                official_hosts=official_domains,
+            )
+            latencies["discovery_ms"] = round((time.monotonic() - start) * 1000, 1)
+
+            docs_summary: list[dict[str, Any]] = []
+            if found and settings.you_contents_configured and effective_policy is not None:
+                candidate_urls = _rich_candidate_urls(p1_record, found, effective_policy)
+                fetcher = _build_content_fetcher()
+                start = time.monotonic()
+                documents = await fetcher.fetch_many(candidate_urls)  # type: ignore[attr-defined]
+                latencies["content_fetch_ms"] = round((time.monotonic() - start) * 1000, 1)
+                docs_summary = [{"url": d.source_url, "title": d.title} for d in documents]
+        return found, docs_summary, latencies
+
+    try:
+        candidates, documents_summary, latencies = asyncio.run(_run())
+    finally:
+        cache.close()
+
+    return {
+        "app_name": baseline.app_name,
+        "app_slug": baseline.app_slug,
+        "provider_requested": provider,
+        "provider_used": metrics.discovery_provider_used
+        or getattr(composite, "last_provider_used", None),
+        "official_domains": list(official_domains),
+        "candidates": [
+            {
+                "url": getattr(candidate, "source_url", ""),
+                "category": getattr(candidate, "category", "unknown"),
+                "provider": getattr(candidate, "provider", "unknown"),
+            }
+            for candidate in candidates
+        ],
+        "documents_fetched": documents_summary,
+        "missing_baseline_fields": _missing_fields(baseline),
+        "latencies_ms": latencies,
+        "cache_hits": metrics.research_cache_hits,
+        "cache_misses": metrics.research_cache_misses,
+    }
+
+
+def probe_you() -> dict[str, Any]:
+    """Explicit, opt-in LIVE check: one cheap Search call, never run at startup.
+
+    Returns only a sanitized success/failure reason — never the API key, the
+    full response body, or a raw provider exception.
+    """
+
+    from ops.config import load_settings
+    from ops.you_research import YouProviderError, YouSearchDiscovery
+
+    settings = load_settings()
+    if settings.you_api_key is None:
+        return {"status": "not_configured", "detail": "YDC_API_KEY is not set."}
+    if not settings.you_search_enabled:
+        return {"status": "disabled", "detail": "YOU_SEARCH_ENABLED is false."}
+
+    discovery = YouSearchDiscovery(settings.you_api_key, count=1, timeout_seconds=10.0, max_calls=1)
+
+    async def _probe() -> tuple[bool, str, float]:
+        start = time.monotonic()
+        try:
+            # One cheap, unfiltered Search call for reachability only.
+            response = await discovery._search(  # noqa: SLF001
+                query="you.com API documentation", provider_domains=()
+            )
+        except YouProviderError as exc:
+            return False, exc.reason_code, round((time.monotonic() - start) * 1000, 1)
+        del response  # the probe only needs success/failure, never the payload
+        return True, "you_search_reachable", round((time.monotonic() - start) * 1000, 1)
+
+    ok, reason, latency_ms = asyncio.run(_probe())
+    return {
+        "status": "ready" if ok else "failed",
+        "reason_code": reason,
+        "latency_ms": latency_ms,
+    }
+
+
 def _default_company(args: argparse.Namespace) -> CompanyProfile:
     from ops.config import load_settings
 
@@ -302,6 +487,18 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser = subparsers.add_parser(command, help=help_text)
         command_parser.add_argument("run_id")
 
+    research_parser = subparsers.add_parser(
+        "research-app",
+        help="Sanitized You.com/Perplexity discovery diagnostic (no extraction, no browser).",
+    )
+    research_parser.add_argument("app_name")
+    research_parser.add_argument("--provider", choices=("you", "perplexity", "auto"), default="you")
+
+    subparsers.add_parser(
+        "probe-you",
+        help="Explicit, opt-in live You.com Search reachability check (spends one call).",
+    )
+
     return parser
 
 
@@ -338,6 +535,15 @@ def main(argv: list[str] | None = None) -> int:
             report, ready = doctor(db_path=args.db_path)
             _emit(report)
             return EXIT_OK if ready else EXIT_ERROR
+
+        if args.command == "research-app":
+            _emit(research_app(args.app_name, provider=args.provider))
+            return EXIT_OK
+
+        if args.command == "probe-you":
+            result = probe_you()
+            _emit(result)
+            return EXIT_OK if result.get("status") == "ready" else EXIT_ERROR
 
         if args.command == "run":
             request = OperationsRequest(

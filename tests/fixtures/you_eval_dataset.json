@@ -1,0 +1,89 @@
+{
+  "_comment": "Reviewed evaluation dataset for the You.com discovery layer. approved_hosts for pipedrive, twenty, hubspot and attio are copied verbatim from the already-reviewed ops/browser_host_policy.py registry (do not diverge from that file without re-reviewing both). twilio, slack and zoho were verified via direct source lookup during this integration (see docs/YOU_COM_INTEGRATION.md); they are NOT yet cross-reviewed against ops/browser_host_policy.py because none of the three has an entry there. expected_categories is intentionally the categories a REAL verified URL for that app actually produces from ops.you_research.classify_category, not an aspirational list: the classifier is keyword-based, so a bare root URL with no path keywords (e.g. a plain login SPA at https://app.twenty.com/) classifies as 'unknown' even though a human would recognize it as a login page. That is a documented, honest limitation (see docs/YOU_COM_INTEGRATION.md) rather than something this dataset papers over. The 'unknown-nonexistent-vendor' entry is a deliberately nonexistent vendor used to verify the pipeline degrades to a truthful empty result rather than fabricating hosts or categories.",
+  "schema_version": 1,
+  "apps": [
+    {
+      "app_slug": "pipedrive",
+      "app_name": "Pipedrive",
+      "expected_categories": ["login", "developer_portal", "credential_creation"],
+      "approved_hosts": [
+        "developers.pipedrive.com",
+        "app.pipedrive.com",
+        "oauth.pipedrive.com",
+        "*.pipedrive.com"
+      ],
+      "reviewed_by": "ops/browser_host_policy.py (existing reviewed dataset)"
+    },
+    {
+      "app_slug": "hubspot",
+      "app_name": "HubSpot",
+      "expected_categories": ["login", "credential_creation"],
+      "approved_hosts": [
+        "developers.hubspot.com",
+        "app.hubspot.com"
+      ],
+      "reviewed_by": "ops/browser_host_policy.py (existing reviewed dataset)"
+    },
+    {
+      "app_slug": "twilio",
+      "app_name": "Twilio",
+      "expected_categories": ["login", "credential_creation"],
+      "approved_hosts": [
+        "console.twilio.com",
+        "www.twilio.com"
+      ],
+      "reviewed_by": "verified via direct source lookup during this integration (2026); not yet cross-reviewed in ops/browser_host_policy.py"
+    },
+    {
+      "app_slug": "slack",
+      "app_name": "Slack",
+      "expected_categories": ["login", "oauth"],
+      "approved_hosts": [
+        "api.slack.com",
+        "slack.com",
+        "docs.slack.dev"
+      ],
+      "reviewed_by": "verified via direct source lookup during this integration (2026); not yet cross-reviewed in ops/browser_host_policy.py"
+    },
+    {
+      "app_slug": "zoho",
+      "app_name": "Zoho",
+      "expected_categories": ["oauth"],
+      "approved_hosts": [
+        "accounts.zoho.com",
+        "api-console.zoho.com",
+        "www.zoho.com"
+      ],
+      "reviewed_by": "verified via direct source lookup during this integration (2026); not yet cross-reviewed in ops/browser_host_policy.py"
+    },
+    {
+      "app_slug": "attio",
+      "app_name": "Attio",
+      "expected_categories": ["login", "general_docs"],
+      "approved_hosts": [
+        "docs.attio.com",
+        "app.attio.com",
+        "build.attio.com"
+      ],
+      "reviewed_by": "ops/browser_host_policy.py (existing reviewed dataset)"
+    },
+    {
+      "app_slug": "twenty",
+      "app_name": "Twenty",
+      "expected_categories": ["general_docs"],
+      "approved_hosts": [
+        "api.twenty.com",
+        "app.twenty.com",
+        "docs.twenty.com"
+      ],
+      "reviewed_by": "ops/browser_host_policy.py (existing reviewed dataset)"
+    },
+    {
+      "app_slug": "unknown-nonexistent-vendor",
+      "app_name": "Nonexistent Vendor Corp",
+      "expected_categories": [],
+      "approved_hosts": [],
+      "reviewed_by": "deliberately fictitious: proves the pipeline returns a truthful empty result instead of fabricating hosts/categories for an app with no reviewed presence at all"
+    }
+  ]
+}

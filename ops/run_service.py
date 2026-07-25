@@ -51,6 +51,7 @@ from ops.models import (
 from ops.network_endpoint_policy import validation_endpoint as network_validation_endpoint
 from ops.operational_research import (
     GeminiStructuredExtractor,
+    OfficialEvidenceFetcher,
     OperationalResearchEnricher,
     PerplexitySearchDiscovery,
     ResearchEnricher,
@@ -71,10 +72,21 @@ from ops.provider_errors import (
     ProviderOperationError,
 )
 from ops.redaction import redact_data, redact_text
+from ops.research_cache import SqliteResearchCache
 from ops.routing import RoutingDecision, decide_access
 from ops.secret_store import SecretStoreError, SQLiteSecretStore
 from ops.state import AccessRoute, OperationsState, RunStatus, validate_status_transition
 from ops.storage import OperationsStorage, OperationsUnitOfWork
+from ops.you_research import (
+    CompositeEvidenceDiscovery,
+    FallbackEvidenceContentFetcher,
+    GuardedHTTPEvidenceFetcher,
+    LegacyDiscoveryAdapter,
+    ResearchHostPolicy,
+    YouContentsFetcher,
+    YouResearchFallback,
+    YouSearchDiscovery,
+)
 
 LOGGER = logging.getLogger("composio_ops.run_service")
 
@@ -94,6 +106,12 @@ _CAPABILITY_SUPPRESSION_REASONS = {
     "composio_ready": "composio_ready",
     "connection_required": "composio_connection_required",
 }
+
+
+class _YouComWiringMarker:
+    """Display-only marker so the wiring audit can show "You.com is
+    configured" without fabricating a reference to internal pipeline
+    objects that only exist inside ``_build_research_enricher``'s closures."""
 
 
 def _capability_reason_code(report: ComposioCapabilityReport | None) -> str:
@@ -268,9 +286,12 @@ def _missing_operational_fields(research: Mapping[str, object]) -> list[str]:
         "authorization_url",
         "token_url",
         "credential_fields",
+        "credential_creation_instructions",
         "scopes",
         "developer_portal_url",
         "signup_url",
+        "login_url",
+        "credential_management_url",
         "production_approval_required",
         "contact_email",
         "contact_url",
@@ -278,7 +299,7 @@ def _missing_operational_fields(research: Mapping[str, object]) -> list[str]:
     missing: list[str] = []
     for name in candidates:
         value = research.get(name)
-        if value is None or value == "" or value == []:
+        if value is None or value == "" or value == [] or value == ():
             missing.append(name)
     return missing
 
@@ -323,6 +344,12 @@ class RunService:
         # Resources owned and closed by this service when built at startup.
         self._http_client: httpx.AsyncClient | None = None
         self._validation_http_client: httpx.AsyncClient | None = None
+        # Persistent research cache shared by the You.com adapters (Search /
+        # Contents / Research). The adapters manage their own SDK client
+        # lifecycle per call via ``async with``; no You.com async client is
+        # stored on the service (that would be unsafe across the per-enrichment
+        # ``asyncio.run`` event loops). Only built when YDC_API_KEY is present.
+        self._research_cache: SqliteResearchCache | None = None
         self._browser_worker: BrowserWorker | None = None
         self._gmail_worker: GmailWorker | None = None
         # In-memory marker of the last inbound reply id handled per run, so the
@@ -405,6 +432,14 @@ class RunService:
             "research_enricher",
             self._enricher,
             configured=settings.google_genai_api_key is not None,
+        )
+        # You.com is a sanitized wiring-audit ENTRY, never a live probe: a
+        # normal health/startup check must never spend a You.com credit. See
+        # `python -m ops.cli probe-you` for the explicit, opt-in live check.
+        self._record_wiring(
+            "you_com",
+            _YouComWiringMarker() if settings.you_api_key is not None else None,
+            configured=settings.you_api_key is not None,
         )
 
         # Read-only credential validator (HubSpot bearer, current endpoint).
@@ -700,15 +735,25 @@ class RunService:
         return polled
 
     def _build_research_enricher(self, settings: Settings) -> ResearchEnricher | None:
-        """Build the enricher only when Gemini is configured; own its HTTP client."""
+        """Build the enricher only when Gemini is configured; own its HTTP client(s).
+
+        Discovery order: You.com Search (primary, when ``you_search_configured``)
+        then Perplexity (fallback, when configured) via
+        ``CompositeEvidenceDiscovery``. Content-fetch order: You.com Contents
+        (primary, when ``you_contents_configured``) then the pre-existing
+        guarded HTTP fetcher (fallback, always available). You.com Research is
+        optional, disabled by default, and only ever supplies MORE candidate
+        pages for the SAME canonical Gemini extraction below.
+
+        Fully backward-compatible: when ``YDC_API_KEY`` is absent, this
+        builds the EXACT pre-existing Perplexity + guarded-HTTP wiring with
+        none of the new dependencies set, so ``OperationalResearchEnricher``
+        runs its original code path unchanged.
+        """
 
         if settings.google_genai_api_key is None:
             return None
-        discovery = (
-            PerplexitySearchDiscovery(settings.perplexity_api_key)
-            if settings.perplexity_api_key is not None
-            else None
-        )
+
         extractor = GeminiStructuredExtractor(
             settings.google_genai_api_key,
             model=settings.gemini_model_chain,
@@ -717,10 +762,98 @@ class RunService:
             timeout=httpx.Timeout(20.0, connect=10.0),
             follow_redirects=False,
         )
+
+        if settings.you_api_key is None:
+            discovery = (
+                PerplexitySearchDiscovery(settings.perplexity_api_key)
+                if settings.perplexity_api_key is not None
+                else None
+            )
+            return OperationalResearchEnricher(
+                discovery=discovery,
+                extractor=extractor,
+                http_client=self._http_client,
+            )
+
+        you_api_key = settings.you_api_key
+        # One persistent research cache shared by all three You.com adapters, so
+        # identical app research does not re-spend credits across enrichments.
+        # The You.com adapters themselves manage their SDK client lifecycle via
+        # ``async with`` per call — no persistent async client is stored here
+        # (that would be unsafe across the per-enrichment asyncio.run loops).
+        if self._research_cache is None:
+            self._research_cache = SqliteResearchCache(settings.research_cache_db_path)
+        research_cache = self._research_cache
+
+        discovery_providers: list[object] = []
+        if settings.you_search_configured:
+            discovery_providers.append(
+                YouSearchDiscovery(
+                    you_api_key,
+                    count=settings.you_search_count,
+                    timeout_seconds=settings.you_search_timeout_seconds,
+                    max_calls=settings.you_max_search_calls_per_enrichment,
+                    cache=research_cache,
+                )
+            )
+        if settings.perplexity_api_key is not None:
+            discovery_providers.append(
+                LegacyDiscoveryAdapter(PerplexitySearchDiscovery(settings.perplexity_api_key))
+            )
+        rich_discovery = (
+            CompositeEvidenceDiscovery(discovery_providers)  # type: ignore[arg-type]
+            if discovery_providers
+            else None
+        )
+
+        content_fetcher_factory = None
+        if settings.you_contents_configured:
+            contents_timeout = settings.you_contents_timeout_seconds
+            contents_max_age = settings.you_contents_max_age_seconds
+            contents_max_pages = settings.you_max_contents_pages_per_enrichment
+            guarded_http_client = self._http_client
+
+            def _build_content_fetcher(host_policy: ResearchHostPolicy) -> object:
+                primary = YouContentsFetcher(
+                    you_api_key,
+                    policy=host_policy,
+                    max_age=contents_max_age,
+                    request_timeout=contents_timeout,
+                    max_pages=contents_max_pages,
+                    cache=research_cache,
+                )
+                fallback_policy = host_policy.official_url_policy
+                if fallback_policy is None:
+                    return primary
+                fallback = GuardedHTTPEvidenceFetcher(
+                    OfficialEvidenceFetcher(guarded_http_client, fallback_policy)
+                )
+                return FallbackEvidenceContentFetcher(primary=primary, fallback=fallback)
+
+            content_fetcher_factory = _build_content_fetcher
+
+        research_fallback = None
+        if settings.you_research_configured:
+            research_fallback = YouResearchFallback(
+                you_api_key,
+                timeout_seconds=settings.you_research_timeout_seconds,
+                cache=research_cache,
+            )
+
         return OperationalResearchEnricher(
-            discovery=discovery,
+            discovery=None,
             extractor=extractor,
             http_client=self._http_client,
+            rich_discovery=rich_discovery,
+            # ops.operational_research declares these as small structural
+            # Protocols typed with `policy: object` (it cannot import the
+            # concrete ResearchHostPolicy without a circular import). The
+            # concrete you_research classes correctly narrow that parameter
+            # to ResearchHostPolicy, which mypy's Protocol contravariance
+            # check flags even though it is safe here: _enrich_rich always
+            # calls both with the exact ResearchHostPolicy it just built.
+            content_fetcher_factory=content_fetcher_factory,  # type: ignore[arg-type]
+            research_fallback=research_fallback,  # type: ignore[arg-type]
         )
 
     def _build_credential_validator(
@@ -881,6 +1014,12 @@ class RunService:
                 except RuntimeError:  # pragma: no cover - already within a loop
                     pass
                 setattr(self, client_attr, None)
+        if self._research_cache is not None:
+            try:
+                self._research_cache.close()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+            self._research_cache = None
         if self._browser_worker is not None:
             try:
                 asyncio.run(self._browser_worker.close())
@@ -922,6 +1061,7 @@ class RunService:
         research_source = "verified_p1_snapshot"
         enrichment_attempts = 0
         enrichment_documents = 0
+        enrichment_metrics: dict[str, object] = {}
         enrichment_capability: CapabilityAvailability | None = None
         if isinstance(lookup, P1LookupFound):
             research = to_operational_research(lookup.record)
@@ -938,6 +1078,7 @@ class RunService:
                 research = outcome.research
                 enrichment_capability = outcome.capability
                 enrichment_documents = outcome.documents_fetched
+                enrichment_metrics = dict(outcome.provider_metrics)
                 if outcome.capability.status == "ready":
                     enrichment_attempts = 1
                     research_source = "official_evidence_combined"
@@ -1050,6 +1191,9 @@ class RunService:
                             "documents_fetched": enrichment_documents,
                             "missing_fields": _missing_operational_fields(research_payload),
                             "confidence": research_payload.get("confidence"),
+                            # Sanitized provider metrics (counts/latency/provider
+                            # name); never query text, page content, or the key.
+                            "provider_metrics": enrichment_metrics,
                             "external_actions": False,
                         },
                     )
@@ -1826,10 +1970,15 @@ class RunService:
                     baseline=baseline,
                 )
             )
+        except (TypeError, AttributeError, ImportError, ModuleNotFoundError, NameError):
+            # A broken integration (wrong kwarg, renamed SDK attribute, missing
+            # module) must reach monitoring/tests, not be silently degraded to a
+            # provider outage. It may surface as a sanitized HTTP 500 upstream.
+            raise
         except Exception:
-            # A provider/transport/extraction failure must never turn an
-            # otherwise valid run request into an untyped HTTP 500. Preserve the
-            # verified P1 baseline and expose only a stable, sanitized reason.
+            # An EXPECTED provider/transport/extraction/validation failure must
+            # never turn an otherwise valid run request into an untyped HTTP 500.
+            # Preserve the verified P1 baseline and expose only a stable reason.
             return ResearchEnrichmentOutcome(
                 research=baseline,
                 capability=CapabilityAvailability(
