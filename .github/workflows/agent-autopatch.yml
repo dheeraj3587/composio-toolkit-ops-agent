@@ -1,23 +1,25 @@
 name: Agent autopatch
 
-# Temporary one-shot generator. This file is removed by the follow-up PR.
+# Temporary one-shot generator. This file is removed before the follow-up PR merges.
 on:
-  push:
+  pull_request:
     branches:
-      - agent/playwright-demo-frontend-wiring
+      - main
 
 permissions:
   contents: write
 
 jobs:
   apply:
-    if: github.actor != 'github-actions[bot]'
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: agent/playwright-demo-frontend-wiring
+          ref: ${{ github.head_ref }}
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
@@ -81,4 +83,4 @@ jobs:
             exit 0
           fi
           git commit -m "fix: synchronize provider and frontend dependency contracts"
-          git push origin HEAD:agent/playwright-demo-frontend-wiring
+          git push origin HEAD:${{ github.head_ref }}
