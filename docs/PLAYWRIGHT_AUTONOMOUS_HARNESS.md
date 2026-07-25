@@ -74,9 +74,14 @@ Consequences that fall out of this structure rather than from instructions:
 
 - A model cannot invent a target: an unknown ID raises
   `ValueError("selected candidate id is not in the generated policy set")`.
-- A model cannot type a credential: `VALUE_ACTIONS` require an **approved value
-  reference** (`login_email`, `login_password`, `login_otp`) which code resolves
-  from the vault. The model passes a reference name, never a value.
+- A model cannot type a credential: the LLM can select a policy-generated fill
+  candidate only when the current checkpoint explicitly authorizes a reviewed
+  **non-secret** value reference (`APPROVED_VALUE_REFS`: `company_name`,
+  `company_website`, `application_name`, `use_case`, `expected_volume` — the
+  trace catalog rejects anything else at parse time). Passwords, OTPs, magic
+  links and account credentials **never become candidate values**; they are
+  inserted only by the deterministic login state machine
+  (`ops/browser_login.py`), never via a candidate.
 - A model cannot reach a secret field at all: elements marked `secretish` are never
   emitted as `type`/`fill` candidates.
 - A model cannot widen the allowlist: hosts come only from reviewed static data,
@@ -126,8 +131,9 @@ Rules that make progression trustworthy:
 
 ```
 inspect_login → LoginState ∈ {
-    login_form_present, email_first, password_step, otp_required,
-    magic_link_required, account_selection, captcha, mfa, complete, unknown
+    unknown, email_required, password_required, credentials_ready,
+    submitted, otp_required, magic_link_required,
+    account_selection_required, authenticated, authentication_failed
 }
 ```
 
@@ -490,9 +496,11 @@ Stated plainly, because the value of this document depends on it.
    uses RFC 2606 `.example` hostnames over real TLS mapped to loopback. That is
    deliberate and it proves the guards work; it does not prove any particular
    vendor's UI is navigable.
-5. **Interactive HITL is written but not exercised end-to-end.** The token logic,
-   authorization ordering and relay refusals are unit-tested; a human has not
-   driven a real noVNC session through it.
+5. **Interactive HITL is deferred and disabled** (see §7). The signed-grant and
+   relay primitives are unit-tested, but there is no operator-usable end-to-end
+   path, so `BrowserServiceSettings` rejects `interactive_hitl_enabled=true`
+   outright rather than exposing a flag that yields an unusable URL. Screenshot
+   HITL is unaffected.
 6. **Shadow mode is not wired into the live Browser Use path.** The planner and
    comparison exist and are tested; emitting a shadow plan during a real Browser Use
    run is a follow-up.
