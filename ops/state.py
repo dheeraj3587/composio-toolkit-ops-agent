@@ -54,7 +54,13 @@ _LEGAL_STATUS_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     "browser_running": frozenset(
         {"waiting_for_hitl", "credentials_ready", "configuration_required", "blocked", "failed"}
     ),
-    "waiting_for_hitl": frozenset({"browser_running", "blocked", "failed"}),
+    # ``configuration_required`` is reachable from ``waiting_for_hitl`` because a
+    # self-hosted (in-process) browser session does not survive an api restart: such
+    # a run is recoverable by operator action, not failed. Cloud-backed providers
+    # whose session can be reattached are simply never reconciled out of this state.
+    "waiting_for_hitl": frozenset(
+        {"browser_running", "configuration_required", "blocked", "failed"}
+    ),
     "outreach_sent": frozenset({"waiting_for_reply", "configuration_required", "failed"}),
     "waiting_for_reply": frozenset(
         {

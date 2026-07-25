@@ -83,6 +83,9 @@ IDEMPOTENCY_KEY_PATTERN = re.compile(r"^idem_[0-9a-f]{32}$")
 # Gated routes that may proceed to a single controlled outreach in
 # execute_when_configured. self_serve/hybrid use the browser path (later
 # milestones) and unknown/blocked never contact a provider.
+_TERMINAL_BROWSER_STATUSES: frozenset[str] = frozenset(
+    {"completed", "failed", "blocked", "configuration_required"}
+)
 _GATED_OUTREACH_ROUTES = frozenset({"approval_required", "partner_gated"})
 
 # Persisted reason codes for a gated run whose outreach the Composio capability
@@ -482,6 +485,19 @@ class RunService:
         Best-effort and never fatal to startup.
         """
 
+        # Provider capability decides which statuses are recoverable. Browser Use
+        # sessions live in the cloud and can be reattached by provider session id, so
+        # its waiting_for_hitl runs are left intact (unchanged behaviour). The
+        # self-hosted Playwright browser dies with the API process, so BOTH
+        # browser_running and waiting_for_hitl must be reconciled — claiming such a
+        # run is resumable would be false.
+        reattach = bool(getattr(self._browser_worker, "supports_restart_reattach", True))
+        stranded_statuses = (
+            ("browser_running",) if reattach else ("browser_running", "waiting_for_hitl")
+        )
+        reason = (
+            "api_restart_stranded_browser_run" if reattach else "playwright_session_lost_on_restart"
+        )
         try:
             offset = 0
             while True:
@@ -489,24 +505,35 @@ class RunService:
                 if not batch:
                     break
                 for record in batch:
-                    if record.get("status") == "browser_running":
-                        self._reconcile_one_stranded(str(record.get("run_id") or ""))
+                    if record.get("status") in stranded_statuses:
+                        self._reconcile_one_stranded(
+                            str(record.get("run_id") or ""),
+                            stranded_statuses=stranded_statuses,
+                            reason=reason,
+                        )
                 if len(batch) < 100:
                     break
                 offset += 100
         except Exception:  # pragma: no cover - reconciliation must never crash boot
             LOGGER.warning("startup run reconciliation was skipped after an error")
 
-    def _reconcile_one_stranded(self, run_id: str) -> None:
+    def _reconcile_one_stranded(
+        self,
+        run_id: str,
+        *,
+        stranded_statuses: tuple[str, ...] = ("browser_running",),
+        reason: str = "api_restart_stranded_browser_run",
+    ) -> None:
         if not run_id:
             return
         try:
             with self.storage.unit_of_work() as transaction:
                 current = transaction.get_run(run_id)
-                if current is None or current.get("status") != "browser_running":
+                if current is None or current.get("status") not in stranded_statuses:
                     return
+                previous_status = cast(RunStatus, current["status"])
                 revision = int(current.get("state_revision", 0) or 0) + 1
-                validate_status_transition("browser_running", "configuration_required", "reconcile")
+                validate_status_transition(previous_status, "configuration_required", "reconcile")
                 transaction.update_run(
                     run_id,
                     status="configuration_required",
@@ -517,9 +544,9 @@ class RunService:
                     run_id=run_id,
                     event_type="run_reconciled_on_startup",
                     payload={
-                        "previous_status": "browser_running",
+                        "previous_status": previous_status,
                         "status": "configuration_required",
-                        "reason": "api_restart_stranded_browser_run",
+                        "reason": reason,
                         "external_actions": False,
                     },
                 )
@@ -1531,7 +1558,7 @@ class RunService:
             if sensitive_data is not None:
                 sensitive_data.clear()
         try:
-            self._apply_async_browser_result(run_id, thread_id, request, workflow_state)
+            self._apply_async_browser_result(run_id, thread_id, request, workflow_state, context)
         except Exception as exc:  # pragma: no cover - defensive
             log_event(
                 "browser.async.apply_error",
@@ -1546,6 +1573,7 @@ class RunService:
         thread_id: str,
         request: OperationsRequest,
         workflow_state: Mapping[str, object],
+        context: Any = None,
     ) -> None:
         """Transition a browser_running run based on the completed navigate."""
 
@@ -1718,7 +1746,33 @@ class RunService:
                     transaction.append_audit_event(
                         run_id=run_id, event_type=event_type, payload=payload
                     )
+        self._stop_terminal_playwright_session(context, next_status)
         log_event("browser.async.applied", run_id=run_id, status=next_status)
+
+    def _stop_terminal_playwright_session(self, context: Any, next_status: RunStatus) -> None:
+        """Close a self-hosted browser session once the run reaches a terminal state.
+
+        A Playwright session is a real local Chromium process, so leaving it running
+        after a terminal outcome leaks memory on a small VPS. Sessions are kept only
+        while a run genuinely still needs the browser (``waiting_for_hitl`` for the
+        human, or ``browser_running`` while the action loop is active).
+
+        Deliberately Playwright-only: Browser Use has its own cleanup and
+        reconciliation semantics (its sessions are intentionally retained for
+        inspection), so this branch must never stop them.
+        """
+
+        worker = self._browser_worker
+        if context is None or worker is None:
+            return
+        if next_status not in _TERMINAL_BROWSER_STATUSES:
+            return
+        if str(getattr(worker, "provider_name", "browser_use")) != "playwright":
+            return
+        try:
+            asyncio.run(worker.stop(context))
+        except Exception:  # pragma: no cover - cleanup must never break the run
+            log_event("browser.async.terminal_stop_error", level=30, status=next_status)
 
     def _mark_async_browser_failed(self, run_id: str) -> None:
         """Best-effort transition of a stuck browser_running run to failed."""
@@ -2291,6 +2345,36 @@ class RunService:
                 return _public_run(updated)
         finally:
             lock.release()
+
+    def get_browser_screenshot(self, run_id: str) -> tuple[bytes, str] | None:
+        """Return the newest masked screenshot for a run's browser session.
+
+        Only the self-hosted Playwright provider offers this (Browser Use supplies a
+        hosted live URL instead). The bytes live solely in the worker's memory: they
+        are never written to SQLite, disk, logs, or the checkpoint.
+        """
+
+        record = self.storage.get_run(run_id)
+        if record is None:
+            return None
+        session_id = record.get("browser_session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        worker = self._browser_worker
+        if worker is None:
+            return None
+        getter = getattr(worker, "latest_screenshot", None)
+        if not callable(getter):
+            return None
+        result = getter(session_id)
+        if (
+            isinstance(result, tuple)
+            and len(result) == 2
+            and isinstance(result[0], bytes)
+            and isinstance(result[1], str)
+        ):
+            return (result[0], result[1])
+        return None
 
     def get_browser_live_url(self, run_id: str) -> str | None:
         """Return the ephemeral signed live-view URL for a run, if one is active.

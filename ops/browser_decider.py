@@ -22,6 +22,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -68,6 +69,9 @@ class SnapshotElement:
     name: str
     element_type: str = ""
     has_value: bool = False
+    # True when the element looks credential-bearing. The model is never allowed to
+    # type into such a field (only code-owned injection may).
+    secretish: bool = False
 
     def render(self) -> str:
         parts = [f"[{self.index}] {self.role}"]
@@ -88,7 +92,12 @@ def render_snapshot(elements: Sequence[SnapshotElement]) -> str:
     return "\n".join(element.render() for element in elements[:MAX_ELEMENTS])
 
 
-_SECRETISH = re.compile(r"(?i)pass|secret|token|otp|code|cvv|card")
+_SECRETISH = re.compile(r"(?i)pass|secret|token|otp|code|cvv|card|credential|api.?key")
+
+# The only keyboard keys a model decision may press. Anything else is rejected.
+ALLOWED_PRESS_KEYS = frozenset(
+    {"Enter", "Escape", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"}
+)
 
 
 def build_snapshot(raw_elements: Sequence[Mapping[str, object]]) -> tuple[SnapshotElement, ...]:
@@ -117,6 +126,7 @@ def build_snapshot(raw_elements: Sequence[Mapping[str, object]]) -> tuple[Snapsh
                 name=name,
                 element_type=element_type,
                 has_value=has_value,
+                secretish=secretish,
             )
         )
     return tuple(elements)
@@ -231,34 +241,57 @@ def build_decision_prompt(
 def validate_action(
     payload: Mapping[str, object],
     *,
-    element_count: int,
+    elements: Sequence[SnapshotElement],
     allowed_hosts: Sequence[str],
     host_check: Any,
 ) -> BrowserAction:
     """Validate a model payload into an executable action, failing closed.
 
-    Enforces the schema, that an index-bearing action points at a real element, and
-    that a ``goto`` target is inside the reviewed allowlist.
+    Receives the ACTUAL elements (not just a count) so it can refuse to type into a
+    credential-bearing field. Also enforces the closed schema, in-range indexes, a
+    reviewed keyboard-key allowlist, and an allowlisted, credential-free ``goto``.
     """
 
     try:
         action = BrowserAction.model_validate(dict(payload))
     except ValidationError as exc:
         raise ValueError(f"action failed schema validation: {exc.error_count()} errors") from None
+
     if action.requires_index():
-        if action.index is None or action.index >= element_count:
+        if action.index is None or action.index >= len(elements):
             raise ValueError("action index does not address a snapshot element")
-    if action.kind == "type" and not action.text:
-        raise ValueError("type action requires text")
-    if action.kind == "press" and not action.text:
-        raise ValueError("press action requires a key name")
+
+    if action.kind == "type":
+        if not action.text:
+            raise ValueError("type action requires text")
+        assert action.index is not None  # guaranteed by requires_index above
+        if elements[action.index].secretish:
+            # Only code-owned injection may fill a credential field; a model must not.
+            raise ValueError("model typing into a secret field is forbidden")
+
+    if action.kind == "press":
+        if not action.text:
+            raise ValueError("press action requires a key name")
+        if action.text not in ALLOWED_PRESS_KEYS:
+            raise ValueError("press key is not in the reviewed allowlist")
+
     if action.kind == "goto":
-        if not action.url or not host_check(action.url, tuple(allowed_hosts)):
+        if not action.url:
+            raise ValueError("goto action requires a url")
+        parsed = urlsplit(action.url)
+        if parsed.scheme != "https":
+            raise ValueError("goto target must be absolute https")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("goto target must not embed credentials")
+        if parsed.fragment:
+            raise ValueError("goto target must not carry a fragment")
+        if not host_check(action.url, tuple(allowed_hosts)):
             raise ValueError("goto target is outside the reviewed host allowlist")
     return action
 
 
 __all__ = [
+    "ALLOWED_PRESS_KEYS",
     "MAX_ELEMENTS",
     "ActionKind",
     "BrowserAction",

@@ -16,6 +16,7 @@ of how many short-lived caller loops come and go.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import threading
 from collections.abc import Coroutine
 from typing import Any, TypeVar
@@ -93,10 +94,24 @@ class BrowserLoop:
             raise
 
     def run_sync(self, coro: Coroutine[Any, Any, T], *, timeout: float = _DEFAULT_TIMEOUT) -> T:
-        """Blocking variant for synchronous callers (no caller loop required)."""
+        """Blocking variant for synchronous callers (no caller loop required).
+
+        ``Future.result(timeout)`` raises but does NOT stop the scheduled coroutine,
+        so a timed-out browser operation would keep running on the browser loop and
+        hold its page. The future is therefore cancelled on every exit path.
+        """
 
         loop = self._ensure_started()
-        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout)
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise BrowserOperationTimeout("browser_operation_timeout") from None
+        except BaseException:
+            if not future.done():
+                future.cancel()
+            raise
 
     def close(self) -> None:
         """Reject new work, drain the loop, then join its thread. Idempotent.

@@ -20,11 +20,23 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class CredentialCaptureSpec:
+    """A reviewed, per-app capture contract.
+
+    Deliberately narrow: reviewed ``selectors`` replace scanning every input on the
+    page (which could pick an unrelated field that happens to match the pattern),
+    and the path/heading checks prove the browser is really on the credential page
+    before any value is read.
+    """
+
     app_slug: str
     url: str
     vendor_domain: str
     field_kind: str
     value_pattern: str
+    selectors: tuple[str, ...] = ()
+    expected_path_prefix: str | None = None
+    expected_heading: str | None = None
+    reveal_selector: str | None = None
 
 
 _SPECS: dict[str, CredentialCaptureSpec] = {
@@ -35,7 +47,14 @@ _SPECS: dict[str, CredentialCaptureSpec] = {
         url="https://app.pipedrive.com/settings/api",
         vendor_domain="pipedrive.com",
         field_kind="api_token",
-        value_pattern=r"^[A-Fa-f0-9]{40}$",
+        value_pattern=r"[A-Fa-f0-9]{40}",
+        selectors=(
+            "input[name='api_token']",
+            "input[data-testid='api-token']",
+            "input[readonly][value]",
+        ),
+        expected_path_prefix="/settings/api",
+        expected_heading="API",
     ),
 }
 
