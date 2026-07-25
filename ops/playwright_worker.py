@@ -41,9 +41,12 @@ from ops.browser_api_trace_catalog import (
 )
 from ops.browser_candidates import (
     ActionCandidate,
+    CandidatePostcondition,
+    ElementPredicate,
     executable_candidates,
     generate_candidates,
     render_candidates,
+    resolve_identity,
     select_candidate,
     validate_press_key,
 )
@@ -57,6 +60,12 @@ from ops.browser_decider import (
     render_snapshot,
     validate_choice,
 )
+from ops.browser_egress import (
+    BrowserEgressPolicy,
+    EgressStage,
+    EgressStageTracker,
+    build_egress_policy,
+)
 from ops.browser_host_policy import BrowserPolicyInactiveError, build_browser_allowed_hosts
 from ops.browser_login import (
     LoginInspection,
@@ -64,6 +73,18 @@ from ops.browser_login import (
     normalize_resume_signal,
 )
 from ops.browser_loop import BrowserLoop, BrowserOperationTimeout, shared_browser_loop
+from ops.browser_pages import (
+    BrowserPageRegistry,
+    DialogPolicy,
+    DialogRecord,
+    DownloadPolicy,
+    DownloadRecord,
+    frame_path_is_reviewed,
+    install_dialog_handler,
+    install_download_guard,
+)
+from ops.browser_risk import BrowserActionRiskPolicy
+from ops.browser_snapshot import build_ranked_snapshot
 from ops.browser_worker import (
     BrowserObservation,
     BrowserSessionContext,
@@ -241,6 +262,17 @@ class _PwSession:
     # Lifecycle state + in-flight operation count (item 7).
     lifecycle: str = "ACTIVE"
     active_operations: int = 0
+    # --- Phase 2: multi-page, dialog, download and staged-egress state ---
+    # Page registry (popups/new tabs). Set up in _launch; the newest page is
+    # never trusted automatically (see BrowserPageRegistry.consider_popup).
+    pages: BrowserPageRegistry | None = field(default=None)
+    dialog_records: list[DialogRecord] = field(default_factory=list)
+    download_records: list[DownloadRecord] = field(default_factory=list)
+    egress: EgressStageTracker = field(default_factory=EgressStageTracker)
+    egress_policy: BrowserEgressPolicy | None = field(default=None)
+    # Current checkpoint's expected signals, so the snapshot can RANK by
+    # checkpoint relevance rather than DOM order.
+    checkpoint_signals: tuple[str, ...] = ()
     # Latest masked screenshot (PNG bytes) for the HITL live view.
     screenshot: bytes | None = field(default=None)
     screenshot_at: str | None = field(default=None)
@@ -348,6 +380,81 @@ def checkpoint_satisfied(checkpoint: BrowserApiTraceStep, inspection: PageInspec
     return predicate_satisfied(checkpoint.completion, inspection)
 
 
+def _predicate_present(predicate: ElementPredicate, inspection: PageInspection) -> bool:
+    return any(predicate.matches(element) for element in inspection.elements)
+
+
+def postcondition_satisfied(
+    postcondition: CandidatePostcondition,
+    *,
+    before: PageInspection,
+    after: PageInspection,
+) -> bool:
+    """Verify an ACTION's own state transition (Phase 2, section 3/5).
+
+    A successful click is not a successful transition. This compares a freshly
+    inspected page against the pre-action inspection and requires the action's
+    specific assertion to hold. ANY satisfied assertion counts (a click may
+    legitimately either navigate or replace part of the DOM), which is what makes
+    it work for SPAs: client-side routing changes the URL, partial DOM
+    replacement makes the control disappear or new text appear.
+
+    Deliberately NOT ``networkidle`` (a persistent WebSocket or background poll
+    means idle may never arrive) and never a sleep.
+    """
+
+    if postcondition.is_empty():
+        return False
+
+    if postcondition.url_matches:
+        path = urlsplit(after.url).path.casefold()
+        if any(token.casefold() in path for token in postcondition.url_matches):
+            return True
+
+    if postcondition.url_changed and after.url != before.url:
+        return True
+
+    for predicate in postcondition.element_appears:
+        if _predicate_present(predicate, after) and not _predicate_present(predicate, before):
+            return True
+
+    for predicate in postcondition.element_disappears:
+        if _predicate_present(predicate, before) and not _predicate_present(predicate, after):
+            return True
+
+    if postcondition.text_appears:
+        text = after.visible_text.casefold()
+        before_text = before.visible_text.casefold()
+        if any(
+            token.casefold() in text and token.casefold() not in before_text
+            for token in postcondition.text_appears
+        ):
+            return True
+
+    if postcondition.checked_state is not None:
+        for element in after.elements:
+            if element.checked is postcondition.checked_state:
+                return True
+
+    if postcondition.selected_value is not None:
+        needle = postcondition.selected_value.casefold()
+        for element in after.elements:
+            if element.selected and needle in element.name.casefold():
+                return True
+
+    return False
+
+
+def structural_change(before: PageInspection, after: PageInspection) -> bool:
+    """A bounded structural DOM change: the interactive surface actually differs.
+
+    Used as the SPA fallback when a candidate asserted no specific postcondition:
+    it proves *something* changed without trusting a click's return value.
+    """
+
+    return before.fingerprint != after.fingerprint
+
+
 class ApprovedBrowserValueResolver:
     """Resolves a reviewed NON-SECRET value reference to its configured value.
 
@@ -415,6 +522,8 @@ class PlaywrightBrowserWorker:
         self._inference = build_json_inference(self._settings)
         # Resolves reviewed NON-SECRET form values (never a credential).
         self._value_resolver = ApprovedBrowserValueResolver(self._settings)
+        # One central risk authority for every action (Phase 2, section 4).
+        self._risk_policy = BrowserActionRiskPolicy()
         # A TTL janitor runs independently of new-session creation, so an idle
         # session is reclaimed even when no further run ever starts.
         self._janitor_stop = threading.Event()
@@ -585,6 +694,10 @@ class PlaywrightBrowserWorker:
         if not target or not navigation_allowed(target, patterns):
             return _blocked(target or "https://unknown.invalid/")
 
+        # Phase 2 guards are installed HERE (not at launch) because they need the
+        # app's reviewed host patterns, which only exist once research resolves.
+        await self._install_interaction_guards(session, patterns)
+
         async def _go() -> bool:
             # REAL enforcement: install the STAGED host guard before any navigation.
             # The stage is read live, so post-auth tightening applies to this route.
@@ -726,6 +839,8 @@ class PlaywrightBrowserWorker:
                     f"Checkpoint {checkpoint.order} requires a human: {checkpoint.instruction}",
                 )
 
+            # Rank the NEXT snapshot by this checkpoint's signals.
+            session.checkpoint_signals = tuple(checkpoint.expected_signals)
             deterministic = match_checkpoint(inspection.elements, checkpoint)
 
             # Policy generates the bounded candidate set; the model only chooses. The
@@ -781,6 +896,20 @@ class PlaywrightBrowserWorker:
                     return outcome
                 chosen = outcome
 
+            # Phase 2: one central risk verdict gates every action. An
+            # irreversible or unauthorized intent never runs autonomously.
+            target_element = None
+            if chosen.identity is not None:
+                status, target_element = resolve_identity(chosen.identity, inspection.elements)
+                del status  # execution re-resolves; this is only for risk context
+            risk = self._risk_policy.classify(
+                candidate=chosen, checkpoint=checkpoint, element=target_element
+            )
+            if not risk.autonomous_allowed:
+                return self._human_required(
+                    session, f"Action requires human authorization ({risk.reason_code})."
+                )
+
             execution = await self._execute_candidate(session, chosen, inspection)
             if execution.status == "blocked":
                 return _blocked(execution.after_url)
@@ -802,11 +931,31 @@ class PlaywrightBrowserWorker:
             fresh = await self._inspect_page(session)
             if not navigation_allowed(fresh.url, session.patterns):
                 return _blocked(fresh.url)
+
+            # A dialog or popup that needs a human is surfaced before replanning.
+            gate = self._pending_interaction_gate(session)
+            if gate is not None:
+                return gate
+
+            # The ACTION's own transition is verified too (SPA-aware): either its
+            # specific postcondition holds, or — when it asserted none — the
+            # interactive surface structurally changed.
+            transitioned = (
+                postcondition_satisfied(chosen.postcondition, before=inspection, after=fresh)
+                if not chosen.postcondition.is_empty()
+                else structural_change(inspection, fresh)
+            )
             if checkpoint_satisfied(checkpoint, fresh):
                 session.checkpoint_index += 1
                 session.attempted_checkpoint_index = session.checkpoint_index
             else:
                 session.attempted_checkpoint_index = session.checkpoint_index + 1
+                if not transitioned:
+                    # Nothing observably changed: count it so a control that does
+                    # nothing cannot spin the loop.
+                    action_failures += 1
+                    if action_failures >= _MAX_ACTION_FAILURES:
+                        return self._failed_observation(session, "postcondition_failed")
 
         return self._human_required(session, "The bounded browser action limit was reached.")
 
@@ -829,18 +978,33 @@ class PlaywrightBrowserWorker:
                     raw_title if isinstance(raw_title, str) else "", max_length=300
                 )
                 visible = sanitize_page_text(raw_visible)
-                raw: list[dict[str, object]] = []
-                locators: list[Any] = []
+                # Phase 2: a RANKED, frame-aware accessible snapshot (no raw HTML,
+                # never "the first 40 DOM nodes"). Only reviewed frame origins are
+                # inspected. Falls back to the Phase 1 main-frame walk if the
+                # richer collection cannot run at all.
                 try:
-                    handles = page.locator(_INTERACTIVE_SELECTOR)
-                    total = int(await handles.count())
+                    elements, locator_tuple = await build_ranked_snapshot(
+                        page,
+                        reviewed_patterns=session.patterns,
+                        checkpoint_signals=session.checkpoint_signals,
+                        limit=MAX_ELEMENTS,
+                    )
+                    locators = list(locator_tuple)
+                except (TypeError, AttributeError, AssertionError, NameError):
+                    raise
                 except Exception:
-                    total = 0
-                for index in range(min(total, MAX_ELEMENTS)):
-                    locator = handles.nth(index)
-                    raw.append(await _describe_element(locator))
-                    locators.append(locator)
-                elements = build_snapshot(raw)
+                    raw: list[dict[str, object]] = []
+                    locators = []
+                    try:
+                        handles = page.locator(_INTERACTIVE_SELECTOR)
+                        total = int(await handles.count())
+                    except Exception:
+                        total = 0
+                    for index in range(min(total, MAX_ELEMENTS)):
+                        locator = handles.nth(index)
+                        raw.append(await _describe_element(locator))
+                        locators.append(locator)
+                    elements = build_snapshot(raw)
                 session.dom_generation += 1
                 return PageInspection(
                     url=sanitize_url(url),
@@ -1050,8 +1214,22 @@ class PlaywrightBrowserWorker:
             async with session.operation_lock:
                 session.last_active_at = datetime.now(UTC)
                 page = session.page
+                # Phase 2: NEVER inject into an unreviewed frame origin. A login
+                # field inside a third-party iframe is refused even when the main
+                # frame is approved.
+                if not await _login_frames_are_reviewed(page, session.patterns):
+                    return LoginInspection(
+                        state="unknown",
+                        email_field=None,
+                        password_field=None,
+                        otp_fields=(),
+                        submit_control=None,
+                        current_url=_page_url(page),
+                        reason_code="login_frame_unreviewed",
+                    )
                 # Tighten BEFORE any fill: even an email/username is account data.
                 session.egress_stage = "post_auth"
+                session.egress.advance_to(EgressStage.AUTHENTICATING)
                 session.screenshots_disabled = True
                 session.screenshot = None
                 session.screenshot_at = None
@@ -1063,6 +1241,67 @@ class PlaywrightBrowserWorker:
             raise  # a programming error must surface, never be swallowed
         except Exception:
             return None
+
+    async def _install_interaction_guards(
+        self, session: _PwSession, patterns: tuple[str, ...]
+    ) -> None:
+        """Install the page/popup registry, dialog handler and download guard.
+
+        All three are installed BEFORE any navigation or action, so a popup,
+        dialog or download can never appear unguarded. Host sets come only from
+        the reviewed per-app patterns — never from page content or model output.
+        """
+
+        session.egress_policy = build_egress_policy(patterns)
+        registry = BrowserPageRegistry(url_allowed=lambda url: navigation_allowed(url, patterns))
+
+        async def _wire() -> None:
+            registry.register(session.page, active=True)
+            install_dialog_handler(session.page, DialogPolicy(), session.dialog_records)
+            # Downloads are refused by default; a trace may approve one later.
+            install_download_guard(session.page, DownloadPolicy(), session.download_records)
+
+            def _on_page(popup: Any) -> None:
+                # The newest page is NEVER trusted automatically: validate first.
+                # The handler runs on the browser loop, which owns these objects.
+                asyncio.ensure_future(  # noqa: RUF006 - fire-and-forget on the browser loop
+                    registry.consider_popup(popup, opener_page_id=registry.active_page_id)
+                )
+
+            session.context.on("page", _on_page)
+
+        try:
+            await self._loop.run(_wire(), timeout=_OP_TIMEOUT_SECONDS)
+        except (TypeError, AttributeError, AssertionError, NameError):
+            raise  # a programming error must surface
+        except Exception:
+            pass  # guards are best-effort to install; the host route guard still applies
+        session.pages = registry
+
+    def _pending_interaction_gate(self, session: _PwSession) -> BrowserObservation | None:
+        """Surface a dialog/download that needs a human, then clear the record.
+
+        A ``confirm``/``prompt`` was already dismissed by the handler (so the page
+        is never wedged), but the RUN must still stop for a human decision rather
+        than silently proceeding as if the dialog had been answered.
+        """
+
+        for record in list(session.dialog_records):
+            if record.outcome == "requires_human":
+                session.dialog_records.clear()
+                return self._human_required(
+                    session, f"A browser dialog needs a human decision ({record.reason_code})."
+                )
+        session.dialog_records.clear()
+
+        for download in list(session.download_records):
+            if not download.allowed:
+                session.download_records.clear()
+                return self._human_required(
+                    session, f"A download was refused by policy ({download.reason_code})."
+                )
+        session.download_records.clear()
+        return None
 
     def _human_required(self, session: _PwSession, instruction: str) -> BrowserObservation:
         url = "https://unknown.invalid/"
@@ -1590,6 +1829,43 @@ async def _safe(coro_fn: Any) -> None:
 def _page_url(page: Any) -> str:
     url = getattr(page, "url", "")
     return url if isinstance(url, str) and url else "https://unknown.invalid/"
+
+
+async def _login_frames_are_reviewed(page: Any, patterns: tuple[str, ...]) -> bool:
+    """True when every frame hosting a password field is on a reviewed origin.
+
+    A credential field inside an UNREVIEWED (e.g. third-party) iframe is never
+    filled, even when the top-level page is approved — the main frame being
+    allowlisted says nothing about who owns the nested document.
+    """
+
+    from ops.browser_snapshot import frame_chain, frame_host
+
+    try:
+        frames = list(page.frames)
+    except Exception:
+        return False  # cannot enumerate frames -> fail closed
+    for frame in frames:
+        try:
+            count = int(await frame.locator("input[type='password']").count())
+        except Exception:
+            continue
+        if count <= 0:
+            continue
+        try:
+            is_main = frame is page.main_frame
+        except Exception:
+            is_main = False
+        if is_main:
+            if not navigation_allowed(_page_url(page), patterns):
+                return False
+            continue
+        host = frame_host(frame)
+        if not host or not navigation_allowed(f"https://{host}/", patterns):
+            return False
+        if not frame_path_is_reviewed(frame_chain(frame), patterns):
+            return False
+    return True
 
 
 async def _has_password_field(page: Any) -> bool:

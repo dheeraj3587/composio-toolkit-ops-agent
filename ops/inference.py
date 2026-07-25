@@ -30,9 +30,12 @@ from __future__ import annotations
 
 import importlib
 import json
+import time
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, cast
 
 import httpx
 from pydantic import SecretStr
@@ -227,17 +230,136 @@ class GeminiJsonBackend:
         raise RuntimeError("all Gemini models failed") from last
 
 
-class JsonInference:
-    """Try each backend in order; the first schema-valid JSON object wins."""
+@dataclass(frozen=True, slots=True)
+class DecisionBudget:
+    """Hard bounds so one decision can never consume the browser-loop budget.
 
-    def __init__(self, backends: Sequence[JsonBackend]) -> None:
+    ``total_seconds`` caps the WHOLE decision across providers;
+    ``provider_seconds`` caps each individual attempt; ``max_providers`` caps how
+    many providers are tried at all.
+    """
+
+    total_seconds: float = 15.0
+    provider_seconds: float = 6.0
+    max_providers: int = 3
+
+
+# Typed, sanitized decision reason codes (never provider payload text).
+DecisionReasonCode = Literal[
+    "rate_limited",
+    "authentication_failed",
+    "provider_timeout",
+    "invalid_json",
+    "schema_invalid",
+    "all_providers_failed",
+]
+
+# Programming errors must propagate out of the decision path, never be recorded
+# as a provider failure.
+_PROGRAMMING_ERRORS: tuple[type[Exception], ...] = (
+    TypeError,
+    AttributeError,
+    NameError,
+    ImportError,
+    ModuleNotFoundError,
+    AssertionError,
+)
+
+
+class DecisionFailed(RuntimeError):
+    """A bounded decision failure carrying only a typed reason code."""
+
+    def __init__(self, reason_code: DecisionReasonCode) -> None:
+        self.reason_code: DecisionReasonCode = reason_code
+        super().__init__(f"decision failed: {reason_code}")
+
+
+def _classify_backend_error(exc: Exception) -> DecisionReasonCode:
+    """Map a provider exception to a sanitized reason code (status/type only)."""
+
+    if isinstance(exc, RateLimited):
+        return "rate_limited"
+    if isinstance(exc, TimeoutError | httpx.TimeoutException):
+        return "provider_timeout"
+    status = getattr(exc, "status_code", None)
+    if status in (401, 403):
+        return "authentication_failed"
+    if isinstance(exc, json.JSONDecodeError):
+        return "invalid_json"
+    if isinstance(exc, ValueError):
+        # pydantic ValidationError and our validate() callables raise ValueError.
+        return "schema_invalid"
+    return "all_providers_failed"
+
+
+@dataclass(slots=True)
+class _Breaker:
+    """A minimal per-provider circuit breaker (opens after repeated failures)."""
+
+    failures: int = 0
+    open_until: float = 0.0
+
+    def is_open(self, now: float) -> bool:
+        return now < self.open_until
+
+    def record_failure(self, now: float, *, threshold: int = 2, cooldown: float = 60.0) -> None:
+        self.failures += 1
+        if self.failures >= threshold:
+            self.open_until = now + cooldown
+            self.failures = 0
+
+    def record_success(self) -> None:
+        self.failures = 0
+        self.open_until = 0.0
+
+
+def _call_with_timeout(
+    func: Any, prompt: str, schema: Mapping[str, object] | None, *, timeout: float
+) -> dict[str, object]:
+    """Run a blocking backend call with a hard wall-clock timeout.
+
+    The backend is blocking HTTP, so it runs on a worker thread and the caller
+    stops waiting at ``timeout``; a late reply is abandoned, so a slow provider
+    can never overrun the decision (or the browser) budget.
+    """
+
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="inference")
+    future = executor.submit(func, prompt, schema)
+    try:
+        return cast("dict[str, object]", future.result(timeout=timeout))
+    except FuturesTimeout:
+        future.cancel()
+        raise TimeoutError("provider exceeded its per-attempt budget") from None
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+class JsonInference:
+    """Try each backend in order under a bounded decision budget.
+
+    The first schema-valid JSON object wins. A provider that times out, is rate
+    limited, or repeatedly fails is skipped (circuit breaker) so the browser loop
+    keeps its own deadline. Programming errors propagate.
+    """
+
+    def __init__(
+        self, backends: Sequence[JsonBackend], *, budget: DecisionBudget | None = None
+    ) -> None:
         if not backends:
             raise ValueError("at least one inference backend is required")
         self._backends = tuple(backends)
+        self._budget = budget or DecisionBudget()
+        self._breakers: dict[str, _Breaker] = {}
+        # Sanitized record of the last decision's failures, for reporting.
+        self.last_reason_codes: tuple[DecisionReasonCode, ...] = ()
 
     @property
     def provider_names(self) -> tuple[str, ...]:
         return tuple(backend.name for backend in self._backends)
+
+    @property
+    def budget(self) -> DecisionBudget:
+        return self._budget
 
     def generate(
         self,
@@ -250,21 +372,48 @@ class JsonInference:
 
         ``validate`` may be a callable raising on an unacceptable payload (e.g. a
         pydantic ``model_validate``), so a malformed decision falls through to the
-        next provider instead of reaching the browser.
+        next provider instead of reaching the browser. Raises
+        :class:`DecisionFailed` with a typed reason code when the budget is spent.
         """
 
-        errors: list[str] = []
+        deadline = time.monotonic() + self._budget.total_seconds
+        reasons: list[DecisionReasonCode] = []
+        attempted = 0
+
         for backend in self._backends:
+            if attempted >= self._budget.max_providers:
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                reasons.append("provider_timeout")
+                break
+            breaker = self._breakers.setdefault(backend.name, _Breaker())
+            if breaker.is_open(now):
+                continue  # skip a provider that recently failed repeatedly
+            # Each attempt is bounded by BOTH the per-provider cap and whatever
+            # remains of the total budget.
+            per_attempt = min(self._budget.provider_seconds, deadline - now)
+            if per_attempt <= 0:
+                reasons.append("provider_timeout")
+                break
+            attempted += 1
             try:
-                payload = backend.generate_json(prompt, schema)
+                payload = _call_with_timeout(
+                    backend.generate_json, prompt, schema, timeout=per_attempt
+                )
                 if validate is not None:
                     validate(payload)
+                breaker.record_success()
+                self.last_reason_codes = tuple(reasons)
                 return InferenceResult(payload=payload, provider=backend.name)
-            except RateLimited:
-                errors.append(f"{backend.name}: rate_limited")
+            except _PROGRAMMING_ERRORS:
+                raise  # a broken integration must surface
             except Exception as exc:
-                errors.append(f"{backend.name}: {type(exc).__name__}")
-        raise InferenceError("; ".join(errors) or "no backend produced valid JSON")
+                reasons.append(_classify_backend_error(exc))
+                breaker.record_failure(time.monotonic())
+
+        self.last_reason_codes = tuple(reasons)
+        raise DecisionFailed(reasons[-1] if reasons else "all_providers_failed")
 
 
 def build_json_inference(settings: object) -> JsonInference | None:
@@ -302,6 +451,9 @@ def build_json_inference(settings: object) -> JsonInference | None:
 
 __all__ = [
     "CerebrasJsonBackend",
+    "DecisionBudget",
+    "DecisionFailed",
+    "DecisionReasonCode",
     "GeminiJsonBackend",
     "GroqJsonBackend",
     "InferenceError",

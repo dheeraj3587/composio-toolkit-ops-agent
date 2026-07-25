@@ -255,7 +255,8 @@ def test_approved_value_can_be_typed_as_a_candidate() -> None:
         expected_postcondition="done",
         allow_value_refs=("company_name",),
     )
-    typed = [c for c in candidates if c.action == "type"]
+    # Phase 2 renamed the value action "type" -> "fill"; both remain valid literals.
+    typed = [c for c in candidates if c.action in {"fill", "type"}]
     assert typed and typed[0].value_ref == "company_name"
     assert "company_name" in APPROVED_VALUE_REFS
 
@@ -270,7 +271,7 @@ def test_unapproved_value_reference_produces_no_candidate() -> None:
         expected_postcondition="done",
         allow_value_refs=("arbitrary_free_text",),
     )
-    assert [c for c in candidates if c.action == "type"] == []
+    assert [c for c in candidates if c.action in {"fill", "type"}] == []
 
 
 # --- Structured checkpoint state machine (pure) --------------------------------

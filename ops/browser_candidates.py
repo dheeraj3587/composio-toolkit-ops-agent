@@ -29,8 +29,87 @@ from typing import Literal
 
 from ops.browser_decider import SnapshotElement
 
-CandidateAction = Literal["click", "type", "press", "goto"]
+# Phase 2 vocabulary. "type" is retained as a backward-compatible alias for
+# "fill" (Phase 1 candidates and their tests use it); new code emits "fill".
+CandidateAction = Literal[
+    "click",
+    "fill",
+    "type",
+    "press",
+    "goto",
+    "select_option",
+    "check",
+    "uncheck",
+    "scroll_into_view",
+    "focus",
+]
 RiskLevel = Literal["low", "medium", "high", "requires_hitl"]
+
+# Actions that only observe/position and change no application state.
+READ_ONLY_ACTIONS: frozenset[str] = frozenset({"scroll_into_view", "focus"})
+# Actions that put a value into a control (never a secret — see APPROVED_VALUE_REFS).
+VALUE_ACTIONS: frozenset[str] = frozenset({"fill", "type", "select_option"})
+
+
+@dataclass(frozen=True, slots=True)
+class ElementPredicate:
+    """A structural expectation about ONE element, used in a postcondition.
+
+    Deliberately identity-shaped (role/name/frame/test id) rather than a
+    selector, so a postcondition can never smuggle in an authored selector.
+    """
+
+    role: str = ""
+    name: str = ""
+    element_type: str = ""
+    frame_path: tuple[str, ...] = ()
+    test_id: str | None = None
+
+    def matches(self, element: SnapshotElement) -> bool:
+        if self.test_id:
+            return element.test_id == self.test_id
+        if self.role and element.role != self.role:
+            return False
+        if self.element_type and element.element_type != self.element_type:
+            return False
+        if self.frame_path and tuple(element.frame_path) != tuple(self.frame_path):
+            return False
+        if self.name:
+            return _normalize(self.name) in _normalize(element.name)
+        return bool(self.role or self.element_type)
+
+
+@dataclass(frozen=True, slots=True)
+class CandidatePostcondition:
+    """What must become true for THIS action to count as a real state transition.
+
+    A successful click is not a successful transition: the action's own
+    postcondition must be verified against a freshly inspected page. Verified by
+    ``ops.playwright_worker.postcondition_satisfied`` using Playwright
+    auto-waiting — never ``networkidle`` as a success proxy and never a sleep.
+    """
+
+    url_changed: bool = False
+    url_matches: tuple[str, ...] = ()
+    element_appears: tuple[ElementPredicate, ...] = ()
+    element_disappears: tuple[ElementPredicate, ...] = ()
+    text_appears: tuple[str, ...] = ()
+    selected_value: str | None = None
+    checked_state: bool | None = None
+
+    def is_empty(self) -> bool:
+        """True when nothing is asserted, so this cannot prove a transition."""
+
+        return not (
+            self.url_changed
+            or self.url_matches
+            or self.element_appears
+            or self.element_disappears
+            or self.text_appears
+            or self.selected_value is not None
+            or self.checked_state is not None
+        )
+
 
 # Intents a bot must never perform autonomously. Matched against the element's
 # accessible name/role, NOT against arbitrary body text.
@@ -73,20 +152,131 @@ _ALLOWED_KEYS: frozenset[str] = frozenset({"Enter", "Escape", "Tab"})
 class ElementIdentity:
     """The stable identity used to re-resolve a target just before execution.
 
-    Deliberately role/name/type — never a positional ``nth`` index, which becomes
-    wrong the moment the DOM changes.
+    Deliberately identity-based — never a positional ``nth`` index, which becomes
+    wrong the moment the DOM changes. Phase 2 adds the frame path plus stronger
+    identity hints (reviewed test id, safe href PATH, nearby reviewed heading).
+    All new fields are defaulted so Phase 1 constructions keep working.
+
+    Resolution is strict and ordered (see :func:`resolve_identity`):
+    reviewed test id -> frame path + exact role/name -> associated label ->
+    placeholder -> safe href path -> nearby reviewed heading. Exactly one match
+    is required at every tier; ambiguity is reported, never guessed.
     """
 
     role: str
     name: str
     element_type: str = ""
+    frame_path: tuple[str, ...] = ()
+    test_id: str | None = None
+    href_path: str | None = None
+    nearby_heading: str | None = None
 
     def matches(self, element: SnapshotElement) -> bool:
+        """Exact role/name/type match WITHIN the same frame.
+
+        The frame is part of identity: the same accessible name in a different
+        frame is a different element and must never be silently substituted.
+        """
+
         return (
             element.role == self.role
             and element.name == self.name
             and element.element_type == self.element_type
+            and tuple(element.frame_path) == tuple(self.frame_path)
         )
+
+
+# Ordered identity tiers. Each returns the elements matching that tier; a tier is
+# only accepted when it yields EXACTLY one element.
+def _tier_test_id(
+    identity: ElementIdentity, elements: Sequence[SnapshotElement]
+) -> list[SnapshotElement]:
+    if not identity.test_id:
+        return []
+    return [e for e in elements if e.test_id and e.test_id == identity.test_id]
+
+
+def _tier_frame_role_name(
+    identity: ElementIdentity, elements: Sequence[SnapshotElement]
+) -> list[SnapshotElement]:
+    return [e for e in elements if identity.matches(e)]
+
+
+def _tier_label_or_placeholder(
+    identity: ElementIdentity, elements: Sequence[SnapshotElement]
+) -> list[SnapshotElement]:
+    if not identity.name:
+        return []
+    needle = _normalize(identity.name)
+    return [
+        e
+        for e in elements
+        if tuple(e.frame_path) == tuple(identity.frame_path)
+        and e.role == identity.role
+        and needle
+        and needle == _normalize(e.name)
+    ]
+
+
+def _tier_href_path(
+    identity: ElementIdentity, elements: Sequence[SnapshotElement]
+) -> list[SnapshotElement]:
+    if not identity.href_path:
+        return []
+    return [
+        e
+        for e in elements
+        if e.href_path
+        and e.href_path == identity.href_path
+        and tuple(e.frame_path) == tuple(identity.frame_path)
+    ]
+
+
+def _tier_nearby_heading(
+    identity: ElementIdentity, elements: Sequence[SnapshotElement]
+) -> list[SnapshotElement]:
+    if not identity.nearby_heading or not identity.name:
+        return []
+    heading = _normalize(identity.nearby_heading)
+    needle = _normalize(identity.name)
+    return [
+        e
+        for e in elements
+        if e.nearby_heading
+        and _normalize(e.nearby_heading) == heading
+        and needle
+        and needle in _normalize(e.name)
+        and tuple(e.frame_path) == tuple(identity.frame_path)
+    ]
+
+
+IdentityResolution = Literal["resolved", "not_found", "ambiguous"]
+
+
+def resolve_identity(
+    identity: ElementIdentity, elements: Sequence[SnapshotElement]
+) -> tuple[IdentityResolution, SnapshotElement | None]:
+    """Resolve an identity to exactly ONE element using the strict tier order.
+
+    Returns ``("resolved", element)`` only when a tier yields a single match.
+    A tier that matches several elements short-circuits to ``"ambiguous"`` — we
+    never fall through to a weaker tier or a positional ``nth`` guess, because
+    that is exactly how the wrong control gets clicked.
+    """
+
+    for tier in (
+        _tier_test_id,
+        _tier_frame_role_name,
+        _tier_label_or_placeholder,
+        _tier_href_path,
+        _tier_nearby_heading,
+    ):
+        hits = tier(identity, elements)
+        if len(hits) == 1:
+            return "resolved", hits[0]
+        if len(hits) > 1:
+            return "ambiguous", None
+    return "not_found", None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,10 +298,20 @@ class ActionCandidate:
     url: str | None = None
     # Snapshot index at generation time: a hint for resolution, never trusted.
     hint_index: int | None = field(default=None)
+    # Phase 2: the action-specific state transition that must be verified after
+    # execution. Empty means "no specific transition asserted" — the caller then
+    # falls back to the checkpoint predicate alone.
+    postcondition: CandidatePostcondition = field(default_factory=CandidatePostcondition)
+    # Reviewed option value for `select_option` (never model-authored).
+    option_value: str | None = None
 
     @property
     def executable(self) -> bool:
         return self.risk != "requires_hitl"
+
+    @property
+    def is_value_action(self) -> bool:
+        return self.action in VALUE_ACTIONS
 
 
 def _candidate_id(*parts: object) -> str:
@@ -165,13 +365,22 @@ def generate_candidates(
             continue
         if not element.name:
             continue
-        identity = ElementIdentity(element.role, element.name, element.element_type)
+        # Phase 2: a hidden or disabled control is not actionable, so it never
+        # becomes a candidate (Playwright would simply time out on it).
+        if not element.actionable():
+            continue
+        identity = _identity_of(element)
         irreversible, category = classify_irreversible(element.name, element.role)
         risk: RiskLevel = "requires_hitl" if irreversible else "low"
         candidates.append(
             ActionCandidate(
                 candidate_id=_candidate_id(
-                    trace_version, checkpoint_order, "click", element.role, element.name
+                    trace_version,
+                    checkpoint_order,
+                    "click",
+                    element.role,
+                    element.name,
+                    "/".join(element.frame_path),
                 ),
                 action="click",
                 semantic_target=element.name[:120],
@@ -183,29 +392,41 @@ def generate_candidates(
                 trace_version=trace_version,
                 checkpoint_order=checkpoint_order,
                 hint_index=element.index,
+                # A click must produce SOME observable transition: either the URL
+                # moves, or this control goes away (typical SPA behavior).
+                postcondition=CandidatePostcondition(
+                    url_changed=True,
+                    element_disappears=(
+                        ElementPredicate(
+                            role=element.role,
+                            name=element.name,
+                            frame_path=element.frame_path,
+                        ),
+                    ),
+                ),
             )
         )
 
-    # `type` candidates: only into a NON-secret input, and only an approved
+    # `fill` candidates: only into a NON-secret input, and only an approved
     # non-secret value reference (never model-supplied text).
     for element in elements:
         if len(candidates) >= max_candidates:
             break
         if element.element_type not in {"text", "email", "search", "url", "tel"}:
             continue
-        if element.secretish:
-            continue  # code-owned injection only
+        if element.secretish or not element.actionable():
+            continue  # code-owned injection only; never a hidden/disabled field
         for ref in allow_value_refs:
             if ref not in APPROVED_VALUE_REFS:
                 continue
             candidates.append(
                 ActionCandidate(
                     candidate_id=_candidate_id(
-                        trace_version, checkpoint_order, "type", ref, element.name
+                        trace_version, checkpoint_order, "fill", ref, element.name
                     ),
-                    action="type",
+                    action="fill",
                     semantic_target=element.name[:120] or element.element_type,
-                    identity=ElementIdentity(element.role, element.name, element.element_type),
+                    identity=_identity_of(element),
                     risk="low",
                     expected_postcondition=expected_postcondition,
                     trace_version=trace_version,
@@ -215,6 +436,63 @@ def generate_candidates(
                 )
             )
             break
+
+    # `select_option` candidates come from the element's REVIEWED options only.
+    for element in elements:
+        if len(candidates) >= max_candidates:
+            break
+        if element.role.casefold() != "select" or not element.actionable():
+            continue
+        for ref in allow_value_refs:
+            if ref not in APPROVED_VALUE_REFS:
+                continue
+            candidates.append(
+                ActionCandidate(
+                    candidate_id=_candidate_id(
+                        trace_version, checkpoint_order, "select_option", ref, element.name
+                    ),
+                    action="select_option",
+                    semantic_target=element.name[:120] or "select",
+                    identity=_identity_of(element),
+                    risk="low",
+                    expected_postcondition=expected_postcondition,
+                    trace_version=trace_version,
+                    checkpoint_order=checkpoint_order,
+                    value_ref=ref,
+                    hint_index=element.index,
+                )
+            )
+            break
+
+    # `check` / `uncheck`: only for a real checkbox/radio, and the postcondition
+    # asserts the resulting checked state so the transition is verifiable.
+    for element in elements:
+        if len(candidates) >= max_candidates:
+            break
+        if element.element_type.casefold() not in {"checkbox", "radio"}:
+            continue
+        if not element.actionable() or element.secretish:
+            continue
+        irreversible, category = classify_irreversible(element.name, element.role)
+        if irreversible:
+            continue  # handled by the click branch as requires_hitl
+        desired = not bool(element.checked)
+        action: CandidateAction = "check" if desired else "uncheck"
+        candidates.append(
+            ActionCandidate(
+                candidate_id=_candidate_id(trace_version, checkpoint_order, action, element.name),
+                action=action,
+                semantic_target=element.name[:120] or element.element_type,
+                identity=_identity_of(element),
+                risk="low",
+                expected_postcondition=expected_postcondition,
+                trace_version=trace_version,
+                checkpoint_order=checkpoint_order,
+                hint_index=element.index,
+                postcondition=CandidatePostcondition(checked_state=desired),
+            )
+        )
+        break
 
     # `goto` candidates come ONLY from the reviewed trace, never from the model.
     for url in reviewed_goto_urls:
@@ -231,6 +509,7 @@ def generate_candidates(
                 trace_version=trace_version,
                 checkpoint_order=checkpoint_order,
                 url=url,
+                postcondition=CandidatePostcondition(url_matches=(_url_path(url),)),
             )
         )
 
@@ -238,7 +517,11 @@ def generate_candidates(
     for element in elements:
         if len(candidates) >= max_candidates:
             break
-        if element.element_type in {"text", "email", "search"} and not element.secretish:
+        if (
+            element.element_type in {"text", "email", "search"}
+            and not element.secretish
+            and element.actionable()
+        ):
             candidates.append(
                 ActionCandidate(
                     candidate_id=_candidate_id(
@@ -246,18 +529,39 @@ def generate_candidates(
                     ),
                     action="press",
                     semantic_target=element.name[:120] or element.element_type,
-                    identity=ElementIdentity(element.role, element.name, element.element_type),
+                    identity=_identity_of(element),
                     risk="low",
                     expected_postcondition=expected_postcondition,
                     trace_version=trace_version,
                     checkpoint_order=checkpoint_order,
                     press_key="Enter",
                     hint_index=element.index,
+                    postcondition=CandidatePostcondition(url_changed=True),
                 )
             )
             break
 
     return tuple(candidates[:max_candidates])
+
+
+def _identity_of(element: SnapshotElement) -> ElementIdentity:
+    """Build the full Phase 2 identity for an element (frame + stable hints)."""
+
+    return ElementIdentity(
+        role=element.role,
+        name=element.name,
+        element_type=element.element_type,
+        frame_path=tuple(element.frame_path),
+        test_id=element.test_id,
+        href_path=element.href_path,
+        nearby_heading=element.nearby_heading,
+    )
+
+
+def _url_path(url: str) -> str:
+    from urllib.parse import urlsplit
+
+    return urlsplit(url).path or "/"
 
 
 def executable_candidates(
@@ -305,14 +609,20 @@ def validate_press_key(key: str) -> str:
 
 __all__ = [
     "APPROVED_VALUE_REFS",
+    "READ_ONLY_ACTIONS",
+    "VALUE_ACTIONS",
     "ActionCandidate",
     "CandidateAction",
+    "CandidatePostcondition",
     "ElementIdentity",
+    "ElementPredicate",
+    "IdentityResolution",
     "RiskLevel",
     "classify_irreversible",
     "executable_candidates",
     "generate_candidates",
     "render_candidates",
+    "resolve_identity",
     "select_candidate",
     "validate_press_key",
 ]
