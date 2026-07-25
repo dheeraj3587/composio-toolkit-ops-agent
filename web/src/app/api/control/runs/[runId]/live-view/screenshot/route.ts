@@ -43,13 +43,15 @@ export async function GET(
       headers["X-Captured-At"] = result.capturedAt
     }
 
-    return new Response(
-      new Blob([result.bytes], { type: "image/png" }),
-      {
-        status: 200,
-        headers,
-      },
-    )
+    const body = result.bytes.buffer.slice(
+      result.bytes.byteOffset,
+      result.bytes.byteOffset + result.bytes.byteLength,
+    ) as ArrayBuffer
+
+    return new Response(body, {
+      status: 200,
+      headers,
+    })
   } catch (error) {
     const status = error instanceof ApiError ? error.status : 500
     return new Response(null, {
