@@ -1003,15 +1003,14 @@ class RunService:
         return browser_configuration_state(settings)
 
     def _browser_login_payload(
-        self, *, app_slug: str, values: Mapping[str, SecretStr]
+        self, *, app_slug: str, scope_id: str, values: Mapping[str, SecretStr]
     ) -> dict[str, str]:
         """Build the credential payload for the ACTIVE browser provider.
 
         Browser Use receives raw values in-process, exactly as before. The browser
         SERVICE must never receive a raw value over RPC, so each permitted secret is
-        first stored as a transient ``vault://`` reference and only the reference
-        travels. Without this the client silently dropped raw values and login could
-        not work at all.
+        first stored as a TRANSIENT (one-time, run-scoped, expiring) ``vault://``
+        reference and only the reference travels; the service consumes it once.
         """
 
         raw = {name: secret.get_secret_value() for name, secret in values.items()}
@@ -1021,16 +1020,19 @@ class RunService:
         if not callable(getattr(worker, "reconcile_session", None)):
             # In-process Playwright: same process, no RPC boundary to cross.
             return raw
-        return self._store_transient_browser_secrets(app_slug=app_slug, values=raw)
+        return self._store_transient_browser_secrets(
+            app_slug=app_slug, scope_id=scope_id, values=raw
+        )
 
     def _store_transient_browser_secrets(
-        self, *, app_slug: str, values: Mapping[str, str]
+        self, *, app_slug: str, scope_id: str, values: Mapping[str, str]
     ) -> dict[str, str]:
-        """Vault each permitted secret and return opaque references only.
+        """Vault each permitted secret as a one-time, run-scoped reference.
 
-        A field outside the reviewed set is refused rather than stored, and a value
-        that cannot be vaulted is omitted (the service then reports a typed login
-        failure) rather than being sent in the clear.
+        A field outside the reviewed set is refused. A vault-write failure is NOT
+        suppressed: every reference created so far is rolled back (deleted) and the
+        whole payload fails, so a run never proceeds with a partial secret set or a
+        raw value on the wire.
         """
 
         from ops.browser_service_client import ALLOWED_BROWSER_SECRET_FIELDS
@@ -1043,17 +1045,35 @@ class RunService:
                 reason_code="secret_vault_required_for_browser_service",
             )
         references: dict[str, str] = {}
-        for name, value in values.items():
-            if name not in ALLOWED_BROWSER_SECRET_FIELDS or not value:
-                continue
-            with contextlib.suppress(Exception):
-                references[name] = store.put(
+        created: list[str] = []
+        try:
+            for name, value in values.items():
+                if name not in ALLOWED_BROWSER_SECRET_FIELDS:
+                    raise ProviderOperationError(
+                        capability="browser service secrets",
+                        reason_code="browser_secret_field_not_allowed",
+                    )
+                if not value:
+                    continue
+                reference = store.put_transient(
                     app_slug=app_slug,
                     # Namespaced so a browser-login secret is distinguishable from a
                     # captured integration credential in the vault.
                     kind=f"browser_login_{name}",
+                    scope_id=scope_id,
                     value=value,
+                    ttl_seconds=600,
                 )
+                references[name] = reference
+                created.append(reference)
+        except Exception:
+            for reference in created:
+                with contextlib.suppress(Exception):
+                    store.delete(reference)
+            raise ProviderOperationError(
+                capability="browser service secrets",
+                reason_code="browser_secret_store_failed",
+            ) from None
         return references
 
     def _build_browser_worker(self, settings: Settings) -> BrowserWorker:
@@ -1434,7 +1454,11 @@ class RunService:
                     start_sensitive_data: dict[str, str] | None = None
                     if browser_login and run_provider_action:
                         start_sensitive_data = self._browser_login_payload(
-                            app_slug=record["app_slug"], values=browser_login
+                            app_slug=str(record["app_slug"]),
+                            # Scope the transient references to THIS run, so the
+                            # service will only consume them for the matching run.
+                            scope_id=str(record["run_id"]),
+                            values=browser_login,
                         )
                     if (
                         self._async_browser_enabled

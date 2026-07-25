@@ -20,6 +20,7 @@ from ops.playwright_worker import (
     PlaywrightBrowserWorker,
     detect_human_gate,
 )
+from tests.browser_app.harness import require_chromium
 
 _HOST = "app.pipedrive.com"
 _PATTERNS = (_HOST, f"*.{_HOST.split('.', 1)[1]}")
@@ -88,7 +89,7 @@ def _start(worker: PlaywrightBrowserWorker) -> object:
     try:
         return asyncio.run(worker.start(None))
     except Exception as exc:  # pragma: no cover - environment without Chromium
-        pytest.skip(f"Chromium not launchable: {type(exc).__name__}")
+        require_chromium(exc)
 
 
 def _route_pages(worker: PlaywrightBrowserWorker, handle: str, pages: dict[str, str]) -> None:
@@ -425,7 +426,9 @@ def test_concurrent_starts_cannot_exceed_capacity() -> None:
 
     results = asyncio.run(_both())
     if all(isinstance(item, Exception) for item in results):
-        pytest.skip("Chromium not launchable in this environment")
+        # Route through the shared helper so this FAILS (not skips) in CI.
+        first = next(item for item in results if isinstance(item, Exception))
+        require_chromium(first)
 
     admitted = [item for item in results if not isinstance(item, Exception)]
     refused = [item for item in results if isinstance(item, Exception)]

@@ -18,6 +18,7 @@ Three fail-closed behaviors live here:
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -38,6 +39,46 @@ class BrowserPageState:
     opener_page_id: str | None
     last_url: str
     active: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PopupDecision:
+    """The typed outcome of considering a new popup.
+
+    Carries the registry ``page_id`` for an activated popup so the caller can wire
+    a close handler to the exact id the registry tracks. The previous
+    ``tuple[bool, str]`` discarded the id, so the close handler was mis-wired with
+    the ``Page`` object instead.
+    """
+
+    activated: bool
+    reason_code: str
+    page_id: str | None = None
+
+
+async def wait_for_committed_popup_url(popup: Any, *, timeout_seconds: float = 5.0) -> str:
+    """Return the popup's first COMMITTED URL, or "" if it closes/never commits.
+
+    A popup usually opens at ``about:blank`` and navigates a moment later. Reading
+    its URL at the instant the event fires therefore rejects legitimate popups.
+    This waits (bounded, no fixed multi-second sleep) for a real destination.
+    """
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while loop.time() < deadline:
+        try:
+            if popup.is_closed():
+                return ""
+        except Exception:
+            return ""
+        raw = getattr(popup, "url", "")
+        url = raw if isinstance(raw, str) else ""
+        if url and url != "about:blank":
+            return url
+        await asyncio.sleep(0.05)
+    raw = getattr(popup, "url", "")
+    return raw if isinstance(raw, str) else ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,22 +156,27 @@ class BrowserPageRegistry:
         return state.page if state is not None else None
 
     # --- popup handling -------------------------------------------------------
-    async def consider_popup(self, popup: Any, *, opener_page_id: str | None) -> tuple[bool, str]:
-        """Validate a new page. Returns (activated, reason_code).
+    async def consider_popup(self, popup: Any, *, opener_page_id: str | None) -> PopupDecision:
+        """Validate a new page and return a typed :class:`PopupDecision`.
 
         The newest page is NEVER trusted automatically: an off-allowlist popup is
         closed and the original page remains active.
+
+        A popup frequently opens at ``about:blank`` and only THEN navigates to its
+        real destination, so the URL is evaluated once it commits (bounded wait)
+        rather than at the instant the event fires. Returning the ``page_id`` lets
+        the caller wire a close handler to the SAME id the registry tracks — the
+        previous ``tuple`` API discarded it, so the close handler was mis-wired.
         """
 
-        url = _page_url(popup)
-        if not self._url_allowed(url):
+        url = await wait_for_committed_popup_url(popup)
+        if not url or url == "about:blank" or not self._url_allowed(url):
             await _safe_close(popup)
             self.events.append("popup_blocked")
-            return False, "popup_blocked"
+            return PopupDecision(activated=False, reason_code="popup_blocked")
         page_id = self.register(popup, opener_page_id=opener_page_id, active=True)
         self.events.append("popup_activated")
-        del page_id
-        return True, "popup_activated"
+        return PopupDecision(activated=True, reason_code="popup_activated", page_id=page_id)
 
     def close_page(self, page_id: str) -> None:
         state = self.pages.pop(page_id, None)
@@ -296,6 +342,8 @@ def frame_path_is_reviewed(frame_path: Sequence[str], reviewed_origins: Sequence
 
 
 __all__ = [
+    "PopupDecision",
+    "wait_for_committed_popup_url",
     "BrowserPageRegistry",
     "BrowserPageState",
     "DialogPolicy",

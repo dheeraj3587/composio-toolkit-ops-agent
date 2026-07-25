@@ -33,6 +33,7 @@ from ops.playwright_worker import (
     checkpoint_satisfied,
     predicate_satisfied,
 )
+from tests.browser_app.harness import require_chromium
 
 _HOST = "app.pipedrive.com"
 _PATTERNS = (_HOST, "*.pipedrive.com")
@@ -119,7 +120,7 @@ def _run(path: str, coro_factory: Any) -> Any:
             try:
                 browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             except Exception as exc:  # pragma: no cover - no Chromium
-                pytest.skip(f"Chromium not launchable: {type(exc).__name__}")
+                require_chromium(exc)
             page = await browser.new_page()
             await _serve(page)
             await page.goto(f"https://{_HOST}{path}", wait_until="domcontentloaded", timeout=20_000)
@@ -346,3 +347,114 @@ def test_required_accessible_name_and_forbidden_text() -> None:
 
 def test_empty_predicate_never_proves_progress() -> None:
     assert predicate_satisfied(CheckpointPredicate(), _inspection(f"https://{_HOST}/x")) is False
+
+
+# ============================================= P0-2: login result propagation
+class TestLoginResultPropagation:
+    """A deterministic login verdict must stop the loop before the LLM, with an
+    accurate typed reason — never be discarded."""
+
+    @staticmethod
+    def _worker() -> Any:
+        from ops.config import Settings
+        from ops.playwright_worker import PlaywrightBrowserWorker
+
+        return PlaywrightBrowserWorker(
+            settings=Settings(allow_live_browser=True, browser_provider="playwright")
+        )
+
+    @staticmethod
+    def _session() -> Any:
+        import asyncio as _asyncio
+
+        from ops.playwright_worker import _PwSession
+
+        return _PwSession(None, None, None, None, _asyncio.Lock(), patterns=_PATTERNS)
+
+    def _disposition(self, state: str, reason: str, *, had_credentials: bool = True) -> Any:
+        from ops.browser_login import LoginInspection
+
+        worker = self._worker()
+        result = LoginInspection(
+            state=state,  # type: ignore[arg-type]
+            email_field=None,
+            password_field=None,
+            otp_fields=(),
+            submit_control=None,
+            current_url="https://app.pipedrive.com/login",
+            reason_code=reason,
+        )
+        return worker._observation_from_login_result(
+            self._session(), result, had_credentials=had_credentials
+        )
+
+    def test_authentication_failure_is_a_typed_failed_observation(self) -> None:
+        obs = self._disposition("authentication_failed", "authentication_failed")
+        assert obs is not None
+        assert obs.status == "failed"
+        assert obs.reason_code == "authentication_failed"
+
+    def test_unreviewed_frame_is_a_failure(self) -> None:
+        obs = self._disposition("unknown", "login_frame_unreviewed")
+        assert obs is not None
+        assert obs.status == "failed"
+        assert obs.reason_code == "login_frame_unreviewed"
+
+    def test_blocked_magic_link_is_a_failure(self) -> None:
+        obs = self._disposition("magic_link_required", "verification_link_blocked")
+        assert obs is not None
+        assert obs.status == "failed"
+        assert obs.reason_code == "verification_link_blocked"
+
+    def test_ambiguous_surfaces_become_typed_hitl(self) -> None:
+        for reason in ("multiple_login_surfaces", "multiple_password_forms", "login_origin_unsafe"):
+            obs = self._disposition("unknown", reason)
+            assert obs is not None
+            assert obs.status == "human_action_required"
+            assert obs.reason_code == reason
+
+    def test_otp_required_is_typed_hitl(self) -> None:
+        obs = self._disposition("otp_required", "otp_required")
+        assert obs is not None
+        assert obs.status == "human_action_required"
+        assert obs.reason_code == "otp_required"
+        assert obs.human_action_type == "email_otp"
+
+    def test_otp_surface_mismatch_stops_with_a_reason(self) -> None:
+        obs = self._disposition("unknown", "otp_surface_not_verified")
+        assert obs is not None
+        assert obs.status == "human_action_required"
+        assert obs.reason_code == "otp_surface_not_verified"
+
+    def test_account_selection_is_typed_hitl(self) -> None:
+        obs = self._disposition("account_selection_required", "account_selection_required")
+        assert obs is not None
+        assert obs.human_action_type == "account_selection"
+
+    def test_login_still_on_form_with_credentials_is_incomplete(self) -> None:
+        obs = self._disposition("credentials_ready", "credentials_ready")
+        assert obs is not None
+        assert obs.status == "failed"
+        assert obs.reason_code == "login_incomplete"
+
+    def test_no_recognized_surface_continues_the_loop(self) -> None:
+        # None means "let the trace predicate decide", not "authenticated".
+        assert self._disposition("unknown", "no_recognized_login_surface") is None
+
+    def test_reason_codes_contain_no_page_or_exception_text(self) -> None:
+        obs = self._disposition("otp_required", "otp_required")
+        assert obs is not None and obs.reason_code is not None
+        import re as _re
+
+        assert _re.fullmatch(r"[a-z0-9_:-]+", obs.reason_code)
+
+    def test_reason_code_field_rejects_page_text(self) -> None:
+        from ops.browser_worker import BrowserObservation
+
+        with pytest.raises(ValueError, match="reason code is invalid"):
+            BrowserObservation(
+                status="failed",
+                current_url="https://app.pipedrive.com/x",
+                page_title="x",
+                reason_code="Your password (from the page) is wrong!",
+            )

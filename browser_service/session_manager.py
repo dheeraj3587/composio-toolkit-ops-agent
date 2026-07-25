@@ -57,6 +57,10 @@ class ManagedSession:
     # The (app, account, owner) triple this session's authenticated state is bound
     # to. None means storage state is not being persisted for this session.
     storage_binding: Any = None
+    # Opaque account reference and run scope, used to bind storage state and to
+    # consume one-time login references only for the matching run.
+    account_ref: str | None = None
+    secret_scope: str = ""
     # Lifecycle + lease accounting.
     lifecycle: SessionLifecycle = "ACTIVE"
     active_operations: int = 0
@@ -96,6 +100,12 @@ class ManagedSession:
             # True. Now reports what is actually available.
             live_view_available=self.screenshot_available or self.interactive_ready,
             hitl_pending=self.hitl_pending,
+            # Distinct capability facts. Interactive is deferred (config-rejected),
+            # so interactive_supported/available are both False today.
+            screenshot_supported=True,
+            screenshot_available=self.screenshot_available,
+            interactive_supported=False,
+            interactive_available=self.interactive_ready,
             current_url_path=self.current_url_path,
             reason_code=self.reason_code,
         )

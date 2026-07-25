@@ -21,6 +21,7 @@ from ops.playwright_worker import (
     make_route_handler,
     navigation_allowed,
 )
+from tests.browser_app.harness import require_chromium
 
 _PATTERNS = ("app.pipedrive.com", "*.pipedrive.com")
 
@@ -112,7 +113,7 @@ def test_live_lifecycle_and_secret_injection() -> None:
         try:
             context = await worker.start(None)
         except Exception as exc:  # no browser binary here -> skip, don't fail
-            pytest.skip(f"Chromium not launchable in this environment: {type(exc).__name__}")
+            require_chromium(exc)
         registered = context.session_id in worker._sessions
         session = worker._sessions[context.session_id]
 

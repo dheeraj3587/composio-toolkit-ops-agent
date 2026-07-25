@@ -11,7 +11,7 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 
 class BrowserServiceSettings(BaseModel):
@@ -38,8 +38,12 @@ class BrowserServiceSettings(BaseModel):
     max_request_bytes: int = Field(default=256 * 1024, ge=1_024, le=8 * 1024 * 1024)
     operation_timeout_seconds: float = Field(default=120.0, ge=1.0, le=600.0)
 
-    # Interactive HITL (noVNC). OFF by default: an interactive remote surface is
-    # only started when an operator explicitly enables it.
+    # Interactive HITL (noVNC). OFF by default AND currently REJECTED when set true
+    # (see the validator below): the end-to-end operator-facing surface — a
+    # same-origin noVNC HTML client, an authenticated API WebSocket proxy, and
+    # per-session display isolation — is not implemented, so enabling it would only
+    # hand out an unusable URL. Screenshot HITL is unaffected. This flag is retained
+    # so the eventual implementation has a switch, but it fails closed today.
     interactive_hitl_enabled: bool = False
     novnc_port: int = Field(default=6080, ge=1, le=65_535)
     # x11vnc's port INSIDE this container. Only ever reached over loopback, so it
@@ -56,6 +60,25 @@ class BrowserServiceSettings(BaseModel):
     # Key used to encrypt storage state at rest. Absent => storage state is not
     # persisted at all (rather than persisted in the clear).
     storage_state_key: SecretStr | None = Field(default=None, repr=False)
+
+    @model_validator(mode="after")
+    def _reject_unusable_interactive_hitl(self) -> BrowserServiceSettings:
+        """Fail closed on interactive HITL rather than serving an unusable URL.
+
+        The interactive path is not yet operator-usable (no same-origin noVNC HTML
+        client, no authenticated API WebSocket proxy, no per-session display
+        isolation). Until that end-to-end surface exists and is tested, enabling
+        the flag is a configuration error — a flag that *looks* functional but
+        produces a dead URL is worse than an honestly disabled one.
+        """
+
+        if self.interactive_hitl_enabled:
+            raise ValueError(
+                "interactive HITL is not yet operator-usable; "
+                "BROWSER_INTERACTIVE_HITL_ENABLED must remain false "
+                "(screenshot HITL is unaffected)"
+            )
+        return self
 
     @property
     def token_configured(self) -> bool:

@@ -153,12 +153,21 @@ class BrowserServiceClient:
 
     # --- provider surface -----------------------------------------------------
     async def start(
-        self, profile_id: str | None, *, app_slug: str = "", use_storage_state: bool = False
+        self,
+        profile_id: str | None,
+        *,
+        app_slug: str = "",
+        account_ref: str | None = None,
+        secret_scope: str | None = None,
+        use_storage_state: bool = False,
+        live_view_mode: str = "screenshot",
     ) -> BrowserSessionContext:
         body: dict[str, object] = {
             "app_slug": app_slug or "unknown",
             "profile_id": profile_id,
-            "live_view_mode": "screenshot",
+            "account_ref": account_ref,
+            "secret_scope": secret_scope or "",
+            "live_view_mode": live_view_mode,
             "use_storage_state": use_storage_state,
         }
         try:
@@ -257,6 +266,7 @@ class BrowserServiceClient:
             human_instruction=payload.get("human_instruction"),
             credential_field_labels=tuple(payload.get("credential_field_labels") or ()),
             non_secret_notes=tuple(payload.get("non_secret_notes") or ()),
+            reason_code=payload.get("reason_code"),
         )
 
     async def session_status(self, session_id: str) -> tuple[bool, str]:

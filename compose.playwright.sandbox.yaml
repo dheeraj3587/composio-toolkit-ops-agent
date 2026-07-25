@@ -100,10 +100,20 @@ services:
       # Storage state is encrypted at rest; with no key it is simply not persisted.
       BROWSER_STORAGE_STATE_KEY: ${BROWSER_STORAGE_STATE_KEY:-}
       BROWSER_STORAGE_STATE_DIR: /browser-data/storage-state
+      # The SHARED encrypted credential vault. The control plane writes one-time
+      # browser-login references here and the service consumes them; without the
+      # same DB and key the service would receive valid references it cannot
+      # resolve. The Fernet key arrives via --env-file, NEVER inline in this file,
+      # and this is an EPHEMERAL sandbox vault — never the production vault.
+      SECRET_VAULT_KEY: ${SECRET_VAULT_KEY:-}
+      SECRET_VAULT_DB_PATH: /vault/credentials.db
     volumes:
       # A throwaway named volume for browser profiles and encrypted storage state.
       # NEVER a production volume.
       - browser_profiles:/browser-data
+      # The shared, private, ephemeral credential vault (same volume the
+      # integration-test/control-plane service mounts).
+      - credential_vault:/vault
     networks:
       - opsnet
     # No `ports:` on purpose. The RPC surface (8081) and the VNC port (5900) are
@@ -125,6 +135,50 @@ services:
       start_period: 30s
       retries: 3
 
+  # Runs the real-Chromium and RPC suites against browser-worker over the private
+  # network. No published port: tests reach the service at http://browser-worker:8081.
+  # Shares the SAME ephemeral vault volume so a service-backed login round-trips.
+  browser-integration-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.browser
+    image: composio-ops-browser:sandbox
+    init: true
+    ipc: host
+    shm_size: 1gb
+    pids_limit: 512
+    user: ops
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=1g,mode=1777
+    environment:
+      BROWSER_PROVIDER: playwright
+      ALLOW_LIVE_BROWSER: ${ALLOW_LIVE_BROWSER:-true}
+      ALLOW_LIVE_VENDOR_EMAIL: "false"
+      PLAYWRIGHT_DISABLE_SANDBOX: "true"
+      REQUIRE_REAL_BROWSER_TESTS: "1"
+      PYTHONPATH: /app
+      # Same token, vault key and DB path as browser-worker, so RPC + shared-vault
+      # tests exercise the real cross-service path.
+      BROWSER_SERVICE_TOKEN: ${BROWSER_SERVICE_TOKEN:-}
+      BROWSER_SERVICE_URL: http://browser-worker:8081
+      BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-ci-owner}
+      SECRET_VAULT_KEY: ${SECRET_VAULT_KEY:-}
+      SECRET_VAULT_DB_PATH: /vault/credentials.db
+    volumes:
+      - credential_vault:/vault
+    networks:
+      - opsnet
+    # Not started by `up`; invoked explicitly with `run --rm` in CI.
+    profiles:
+      - ci
+    # No `ports:` — this is a private test runner.
+    command: ["python", "-m", "pytest", "-m", "browser", "-q"]
+
 networks:
   opsnet:
     driver: bridge
@@ -132,3 +186,6 @@ networks:
 volumes:
   browser_sandbox_profiles:
   browser_profiles:
+  # A private, ephemeral shared vault for one-time browser-login references. Removed
+  # after CI with `docker compose down --volumes`. Never the production vault.
+  credential_vault:

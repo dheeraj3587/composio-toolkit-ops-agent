@@ -193,31 +193,27 @@ post-auth.
 
 ## 7. HITL
 
-Two modes, because a screenshot cannot solve every gate.
+**Screenshot HITL (the only usable mode today)**:
+`GET /internal/browser/sessions/{id}/screenshot`, owner-gated. When no frame is
+available it returns **409 `screenshot_unavailable`** rather than serving a stale
+frame from a previous page. Availability is truthful: `screenshot_available` is
+False until a real, non-sensitive frame has been captured.
 
-**Screenshot** (default): `GET /internal/browser/sessions/{id}/screenshot`,
-owner-gated. When no frame is available it returns **409 `screenshot_unavailable`**
-rather than serving a stale frame from a previous page.
+**Interactive remote — DEFERRED and DISABLED.** An operator-usable interactive
+surface would require a same-origin noVNC HTML client, an authenticated API
+WebSocket proxy (a browser `WebSocket()` cannot send a custom owner header), a URL
+that is not the private Docker hostname, and per-session display isolation. None of
+that is implemented end to end, so the feature is **not** available:
+`BrowserServiceSettings` **rejects `interactive_hitl_enabled=true`** (a flag that
+looks functional but yields a dead URL is worse than an honestly disabled one).
+`SessionSummary` reports `interactive_supported=False` and
+`interactive_available=False`. Screenshot HITL is unaffected.
 
-**Interactive remote** (opt-in, `BROWSER_INTERACTIVE_HITL_ENABLED=true`): needed for
-CAPTCHA, account choosers and MFA. Access is gated by a token that is
-
-- **signed** (HMAC-SHA256),
-- **bound to one session id**,
-- **bound to the owner**,
-- **short-lived** (minutes), and
-- verified with constant-time comparison.
-
-x11vnc binds to container loopback (`-localhost`) and the container publishes
-nothing, so the only path in is the authenticated WebSocket relay in
-`browser_service/novnc.py`. Opens, closes and denials are audited by reason code.
-**The grant URL is returned once and never durably persisted.**
-
-**Why not websockify?** Verified against its source, not assumed:
-`auth_plugins.BasePlugin.authenticate(headers, target_host, target_port)` receives
-only headers, so a URL grant token cannot be validated there; and its token plugin
-logs unknown tokens verbatim (`"Token '%s' not found"`). It cannot satisfy both "no
-unauthenticated noVNC" and "never log the token", so the relay is ours.
+The signed, session-and-owner-bound, short-lived grant token
+(`ops.browser_live_view`) and the loopback-only relay (`browser_service/novnc.py`)
+remain in the tree behind the flag and are unit-tested, so the eventual
+implementation has reviewed primitives to build on — but interactive HITL must be
+treated as **not yet implemented**.
 
 ---
 
@@ -360,28 +356,39 @@ against different semantics.
 
 Two jobs, deliberately different:
 
-- **`ci.yml` → `backend`** stays browser-free and fast.
+- **`ci.yml` → `backend`** stays browser-free and fast. Backend unit tests are
+  allowed to skip browser integration; real Chromium is enforced only in the
+  dedicated browser-image job.
 - **`browser-image.yml` → `browser-image`** is the mandatory real-Chromium gate:
   validates the compose file, builds `Dockerfile.browser`, proves Chromium launches
-  *inside the image*, starts the browser service, waits for health, asserts an
-  unauthenticated RPC call is refused, runs the real-browser suite, **fails if any
-  browser test skipped**, checks for orphaned Chromium (host and container), asserts
-  the token never reached the logs, and tears the containers down.
+  *inside the image*, starts the browser service, waits for cached readiness,
+  asserts an unauthenticated RPC call is refused, runs the real-browser suite in a
+  private `browser-integration-tests` container on the same network and shared
+  ephemeral vault, **fails if any browser test skipped** (`scripts/assert_zero_skips.py`),
+  runs the RPC/lifecycle suites, asserts the service log is secret-free
+  (`scripts/assert_secret_free_log.py`), checks for orphaned Chromium in the
+  container (`scripts/assert_no_orphan_chromium.py`), and tears everything down
+  with `--volumes`.
 
 `REQUIRE_REAL_BROWSER_TESTS=1` turns "Chromium is missing" from a skip into a
-failure. The zero-skip assertion is a separate, explicit check on the JUnit XML,
-because a future `skipif` could otherwise hollow the gate out while it still
-reported green.
+failure — every browser test routes through `tests/browser_app/harness.require_chromium`,
+verified by forcing an unavailable Chromium and observing a FAIL, not a skip. The
+zero-skip assertion is a separate, explicit check on the JUnit XML, because GitHub
+treats a skipped check as successful.
 
 > **`browser-image.yml` is committed locally but is NOT on the remote.** The
 > integration used to push this branch lacks the GitHub Actions `workflows`
-> permission, so `PUT .github/workflows/browser-image.yml` returns
-> `403 Resource not accessible by integration`. The file must be added by someone
-> with that permission (`git push` from a normal credential is enough).
+> permission, so pushing `.github/workflows/browser-image.yml` returns
+> `403 Resource not accessible by integration`. The file (and
+> `scripts/wait_for_browser_service.py`, `scripts/assert_zero_skips.py`,
+> `scripts/assert_secret_free_log.py`, `scripts/assert_no_orphan_chromium.py`) must
+> be added by someone with that permission — a normal `git push` is enough.
 >
-> **Then make `browser-image` a required status check on the protected branch.**
-> Until both of those happen, **there is no browser-image CI gate on this
-> repository** — the job is written and locally verified, not running.
+> **Then make `browser-image` a required status check on the protected branch**
+> (strict mode, so the branch must be current with main). Until both happen,
+> **there is no browser-image CI gate on this repository** — the job is written and
+> locally verified, not running. The Docker-based gates likewise cannot run in the
+> authoring sandbox (no Docker), so they are validated structurally, not executed.
 
 ---
 
@@ -413,18 +420,28 @@ and never in ordinary CI.
 
 ## 16. Rollout
 
-| Stage | What runs | Vendor contact | Activated |
-| --- | --- | --- | --- |
-| 0 | Local deterministic test app only | no | ✅ |
-| 1 | Shadow planning; Browser Use executes the real task | no | ✅ |
-| 2 | Playwright read-only canary, one reviewed test app | yes | ✅ |
-| 3 | Playwright login + read-only credential-page navigation | yes | ✅ |
-| 4 | Reviewed deterministic capture + read-only validation | yes | ✅ |
-| 5 | Limited production canary, one session, auto-fallback | yes | ❌ **not activated** |
+The single "Activated" column was misleading (it conflated "code exists" with
+"proven in production"). Four distinct columns instead — **Implemented**, **CI
+verified**, **Live verified**, **Production activated**:
 
+| Stage | Implemented | CI verified | Live verified | Production activated |
+| --- | --- | --- | --- | --- |
+| 0 — Local deterministic tests | yes | yes | n/a | no |
+| 1 — Offline shadow planner library | yes | yes | no | no |
+| 2 — Read-only canary gates | yes | yes | no | no |
+| 3 — Login + read-only navigation | yes | local/RPC only | no | no |
+| 4 — Credential capture | app-specific only | local only | no | no |
+| 5 — Production canary | no | no | no | no |
+
+"CI verified" for stages that touch a browser is contingent on the browser-image
+job actually running on the remote (see §14 — it is not yet pushed). No stage has
+been **live verified**: the canary has never executed against a real vendor.
 Stage 5 is *defined* so the plan is reviewable, but `production_canary_activated()`
-returns `False` and a test asserts it. Activating it is a separate, explicit
+returns `False` and a test asserts it; activating it is a separate, explicit
 decision.
+
+Interactive HITL is intentionally absent from this table because it is deferred
+and config-rejected (see §7), not a rollout stage.
 
 **Shadow mode (stage 1)** is safe structurally, not procedurally: `ShadowPlanner`
 has no page, no browser and no execution path. It is a pure function from a

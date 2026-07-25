@@ -158,6 +158,15 @@ class _FakeWorker:
     async def refresh_live_view(self, session: _FakePwSession) -> None:
         session.screenshot = self._screenshot
 
+    async def refresh_session_screenshot(self, context: BrowserSessionContext) -> bytes | None:
+        # Public contract the service now uses instead of reaching into _sessions.
+        return self._screenshot
+
+    async def export_storage_state(
+        self, context: BrowserSessionContext, *, include_indexed_db: bool = True
+    ) -> dict[str, Any]:
+        return self.storage_state
+
     async def stop(self, context: BrowserSessionContext) -> None:
         self.stopped.append(context.session_id)
         session = self._sessions.pop(context.session_id, None)
@@ -175,6 +184,27 @@ def _settings(**overrides: Any) -> BrowserServiceSettings:
     }
     base.update(overrides)
     return BrowserServiceSettings(**base)
+
+
+def _interactive_settings(**overrides: Any) -> BrowserServiceSettings:
+    """Settings with interactive HITL forced on, bypassing the production validator.
+
+    Production config REJECTS interactive_hitl_enabled=true (the operator-facing
+    noVNC surface is deferred). These low-level tests still exercise the grant and
+    relay machinery that exists behind the flag, so they construct settings with
+    model_construct to bypass that guard deliberately.
+    """
+
+    base: dict[str, Any] = {
+        "service_token": SecretStr(TOKEN),
+        "max_sessions": 1,
+        "inactivity_seconds": 900,
+        "maximum_age_seconds": 14_400,
+        "drain_seconds": 1.0,
+        "interactive_hitl_enabled": True,
+    }
+    base.update(overrides)
+    return BrowserServiceSettings.model_construct(**base)
 
 
 def _headers(token: str | None = TOKEN, owner: str | None = OWNER) -> dict[str, str]:
@@ -316,8 +346,14 @@ class TestSessionRpcLifecycle:
             gone = client.get(f"/internal/browser/sessions/{session_id}/status", headers=_headers())
             assert gone.status_code == 404
 
-    def test_navigate_sends_only_vault_references_and_service_resolves_them(self) -> None:
-        """A raw credential value must never cross the RPC boundary."""
+    def test_navigate_never_types_a_raw_value_and_requires_a_configured_vault(self) -> None:
+        """A raw credential value must never reach the worker.
+
+        Two corrections asserted together: the service now requires a configured
+        shared vault (an explicit typed error, not a silent drop), and even so a raw
+        value passed in credential_refs is never typed into the worker — resolution
+        consumes only vault references.
+        """
 
         client, worker = _client()
         with client:
@@ -326,18 +362,17 @@ class TestSessionRpcLifecycle:
                 f"/internal/browser/sessions/{session_id}/navigate",
                 json={
                     "research": RESEARCH_PAYLOAD,
-                    # Only references are accepted; a raw value is dropped, not typed.
                     "credential_refs": {
-                        "login_email": "vault://run/login_email",
+                        "login_email": "vault://pipedrive/browser_login_login_email/x",
                         "login_password": "hunter2-raw-value",
                     },
                 },
                 headers=_headers(),
             )
-        assert response.status_code == 200
-        # No vault key is configured in this test env, so nothing resolves — the
-        # important assertion is that the RAW value never reached the worker.
-        assert worker.seen_sensitive
+        # No shared vault is configured in this unit-test env, so resolution fails
+        # CLOSED with a typed error surfaced as 502 — never a silent success.
+        assert response.status_code == 502
+        # And the raw value never reached the worker (resolution ran first).
         assert "hunter2-raw-value" not in json.dumps(worker.seen_sensitive)
 
     def test_delete_is_idempotent(self) -> None:
@@ -611,7 +646,7 @@ class TestInteractiveHitlGrants:
         assert body["url"] is None
 
     def test_live_view_grant_is_bound_and_expiring_when_enabled(self) -> None:
-        client, _ = _client(_settings(interactive_hitl_enabled=True))
+        client, _ = _client(_interactive_settings())
         with client:
             session_id = _create_session(client)["session_id"]
             response = client.post(
@@ -677,7 +712,7 @@ class TestInteractiveHitlGrants:
     def test_websocket_relay_is_refused_without_a_valid_grant(self) -> None:
         from starlette.websockets import WebSocketDisconnect
 
-        client, _ = _client(_settings(interactive_hitl_enabled=True))
+        client, _ = _client(_interactive_settings())
         with client:
             session_id = _create_session(client)["session_id"]
             with pytest.raises(WebSocketDisconnect) as excinfo:
@@ -955,7 +990,7 @@ class TestNoSecretsCrossTheBoundary:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         caplog.set_level(logging.DEBUG)
-        client, worker = _client(_settings(interactive_hitl_enabled=True))
+        client, worker = _client(_interactive_settings())
         with client, caplog.at_level(logging.DEBUG):
             session_id = _create_session(client)["session_id"]
             navigate = client.post(
@@ -995,7 +1030,7 @@ class TestNoSecretsCrossTheBoundary:
     ) -> None:
         from starlette.websockets import WebSocketDisconnect
 
-        client, _ = _client(_settings(interactive_hitl_enabled=True))
+        client, _ = _client(_interactive_settings())
         # Well-FORMED but signed with the wrong key, so the denial is specifically a
         # signature failure rather than a parse failure.
         forged, _ = issue_live_view_token(
@@ -1326,11 +1361,23 @@ class TestLiveViewAvailabilityIsTruthful:
     """``live_view_available`` must not be hard-coded True."""
 
     def test_screenshot_availability_drives_the_flag(self) -> None:
-        client, _ = _client()
+        # P0-5: availability is False until a frame is actually captured — a
+        # launched browser is not a current screenshot.
+        client, _ = _client(worker=_FakeWorker(screenshot=b"\x89PNG\r\n\x1a\nx"))
         with client:
             created = _create_session(client)
-            # A launched session can be screenshotted, so this is genuinely True.
-            assert created["live_view_available"] is True
+            assert created["live_view_available"] is False
+            session_id = created["session_id"]
+            assert (
+                client.get(
+                    f"/internal/browser/sessions/{session_id}/screenshot", headers=_headers()
+                ).status_code
+                == 200
+            )
+            summary = client.get(
+                f"/internal/browser/sessions/{session_id}/status", headers=_headers()
+            ).json()
+            assert summary["live_view_available"] is True
 
     def test_flag_is_false_before_anything_is_available(self) -> None:
         from browser_service.session_manager import ManagedSession
@@ -1529,3 +1576,391 @@ class TestProviderFactoryWiring:
         settings = Settings.from_env(dotenv_path=None)
         assert settings.browser_provider == "browser_use"
         assert settings.playwright_in_process_sandbox is False
+
+
+# ---------------------------------------------- P0-3: single lifecycle owner
+class TestServiceIsSoleCapacityOwner:
+    """In service mode the manager owns capacity/TTL; the worker owns neither."""
+
+    def test_service_limit_wins_over_worker_limit(self) -> None:
+        """Deliberately conflicting limits: worker=1, service=2.
+
+        Two sessions must be admitted, because only the service limit is
+        authoritative in service mode. If the worker still took its own semaphore,
+        the second create would wrongly fail with browser_capacity_exceeded.
+        """
+
+        from ops.config import Settings
+        from ops.playwright_worker import PlaywrightBrowserWorker
+
+        worker = PlaywrightBrowserWorker(
+            settings=Settings(
+                allow_live_browser=True,
+                browser_provider="playwright",
+                playwright_max_sessions=1,
+            ),
+            service_mode=True,
+        )
+        client, _ = _client(_settings(max_sessions=2))
+        client.app.state.worker = worker  # type: ignore[attr-defined]
+        with client:
+            first = client.post(
+                "/internal/browser/sessions",
+                json={"app_slug": "pipedrive"},
+                headers=_headers(),
+            )
+            second = client.post(
+                "/internal/browser/sessions",
+                json={"app_slug": "pipedrive"},
+                headers=_headers(),
+            )
+        assert first.status_code == 201
+        # The worker's max of 1 must NOT block this; the service max of 2 governs.
+        assert second.status_code == 201
+
+    def test_service_mode_worker_does_not_start_a_janitor(self) -> None:
+        from ops.config import Settings
+        from ops.playwright_worker import PlaywrightBrowserWorker
+
+        worker = PlaywrightBrowserWorker(
+            settings=Settings(allow_live_browser=True, browser_provider="playwright"),
+            service_mode=True,
+        )
+        assert worker._janitor_thread is None
+
+    def test_service_mode_reaper_is_a_no_op(self) -> None:
+        from ops.config import Settings
+        from ops.playwright_worker import PlaywrightBrowserWorker
+
+        worker = PlaywrightBrowserWorker(
+            settings=Settings(allow_live_browser=True, browser_provider="playwright"),
+            service_mode=True,
+        )
+        assert worker._reap_expired() == ()
+
+    def test_in_process_mode_still_enforces_worker_capacity(self) -> None:
+        from ops.config import Settings
+        from ops.playwright_worker import PlaywrightBrowserWorker
+
+        worker = PlaywrightBrowserWorker(
+            settings=Settings(allow_live_browser=True, browser_provider="playwright"),
+        )
+        # The in-process worker keeps its own janitor and capacity.
+        assert worker._janitor_thread is not None
+
+
+# --------------------------------------- P0-5: no private worker access
+class TestNoPrivateWorkerAccess:
+    """The service must use the worker's public contract, not its _sessions dict."""
+
+    def test_service_source_has_no_worker_sessions_access(self) -> None:
+        source = (REPO_ROOT / "browser_service" / "main.py").read_text()
+        # No executable access to the worker's private registry. (Comments that
+        # explain the boundary are fine; an attribute access is not.)
+        assert "worker._sessions" not in source
+        assert 'getattr(worker, "_sessions"' not in source
+
+    def test_screenshot_available_is_false_before_any_capture(self) -> None:
+        client, _ = _client(worker=_FakeWorker(screenshot=None))
+        with client:
+            created = _create_session(client)
+            # A launched browser is not a captured frame.
+            assert created["live_view_available"] is False
+
+    def test_screenshot_available_becomes_true_after_capture(self) -> None:
+        png = b"\x89PNG\r\n\x1a\nframe"
+        client, _ = _client(worker=_FakeWorker(screenshot=png))
+        with client:
+            session_id = _create_session(client)["session_id"]
+            response = client.get(
+                f"/internal/browser/sessions/{session_id}/screenshot", headers=_headers()
+            )
+            assert response.status_code == 200
+            summary = client.get(
+                f"/internal/browser/sessions/{session_id}/status", headers=_headers()
+            ).json()
+        assert summary["live_view_available"] is True
+
+    def test_export_storage_state_uses_the_public_method(self) -> None:
+        # The save path calls worker.export_storage_state, not worker._sessions.
+        import inspect
+
+        from browser_service.main import _save_storage_state
+
+        source = inspect.getsource(_save_storage_state)
+        assert "export_storage_state" in source
+        assert "_sessions" not in source.replace("its private ``_sessions`` dict", "")
+
+
+# --------------------------------------- P0-7: interactive HITL fails closed
+class TestInteractiveHitlFailsClosed:
+    """The interactive surface is deferred, so enabling it is a config error."""
+
+    def test_production_config_rejects_enabling_interactive_hitl(self) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="not yet operator-usable"):
+            BrowserServiceSettings(service_token=SecretStr(TOKEN), interactive_hitl_enabled=True)
+
+    def test_env_true_is_rejected(self) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            BrowserServiceSettings.from_env(
+                {"BROWSER_SERVICE_TOKEN": TOKEN, "BROWSER_INTERACTIVE_HITL_ENABLED": "true"}
+            )
+
+    def test_screenshot_hitl_is_unaffected_when_interactive_is_disabled(self) -> None:
+        # With interactive off (the only allowed production state), the live-view
+        # endpoint still returns screenshot mode — screenshot HITL keeps working.
+        client, _ = _client()
+        with client:
+            session_id = _create_session(client)["session_id"]
+            body = client.post(
+                f"/internal/browser/sessions/{session_id}/live-view", headers=_headers()
+            ).json()
+        assert body["mode"] == "screenshot"
+        assert body["url"] is None
+
+
+# --------------------------------------- P0-4: RPC transient secret boundary
+class TestTransientSecretRoundTrip:
+    """End-to-end: API mints one-time scoped refs; the service consumes them once."""
+
+    @staticmethod
+    def _shared_vault(tmp_path: Path) -> tuple[Any, str]:
+        from cryptography.fernet import Fernet
+
+        from ops.secret_store import SQLiteSecretStore
+
+        key = Fernet.generate_key().decode()
+        store = SQLiteSecretStore(tmp_path / "vault" / "credentials.db", key)
+        return store, key
+
+    def test_service_consumes_scoped_reference_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store, key = self._shared_vault(tmp_path)
+        # A one-time reference the CONTROL PLANE would have minted for this run.
+        reference = store.put_transient(
+            app_slug="pipedrive",
+            kind="browser_login_login_password",
+            scope_id="run-xyz",
+            value="the-real-password",
+        )
+        # Point the service's vault resolution at the SAME db + key.
+        from ops.config import Settings as OpsSettings
+
+        real_from_env = OpsSettings.from_env
+
+        def _patched(*args: Any, **kwargs: Any) -> Any:
+            base = real_from_env(dotenv_path=None)
+            return base.model_copy(
+                update={
+                    "secret_vault_key": SecretStr(key),
+                    "secret_vault_db_path": store.db_path,
+                }
+            )
+
+        monkeypatch.setattr(OpsSettings, "from_env", staticmethod(_patched))
+
+        from browser_service.main import _resolve_credential_refs
+        from browser_service.session_manager import ManagedSession
+
+        session = ManagedSession(
+            session_id="bs_1", owner=OWNER, app_slug="pipedrive", secret_scope="run-xyz"
+        )
+        resolved = _resolve_credential_refs(
+            session=session,
+            credential_refs={"login_password": reference},
+            settings=_settings(),
+        )
+        assert resolved == {"login_password": "the-real-password"}
+        # Consumed: a second resolution yields nothing (the row is gone).
+        again = _resolve_credential_refs(
+            session=session,
+            credential_refs={"login_password": reference},
+            settings=_settings(),
+        )
+        assert again == {}
+
+    def test_wrong_scope_reference_is_not_resolved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store, key = self._shared_vault(tmp_path)
+        reference = store.put_transient(
+            app_slug="pipedrive",
+            kind="browser_login_login_email",
+            scope_id="run-A",
+            value="ops@example.test",
+        )
+        from ops.config import Settings as OpsSettings
+
+        real_from_env = OpsSettings.from_env
+        monkeypatch.setattr(
+            OpsSettings,
+            "from_env",
+            staticmethod(
+                lambda *a, **k: real_from_env(dotenv_path=None).model_copy(
+                    update={
+                        "secret_vault_key": SecretStr(key),
+                        "secret_vault_db_path": store.db_path,
+                    }
+                )
+            ),
+        )
+        from browser_service.main import _resolve_credential_refs
+        from browser_service.session_manager import ManagedSession
+
+        # A session for a DIFFERENT run must not consume run-A's reference.
+        session = ManagedSession(
+            session_id="bs_1", owner=OWNER, app_slug="pipedrive", secret_scope="run-B"
+        )
+        assert (
+            _resolve_credential_refs(
+                session=session,
+                credential_refs={"login_email": reference},
+                settings=_settings(),
+            )
+            == {}
+        )
+
+    def test_missing_shared_vault_is_an_explicit_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ops.config import Settings as OpsSettings
+        from ops.provider_errors import ProviderOperationError
+
+        real_from_env = OpsSettings.from_env
+        monkeypatch.setattr(
+            OpsSettings,
+            "from_env",
+            staticmethod(
+                lambda *a, **k: real_from_env(dotenv_path=None).model_copy(
+                    update={"secret_vault_key": None}
+                )
+            ),
+        )
+        from browser_service.main import _resolve_credential_refs
+        from browser_service.session_manager import ManagedSession
+
+        session = ManagedSession(
+            session_id="bs_1", owner=OWNER, app_slug="pipedrive", secret_scope="run-1"
+        )
+        with pytest.raises(ProviderOperationError) as excinfo:
+            _resolve_credential_refs(
+                session=session,
+                credential_refs={"login_email": "vault://pipedrive/browser_login_login_email/x"},
+                settings=_settings(),
+            )
+        assert excinfo.value.reason_code == "secret_vault_not_configured"
+
+    def test_client_start_sends_scope_and_account_ref(self) -> None:
+        import httpx
+
+        from ops.browser_service_client import BrowserServiceClient
+
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content.decode())
+            return httpx.Response(
+                201,
+                json={
+                    "session_id": "bs_1",
+                    "lifecycle": "ACTIVE",
+                    "app_slug": "pipedrive",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "last_active_at": "2026-01-01T00:00:00+00:00",
+                    "maximum_expires_at": "2026-01-01T04:00:00+00:00",
+                    "active_operations": 0,
+                    "live_view_mode": "screenshot",
+                    "live_view_available": False,
+                    "hitl_pending": False,
+                },
+            )
+
+        client = BrowserServiceClient(
+            base_url="http://browser-worker:8081",
+            token=TOKEN,
+            owner=OWNER,
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        asyncio.run(
+            client.start(
+                "profile-1",
+                app_slug="pipedrive",
+                account_ref="abc123hash",
+                secret_scope="run-xyz",
+                use_storage_state=True,
+            )
+        )
+        body = captured["body"]
+        assert body["secret_scope"] == "run-xyz"
+        assert body["account_ref"] == "abc123hash"
+        assert body["use_storage_state"] is True
+
+
+# --------------------------------------- P0-6: storage-state runtime binding
+class TestStorageStateBinding:
+    """Storage state is bound to (app, opaque account, owner) and is opaque on disk."""
+
+    def test_account_ref_is_an_opaque_hash_not_an_email(self) -> None:
+        from ops.graph import browser_account_ref
+
+        ref = browser_account_ref("vault://pipedrive/work_email/abc123")
+        assert len(ref) == 32
+        assert "@" not in ref
+        assert "vault://" not in ref
+        # Stable: the same input yields the same binding across runs.
+        assert browser_account_ref("vault://pipedrive/work_email/abc123") == ref
+
+    def test_saved_state_is_encrypted_and_not_loadable_cross_binding(self, tmp_path: Path) -> None:
+        from cryptography.fernet import Fernet
+
+        store = EncryptedStorageStateStore(tmp_path / "state", Fernet.generate_key().decode())
+        binding = StorageStateBinding(app_slug="pipedrive", account_ref="acct-hash", owner=OWNER)
+        state = {"cookies": [{"name": "session", "value": "SUPERSECRETCOOKIEVALUE"}]}
+        store.save(binding, state)
+
+        # On disk the cookie value is not plaintext.
+        blob = (tmp_path / "state" / f"{binding.fingerprint()}.state").read_text()
+        assert "SUPERSECRETCOOKIEVALUE" not in blob
+        # A different owner/app/account cannot load it.
+        for other in (
+            StorageStateBinding(app_slug="pipedrive", account_ref="acct-hash", owner="intruder"),
+            StorageStateBinding(app_slug="hubspot", account_ref="acct-hash", owner=OWNER),
+            StorageStateBinding(app_slug="pipedrive", account_ref="other-hash", owner=OWNER),
+        ):
+            assert store.load(other) is None
+        # The correct binding round-trips.
+        assert store.load(binding) == state
+
+    def test_create_session_records_binding_only_when_requested(self) -> None:
+        client, _ = _client()
+        with client:
+            # use_storage_state defaults False -> no binding recorded.
+            session_id = _create_session(client)["session_id"]
+            manager = client.app.state.manager  # type: ignore[attr-defined]
+            session = manager.get_if_present(session_id)
+            assert session is not None
+            assert session.storage_binding is None
+
+    def test_worker_receives_restored_state_when_requested(self) -> None:
+        # A fake worker records whatever storage_state the service hands start().
+        worker = _FakeWorker()
+        client, _ = _client(worker=worker)
+        with client:
+            client.post(
+                "/internal/browser/sessions",
+                json={
+                    "app_slug": "pipedrive",
+                    "use_storage_state": True,
+                    "account_ref": "acct-hash",
+                    "secret_scope": "run-1",
+                },
+                headers=_headers(),
+            )
+        # No state saved yet in this env, so None is handed over — the point is the
+        # service passed the use_storage_state path through start() without error.
+        assert worker.received_storage_state is None

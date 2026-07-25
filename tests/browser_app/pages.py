@@ -235,6 +235,38 @@ OAUTH_POPUP = _doc(
     "<button type='button'>Authorize</button>",
 )
 
+# A popup that opens at about:blank and only THEN navigates to a real (reviewed)
+# destination via JS — the common OAuth pattern. Reading its URL at open time would
+# wrongly reject it, so this exercises the committed-URL wait.
+POPUP_BLANK_THEN_REDIRECT = _doc(
+    "Connect",
+    "<h1>Connect</h1><button id='open-delayed' type='button'>Continue</button>",
+    head=(
+        "<script>"
+        "window.addEventListener('DOMContentLoaded', function(){"
+        " document.getElementById('open-delayed').addEventListener('click', function(){"
+        "  var w = window.open('', 'delayed', 'width=500,height=600');"
+        "  setTimeout(function(){ if (w) { w.location.href = '/oauth-popup'; } }, 250); });"
+        "});"
+        "</script>"
+    ),
+)
+
+# A popup that navigates to the SEPARATE third-party origin — must be closed.
+POPUP_OFF_DOMAIN = _doc(
+    "Connect",
+    "<h1>Connect</h1><button id='open-evil' type='button'>Continue</button>",
+    head=(
+        "<script>"
+        "window.addEventListener('DOMContentLoaded', function(){"
+        " document.getElementById('open-evil').addEventListener('click', function(){"
+        "  window.open('" + _THIRD_PARTY_PLACEHOLDER + "/oauth', 'evil',"
+        " 'width=500,height=600'); });"
+        "});"
+        "</script>"
+    ),
+)
+
 # --- Ambiguous / awkward controls ---------------------------------------------
 DUPLICATE_BUTTONS = _doc(
     "Duplicate controls",
@@ -411,6 +443,8 @@ __all__ = [
     "OTP_MULTIPLE",
     "OTP_SINGLE",
     "PASSWORD_STEP",
+    "POPUP_BLANK_THEN_REDIRECT",
+    "POPUP_OFF_DOMAIN",
     "POPUP_OAUTH",
     "SERVER_ERROR",
     "SETTINGS",

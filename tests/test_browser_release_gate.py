@@ -22,6 +22,7 @@ from ops.playwright_worker import (
     make_egress_route_handler,
     make_route_handler,
 )
+from tests.browser_app.harness import require_chromium
 
 _HOST = "app.pipedrive.com"
 _PATTERNS = (_HOST, "*.pipedrive.com")
@@ -37,7 +38,7 @@ def _start(worker: PlaywrightBrowserWorker) -> object:
     try:
         return asyncio.run(worker.start(None))
     except Exception as exc:  # pragma: no cover
-        pytest.skip(f"Chromium not launchable: {type(exc).__name__}")
+        require_chromium(exc)
 
 
 # --- Item 6: staged egress policy (unit level) ---------------------------------

@@ -42,10 +42,18 @@ from browser_service.models import (
 from browser_service.novnc import LiveViewDenied, VncTarget, authorize_live_view
 from browser_service.session_manager import ManagedSession, SessionManager, SessionUnavailable
 from browser_service.settings import BrowserServiceSettings
+from ops.provider_errors import ProviderOperationError
 
 LOGGER = logging.getLogger("browser_service")
 
 _JANITOR_INTERVAL_SECONDS = 60.0
+
+# Only these reasons mean the SAVED authentication state is no longer valid. A
+# generic failure (timeout, model error, popup, transient outage) must not discard
+# a working session.
+_AUTH_STATE_INVALIDATION_REASONS = frozenset(
+    {"authentication_failed", "session_expired", "logout_detected", "storage_state_rejected"}
+)
 
 # Module-level dependency singleton: FastAPI resolves this per request, and
 # defining it once avoids a function call in an argument default (ruff B008).
@@ -252,7 +260,13 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             session.worker_context = context
             session.reason_code = "session_started"
             session.current_page_id = context.session_id
-            session.screenshot_available = True
+            # Bind the run scope and account so one-time login references can only be
+            # consumed for the matching run.
+            session.secret_scope = payload.secret_scope
+            session.account_ref = payload.account_ref
+            # A screenshot is NOT available until one is actually captured — a
+            # launched browser is not the same as a current, non-sensitive frame.
+            session.screenshot_available = False
             if payload.use_storage_state:
                 session.storage_binding = _storage_binding(payload, auth.owner)
         except Exception as exc:  # sanitized: never surface provider text
@@ -328,13 +342,12 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
         assert_session_owner(session_owner=session.owner, caller_owner=auth.owner)
         worker = _worker()
-        handle = session.current_page_id
         data: bytes | None = None
-        worker_session = getattr(worker, "_sessions", {}).get(handle)
-        if worker_session is not None:
+        if session.worker_context is not None:
+            # PUBLIC contract only — never the worker's private _sessions dict.
             with contextlib.suppress(Exception):
-                await worker.refresh_live_view(worker_session)
-                data = getattr(worker_session, "screenshot", None)
+                data = await worker.refresh_session_screenshot(session.worker_context)
+        session.screenshot_available = bool(data)
         if not data:
             # No frame is available (or capture is disabled because the page is
             # credential-bearing): say so rather than serving a STALE frame from
@@ -579,20 +592,15 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
 async def _save_storage_state(worker: Any, session: ManagedSession, store: Any) -> None:
     """Capture and encrypt the browser's authenticated state, best effort.
 
-    Uses the WORKER's own context rather than reaching for Playwright objects the
-    manager never held. A failure here must not fail the run: the next run simply
-    logs in again.
+    Exports through the worker's PUBLIC ``export_storage_state`` contract rather than
+    reaching into its private ``_sessions`` dict. A failure here must not fail the
+    run: the next run simply logs in again.
     """
 
     if session.worker_context is None or not getattr(store, "enabled", False):
         return
-    handle = session.current_page_id
-    pw_session = getattr(worker, "_sessions", {}).get(handle)
-    context = getattr(pw_session, "context", None)
-    if context is None:
-        return
     try:
-        state = await context.storage_state()
+        state = await worker.export_storage_state(session.worker_context)
     except Exception:
         return
     if isinstance(state, dict) and session.storage_binding is not None:
@@ -636,7 +644,17 @@ async def _drive(
         inactivity_expires_at=session.maximum_expires_at.isoformat(),
         maximum_expires_at=session.maximum_expires_at.isoformat(),
     )
-    sensitive = _resolve_credential_refs(credential_refs, settings)
+    try:
+        sensitive = _resolve_credential_refs(
+            session=session, credential_refs=credential_refs, settings=settings
+        )
+    except ProviderOperationError as exc:
+        # A shared-vault misconfiguration is a deployment error, surfaced as a
+        # sanitized 502 with the typed reason rather than an unhandled 500.
+        session.reason_code = exc.reason_code
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.reason_code
+        ) from None
     try:
         if resume_signal is None:
             observation = await asyncio.wait_for(
@@ -676,9 +694,13 @@ async def _drive(
         store = _state_store(settings)
         if observation.status in {"credential_page_ready", "succeeded"}:
             await _save_storage_state(worker, session, store)
-        elif observation.status == "failed":
+        elif observation.reason_code in _AUTH_STATE_INVALIDATION_REASONS:
+            # Invalidate saved authentication state ONLY for explicit auth reasons.
+            # Previously ANY failed observation invalidated it, so a navigation
+            # timeout, model failure, popup failure or transient outage wrongly
+            # discarded a still-valid session and forced a needless re-login.
             with contextlib.suppress(Exception):
-                store.invalidate(session.storage_binding, reason_code="authentication_failed")
+                store.invalidate(session.storage_binding, reason_code=observation.reason_code)
     return ObservationResponse(
         status=observation.status,
         current_url=observation.current_url,
@@ -688,43 +710,62 @@ async def _drive(
         human_instruction=observation.human_instruction,
         credential_field_labels=tuple(observation.credential_field_labels),
         non_secret_notes=tuple(observation.non_secret_notes),
+        reason_code=observation.reason_code,
         session=session.summary(),
     )
 
 
 def _resolve_credential_refs(
-    credential_refs: dict[str, str], settings: BrowserServiceSettings
+    *,
+    session: ManagedSession,
+    credential_refs: dict[str, str],
+    settings: BrowserServiceSettings,
 ) -> dict[str, str]:
-    """Resolve vault references to values INSIDE this service.
+    """Consume the run's ONE-TIME vault references to values INSIDE this service.
 
     A raw credential value never crosses the RPC boundary; the API sends only
-    ``vault://`` references and the service reads the vault itself.
+    ``vault://`` references and the service consumes them here, bound to this
+    session's app and run scope. A missing shared vault is an EXPLICIT error
+    (secret_vault_not_configured) rather than a silent empty mapping, because the
+    latter turned a deployment mistake into an unexplained login failure.
     """
 
     del settings
     if not credential_refs:
         return {}
-    resolved: dict[str, str] = {}
-    try:
-        from ops.config import Settings
-        from ops.secret_store import SQLiteSecretStore
 
-        app_settings = Settings.from_env(dotenv_path=None)
-        if app_settings.secret_vault_key is None:
-            return {}
-        store = SQLiteSecretStore(
-            app_settings.secret_vault_db_path,
-            app_settings.secret_vault_key.get_secret_value(),
+    from ops.config import Settings
+    from ops.secret_store import SQLiteSecretStore, TransientSecretError
+
+    app_settings = Settings.from_env(dotenv_path=None)
+    if app_settings.secret_vault_key is None:
+        raise ProviderOperationError(
+            capability="browser service vault",
+            reason_code="secret_vault_not_configured",
         )
-    except Exception:
-        return {}
+    store = SQLiteSecretStore(
+        app_settings.secret_vault_db_path,
+        app_settings.secret_vault_key.get_secret_value(),
+    )
+    resolved: dict[str, str] = {}
     for field_name, reference in credential_refs.items():
         if not isinstance(reference, str) or not reference.startswith("vault://"):
             continue
-        with contextlib.suppress(Exception):
-            value = store.get(reference)
-            if isinstance(value, str) and value:
-                resolved[field_name] = value
+        expected_kind = f"browser_login_{field_name}"
+        try:
+            # Consume once, bound to this session's app and this run's scope. A
+            # mismatch or expiry is a typed reason, never a raw value or a probe of
+            # another app's secrets.
+            value = store.consume_transient(
+                reference,
+                expected_app_slug=session.app_slug,
+                expected_kind=expected_kind,
+                expected_scope_id=session.secret_scope,
+            )
+        except TransientSecretError:
+            continue
+        if isinstance(value, str) and value:
+            resolved[field_name] = value
     return resolved
 
 

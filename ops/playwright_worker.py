@@ -403,6 +403,14 @@ class _PwSession:
     # The opaque worker-side handle (pw_...), used only to correlate sanitized
     # decision events for one session. Never a URL, account or credential.
     handle: str = ""
+    # Strong references to in-flight popup-configuration tasks. Without this the
+    # event loop keeps only a WEAK reference and a task can be garbage-collected
+    # before it finishes installing the popup's guards.
+    popup_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    # True only when the WORKER acquired its own capacity slot for this session.
+    # False in service mode, where the manager owns capacity — so the worker must
+    # not release a slot it never took.
+    worker_capacity_owned: bool = False
     # Confirmed vs attempted checkpoint state: `checkpoint_index` advances ONLY
     # after a verified postcondition, so a failed action cannot skip a checkpoint.
     checkpoint_index: int = 0
@@ -780,11 +788,19 @@ class PlaywrightBrowserWorker:
                 continue  # sanitized: never log page content or credentials
 
     def _release_capacity(self, session: _PwSession) -> None:
-        """Release a session's capacity slot exactly once."""
+        """Release a worker-owned capacity slot exactly once.
 
+        In service mode the worker never acquired a slot, so there is nothing to
+        release — the manager owns capacity. Releasing here would corrupt the
+        worker's semaphore count.
+        """
+
+        if not session.worker_capacity_owned:
+            return
         if session.capacity_released:
             return
         session.capacity_released = True
+        session.worker_capacity_owned = False
         try:
             self._capacity.release()
         except ValueError:  # pragma: no cover - defensive against double release
@@ -807,9 +823,13 @@ class PlaywrightBrowserWorker:
         """Drop sessions past their inactivity or maximum lifetime.
 
         Synchronous so it can run from ``start`` before admitting a new session;
-        teardown of the reaped browsers is scheduled on the owning loop.
+        teardown of the reaped browsers is scheduled on the owning loop. In service
+        mode this is a no-op: the manager owns expiry, and reaping here would close
+        a session the manager still believes is alive.
         """
 
+        if self._service_mode:
+            return ()
         now = datetime.now(UTC)
         with self._registry_lock:
             expired = [
@@ -859,15 +879,23 @@ class PlaywrightBrowserWorker:
                 reason_code="playwright_not_installed",
             ) from None
 
-        # Reclaim expired slots first, then take a slot ATOMICALLY. A non-blocking
-        # bounded semaphore makes two concurrent starts race-free (a len() check
-        # outside the registry lock would admit both).
-        self._reap_expired()
-        if not self._capacity.acquire(blocking=False):
-            raise ProviderOperationError(
-                capability="Playwright browser",
-                reason_code="browser_capacity_exceeded",
-            )
+        # In service mode the browser-service SessionManager is the SOLE owner of
+        # admission, capacity and TTL. The worker must not run its own reaper or
+        # take its own semaphore, or two independent limits would disagree (a run
+        # admitted by the service could still be refused here, or a session the
+        # service considers alive could be reaped from under it).
+        capacity_owned = False
+        if not self._service_mode:
+            # Reclaim expired slots first, then take a slot ATOMICALLY. A
+            # non-blocking bounded semaphore makes two concurrent starts race-free
+            # (a len() check outside the registry lock would admit both).
+            self._reap_expired()
+            if not self._capacity.acquire(blocking=False):
+                raise ProviderOperationError(
+                    capability="Playwright browser",
+                    reason_code="browser_capacity_exceeded",
+                )
+            capacity_owned = True
 
         async def _launch() -> tuple[Any, Any, Any, Any, asyncio.Lock]:
             playwright = await module.async_playwright().start()
@@ -895,12 +923,14 @@ class PlaywrightBrowserWorker:
         try:
             playwright, browser, context, page, operation_lock = await self._loop.run(_launch())
         except BrowserOperationTimeout:
-            self._capacity.release()  # the slot was never used
+            if capacity_owned:
+                self._capacity.release()  # the slot was never used
             raise ProviderOperationError(
                 capability="Playwright browser", reason_code="browser_launch_timeout"
             ) from None
         except Exception as exc:
-            self._capacity.release()
+            if capacity_owned:
+                self._capacity.release()
             # Distinguish the real failure modes instead of collapsing them all into
             # provider_request_failed, which hides a missing binary or dependency.
             raise ProviderOperationError(
@@ -912,6 +942,9 @@ class PlaywrightBrowserWorker:
         session.created_at = now
         session.last_active_at = now
         session.handle = handle
+        # Only a worker-owned slot is later released by the worker; in service mode
+        # the manager releases its own slot.
+        session.worker_capacity_owned = capacity_owned
         with self._registry_lock:
             self._sessions[handle] = session
         return BrowserSessionContext(
@@ -1025,9 +1058,18 @@ class PlaywrightBrowserWorker:
             return self._human_required(session, "No reviewed navigation trace is available.")
 
         # Code-owned login injection happens once, before the loop, and never via a
-        # model action, so a credential value cannot reach a prompt.
+        # model action, so a credential value cannot reach a prompt. Its typed
+        # result is HANDLED rather than discarded: a proven authentication failure
+        # or an ambiguous/gated login must stop here with an accurate reason, not
+        # fall through into the general LLM action loop.
         if sensitive_data:
-            await self._inject_credentials(session, sensitive_data)
+            login_result = await self._inject_credentials(session, sensitive_data)
+            if login_result is not None:
+                login_observation = self._observation_from_login_result(
+                    session, login_result, had_credentials=True
+                )
+                if login_observation is not None:
+                    return login_observation
 
         deadline = asyncio.get_running_loop().time() + _MAX_AGENT_SECONDS
         repeated: dict[str, int] = {}
@@ -1652,29 +1694,30 @@ class PlaywrightBrowserWorker:
             async def _configure_new_page(popup: Any) -> None:
                 """Admit a popup only after policy approval, then guard it too."""
 
-                activated, _reason = await registry.consider_popup(
+                decision = await registry.consider_popup(
                     popup, opener_page_id=registry.active_page_id
                 )
-                if not activated:
+                if not decision.activated:
                     return
+                if decision.page_id is None:  # pragma: no cover - invariant
+                    raise RuntimeError("activated popup has no page id")
+                page_id = decision.page_id
                 # An approved popup becomes a working surface, so it needs the SAME
                 # protections as the opener rather than being unguarded.
                 install_dialog_handler(popup, dialog_policy, session.dialog_records)
                 install_download_guard(popup, download_policy, session.download_records)
 
-                def _on_close() -> None:
-                    # Fall back to the opener rather than leaving a closed page active.
-                    with contextlib.suppress(Exception):
-                        registry.close_page(popup)
-
-                popup.on("close", lambda _page=None: _on_close())
+                # Close by PAGE ID (the registry key), not the Page object — passing
+                # the Page silently no-ops and leaves the registry on a closed page.
+                popup.on("close", lambda _page=None: registry.close_page(page_id))
 
             def _on_page(popup: Any) -> None:
                 # The newest page is NEVER trusted automatically: validate first.
-                # The handler runs on the browser loop, which owns these objects.
-                asyncio.ensure_future(  # noqa: RUF006 - fire-and-forget on the browser loop
-                    _configure_new_page(popup)
-                )
+                # A STRONG reference is kept: the loop retains only weak references to
+                # tasks, so a fire-and-forget task can vanish before it finishes.
+                task = asyncio.create_task(_configure_new_page(popup))
+                session.popup_tasks.add(task)
+                task.add_done_callback(session.popup_tasks.discard)
 
             session.context.on("page", _on_page)
 
@@ -1717,7 +1760,88 @@ class PlaywrightBrowserWorker:
         session.download_records.clear()
         return None
 
-    def _human_required(self, session: _PwSession, instruction: str) -> BrowserObservation:
+    def _observation_from_login_result(
+        self,
+        session: _PwSession,
+        result: LoginInspection,
+        *,
+        had_credentials: bool,
+    ) -> BrowserObservation | None:
+        """Turn a deterministic login result into a typed observation, or None.
+
+        None means "no login-level verdict — continue into the trace loop", which
+        happens only when no login surface was recognised (authentication is proven
+        by the reviewed checkpoint predicate, never by the absence of login fields).
+        """
+
+        reason = result.reason_code
+
+        if result.state == "authentication_failed":
+            return self._failed_observation(session, "authentication_failed")
+
+        # Hard blocks: a reviewed-frame or safe-link violation is a failure.
+        if reason in {"login_frame_unreviewed", "verification_link_blocked"}:
+            return self._failed_observation(session, reason)
+
+        # Ambiguity or an unverified surface needs a human, with an accurate reason.
+        if reason in {
+            "multiple_login_surfaces",
+            "multiple_password_forms",
+            "login_origin_unsafe",
+            "otp_surface_not_verified",
+            "otp_injection_failed",
+            "verification_link_navigation_failed",
+        }:
+            return self._human_required(
+                session,
+                f"The deterministic login flow requires review ({reason}).",
+                reason_code=reason,
+                action_type="provider_verification",
+            )
+
+        if result.state == "otp_required":
+            return self._human_required(
+                session,
+                "Enter the emailed one-time code.",
+                reason_code="otp_required",
+                action_type="email_otp",
+            )
+        if result.state == "magic_link_required":
+            return self._human_required(
+                session,
+                "Complete the reviewed email verification link.",
+                reason_code="magic_link_required",
+                action_type="provider_verification",
+            )
+        if result.state == "account_selection_required":
+            return self._human_required(
+                session,
+                "Select the intended account.",
+                reason_code="account_selection_required",
+                action_type="account_selection",
+            )
+
+        # Credentials were supplied but a login form is still present: the login did
+        # not complete, so stop rather than looping the model on a login wall.
+        if had_credentials and result.state in {
+            "email_required",
+            "password_required",
+            "credentials_ready",
+        }:
+            return self._failed_observation(session, "login_incomplete")
+
+        # No recognised login surface: authentication is decided by the trace
+        # predicate downstream, so let the loop continue.
+        return None
+
+    def _human_required(
+        self,
+        session: _PwSession,
+        instruction: str,
+        *,
+        reason_code: str | None = None,
+        action_type: HumanActionType | None = None,
+    ) -> BrowserObservation:
         url = "https://unknown.invalid/"
         try:
             url = sanitize_browser_url(_page_url(_active_page(session)))
@@ -1727,8 +1851,9 @@ class PlaywrightBrowserWorker:
             status="human_action_required",
             current_url=url,
             page_title="Human action required",
-            human_action_type=_classify_gate(instruction),
+            human_action_type=action_type or _classify_gate(instruction),
             human_instruction=instruction[:1_000],
+            reason_code=reason_code,
         )
 
     def _failed_observation(self, session: _PwSession, reason_code: str) -> BrowserObservation:
@@ -1742,6 +1867,9 @@ class PlaywrightBrowserWorker:
             current_url=url,
             page_title="Browser step failed",
             non_secret_notes=(f"reason_code={reason_code}",),
+            # The typed reason travels in the dedicated field, so a caller (and the
+            # storage-state invalidation decision) can key on it precisely.
+            reason_code=reason_code,
         )
 
     def _resolve_patterns(self, research: OperationalResearch) -> tuple[str, ...]:
@@ -1889,6 +2017,55 @@ class PlaywrightBrowserWorker:
         if session is None or session.screenshot is None or session.screenshot_at is None:
             return None
         return session.screenshot, session.screenshot_at
+
+    def _session_for_context(self, context: BrowserSessionContext) -> _PwSession:
+        """Public-contract lookup so callers never touch the private registry.
+
+        The browser service used to read ``worker._sessions[...]`` directly, coupling
+        it to the private ``_PwSession`` shape. These accessor methods are the
+        supported surface instead.
+        """
+
+        session = self._sessions.get(context.session_id)
+        if session is None:
+            raise ProviderOperationError(
+                capability="Playwright browser", reason_code="session_missing"
+            )
+        return session
+
+    async def refresh_session_screenshot(self, context: BrowserSessionContext) -> bytes | None:
+        """Refresh and return the current screenshot for a session (or None).
+
+        Public method for the service, replacing direct ``_sessions`` access. Returns
+        None when capture is unavailable or the page is credential-bearing.
+        """
+
+        session = self._session_for_context(context)
+        await self.refresh_live_view(session)
+        return session.screenshot
+
+    async def export_storage_state(
+        self, context: BrowserSessionContext, *, include_indexed_db: bool = True
+    ) -> dict[str, object]:
+        """Export the session's authenticated storage state via the public contract.
+
+        ``indexed_db=True`` is used only because the installed Playwright supports it
+        (verified by signature inspection). The result is a dict Playwright can later
+        restore; it is bearer credential material and is encrypted by the caller.
+        """
+
+        session = self._session_for_context(context)
+
+        async def _export() -> dict[str, object]:
+            async with session.operation_lock:
+                result = await session.context.storage_state(indexed_db=include_indexed_db)
+                if not isinstance(result, dict):
+                    raise ProviderOperationError(
+                        capability="Playwright browser", reason_code="storage_state_invalid"
+                    )
+                return result
+
+        return await self._loop.run(_export(), timeout=_OP_TIMEOUT_SECONDS)
 
     async def stop(self, context: BrowserSessionContext) -> None:
         with self._registry_lock:
@@ -2206,6 +2383,15 @@ async def _shutdown_session(session: _PwSession) -> None:
     """Close a session's page/context/browser/playwright in dependency order."""
 
     session.screenshot = None
+    # Cancel and DRAIN any in-flight popup-configuration tasks first, so a popup
+    # guard cannot finish installing against a context that is being torn down.
+    pending = list(session.popup_tasks)
+    for task in pending:
+        task.cancel()
+    if pending:
+        with contextlib.suppress(Exception):
+            await asyncio.gather(*pending, return_exceptions=True)
+    session.popup_tasks.clear()
     await _safe(session.context.close)
     await _safe(session.browser.close)
     await _safe(session.playwright.stop)

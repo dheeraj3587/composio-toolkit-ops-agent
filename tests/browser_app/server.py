@@ -155,6 +155,8 @@ class _VendorHandler(_Handler):
             "/iframe-login": pages.IFRAME_LOGIN,
             "/iframe-login-inner": pages.IFRAME_LOGIN_INNER,
             "/popup-oauth": pages.POPUP_OAUTH,
+            "/popup-blank-redirect": pages.POPUP_BLANK_THEN_REDIRECT,
+            "/popup-off-domain": pages.POPUP_OFF_DOMAIN,
             "/oauth-popup": pages.OAUTH_POPUP,
             "/duplicate-buttons": pages.DUPLICATE_BUTTONS,
             "/hidden-controls": pages.HIDDEN_CONTROLS,

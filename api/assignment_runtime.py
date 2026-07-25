@@ -408,7 +408,16 @@ class AssignmentBrowserWorker(BrowserWorker):
             except Exception:
                 pass
 
-    async def start(self, profile_id: str | None) -> BrowserSessionContext:
+    async def start(
+        self,
+        profile_id: str | None,
+        *,
+        app_slug: str = "",
+        account_ref: str | None = None,
+        secret_scope: str | None = None,
+        use_storage_state: bool = False,
+        live_view_mode: str = "screenshot",
+    ) -> BrowserSessionContext:
         """Create the real Browser Use session up front and capture its live URL.
 
         The provider session (and its signed live-view URL) exists the moment the
@@ -417,8 +426,12 @@ class AssignmentBrowserWorker(BrowserWorker):
         and HITL are available for the entire duration of the autonomous task
         rather than only after it finishes. The bounded onboarding task is then
         run against this same ``session_id``.
+
+        The Playwright-specific metadata is accepted and IGNORED so the graph has a
+        single call site; Browser Use's session-creation request is unchanged.
         """
 
+        del app_slug, account_ref, secret_scope, use_storage_state, live_view_mode
         self._require_configuration()
         client = self._get_client()
         # Attach a fresh Browser Use profile so the autonomous login state

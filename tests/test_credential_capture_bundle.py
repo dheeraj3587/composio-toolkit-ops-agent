@@ -33,7 +33,7 @@ class _FakeBrowser:
         self.outcome = outcome
         self.starts = 0
 
-    async def start(self, profile_id: str | None) -> BrowserSessionContext:
+    async def start(self, profile_id: str | None, **_kwargs: object) -> BrowserSessionContext:
         self.starts += 1
         return BrowserSessionContext(
             profile_id=profile_id or "profile-hs",

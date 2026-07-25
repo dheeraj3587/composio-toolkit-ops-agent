@@ -454,7 +454,8 @@ class TestComplexBrowserBehavior:
                     await fx.page.click("#open-oauth")
                 popup = await popup_info.value
                 await popup.wait_for_load_state("domcontentloaded")
-                accepted, reason = await registry.consider_popup(popup, opener_page_id=opener_id)
+                decision = await registry.consider_popup(popup, opener_page_id=opener_id)
+                accepted, reason = decision.activated, decision.reason_code
                 # And an off-domain popup URL must be refused by the same policy.
                 off_domain_allowed = navigation_allowed(
                     app.third_party_url("/elsewhere"), app.host_patterns
@@ -1093,3 +1094,115 @@ class TestCredentialCapture:
         assert FAKE_API_TOKEN not in reference
         # And the value is retrievable only by explicit vault read.
         assert revealed == FAKE_API_TOKEN
+
+
+# ==================================================== corrective popup lifecycle
+class TestPopupLifecycle:
+    """P0-1: committed-URL admission, page-id close wiring, task retention."""
+
+    def test_blank_then_redirect_popup_is_accepted(self) -> None:
+        """A popup that opens about:blank then navigates to a reviewed URL must be
+        accepted — the committed-URL wait is what makes this work."""
+
+        async def scenario(app: BrowserTestApp) -> tuple[bool, str]:
+            async with browser_page(app) as fx:
+                registry = BrowserPageRegistry(
+                    url_allowed=lambda url: navigation_allowed(url, app.host_patterns)
+                )
+                opener = registry.register(fx.page, active=True)
+                await fx.page.goto(app.url("/popup-blank-redirect"), wait_until="domcontentloaded")
+                async with fx.page.expect_popup() as popup_info:
+                    await fx.page.click("#open-delayed")
+                popup = await popup_info.value
+                decision = await registry.consider_popup(popup, opener_page_id=opener)
+                return decision.activated, decision.reason_code
+
+        activated, reason = _run(scenario)
+        assert activated is True
+        assert reason == "popup_activated"
+
+    def test_off_domain_popup_is_closed(self) -> None:
+        async def scenario(app: BrowserTestApp) -> tuple[bool, str, bool]:
+            async with browser_page(app) as fx:
+                registry = BrowserPageRegistry(
+                    url_allowed=lambda url: navigation_allowed(url, app.host_patterns)
+                )
+                opener = registry.register(fx.page, active=True)
+                await fx.page.goto(app.url("/popup-off-domain"), wait_until="domcontentloaded")
+                async with fx.page.expect_popup() as popup_info:
+                    await fx.page.click("#open-evil")
+                popup = await popup_info.value
+                decision = await registry.consider_popup(popup, opener_page_id=opener)
+                # The opener stays active after an off-domain popup is refused.
+                return decision.activated, decision.reason_code, registry.active_page_id == opener
+
+        activated, reason, opener_active = _run(scenario)
+        assert activated is False
+        assert reason == "popup_blocked"
+        assert opener_active is True
+
+    def test_closing_active_popup_restores_the_opener_by_page_id(self) -> None:
+        """The close handler must key on the registry page id, not the Page object.
+
+        Passing the Page (the old bug) silently no-ops, leaving the registry stuck
+        on a closed page.
+        """
+
+        async def scenario(app: BrowserTestApp) -> tuple[str, str, bool]:
+            async with browser_page(app) as fx:
+                registry = BrowserPageRegistry(
+                    url_allowed=lambda url: navigation_allowed(url, app.host_patterns)
+                )
+                opener = registry.register(fx.page, active=True)
+                await fx.page.goto(app.url("/popup-oauth"), wait_until="domcontentloaded")
+                async with fx.page.expect_popup() as popup_info:
+                    await fx.page.click("#open-oauth")
+                popup = await popup_info.value
+                decision = await registry.consider_popup(popup, opener_page_id=opener)
+                assert decision.page_id is not None
+                active_with_popup = registry.active_page_id
+                # Simulate the popup closing; the handler closes BY PAGE ID.
+                registry.close_page(decision.page_id)
+                restored = registry.active_page is fx.page
+                return active_with_popup, registry.active_page_id, restored
+
+        active_with_popup, after_close, restored = _run(scenario)
+        assert active_with_popup != after_close
+        # The opener is the active page again, and it is the real opener Page.
+        assert restored is True
+
+    def test_action_executes_on_restored_opener(self) -> None:
+        async def scenario(app: BrowserTestApp) -> str:
+            async with browser_page(app) as fx:
+                registry = BrowserPageRegistry(
+                    url_allowed=lambda url: navigation_allowed(url, app.host_patterns)
+                )
+                opener = registry.register(fx.page, active=True)
+                await fx.page.goto(app.url("/popup-oauth"), wait_until="domcontentloaded")
+                async with fx.page.expect_popup() as popup_info:
+                    await fx.page.click("#open-oauth")
+                popup = await popup_info.value
+                decision = await registry.consider_popup(popup, opener_page_id=opener)
+                assert decision.page_id is not None
+                await popup.close()
+                registry.close_page(decision.page_id)
+                # The restored opener is usable: navigate it.
+                restored_page = registry.active_page
+                await restored_page.goto(app.url("/settings"), wait_until="domcontentloaded")
+                return await restored_page.title()
+
+        assert _run(scenario) == "Settings"
+
+    def test_committed_url_helper_returns_empty_for_a_closed_popup(self) -> None:
+        from ops.browser_pages import wait_for_committed_popup_url
+
+        async def scenario(app: BrowserTestApp) -> str:
+            async with browser_page(app) as fx:
+                await fx.page.goto(app.url("/popup-oauth"), wait_until="domcontentloaded")
+                async with fx.page.expect_popup() as popup_info:
+                    await fx.page.click("#open-oauth")
+                popup = await popup_info.value
+                await popup.close()
+                return await wait_for_committed_popup_url(popup, timeout_seconds=1.0)
+
+        assert _run(scenario) == ""

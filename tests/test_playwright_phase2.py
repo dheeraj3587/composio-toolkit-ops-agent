@@ -46,6 +46,7 @@ from ops.playwright_worker import (
     postcondition_satisfied,
     structural_change,
 )
+from tests.browser_app.harness import require_chromium
 
 _HOST = "app.pipedrive.com"
 _IDP = "auth.pipedrive.com"
@@ -185,7 +186,7 @@ def _launch(path: str, coro_factory: Any, *, guard: bool = False) -> Any:
             try:
                 browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             except Exception as exc:  # pragma: no cover - no Chromium
-                pytest.skip(f"Chromium not launchable: {type(exc).__name__}")
+                require_chromium(exc)
             context = await browser.new_context()
             reached: list[str] = []
             if guard:
@@ -315,8 +316,8 @@ def test_approved_popup_becomes_active_and_unapproved_is_closed() -> None:
             await popup.wait_for_load_state("domcontentloaded", timeout=5_000)
         except Exception:
             pass
-        approved, approved_reason = await registry.consider_popup(popup, opener_page_id=original)
-        return approved, approved_reason, registry.active_page_id != original
+        decision = await registry.consider_popup(popup, opener_page_id=original)
+        return decision.activated, decision.reason_code, registry.active_page_id != original
 
     approved, reason, switched = _launch("/popup-approved", _c)
     assert approved is True
@@ -331,8 +332,13 @@ def test_unapproved_popup_is_closed_and_original_stays_active() -> None:
         async with page.context.expect_page() as info:
             await page.click("button")
         popup = await info.value
-        activated, reason = await registry.consider_popup(popup, opener_page_id=original)
-        return activated, reason, registry.active_page_id == original, registry.events
+        decision = await registry.consider_popup(popup, opener_page_id=original)
+        return (
+            decision.activated,
+            decision.reason_code,
+            registry.active_page_id == original,
+            registry.events,
+        )
 
     activated, reason, stayed, events = _launch("/popup-evil", _c, guard=True)
     assert activated is False

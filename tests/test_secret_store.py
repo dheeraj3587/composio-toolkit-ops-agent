@@ -93,3 +93,162 @@ def test_vault_rejects_symlink_database_without_following_it(tmp_path) -> None:
 
     assert target.read_text(encoding="utf-8") == "do not mutate"
     assert db_path.is_symlink()
+
+
+# ============================================ P0-4: transient one-time secrets
+class TestTransientSecrets:
+    """One-time, scope-bound, expiring references for browser-login credentials."""
+
+    @staticmethod
+    def _store(tmp_path: object) -> SQLiteSecretStore:
+        return SQLiteSecretStore(tmp_path / "vault" / "secrets.db", Fernet.generate_key())  # type: ignore[operator]
+
+    def test_consume_once_returns_value_then_is_gone(self, tmp_path) -> None:
+        from ops.secret_store import TransientSecretError
+
+        store = self._store(tmp_path)
+        ref = store.put_transient(
+            app_slug="pipedrive",
+            kind="browser_login_login_password",
+            scope_id="run-123",
+            value="s3cret-value",
+        )
+        got = store.consume_transient(
+            ref,
+            expected_app_slug="pipedrive",
+            expected_kind="browser_login_login_password",
+            expected_scope_id="run-123",
+        )
+        assert got == "s3cret-value"
+        # A second consume must fail: the row was deleted.
+        with pytest.raises(TransientSecretError) as excinfo:
+            store.consume_transient(
+                ref,
+                expected_app_slug="pipedrive",
+                expected_kind="browser_login_login_password",
+                expected_scope_id="run-123",
+            )
+        assert excinfo.value.reason_code == "browser_secret_not_found"
+
+    def test_wrong_app_is_refused(self, tmp_path) -> None:
+        from ops.secret_store import TransientSecretError
+
+        store = self._store(tmp_path)
+        ref = store.put_transient(
+            app_slug="pipedrive", kind="browser_login_login_email", scope_id="r", value="v"
+        )
+        with pytest.raises(TransientSecretError) as excinfo:
+            store.consume_transient(
+                ref,
+                expected_app_slug="hubspot",
+                expected_kind="browser_login_login_email",
+                expected_scope_id="r",
+            )
+        assert excinfo.value.reason_code == "browser_secret_app_mismatch"
+
+    def test_wrong_kind_is_refused(self, tmp_path) -> None:
+        from ops.secret_store import TransientSecretError
+
+        store = self._store(tmp_path)
+        ref = store.put_transient(
+            app_slug="pipedrive", kind="browser_login_login_email", scope_id="r", value="v"
+        )
+        with pytest.raises(TransientSecretError) as excinfo:
+            store.consume_transient(
+                ref,
+                expected_app_slug="pipedrive",
+                expected_kind="browser_login_login_password",
+                expected_scope_id="r",
+            )
+        assert excinfo.value.reason_code == "browser_secret_kind_mismatch"
+
+    def test_wrong_scope_is_refused(self, tmp_path) -> None:
+        from ops.secret_store import TransientSecretError
+
+        store = self._store(tmp_path)
+        ref = store.put_transient(
+            app_slug="pipedrive", kind="browser_login_login_email", scope_id="run-A", value="v"
+        )
+        with pytest.raises(TransientSecretError) as excinfo:
+            store.consume_transient(
+                ref,
+                expected_app_slug="pipedrive",
+                expected_kind="browser_login_login_email",
+                expected_scope_id="run-B",
+            )
+        assert excinfo.value.reason_code == "browser_secret_scope_mismatch"
+
+    def test_expired_reference_is_refused(self, tmp_path) -> None:
+        import sqlite3
+        from datetime import UTC, datetime, timedelta
+
+        from ops.secret_store import TransientSecretError, parse_vault_reference
+
+        store = self._store(tmp_path)
+        ref = store.put_transient(
+            app_slug="pipedrive", kind="browser_login_login_otp", scope_id="r", value="483920"
+        )
+        # Force the row's expiry into the past.
+        parts = parse_vault_reference(ref)
+        past = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+        connection = sqlite3.connect(store.db_path)
+        try:
+            connection.execute(
+                "UPDATE vault_entries SET expires_at = ? WHERE id = ?", (past, parts.identifier)
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with pytest.raises(TransientSecretError) as excinfo:
+            store.consume_transient(
+                ref,
+                expected_app_slug="pipedrive",
+                expected_kind="browser_login_login_otp",
+                expected_scope_id="r",
+            )
+        assert excinfo.value.reason_code == "browser_secret_expired"
+
+    def test_permanent_entry_cannot_be_consumed_as_transient(self, tmp_path) -> None:
+        from ops.secret_store import TransientSecretError
+
+        store = self._store(tmp_path)
+        # A normal permanent put (one_time=0) must not be consumable one-time.
+        ref = store.put(app_slug="pipedrive", kind="api_token", value="tok")
+        with pytest.raises(TransientSecretError) as excinfo:
+            store.consume_transient(
+                ref,
+                expected_app_slug="pipedrive",
+                expected_kind="api_token",
+                expected_scope_id="whatever",
+            )
+        assert excinfo.value.reason_code == "browser_secret_scope_mismatch"
+
+    def test_ttl_bounds_are_enforced(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+        for bad in (10, 3_600):
+            with pytest.raises(ValueError, match="ttl"):
+                store.put_transient(
+                    app_slug="pipedrive",
+                    kind="browser_login_login_email",
+                    scope_id="r",
+                    value="v",
+                    ttl_seconds=bad,
+                )
+
+    def test_migration_is_idempotent_and_preserves_permanent_entries(self, tmp_path) -> None:
+        db = tmp_path / "vault" / "secrets.db"
+        key = Fernet.generate_key()
+        first = SQLiteSecretStore(db, key)
+        ref = first.put(app_slug="pipedrive", kind="api_token", value="keep-me")
+        # Re-open (re-runs initialize/migration); the permanent entry survives.
+        second = SQLiteSecretStore(db, key)
+        assert second.get(ref) == "keep-me"
+
+    def test_parse_vault_reference_is_the_shared_parser(self) -> None:
+        from ops.secret_store import parse_vault_reference
+
+        parts = parse_vault_reference("vault://pipedrive/browser_login_login_email/abc123")
+        assert parts.app_slug == "pipedrive"
+        assert parts.kind == "browser_login_login_email"
+        with pytest.raises(ValueError, match="exact vault reference"):
+            parse_vault_reference("not a reference")

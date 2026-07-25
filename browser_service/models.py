@@ -46,6 +46,10 @@ class CreateSessionRequest(_Strict):
     # email address: the binding fingerprint must not be derived from, or reveal,
     # a real account identifier.
     account_ref: str | None = Field(default=None, max_length=200)
+    # Run/session scope that binds transient login references. One-time credential
+    # references may be consumed only for the matching scope, so a reference minted
+    # for one run cannot be replayed by another.
+    secret_scope: str = Field(default="", max_length=200, pattern=r"^[A-Za-z0-9_-]*$")
 
 
 class SessionSummary(_Strict):
@@ -61,6 +65,15 @@ class SessionSummary(_Strict):
     live_view_mode: LiveViewMode
     live_view_available: bool
     hitl_pending: bool
+    # Four DISTINCT capability facts, so a caller is never misled by one boolean:
+    #   screenshot_supported   - the worker can produce screenshots at all
+    #   screenshot_available   - a current, non-sensitive frame exists right now
+    #   interactive_supported  - the build includes the interactive components
+    #   interactive_available  - THIS session has a usable, authorized interactive path
+    screenshot_supported: bool = True
+    screenshot_available: bool = False
+    interactive_supported: bool = False
+    interactive_available: bool = False
     current_url_path: str = ""
     reason_code: str = ""
 
@@ -93,6 +106,8 @@ class ObservationResponse(_Strict):
     human_instruction: str | None = None
     credential_field_labels: tuple[str, ...] = ()
     non_secret_notes: tuple[str, ...] = ()
+    # Bounded, value-free reason code mirrored from BrowserObservation.
+    reason_code: str | None = None
     session: SessionSummary | None = None
 
 
