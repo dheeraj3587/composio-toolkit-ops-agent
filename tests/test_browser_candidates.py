@@ -166,25 +166,32 @@ def test_choice_schema_enumerates_only_generated_ids() -> None:
     assert set(schema["required"]) == set(schema["properties"])  # type: ignore[arg-type]
 
 
-# --- type/press/goto candidates are policy-sourced ----------------------------
-def test_type_candidates_use_an_approved_value_reference_only() -> None:
+# --- fill/press/goto candidates are policy-sourced ----------------------------
+# Phase 2 renamed the value action "type" -> "fill" (Playwright's own verb);
+# "type" stays a valid literal for backward compatibility, so these tests accept
+# either name and assert the SECURITY property: the value comes from an approved
+# reference, never from the model.
+_VALUE_ACTIONS = {"fill", "type"}
+
+
+def test_value_candidates_use_an_approved_value_reference_only() -> None:
     elements = _elements({"tag": "input", "type": "text", "name": "Company"})
     candidates = _generate(elements, ("Company",), allow_value_refs=("company_name",))
-    typed = [candidate for candidate in candidates if candidate.action == "type"]
+    typed = [candidate for candidate in candidates if candidate.action in _VALUE_ACTIONS]
     assert typed and typed[0].value_ref == "company_name"
     assert typed[0].value_ref in APPROVED_VALUE_REFS
 
 
-def test_unapproved_value_reference_yields_no_type_candidate() -> None:
+def test_unapproved_value_reference_yields_no_value_candidate() -> None:
     elements = _elements({"tag": "input", "type": "text", "name": "Company"})
     candidates = _generate(elements, ("Company",), allow_value_refs=("arbitrary_text",))
-    assert [c for c in candidates if c.action == "type"] == []
+    assert [c for c in candidates if c.action in _VALUE_ACTIONS] == []
 
 
-def test_secret_fields_never_become_type_candidates() -> None:
+def test_secret_fields_never_become_value_candidates() -> None:
     elements = _elements({"tag": "input", "type": "password", "name": "Password"})
     candidates = _generate(elements, ("Password",), allow_value_refs=("company_name",))
-    assert [c for c in candidates if c.action == "type"] == []
+    assert [c for c in candidates if c.action in _VALUE_ACTIONS] == []
 
 
 def test_goto_candidates_come_from_the_reviewed_trace() -> None:

@@ -41,23 +41,94 @@ _APP_KEYS = frozenset(
         "credential_goal",
         "checkpoints",
         "success_signals",
+        "success",
     }
 )
-_STEP_KEYS = frozenset({"order", "instruction", "expected_signals"})
+_STEP_KEYS = frozenset(
+    {
+        "order",
+        "instruction",
+        "expected_signals",
+        "completion",
+        "allowed_value_refs",
+        "requires_hitl",
+    }
+)
+_PREDICATE_KEYS = frozenset(
+    {
+        "url_path_contains",
+        "title_contains",
+        "visible_text_contains",
+        "required_accessible_names",
+        "forbidden_text",
+    }
+)
+# Non-secret value references a checkpoint may authorize the agent to TYPE. Kept
+# in sync with ops.browser_candidates.APPROVED_VALUE_REFS.
+_ALLOWED_VALUE_REFS = frozenset(
+    {"company_name", "company_website", "application_name", "use_case", "expected_volume"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointPredicate:
+    """A structured, evidence-based completion/success condition.
+
+    A predicate is SATISFIED (see ``predicate_satisfied`` in
+    ``ops.playwright_worker``) only when every positive condition is present on
+    the inspected page and no ``forbidden_text`` appears. Natural-language
+    ``expected_signals`` are hints for the model; only these structured
+    predicates advance the state machine or declare success.
+    """
+
+    url_path_contains: tuple[str, ...] = ()
+    title_contains: tuple[str, ...] = ()
+    visible_text_contains: tuple[str, ...] = ()
+    required_accessible_names: tuple[str, ...] = ()
+    forbidden_text: tuple[str, ...] = ()
+
+    def has_positive_condition(self) -> bool:
+        """True when the predicate asserts at least one thing that must be present.
+
+        A predicate with only ``forbidden_text`` (or nothing) can never be used
+        to PROVE progress, so the state machine treats it as unprovable.
+        """
+
+        return bool(
+            self.url_path_contains
+            or self.title_contains
+            or self.visible_text_contains
+            or self.required_accessible_names
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class BrowserApiTraceStep:
-    """One ordered, observable navigation checkpoint."""
+    """One ordered, observable navigation checkpoint.
+
+    ``completion`` is the structured predicate that must be proven before the
+    state machine advances past this checkpoint. ``allowed_value_refs`` lists
+    the reviewed NON-SECRET values the agent may type here. ``requires_hitl``
+    marks a checkpoint whose completion cannot be reliably auto-verified — the
+    loop escalates to a human rather than inventing evidence.
+    """
 
     order: int
     instruction: str
     expected_signals: tuple[str, ...]
+    completion: CheckpointPredicate = CheckpointPredicate()
+    allowed_value_refs: tuple[str, ...] = ()
+    requires_hitl: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class BrowserApiTrace:
-    """Non-secret browser guidance for one app."""
+    """Non-secret browser guidance for one app.
+
+    ``success`` is the structured final predicate for the credential page. It
+    must require at least an approved URL/path indicator AND a specific
+    structural heading/credential-field label (never generic body text).
+    """
 
     position: int
     app_slug: str
@@ -68,6 +139,7 @@ class BrowserApiTrace:
     credential_goal: str
     checkpoints: tuple[BrowserApiTraceStep, ...]
     success_signals: tuple[str, ...]
+    success: CheckpointPredicate = CheckpointPredicate()
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,15 +213,78 @@ def _https_url(value: object, label: str) -> str:
     return url
 
 
+def _predicate_strings(value: object, label: str) -> tuple[str, ...]:
+    """Parse an OPTIONAL predicate string list (0..20 items, no duplicates)."""
+
+    if not isinstance(value, list) or len(value) > 20:
+        raise ValueError(f"{label} must be a list of at most 20 strings")
+    items = tuple(_string(item, f"{label} item", maximum=300) for item in value)
+    if len(set(items)) != len(items):
+        raise ValueError(f"{label} must not contain duplicates")
+    return items
+
+
+def _parse_predicate(value: object, label: str) -> CheckpointPredicate:
+    data = _mapping(value, label)
+    extra = frozenset(data) - _PREDICATE_KEYS
+    if extra:
+        raise ValueError(f"{label} has unknown predicate fields")
+    return CheckpointPredicate(
+        url_path_contains=_predicate_strings(
+            data.get("url_path_contains", []), f"{label} url_path"
+        ),
+        title_contains=_predicate_strings(data.get("title_contains", []), f"{label} title"),
+        visible_text_contains=_predicate_strings(
+            data.get("visible_text_contains", []), f"{label} visible_text"
+        ),
+        required_accessible_names=_predicate_strings(
+            data.get("required_accessible_names", []), f"{label} accessible_names"
+        ),
+        forbidden_text=_predicate_strings(
+            data.get("forbidden_text", []), f"{label} forbidden_text"
+        ),
+    )
+
+
+def _parse_value_refs(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or len(value) > 10:
+        raise ValueError(f"{label} must be a list of at most 10 value references")
+    refs = tuple(_string(item, f"{label} item", maximum=60) for item in value)
+    unknown = set(refs) - _ALLOWED_VALUE_REFS
+    if unknown:
+        raise ValueError(f"{label} references unapproved values: {sorted(unknown)}")
+    return refs
+
+
 def _parse_step(value: object, app_slug: str) -> BrowserApiTraceStep:
     data = _mapping(value, f"{app_slug} checkpoint")
-    _exact_keys(data, _STEP_KEYS, f"{app_slug} checkpoint")
+    extra = frozenset(data) - _STEP_KEYS
+    if extra:
+        raise ValueError(f"{app_slug} checkpoint has unknown fields")
+    requires_hitl = bool(data.get("requires_hitl", False))
+    completion = (
+        _parse_predicate(data["completion"], f"{app_slug} checkpoint completion")
+        if "completion" in data
+        else CheckpointPredicate()
+    )
+    # A non-HITL checkpoint MUST carry a provable completion predicate, so the
+    # state machine can never advance on an empty/unprovable condition.
+    if not requires_hitl and not completion.has_positive_condition():
+        raise ValueError(
+            f"{app_slug} checkpoint {data.get('order')} needs a completion predicate "
+            "or requires_hitl=true"
+        )
     return BrowserApiTraceStep(
         order=_positive_integer(data["order"], f"{app_slug} checkpoint order"),
         instruction=_string(data["instruction"], f"{app_slug} checkpoint instruction"),
         expected_signals=_strings(
             data["expected_signals"], f"{app_slug} checkpoint expected signals"
         ),
+        completion=completion,
+        allowed_value_refs=_parse_value_refs(
+            data.get("allowed_value_refs", []), f"{app_slug} checkpoint allowed_value_refs"
+        ),
+        requires_hitl=requires_hitl,
     )
 
 
@@ -166,6 +301,23 @@ def _parse_app(value: object) -> BrowserApiTrace:
     checkpoints = tuple(_parse_step(step, slug) for step in raw_steps)
     if tuple(step.order for step in checkpoints) != tuple(range(1, len(checkpoints) + 1)):
         raise ValueError(f"{slug} checkpoint order must be contiguous")
+    success = _parse_predicate(data["success"], f"{slug} success predicate")
+    # An EMPTY success predicate is allowed and means "final credential-page
+    # readiness must be confirmed by a human" (HITL-only) — the conservative
+    # migration for apps without a reviewed, reliable auto-success predicate.
+    # A NON-EMPTY success predicate must require an approved URL/path indicator
+    # AND a specific structural heading/label — never generic body text alone.
+    if success.has_positive_condition() and (
+        not success.url_path_contains
+        or not (
+            success.required_accessible_names
+            or success.visible_text_contains
+            or success.title_contains
+        )
+    ):
+        raise ValueError(
+            f"{slug} success predicate must require a URL/path indicator AND a specific label"
+        )
     return BrowserApiTrace(
         position=_positive_integer(data["position"], f"{slug} position"),
         app_slug=slug,
@@ -176,6 +328,7 @@ def _parse_app(value: object) -> BrowserApiTrace:
         credential_goal=_string(data["credential_goal"], f"{slug} credential goal"),
         checkpoints=checkpoints,
         success_signals=_strings(data["success_signals"], f"{slug} success signals"),
+        success=success,
     )
 
 
@@ -209,7 +362,7 @@ def load_browser_api_trace_catalog() -> BrowserApiTraceCatalog:
         ),
         apps=apps,
     )
-    if catalog.schema_version != "1.0":
+    if catalog.schema_version != "2.0":
         raise ValueError("unsupported browser API trace catalog schema version")
     if catalog.selection_source != "data/p1/results.json":
         raise ValueError("browser API trace catalog has an unexpected selection source")
@@ -255,6 +408,7 @@ __all__ = [
     "BrowserApiTrace",
     "BrowserApiTraceCatalog",
     "BrowserApiTraceStep",
+    "CheckpointPredicate",
     "get_browser_api_trace",
     "load_browser_api_trace_catalog",
     "render_browser_api_trace",

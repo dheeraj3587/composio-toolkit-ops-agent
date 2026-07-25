@@ -61,6 +61,29 @@ BrowserObservationStatus = Literal[
     "failed",
 ]
 
+# Bounded, value-free reason codes an observation may carry. Kept as a reference
+# vocabulary (the field is validated by character class, not against this list, so
+# a provider-specific code is still allowed) so callers share consistent names.
+BrowserReasonCode = Literal[
+    "authentication_failed",
+    "login_frame_unreviewed",
+    "multiple_login_surfaces",
+    "multiple_password_forms",
+    "login_origin_unsafe",
+    "login_incomplete",
+    "otp_required",
+    "otp_surface_not_verified",
+    "otp_injection_failed",
+    "magic_link_required",
+    "verification_link_blocked",
+    "verification_link_navigation_failed",
+    "account_selection_required",
+    "policy_blocked",
+    "navigation_timeout",
+    "postcondition_failed",
+    "session_lost",
+]
+
 HumanActionType = Literal[
     "captcha",
     "email_otp",
@@ -109,11 +132,21 @@ class BrowserObservation:
     credential_field_labels: tuple[str, ...] = ()
     stable_selector_hints: tuple[SelectorHint, ...] = ()
     non_secret_notes: tuple[str, ...] = ()
+    # A bounded, value-free reason code (e.g. "authentication_failed"). Optional so
+    # existing Browser Use results need not supply one. NEVER page or exception
+    # text — it is validated to a strict character class below.
+    reason_code: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "current_url", sanitize_browser_url(self.current_url))
         if not self.page_title or len(self.page_title) > 500:
             raise ValueError("browser page title is invalid")
+        if self.reason_code is not None and (
+            not self.reason_code
+            or len(self.reason_code) > 100
+            or re.fullmatch(r"[a-z0-9_:-]+", self.reason_code) is None
+        ):
+            raise ValueError("browser reason code is invalid")
         if self.status == "human_action_required" and (
             self.human_action_type is None or not self.human_instruction
         ):
@@ -177,7 +210,20 @@ class BrowserWorker:
         # re-derive the official allowlist without changing the graph contract.
         self._research: dict[str, OperationalResearch] = {}
 
-    async def start(self, profile_id: str | None) -> BrowserSessionContext:
+    async def start(
+        self,
+        profile_id: str | None,
+        *,
+        app_slug: str = "",
+        account_ref: str | None = None,
+        secret_scope: str | None = None,
+        use_storage_state: bool = False,
+        live_view_mode: str = "screenshot",
+    ) -> BrowserSessionContext:
+        # Accept and IGNORE the Playwright-specific metadata so a single call site
+        # in the graph works for both providers. Browser Use's own session-creation
+        # request is unchanged — these arguments never alter its behaviour.
+        del app_slug, account_ref, secret_scope, use_storage_state, live_view_mode
         self._require_configuration()
         client = self._get_client()
         create_kwargs: dict[str, Any] = {

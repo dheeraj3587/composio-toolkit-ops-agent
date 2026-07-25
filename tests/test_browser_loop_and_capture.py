@@ -15,6 +15,7 @@ import pytest
 from ops.browser_loop import BrowserLoop, BrowserLoopClosedError, shared_browser_loop
 from ops.config import Settings
 from ops.playwright_worker import PlaywrightBrowserWorker
+from tests.browser_app.harness import require_chromium
 
 
 # --- BrowserLoop: one loop, usable from many caller loops ---------------------
@@ -78,7 +79,7 @@ def test_live_session_survives_separate_event_loops() -> None:
     try:
         context = asyncio.run(worker.start(None))
     except Exception as exc:
-        pytest.skip(f"Chromium not launchable: {type(exc).__name__}")
+        require_chromium(exc)
 
     session = worker._sessions[context.session_id]
 
@@ -159,7 +160,7 @@ def test_live_capture_uses_reviewed_selector_and_vaults_reference() -> None:
     try:
         context = asyncio.run(worker.start(None))
     except Exception as exc:
-        pytest.skip(f"Chromium not launchable: {type(exc).__name__}")
+        require_chromium(exc)
 
     _serve_pipedrive(worker, context.session_id, _credential_page())
     refs = asyncio.run(worker.auto_capture_credentials(context.session_id, "pipedrive", store))
@@ -178,7 +179,7 @@ def test_live_capture_fails_when_expected_heading_is_absent() -> None:
     try:
         context = asyncio.run(worker.start(None))
     except Exception as exc:
-        pytest.skip(f"Chromium not launchable: {type(exc).__name__}")
+        require_chromium(exc)
 
     _serve_pipedrive(
         worker,
@@ -199,7 +200,7 @@ def test_live_capture_rejects_a_partial_pattern_match() -> None:
     try:
         context = asyncio.run(worker.start(None))
     except Exception as exc:
-        pytest.skip(f"Chromium not launchable: {type(exc).__name__}")
+        require_chromium(exc)
 
     _serve_pipedrive(
         worker,

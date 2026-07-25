@@ -36,7 +36,7 @@ RAW_TOKEN = "hs-owner-supplied-token-DO-NOT-PERSIST"  # pragma: allowlist secret
 
 
 class _FakeBrowser:
-    async def start(self, profile_id: str | None) -> BrowserSessionContext:
+    async def start(self, profile_id: str | None, **_kwargs: object) -> BrowserSessionContext:
         return BrowserSessionContext(
             profile_id=profile_id or "profile-hs",
             session_id="browser-sess-1",

@@ -257,20 +257,67 @@ class LocalRunService:
             ),
             # Report under the SELECTED provider's identity. Browser Use keeps its
             # exact previous wording/behaviour; Playwright is judged by its own
-            # requirements (no Browser Use key) and reported as
-            # configured_not_verified because the API image intentionally has no
-            # Chromium — readiness is proven by the separate browser image's probe.
+            # requirements (no Browser Use key). Readiness for the service-backed
+            # Playwright path comes from the SERVICE's own cached probe — the API
+            # image has no Chromium and must never try to launch one here.
             state(
                 selected_browser,
                 configured=browser_configured,
                 enabled=live_browser_enabled,
-                detail=(
-                    "Live browser execution is policy-disabled."
-                    if not live_browser_enabled
-                    else "Browser configuration is present but has not been verified."
+                detail=self._browser_provider_detail(
+                    provider=selected_browser,
+                    settings=settings,
+                    live_enabled=live_browser_enabled,
                 ),
             ),
         ]
+
+    @staticmethod
+    def _browser_provider_detail(*, provider: str, settings: Settings, live_enabled: bool) -> str:
+        """Provider health detail. Never launches a browser from the API path."""
+
+        if not live_enabled:
+            return "Live browser execution is policy-disabled."
+        if provider != "playwright":
+            return "Browser configuration is present but has not been verified."
+        if getattr(settings, "playwright_in_process_sandbox", False):
+            return (
+                "In-process Playwright sandbox is enabled (tests and local debugging "
+                "only); Chromium runs inside this process rather than the browser service."
+            )
+        if not settings.browser_service_url or settings.browser_service_token is None:
+            return (
+                "The Playwright provider requires BROWSER_SERVICE_URL and "
+                "BROWSER_SERVICE_TOKEN, or the explicit in-process sandbox flag."
+            )
+        return (
+            "Chromium runs in the isolated browser service; its readiness is reported "
+            "by that service's own cached probe rather than by this image."
+        )
+
+    @staticmethod
+    def _browser_phase_detail(*, provider: str, configured: bool) -> str:
+        """Describe the SELECTED browser provider's state in its own terms."""
+
+        if provider == "playwright":
+            if not configured:
+                return (
+                    "The self-hosted browser harness requires the ALLOW_LIVE_BROWSER policy "
+                    "opt-in. No Browser Use key is needed for this provider."
+                )
+            return (
+                "The self-hosted harness enforces the host allowlist in-process via request "
+                "interception, and Chromium runs in the separate browser service so an API "
+                "restart does not end a live session. Readiness is proven by that service's "
+                "own health probe rather than by this image."
+            )
+        if not configured:
+            return "A Browser Use key and ALLOW_LIVE_BROWSER policy opt-in are required."
+        return (
+            "Browser Use v3 agent navigation fails closed because the installed SDK cannot "
+            "prove the mandatory domain allowlist. Trusted adapter-owned Playwright capture "
+            "remains a separate deterministic boundary."
+        )
 
     def _phases(
         self,
@@ -302,6 +349,14 @@ class LocalRunService:
         has_checkpoint_key = self._settings.langgraph_aes_key is not None
         # Provider-aware: a Playwright deployment needs no Browser Use key.
         has_browser_configuration = browser_configuration_state(self._settings)
+        browser_provider = str(getattr(self._settings, "browser_provider", "browser_use"))
+        # The detail text must describe the SELECTED provider. Reporting Browser Use's
+        # v3 allowlist limitation on a Playwright deployment would be simply false:
+        # the self-hosted harness enforces the host allowlist itself via route
+        # interception, which is the reason it exists.
+        browser_detail = self._browser_phase_detail(
+            provider=browser_provider, configured=has_browser_configuration
+        )
         has_email_configuration = bool(
             self._settings.composio_api_key is not None
             and self._settings.composio_gmail_connected_account_id
@@ -315,13 +370,7 @@ class LocalRunService:
                 name="Browser",
                 phase="5/6",
                 status="unavailable" if has_browser_configuration else "configuration_required",
-                detail=(
-                    "Browser Use v3 agent navigation fails closed because the installed SDK cannot "
-                    "prove the mandatory domain allowlist. Trusted adapter-owned Playwright capture "
-                    "remains a separate deterministic boundary."
-                    if has_browser_configuration
-                    else "A Browser Use key and ALLOW_LIVE_BROWSER policy opt-in are required."
-                ),
+                detail=browser_detail,
                 available=False,
             ),
             PhaseState(

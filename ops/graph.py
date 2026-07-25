@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import sqlite3
 import threading
@@ -40,8 +41,30 @@ from ops.state import OperationsState
 ResearchLoader = Callable[[str], OperationalResearch]
 
 
+def browser_account_ref(work_email_ref: str) -> str:
+    """A stable, OPAQUE account reference for storage-state binding.
+
+    Hashes the (already non-raw) work-email vault REFERENCE so a real email address
+    never becomes a filename component or crosses to the browser service, while the
+    same account still maps to the same saved-state binding across runs.
+    """
+
+    import hashlib
+
+    return hashlib.sha256(work_email_ref.encode("utf-8")).hexdigest()[:32]
+
+
 class WorkflowBrowser(Protocol):
-    async def start(self, profile_id: str | None) -> BrowserSessionContext: ...
+    async def start(
+        self,
+        profile_id: str | None,
+        *,
+        app_slug: str = ...,
+        account_ref: str | None = ...,
+        secret_scope: str | None = ...,
+        use_storage_state: bool = ...,
+        live_view_mode: str = ...,
+    ) -> BrowserSessionContext: ...
 
     async def navigate_onboarding(
         self,
@@ -363,8 +386,24 @@ class DurableOperationsWorkflow:
             if reservation.status == "completed":  # pragma: no cover - fresh key per run
                 return {}
         try:
+            browser = self._dependencies.browser
+            # Supply the app slug, an OPAQUE account reference, the run scope (so
+            # one-time login references are consumed only for this run) and the
+            # storage-state flag. Both providers accept this signature; Browser Use
+            # ignores the extra metadata, so its request is unchanged.
+            is_playwright = getattr(browser, "provider_name", "") == "playwright"
+            account_ref: str | None = None
+            with contextlib.suppress(Exception):
+                request = OperationsRequest.model_validate(state["request"])
+                account_ref = browser_account_ref(request.company.work_email_ref)
             context = _run_async(
-                self._dependencies.browser.start(self._dependencies.browser_profile_id)
+                browser.start(
+                    self._dependencies.browser_profile_id,
+                    app_slug=str(state.get("app_slug") or ""),
+                    account_ref=account_ref,
+                    secret_scope=str(state["run_id"]),
+                    use_storage_state=is_playwright,
+                )
             )
         except PhaseUnavailableError as exc:
             return _unavailable_update(state, exc)

@@ -78,7 +78,13 @@ class BrowserAction(BaseModel):
 
 @dataclass(frozen=True, slots=True)
 class SnapshotElement:
-    """One interactive element, addressable only by its index."""
+    """One interactive element, addressable only by its index.
+
+    Phase 2 adds accessibility-facing state (visible/enabled/checked/selected/
+    expanded), the frame path the element lives in, and stable identity hints
+    (test id, safe href path, nearby heading). Every new field is DEFAULTED so
+    existing callers and the Phase 1 snapshot builder keep working unchanged.
+    """
 
     index: int
     role: str
@@ -88,6 +94,25 @@ class SnapshotElement:
     # True when the element looks credential-bearing. The model is never allowed to
     # type into such a field (only code-owned injection may).
     secretish: bool = False
+    # --- Phase 2: accessibility-facing state ---
+    visible: bool = True
+    enabled: bool = True
+    checked: bool | None = None
+    selected: bool | None = None
+    expanded: bool | None = None
+    # --- Phase 2: stable identity hints ---
+    # Frame chain this element lives in ("" == main frame); used to re-resolve the
+    # element in the SAME frame and to refuse secret injection in an unreviewed one.
+    frame_path: tuple[str, ...] = ()
+    # PATH ONLY (never a full URL with query/fragment), so no token can leak here.
+    href_path: str | None = None
+    test_id: str | None = None
+    nearby_heading: str | None = None
+    # For a NON-secret <select>: the currently selected option's visible label.
+    # Needed because ``selected`` is only meaningful on <option> elements, which the
+    # interactive-element snapshot deliberately does not collect — so without this
+    # there was nothing reliable to verify a select_option action against.
+    selected_label: str | None = None
 
     def render(self) -> str:
         parts = [f"[{self.index}] {self.role}"]
@@ -97,7 +122,24 @@ class SnapshotElement:
             parts.append(f'name="{self.name}"')
         if self.has_value:
             parts.append("filled")
+        if not self.visible:
+            parts.append("hidden")
+        if not self.enabled:
+            parts.append("disabled")
+        if self.checked is not None:
+            parts.append(f"checked={str(self.checked).casefold()}")
+        if self.selected is not None:
+            parts.append(f"selected={str(self.selected).casefold()}")
+        if self.expanded is not None:
+            parts.append(f"expanded={str(self.expanded).casefold()}")
+        if self.frame_path:
+            parts.append(f"frame={'/'.join(self.frame_path)}")
         return " ".join(parts)
+
+    def actionable(self) -> bool:
+        """True when the element can actually be acted on right now."""
+
+        return self.visible and self.enabled
 
 
 def render_snapshot(elements: Sequence[SnapshotElement]) -> str:
@@ -135,6 +177,12 @@ def build_snapshot(raw_elements: Sequence[Mapping[str, object]]) -> tuple[Snapsh
         element_type = _text(raw.get("type") or "")[:40]
         secretish = bool(_SECRETISH.search(f"{name} {element_type}"))
         has_value = bool(raw.get("value_present")) and not secretish
+        frame_path_raw = raw.get("frame_path")
+        frame_path = (
+            tuple(str(part)[:60] for part in frame_path_raw if str(part))
+            if isinstance(frame_path_raw, (list, tuple))
+            else ()
+        )
         elements.append(
             SnapshotElement(
                 index=len(elements),
@@ -143,9 +191,41 @@ def build_snapshot(raw_elements: Sequence[Mapping[str, object]]) -> tuple[Snapsh
                 element_type=element_type,
                 has_value=has_value,
                 secretish=secretish,
+                # Phase 2 state: default to actionable so a Phase 1 raw dict
+                # (which carries none of these keys) behaves exactly as before.
+                visible=bool(raw.get("visible", True)),
+                enabled=bool(raw.get("enabled", True)),
+                checked=_tri_state(raw.get("checked")),
+                selected=_tri_state(raw.get("selected")),
+                expanded=_tri_state(raw.get("expanded")),
+                frame_path=frame_path,
+                href_path=(_text(raw.get("href_path") or "")[:300] or None),
+                test_id=(_text(raw.get("test_id") or "")[:120] or None),
+                nearby_heading=(_text(raw.get("nearby_heading") or "")[:_MAX_NAME] or None),
+                # A select's chosen option label. Suppressed for a secret-ish
+                # control so no value can ride out through this field.
+                selected_label=(
+                    None if secretish else (_text(raw.get("selected_label") or "")[:120] or None)
+                ),
             )
         )
     return tuple(elements)
+
+
+def _tri_state(value: object) -> bool | None:
+    """Project a raw checked/selected/expanded value into True/False/None."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().casefold()
+        if lowered in {"true", "checked", "selected", "expanded"}:
+            return True
+        if lowered in {"false", "unchecked", "unselected", "collapsed"}:
+            return False
+    return None
 
 
 def _text(value: object) -> str:

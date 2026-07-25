@@ -13,13 +13,16 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from ops.browser_egress import EgressStage, build_egress_policy
 from ops.config import Settings
 from ops.playwright_worker import (
     PlaywrightBrowserWorker,
     _has_credential_content,
     _looks_credential_bearing,
+    make_egress_route_handler,
     make_route_handler,
 )
+from tests.browser_app.harness import require_chromium
 
 _HOST = "app.pipedrive.com"
 _PATTERNS = (_HOST, "*.pipedrive.com")
@@ -35,7 +38,7 @@ def _start(worker: PlaywrightBrowserWorker) -> object:
     try:
         return asyncio.run(worker.start(None))
     except Exception as exc:  # pragma: no cover
-        pytest.skip(f"Chromium not launchable: {type(exc).__name__}")
+        require_chromium(exc)
 
 
 # --- Item 6: staged egress policy (unit level) ---------------------------------
@@ -173,7 +176,10 @@ def test_live_canary_cannot_be_exfiltrated_after_authentication() -> None:
     handle = context.session_id  # type: ignore[attr-defined]
     session = worker._sessions[handle]
     session.patterns = _PATTERNS
-    session.egress_stage = "post_auth"  # credentials are present in the DOM
+    # Credentials are present in the DOM, so egress is at its tightest stage. This
+    # now drives the SINGLE canonical tracker (the duplicate string field is gone).
+    session.egress_policy = build_egress_policy(_PATTERNS)
+    session.egress.advance_to(EgressStage.CREDENTIAL_SURFACE)
 
     reached: list[str] = []
 
@@ -183,9 +189,15 @@ def test_live_canary_cannot_be_exfiltrated_after_authentication() -> None:
             reached.append(route.request.url)  # type: ignore[attr-defined]
             await route.abort()  # type: ignore[attr-defined]
 
-        # The production staged guard is installed FIRST (context level).
+        # The production FOUR-STAGE egress policy is the route authority now, and
+        # it is installed FIRST (context level).
+        assert session.egress_policy is not None
         await session.context.route(
-            "**/*", make_route_handler(_PATTERNS, stage_provider=lambda: session.egress_stage)
+            "**/*",
+            make_egress_route_handler(
+                policy=session.egress_policy,
+                stage_provider=lambda: session.egress.stage,
+            ),
         )
 
         # Serve the adversarial page from the allowlisted host.

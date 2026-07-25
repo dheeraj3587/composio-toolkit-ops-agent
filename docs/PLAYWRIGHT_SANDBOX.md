@@ -93,22 +93,86 @@ the loop continues.
 | 9. Deadline-bounded inference | **Deferred.** The action loop is bounded (20 steps / 180 s / 3 repeats / 2 model failures) and providers have per-request timeouts, but there is no single decision-level deadline shared across the fallback chain, no `Retry-After` handling, and no circuit breaker. |
 | 10. Sanitized observability | **Deferred.** No metrics record is emitted yet. |
 | 11. Real browser CI | **Written, NOT active.** The job exists locally but could not be pushed (the integration lacks GitHub Actions `workflows` permission) and its actions are not yet pinned to immutable SHAs. **There is currently no browser-image CI gate on this repository.** |
-| 12. Durable worker RPC | **Deferred** by design. |
+| 12. Durable worker RPC | **Done (Phase 3).** See below. |
 | 13. Release benchmark | **Deferred.** |
+
+## Phase 3: the isolated browser service
+
+Chromium now runs in its **own container** (`browser-worker`), not in the API process.
+That single change is what makes a session survive an API restart, and it stops a
+Chromium crash or memory spike from threatening the control plane.
+
+- **`browser_service/`** is a small FastAPI app (`browser_service.main:app`) that drives
+  the *same* `PlaywrightBrowserWorker`. All Phase 1/2 safety logic — reviewed host
+  policy, opaque candidate policy, risk gate, staged egress, dialog/popup/download
+  guards, DLP boundary — is reused unchanged rather than reimplemented.
+- **Authenticated RPC.** Every `/internal/...` route requires the shared
+  `X-Browser-Service-Token` (constant-time compare) plus an owner header, and enforces
+  per-session ownership. A caller who does not own a session gets **404, not 403**, so
+  another run's session existence is never confirmed. With no token configured the
+  service refuses everything — unconfigured means inert, not open.
+- **Credential values never cross the boundary.** The API sends only `vault://`
+  references; the service resolves them internally and clears them immediately after
+  the operation.
+- **Verified reattachment.** `BrowserServiceClient.supports_restart_reattach = True`,
+  but a persisted session id is *never* trusted on its own: startup reconciliation
+  queries the service and only leaves a run resumable when it reports `ACTIVE`. A
+  missing session becomes `browser_service_session_lost`; an **unreachable** service is
+  treated as inconclusive and the run is left alone (a transient outage must not
+  destroy a live session).
+- **Lifecycle safety.** Every operation takes a lease. Closing is
+  `ACTIVE → CLOSING → bounded drain → cancel → close → CLOSED → release capacity once`,
+  so the janitor can never close a session mid-action and a slot cannot be
+  double-released.
+- **Interactive HITL.** A screenshot cannot solve a CAPTCHA, an account chooser or an
+  MFA prompt, so real remote control is available — gated by an HMAC-signed token bound
+  to one session id, one owner, and a few minutes' expiry. It is **off by default**
+  (`BROWSER_INTERACTIVE_HITL_ENABLED=false`); when off, Xvfb/x11vnc are never even
+  started. x11vnc binds to container loopback (`-localhost`) and the container
+  publishes **no port**, so the only path in is the authenticated WebSocket relay.
+  Opens, closes and denials are audited by reason code; the grant URL is returned once
+  and never durably persisted.
+- **Why not websockify?** Verified against its source, not assumed:
+  `auth_plugins.BasePlugin.authenticate(headers, target_host, target_port)` receives
+  only headers, so a URL grant token cannot be validated there; `token_plugins` is a
+  routing hook whose failure path logs the token verbatim
+  (`"Token '%s' not found"`). It cannot satisfy "no unauthenticated noVNC" *and*
+  "never log the token" simultaneously, so the relay lives in `browser_service/novnc.py`
+  behind the same verification the RPC routes use.
+- **Storage state is treated as secret material.** Fernet-encrypted at rest, `0600`
+  inside a `0700` directory, bound to `(app, account, owner)` so it cannot leak
+  sideways, expiry-tracked, and invalidated on logout or auth failure. With no key it
+  is simply **not persisted** rather than written in the clear.
 
 ## Known limitations (honest)
 
-- **No restart survival.** The browser runs in‑process, so an API restart destroys the
-  session. The provider declares `supports_restart_reattach = False`, and startup
-  reconciliation moves both `browser_running` and `waiting_for_hitl` runs to
-  `configuration_required` with reason `playwright_session_lost_on_restart` rather
-  than pretending they can resume. Browser Use behaviour is unchanged.
+- **In-process provider still has no restart survival.** When Playwright runs inside the
+  API (no browser service configured), the browser dies with the process:
+  `supports_restart_reattach = False` and reconciliation moves both `browser_running`
+  and `waiting_for_hitl` runs to `configuration_required` with reason
+  `playwright_session_lost_on_restart`. Restart survival is a property of the
+  **browser service** deployment, not of Playwright as such. Browser Use behaviour is
+  unchanged in both cases.
 - **No hosted live URL.** HITL uses the authenticated screenshot endpoint
-  (`GET /api/runs/{run_id}/live-view/screenshot`, owner‑gated, `no-store`).
+  (`GET /api/runs/{run_id}/live-view/screenshot`, owner‑gated, `no-store`), or the
+  short-lived interactive grant above when explicitly enabled.
 - **Hands‑off capture covers Pipedrive only.** Other apps use owner submission until
   each app's selectors are verified live.
 - **API health does not launch Chromium** (the API image has none). Playwright reports
-  `configured_not_verified`; the browser image's own probe is the readiness proof.
+  `configured_not_verified`; the browser service's own health endpoint is the readiness
+  proof.
+- **The Docker gates for Phase 3 were not executed.** `docker compose config` and
+  `docker compose build` could not run in the authoring environment (no `docker` binary,
+  no `/var/run/docker.sock`). `Dockerfile.browser`, the entrypoint and the
+  `browser-worker` service are validated **structurally** by
+  `tests/test_browser_service_phase3.py::TestContainerIsolationShape` (YAML parse plus
+  assertions that no port is published, the container is non-root and read-only, the
+  display stack is installed, VNC binds to loopback, and every dangerous switch
+  defaults to off). Those tests check the declared configuration, **not a running
+  container** — a real `docker compose build` is still required before deployment.
+- **Production is not switched.** `browser_provider` still defaults to `browser_use`,
+  `compose.prod.yaml` is untouched, and `browser-worker` exists only in the sandbox
+  stack.
 
 ## Live sandbox runs
 

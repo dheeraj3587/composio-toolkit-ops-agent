@@ -21,6 +21,7 @@ from ops.playwright_worker import (
     make_route_handler,
     navigation_allowed,
 )
+from tests.browser_app.harness import require_chromium
 
 _PATTERNS = ("app.pipedrive.com", "*.pipedrive.com")
 
@@ -112,7 +113,7 @@ def test_live_lifecycle_and_secret_injection() -> None:
         try:
             context = await worker.start(None)
         except Exception as exc:  # no browser binary here -> skip, don't fail
-            pytest.skip(f"Chromium not launchable in this environment: {type(exc).__name__}")
+            require_chromium(exc)
         registered = context.session_id in worker._sessions
         session = worker._sessions[context.session_id]
 
@@ -146,12 +147,42 @@ def test_live_lifecycle_and_secret_injection() -> None:
 
 
 # --- integration: the provider factory now selects the Playwright harness -----
-def test_factory_selects_playwright_worker(tmp_path: object) -> None:
+def test_factory_selects_the_browser_service_for_playwright(tmp_path: object) -> None:
+    """Service-backed Playwright is the NORMAL path; in-process is opt-in.
+
+    This previously asserted that selecting the provider returned the in-process
+    worker, which is exactly why the browser service, its RPC auth, restart
+    reattachment and lifecycle manager were never reached by the real application.
+    """
+
     from pathlib import Path
 
+    from pydantic import SecretStr
+
+    from ops.provider_errors import ConfigurationRequiredError
     from ops.run_service import RunService
 
     settings = Settings(allow_live_browser=True, browser_provider="playwright")
     svc = RunService.from_paths(db_path=Path(str(tmp_path)) / "ops.db", settings=settings)
-    worker = svc._build_browser_worker(settings)
+
+    # Unconfigured service: fail closed rather than silently launching Chromium
+    # inside the control plane.
+    with pytest.raises(ConfigurationRequiredError) as excinfo:
+        svc._build_browser_worker(settings)
+    assert excinfo.value.reason_code == "browser_service_configuration_required"
+
+    # Configured service: the RPC client, which can survive an API restart.
+    service_settings = settings.model_copy(
+        update={
+            "browser_service_url": "http://browser-worker:8081",
+            "browser_service_token": SecretStr("test-token"),
+        }
+    )
+    client = svc._build_browser_worker(service_settings)
+    assert type(client).__name__ == "BrowserServiceClient"
+    assert client.supports_restart_reattach is True
+
+    # In-process Chromium remains available, but only when asked for explicitly.
+    sandbox_settings = settings.model_copy(update={"playwright_in_process_sandbox": True})
+    worker = svc._build_browser_worker(sandbox_settings)
     assert type(worker).__name__ == "PlaywrightBrowserWorker"

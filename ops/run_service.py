@@ -10,6 +10,7 @@ explicit retry/resume actions guarded by runtime policy.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -523,9 +524,15 @@ class RunService:
         # Provider capability decides which statuses are recoverable. Browser Use
         # sessions live in the cloud and can be reattached by provider session id, so
         # its waiting_for_hitl runs are left intact (unchanged behaviour). The
-        # self-hosted Playwright browser dies with the API process, so BOTH
+        # in-process Playwright browser dies with the API process, so BOTH
         # browser_running and waiting_for_hitl must be reconciled — claiming such a
         # run is resumable would be false.
+        #
+        # The browser SERVICE is the third case: Chromium is in its own container, so
+        # a session can genuinely outlive an API restart. But the capability flag
+        # alone is not evidence, so each waiting_for_hitl run is CHECKED against the
+        # service (see _browser_session_is_live); only a session the service still
+        # reports ACTIVE is left resumable.
         reattach = bool(getattr(self._browser_worker, "supports_restart_reattach", True))
         stranded_statuses = (
             ("browser_running",) if reattach else ("browser_running", "waiting_for_hitl")
@@ -533,6 +540,8 @@ class RunService:
         reason = (
             "api_restart_stranded_browser_run" if reattach else "playwright_session_lost_on_restart"
         )
+        # Only the RPC-backed provider can be asked whether a session survived.
+        verifies_sessions = callable(getattr(self._browser_worker, "reconcile_session", None))
         try:
             offset = 0
             while True:
@@ -540,17 +549,60 @@ class RunService:
                 if not batch:
                     break
                 for record in batch:
-                    if record.get("status") in stranded_statuses:
+                    status = record.get("status")
+                    run_id = str(record.get("run_id") or "")
+                    if status in stranded_statuses:
                         self._reconcile_one_stranded(
-                            str(record.get("run_id") or ""),
+                            run_id,
                             stranded_statuses=stranded_statuses,
                             reason=reason,
+                        )
+                    elif (
+                        verifies_sessions
+                        and status == "waiting_for_hitl"
+                        and self._browser_session_is_live(record) is False
+                    ):
+                        # The service says this session is gone: the run cannot be
+                        # resumed, so surface that instead of waiting forever on a
+                        # browser that no longer exists.
+                        self._reconcile_one_stranded(
+                            run_id,
+                            stranded_statuses=("waiting_for_hitl",),
+                            reason="browser_service_session_lost",
                         )
                 if len(batch) < 100:
                     break
                 offset += 100
         except Exception:  # pragma: no cover - reconciliation must never crash boot
             LOGGER.warning("startup run reconciliation was skipped after an error")
+
+    def _browser_session_is_live(self, record: Mapping[str, Any]) -> bool | None:
+        """Ask the browser service whether a persisted session id still exists.
+
+        Returns ``True`` when the service reports the session ACTIVE, ``False``
+        when it is definitively gone, and ``None`` when the answer is unknown
+        (service unreachable, or the provider cannot be queried). ``None`` must be
+        treated as "leave the run alone": tearing a run down because the service
+        was briefly unreachable would destroy a session that is actually alive.
+        """
+
+        worker = self._browser_worker
+        reconcile = getattr(worker, "reconcile_session", None)
+        if not callable(reconcile):
+            return None
+        session_id = record.get("browser_session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return False
+        try:
+            outcome = asyncio.run(reconcile(session_id))
+        except Exception:
+            return None
+        if outcome == "resumable":
+            return True
+        if outcome == "session_lost":
+            return False
+        # "unreachable" (or anything unexpected) is inconclusive, never a teardown.
+        return None
 
     def _reconcile_one_stranded(
         self,
@@ -950,23 +1002,126 @@ class RunService:
         # so a Playwright deployment is never judged by a Browser Use key.
         return browser_configuration_state(settings)
 
+    def _browser_login_payload(
+        self, *, app_slug: str, scope_id: str, values: Mapping[str, SecretStr]
+    ) -> dict[str, str]:
+        """Build the credential payload for the ACTIVE browser provider.
+
+        Browser Use receives raw values in-process, exactly as before. The browser
+        SERVICE must never receive a raw value over RPC, so each permitted secret is
+        first stored as a TRANSIENT (one-time, run-scoped, expiring) ``vault://``
+        reference and only the reference travels; the service consumes it once.
+        """
+
+        raw = {name: secret.get_secret_value() for name, secret in values.items()}
+        worker = self._browser_worker
+        if getattr(worker, "provider_name", "") != "playwright":
+            return raw
+        if not callable(getattr(worker, "reconcile_session", None)):
+            # In-process Playwright: same process, no RPC boundary to cross.
+            return raw
+        return self._store_transient_browser_secrets(
+            app_slug=app_slug, scope_id=scope_id, values=raw
+        )
+
+    def _store_transient_browser_secrets(
+        self, *, app_slug: str, scope_id: str, values: Mapping[str, str]
+    ) -> dict[str, str]:
+        """Vault each permitted secret as a one-time, run-scoped reference.
+
+        A field outside the reviewed set is refused. A vault-write failure is NOT
+        suppressed: every reference created so far is rolled back (deleted) and the
+        whole payload fails, so a run never proceeds with a partial secret set or a
+        raw value on the wire.
+        """
+
+        from ops.browser_service_client import ALLOWED_BROWSER_SECRET_FIELDS
+
+        store = self._secret_store
+        if store is None:
+            raise ConfigurationRequiredError(
+                phase=5,
+                capability="browser service secrets",
+                reason_code="secret_vault_required_for_browser_service",
+            )
+        references: dict[str, str] = {}
+        created: list[str] = []
+        try:
+            for name, value in values.items():
+                if name not in ALLOWED_BROWSER_SECRET_FIELDS:
+                    raise ProviderOperationError(
+                        capability="browser service secrets",
+                        reason_code="browser_secret_field_not_allowed",
+                    )
+                if not value:
+                    continue
+                reference = store.put_transient(
+                    app_slug=app_slug,
+                    # Namespaced so a browser-login secret is distinguishable from a
+                    # captured integration credential in the vault.
+                    kind=f"browser_login_{name}",
+                    scope_id=scope_id,
+                    value=value,
+                    ttl_seconds=600,
+                )
+                references[name] = reference
+                created.append(reference)
+        except Exception:
+            for reference in created:
+                with contextlib.suppress(Exception):
+                    store.delete(reference)
+            raise ProviderOperationError(
+                capability="browser service secrets",
+                reason_code="browser_secret_store_failed",
+            ) from None
+        return references
+
     def _build_browser_worker(self, settings: Settings) -> BrowserWorker:
-        """Select the browser backend. Default resolves the (possibly assignment-
-        patched) ``BrowserWorker`` in this module's namespace, so the Browser Use
-        path is byte-for-byte unchanged. ``playwright`` selects the self-hosted
-        harness, failing closed with a clear reason if it is not yet available."""
+        """Select the browser backend.
+
+        Default resolves the (possibly assignment-patched) ``BrowserWorker`` in this
+        module's namespace, so the Browser Use path is byte-for-byte unchanged.
+
+        For ``playwright`` the NORMAL path is now the isolated browser service over
+        authenticated RPC. Previously this always returned the in-process worker, so
+        the service, its RPC auth, restart reattachment, health and lifecycle manager
+        were never used by the real application. Running Chromium inside the API is
+        still possible but must be requested explicitly via
+        ``playwright_in_process_sandbox`` — it is for isolated tests and local
+        debugging, not a silent fallback when the service is unconfigured.
+        """
 
         provider = getattr(settings, "browser_provider", "browser_use")
         if provider == "playwright":
-            try:
-                from ops.playwright_worker import PlaywrightBrowserWorker
-            except ImportError:
+            if getattr(settings, "playwright_in_process_sandbox", False):
+                try:
+                    from ops.playwright_worker import PlaywrightBrowserWorker
+                except ImportError:
+                    raise ConfigurationRequiredError(
+                        phase=5,
+                        capability="Playwright browser provider",
+                        reason_code="playwright_provider_unavailable",
+                    ) from None
+                return cast("BrowserWorker", PlaywrightBrowserWorker(settings=settings))
+
+            if not settings.browser_service_url or settings.browser_service_token is None:
+                # Fail closed with an actionable reason rather than quietly starting
+                # a browser in the control plane.
                 raise ConfigurationRequiredError(
                     phase=5,
-                    capability="Playwright browser provider",
-                    reason_code="playwright_provider_unavailable",
-                ) from None
-            return cast("BrowserWorker", PlaywrightBrowserWorker(settings=settings))
+                    capability="Playwright browser service",
+                    reason_code="browser_service_configuration_required",
+                )
+            from ops.browser_service_client import BrowserServiceClient
+
+            return cast(
+                "BrowserWorker",
+                BrowserServiceClient(
+                    base_url=settings.browser_service_url,
+                    token=settings.browser_service_token,
+                    owner=settings.browser_service_owner,
+                ),
+            )
         return BrowserWorker(settings=settings)
 
     def _record_wiring(
@@ -1298,10 +1453,13 @@ class RunService:
                     # never persisted to state, checkpoints, the ledger, or logs.
                     start_sensitive_data: dict[str, str] | None = None
                     if browser_login and run_provider_action:
-                        start_sensitive_data = {
-                            name: secret.get_secret_value()
-                            for name, secret in browser_login.items()
-                        }
+                        start_sensitive_data = self._browser_login_payload(
+                            app_slug=str(record["app_slug"]),
+                            # Scope the transient references to THIS run, so the
+                            # service will only consume them for the matching run.
+                            scope_id=str(record["run_id"]),
+                            values=browser_login,
+                        )
                     if (
                         self._async_browser_enabled
                         and is_self_serve

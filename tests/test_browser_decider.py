@@ -26,7 +26,6 @@ from ops.browser_decider import (
 from ops.browser_worker import is_allowed_browser_url
 from ops.config import Settings
 from ops.inference import (
-    InferenceError,
     JsonInference,
     RateLimited,
     _loads_json_object,
@@ -281,9 +280,17 @@ def test_inference_skips_a_payload_that_fails_validation() -> None:
     assert result.provider == "cerebras"
 
 
-def test_inference_raises_when_every_backend_fails() -> None:
-    with pytest.raises(InferenceError):
+def test_inference_raises_a_typed_failure_when_every_backend_fails() -> None:
+    # Phase 2: the decision path raises the TYPED DecisionFailed carrying a
+    # sanitized reason code, instead of an untyped error with provider text in
+    # its message.
+    from ops.inference import DecisionFailed
+
+    with pytest.raises(DecisionFailed) as exc_info:
         JsonInference([_Backend("groq", error=RuntimeError("boom"))]).generate("p")
+    assert exc_info.value.reason_code == "all_providers_failed"
+    # The provider's own message never leaks into the raised error.
+    assert "boom" not in str(exc_info.value)
 
 
 def test_inference_requires_at_least_one_backend() -> None:

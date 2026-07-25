@@ -50,7 +50,7 @@ def test_catalog_is_exactly_the_first_25_p1_snapshot_records() -> None:
     catalog = load_browser_api_trace_catalog()
     p1_records = json.loads(_P1_PATH.read_text(encoding="utf-8"))
 
-    assert catalog.schema_version == "1.0"
+    assert catalog.schema_version == "2.0"
     assert catalog.selection_source == "data/p1/results.json"
     assert "not a popularity ranking" in catalog.selection_basis
     assert len(catalog.apps) == 25

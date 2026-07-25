@@ -20,6 +20,7 @@ from ops.playwright_worker import (
     PlaywrightBrowserWorker,
     detect_human_gate,
 )
+from tests.browser_app.harness import require_chromium
 
 _HOST = "app.pipedrive.com"
 _PATTERNS = (_HOST, f"*.{_HOST.split('.', 1)[1]}")
@@ -56,11 +57,39 @@ def _research(slug: str = "pipedrive") -> OperationalResearch:
     )
 
 
+def _synthetic_trace(
+    *, success: object, checkpoints: object, start_path: str = "/settings/api"
+) -> object:
+    """Build an in-test v2 trace so the state machine can be exercised without a
+    conservative catalog checkpoint short-circuiting to HITL."""
+
+    from ops.browser_api_trace_catalog import BrowserApiTrace
+
+    return BrowserApiTrace(
+        position=3,
+        app_slug="pipedrive",
+        app_name="Pipedrive",
+        access_model="self_serve",
+        start_url=f"https://{_HOST}{start_path}",
+        evidence_url="https://developers.pipedrive.com/docs",
+        credential_goal="API token page",
+        checkpoints=tuple(checkpoints),  # type: ignore[arg-type]
+        success_signals=("API token field label is visible",),
+        success=success,  # type: ignore[arg-type]
+    )
+
+
+def _install_trace(monkeypatch: object, trace: object) -> None:
+    import ops.playwright_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "get_browser_api_trace", lambda slug: trace)  # type: ignore[attr-defined]
+
+
 def _start(worker: PlaywrightBrowserWorker) -> object:
     try:
         return asyncio.run(worker.start(None))
     except Exception as exc:  # pragma: no cover - environment without Chromium
-        pytest.skip(f"Chromium not launchable: {type(exc).__name__}")
+        require_chromium(exc)
 
 
 def _route_pages(worker: PlaywrightBrowserWorker, handle: str, pages: dict[str, str]) -> None:
@@ -91,17 +120,37 @@ def _route_pages(worker: PlaywrightBrowserWorker, handle: str, pages: dict[str, 
 
 
 # --- Action loop: login -> submit -> settings -> credential page ---------------
-def test_loop_submits_login_follows_checkpoints_and_verifies_success() -> None:
-    """A full deterministic path: the loop must submit the login form, advance
-    through the trace, and only then report the credential page."""
+def test_loop_submits_login_follows_checkpoints_and_verifies_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full deterministic path: the loop must submit the login form, then report
+    the credential page ONLY when the structured success predicate is proven."""
+
+    from ops.browser_api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
+
+    _install_trace(
+        monkeypatch,
+        _synthetic_trace(
+            checkpoints=(
+                BrowserApiTraceStep(
+                    order=1,
+                    instruction="Reach the API token page.",
+                    expected_signals=("API",),
+                    completion=CheckpointPredicate(visible_text_contains=("API token",)),
+                ),
+            ),
+            success=CheckpointPredicate(
+                url_path_contains=("/done",), visible_text_contains=("API token",)
+            ),
+        ),
+    )
 
     worker = _worker()
     context = _start(worker)
     handle = context.session_id  # type: ignore[attr-defined]
 
-    # The trace's start_url is /settings/api, so the loop lands there first. Serve a
-    # login wall whose form posts to /done; after submit the app shows the API
-    # settings page carrying the reviewed success signals.
+    # Serve a login wall at the start URL; after submit the app shows the API
+    # settings page (path /done) carrying the structured success evidence.
     login = (
         "<html><body><h1>Sign in</h1><form action='/done' method='get'>"
         "<input type='email' name='email'>"
@@ -111,26 +160,24 @@ def test_loop_submits_login_follows_checkpoints_and_verifies_success() -> None:
     )
     settings_page = (
         "<html><body><h1>API</h1>"
-        "<p>API settings page is visible with the API token field label</p>"
+        "<p>The API token field label is visible on this settings page.</p>"
         f"<input name='api_token' readonly value='{_TOKEN}'>"
         "</body></html>"
     )
     _route_pages(worker, handle, {"/settings/api": login, "*": settings_page})
 
-    session = worker._sessions[handle]
     observation = asyncio.run(
         worker.navigate_onboarding(
             context,  # type: ignore[arg-type]
             _research(),
-            sensitive_data={"login_email": "ops@example.test", "login_password": "  pw  "},
+            sensitive_data={"login_email": "ops@example.test", "login_password": "pw-not-logged"},
         )
     )
     asyncio.run(worker.stop(context))  # type: ignore[arg-type]
 
-    # Success is declared ONLY from a reviewed signal actually present on the page.
+    # Success is declared ONLY from the structured predicate (path + label).
     assert observation.status == "credential_page_ready"
-    assert "Verified success signal" in observation.non_secret_notes[0]
-    del session
+    assert "structured success predicate" in observation.non_secret_notes[0]
 
 
 def test_loop_reports_hitl_for_a_captcha_page() -> None:
@@ -154,20 +201,41 @@ def test_loop_reports_hitl_for_a_captcha_page() -> None:
     assert observation.human_action_type == "captcha"
 
 
-def test_loop_stops_on_repeated_state_without_inference() -> None:
-    """No inference configured + ambiguous page -> bounded, honest HITL stop."""
+def test_loop_stops_on_repeated_state_without_inference(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No inference configured + an AMBIGUOUS checkpoint -> bounded, honest HITL."""
+
+    from ops.browser_api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
+
+    _install_trace(
+        monkeypatch,
+        _synthetic_trace(
+            checkpoints=(
+                BrowserApiTraceStep(
+                    order=1,
+                    instruction="Open the API area.",
+                    expected_signals=("API",),
+                    completion=CheckpointPredicate(visible_text_contains=("unreachable-token",)),
+                ),
+            ),
+            # A success that never matches this page, so the loop must plan instead.
+            success=CheckpointPredicate(
+                url_path_contains=("/never",), visible_text_contains=("unreachable-token",)
+            ),
+        ),
+    )
 
     worker = _worker()
     assert worker._inference is None  # no provider keys in this Settings
     context = _start(worker)
     handle = context.session_id  # type: ignore[attr-defined]
+    # Two "API" links -> the deterministic match is ambiguous (zero unique hit).
     _route_pages(
         worker,
         handle,
         {
             "/settings/api": (
-                "<html><body><h1>Dashboard</h1>"
-                "<a href='/a'>Deals</a><a href='/b'>Contacts</a></body></html>"
+                "<html><body><h1>Settings</h1>"
+                "<a href='/x'>API access</a><a href='/y'>API tokens</a></body></html>"
             )
         },
     )
@@ -358,7 +426,9 @@ def test_concurrent_starts_cannot_exceed_capacity() -> None:
 
     results = asyncio.run(_both())
     if all(isinstance(item, Exception) for item in results):
-        pytest.skip("Chromium not launchable in this environment")
+        # Route through the shared helper so this FAILS (not skips) in CI.
+        first = next(item for item in results if isinstance(item, Exception))
+        require_chromium(first)
 
     admitted = [item for item in results if not isinstance(item, Exception)]
     refused = [item for item in results if isinstance(item, Exception)]
@@ -486,12 +556,32 @@ class _RecordingBackend:
         return {"decision": "select_candidate", "candidate_id": ids[0], "reason": "picked"}
 
 
-def test_llm_decision_path_is_actually_reached_on_an_ambiguous_page() -> None:
+def test_llm_decision_path_is_actually_reached_on_an_ambiguous_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Regression for a real break: two DLP/guard bugs made the model path
     unreachable, so the loop silently degraded to HITL on every ambiguous page and
     the brain was never invoked. This asserts the model is genuinely consulted."""
 
+    from ops.browser_api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
     from ops.inference import JsonInference
+
+    _install_trace(
+        monkeypatch,
+        _synthetic_trace(
+            checkpoints=(
+                BrowserApiTraceStep(
+                    order=1,
+                    instruction="Open the API area.",
+                    expected_signals=("API",),
+                    completion=CheckpointPredicate(visible_text_contains=("unreachable-token",)),
+                ),
+            ),
+            success=CheckpointPredicate(
+                url_path_contains=("/never",), visible_text_contains=("unreachable-token",)
+            ),
+        ),
+    )
 
     backend = _RecordingBackend()
     worker = _worker()
