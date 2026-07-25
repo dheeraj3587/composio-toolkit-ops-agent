@@ -96,10 +96,28 @@ def test_copy_control_text_is_dropped_not_merely_redacted() -> None:
 # --- Channel 5: aria-label -----------------------------------------------------
 @pytest.mark.parametrize("canary", ALL_CANARIES)
 def test_canary_in_aria_label_is_redacted(canary: str) -> None:
-    sanitized = sanitize_element_name(f"API token value {canary}")
+    # On a LABEL the text is preserved (the agent must be able to read and click
+    # "API tokens"), but embedded secret material is still redacted.
+    sanitized = sanitize_element_name(f"API token value {canary}", role="a")
     _assert_clean(sanitized, canary)
-    # A credential-describing name becomes a semantic placeholder.
+    assert REDACTED in sanitized
+
+
+@pytest.mark.parametrize("canary", ALL_CANARIES)
+def test_canary_in_a_credential_field_label_becomes_a_placeholder(canary: str) -> None:
+    # On a VALUE-BEARING field the whole name collapses to a semantic placeholder.
+    sanitized = sanitize_element_name(
+        f"API token value {canary}", element_type="text", role="input"
+    )
+    _assert_clean(sanitized, canary)
     assert sanitized.startswith("<secret-field:")
+
+
+def test_navigation_labels_survive_so_the_agent_can_still_navigate() -> None:
+    # Regression: over-redacting these broke the Pipedrive flow entirely, because
+    # reaching the API token page REQUIRES clicking a link named after it.
+    for label in ("API tokens", "Manage API keys", "Personal preferences"):
+        assert sanitize_element_name(label, role="a") == label
 
 
 # --- Channel 6: placeholder ----------------------------------------------------

@@ -465,3 +465,71 @@ def threading_event() -> object:
     import threading
 
     return threading.Event()
+
+
+# --- The LLM decision path must ACTUALLY execute (regression) ------------------
+class _RecordingBackend:
+    """A fake inference backend that picks the first offered candidate id."""
+
+    name = "recording"
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    def generate_json(self, prompt: str, schema: object) -> dict:
+        import re
+
+        self.prompts.append(prompt)
+        ids = re.findall(r"\b(c_[0-9a-f]{12})\b", prompt)
+        if not ids:
+            return {"decision": "report_hitl", "candidate_id": None, "reason": "no options"}
+        return {"decision": "select_candidate", "candidate_id": ids[0], "reason": "picked"}
+
+
+def test_llm_decision_path_is_actually_reached_on_an_ambiguous_page() -> None:
+    """Regression for a real break: two DLP/guard bugs made the model path
+    unreachable, so the loop silently degraded to HITL on every ambiguous page and
+    the brain was never invoked. This asserts the model is genuinely consulted."""
+
+    from ops.inference import JsonInference
+
+    backend = _RecordingBackend()
+    worker = _worker()
+    worker._inference = JsonInference([backend])
+    context = _start(worker)
+    handle = context.session_id  # type: ignore[attr-defined]
+    # Two equally plausible "API" links -> deterministic matching must decline.
+    _route_pages(
+        worker,
+        handle,
+        {
+            "/settings/api": (
+                "<html><body><h1>Settings</h1>"
+                "<a href='/x'>API access</a><a href='/y'>API tokens</a>"
+                "</body></html>"
+            )
+        },
+    )
+
+    asyncio.run(worker.navigate_onboarding(context, _research()))  # type: ignore[arg-type]
+    asyncio.run(worker.stop(context))  # type: ignore[arg-type]
+
+    assert backend.prompts, "the model path was never reached"
+    prompt = backend.prompts[0]
+    # The model is offered opaque candidate ids and fenced, selector-free page text.
+    assert "CANDIDATES:" in prompt
+    assert "<<<PAGE>>>" in prompt and "<<<END_PAGE>>>" in prompt
+    assert "input[" not in prompt and "nth(" not in prompt
+    # A legitimate navigation label survives DLP so the agent can still navigate.
+    assert "API tokens" in prompt
+
+
+def test_dlp_boundary_still_blocks_a_prompt_carrying_secret_material() -> None:
+    """The guard that broke the path must still fire on a genuine leak."""
+
+    from ops.model_input_dlp import contains_secret_material
+
+    assert contains_secret_material("token " + "a1b2c3d4e5" * 4) is True
+    # ...but not on ordinary prompt scaffolding or a normal URL.
+    assert contains_secret_material("https://app.pipedrive.com/settings/api") is False
+    assert contains_secret_material('{"decision": "select_candidate"}') is False

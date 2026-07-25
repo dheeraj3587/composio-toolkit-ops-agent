@@ -1,4 +1,11 @@
-"""Bounded browser action decision: deterministic first, LLM only for ambiguity.
+"""Bounded browser decision: deterministic first, LLM only for ambiguity.
+
+RUNTIME PATH: ``CandidateChoice`` / ``candidate_choice_schema`` / ``validate_choice``
+/ ``build_choice_prompt``, driven by ``ops.browser_candidates``. The model returns
+only a candidate id (or a report decision) and can never author an action.
+
+LEGACY (not wired): ``BrowserAction`` / ``validate_action`` / ``action_schema`` /
+``build_decision_prompt`` remain for their tests and as reference only.
 
 Accuracy comes from constraint, not from a cleverer prompt:
 
@@ -43,7 +50,16 @@ ActionKind = Literal[
 
 
 class BrowserAction(BaseModel):
-    """One bounded, schema-validated step the harness may execute."""
+    """LEGACY free-form action model — NOT wired into the runtime.
+
+    Superseded by ``CandidateChoice`` + ``ops.browser_candidates``: the model may no
+    longer author an action, only select a policy-generated candidate id. This class
+    and its helpers (``validate_action``, ``build_decision_prompt``,
+    ``action_schema``) are retained only for their validation tests and as a
+    reference; ``PlaywrightBrowserWorker`` does not import or execute them, so there
+    is no path by which a model-authored payload reaches the browser. Do not re-wire
+    them without re-reviewing the candidate-policy boundary.
+    """
 
     model_config = ConfigDict(extra="forbid")
 

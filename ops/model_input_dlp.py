@@ -76,20 +76,35 @@ def _shannon_entropy(value: str) -> float:
     return -sum((count / length) * math.log2(count / length) for count in counts.values())
 
 
-def is_high_entropy(value: str, *, min_length: int = 20, threshold: float = 3.6) -> bool:
+# Structural shapes that are NOT secrets even though they are long and mixed-case:
+# URLs (already query/fragment-stripped by sanitize_url), dotted hostnames, and
+# punctuation-heavy prompt scaffolding. Flagging these made the DLP assertion fire
+# on every decision, which silently disabled the model path entirely.
+_URLISH = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
+_HOSTISH = re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+){1,}$")
+_SCAFFOLD_CHARS = re.compile(r'[|"{}<>()\[\]]')
+
+
+def is_high_entropy(value: str, *, min_length: int = 20, threshold: float = 4.0) -> bool:
     """True when a token looks like random key material rather than prose.
 
-    Prose has low per-character entropy; base64/hex secrets are high. The length
-    floor avoids flagging ordinary short words.
+    Prose and structure have low per-character entropy; base64/hex secrets are high.
+    Deliberately conservative about SHAPE first: a URL, a dotted hostname, or a
+    string carrying prompt/JSON scaffolding punctuation is never treated as key
+    material, because those legitimately look mixed-case-and-long. Provider-key
+    prefixes and JWTs are caught by their explicit patterns, not by entropy.
     """
 
     candidate = value.strip()
     if len(candidate) < min_length or " " in candidate:
         return False
-    # Require a mix that looks encoded rather than a long dictionary word.
-    if not re.search(r"[0-9]", candidate) and not re.search(r"[_\-+/=]", candidate):
-        if candidate.isalpha() and candidate.islower():
-            return False
+    if _URLISH.match(candidate) or _HOSTISH.match(candidate):
+        return False  # a URL/hostname is structure, not a secret
+    if _SCAFFOLD_CHARS.search(candidate):
+        return False  # JSON/prompt scaffolding, not an opaque token
+    # A long single dictionary-ish word is not key material.
+    if candidate.isalpha() and (candidate.islower() or candidate.istitle()):
+        return False
     return _shannon_entropy(candidate) >= threshold
 
 
@@ -145,20 +160,36 @@ def sanitize_url(url: str) -> str:
     return urlunsplit((parsed.scheme, host, path, "", ""))
 
 
-def sanitize_element_name(name: str, *, element_type: str = "", origin: str = "") -> str:
+# Element roles that can HOLD a credential value. A link or button merely *labelled*
+# "API tokens" is navigation the agent must be able to read and click; only a
+# value-bearing field is replaced with a placeholder.
+_VALUE_BEARING_ROLES = frozenset({"input", "textarea", "select", "contenteditable"})
+
+
+def sanitize_element_name(
+    name: str, *, element_type: str = "", origin: str = "", role: str = ""
+) -> str:
     """Sanitize an accessible name/label/placeholder for model consumption.
 
-    A credential-describing name becomes a semantic placeholder, so the model can
-    still reason about page structure ("there is a password field here") without
-    receiving a value or a value-shaped string.
+    A credential-describing name on a VALUE-BEARING field becomes a semantic
+    placeholder, so the model still learns "a password goes here" without receiving
+    a value or a value-shaped string.
+
+    Crucially, a navigation LABEL is not a value: links and buttons such as
+    "API tokens" or "Manage API keys" keep their text, because the agent's whole job
+    is to navigate to those pages. Any token-shaped content inside the label is still
+    redacted, so a label that *contains* a real secret cannot leak.
     """
 
     if origin.casefold() in UNSAFE_TEXT_ORIGINS:
         return DROPPED
     combined = f"{name} {element_type}"
-    if _SECRET_NAME.search(combined):
+    role_key = (role or origin or "").casefold()
+    value_bearing = role_key in _VALUE_BEARING_ROLES or bool(element_type)
+    if value_bearing and _SECRET_NAME.search(combined):
         kind = _secret_kind(combined)
         return SECRET_FIELD.format(kind=kind)
+    # Labels keep their meaning; embedded secret material is still redacted.
     return redact_secrets(name, max_length=120)
 
 

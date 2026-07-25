@@ -1124,7 +1124,7 @@ async def _describe_element(locator: Any) -> dict[str, object]:
     # Sanitize the accessible name at the source: a credential-describing name
     # becomes a semantic placeholder, and any token-shaped text is redacted.
     origin = "contenteditable" if tag == "div" and await _attr("contenteditable") else tag
-    name = sanitize_element_name(name, element_type=element_type, origin=origin)
+    name = sanitize_element_name(name, element_type=element_type, origin=origin, role=tag or role)
     value_present = False
     if not secretish and tag in {"input", "textarea"}:
         try:
