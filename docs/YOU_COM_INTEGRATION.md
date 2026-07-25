@@ -95,12 +95,15 @@ and news results are not used.
 `ops/research_cache.py::SqliteResearchCache` (WAL, thread-safe, transactional,
 TTL, bounded payloads) is shared by Search/Contents/Research and wired through
 `RunService`. Keys: `you-search:v2:<hash>`, `you-contents:v2:<hash>`,
-`you-research:v2:<hash>`. TTLs: Search 24h, Contents = `YOU_CONTENTS_MAX_AGE_SECONDS`,
-Research 7d. A per-key lock provides **single-flight**: concurrent identical
-requests collapse to one provider call. Only validated, bounded, public
-projections are cached — never keys, credentials, headers, private URLs, OTPs,
-or raw bodies. Cached rows are re-validated through Pydantic on read; a corrupt
-row is a miss.
+`you-research:v2:<hash>`, and `operational-research:v2:<hash>`. TTLs: Search
+24h, Contents and fully validated operational-research results =
+`YOU_CONTENTS_MAX_AGE_SECONDS`, Research 7d. A per-key lock provides
+**single-flight**: concurrent identical requests collapse to one provider call.
+Only validated, bounded, public projections are cached — never keys,
+credentials, headers, private URLs, OTPs, prompts, or raw provider errors/bodies.
+A cached operational result includes the evidence documents needed to rerun the
+same identity, current host-policy, and field-level URL-claim checks; a corrupt,
+expired, or newly off-policy row is a miss.
 
 ## Call budgets
 
@@ -160,6 +163,27 @@ local `.env` may enable them deliberately.
 | `YOU_MAX_RESEARCH_CALLS_PER_ENRICHMENT` | 1 | 0–1 (0 disables Research) |
 | `YOU_CONTENTS_MAX_AGE_SECONDS` | 86400 | sent to Contents + local cache TTL |
 | `RESEARCH_CACHE_DB_PATH` | `./private/research_cache.db` | persistent cache |
+
+## Bounded pre-warming command
+
+`python scripts/warm_you_research.py` enumerates only the immutable verified P1
+snapshot and constructs the same `RunService` enrichment wiring used at runtime.
+It is **dry-run by default**: no You.com, Gemini, browser, Gmail, or vendor call
+is made without `--execute`.
+
+```bash
+python scripts/warm_you_research.py --all
+python scripts/warm_you_research.py --app-slug pipedrive --execute
+python scripts/warm_you_research.py --all --execute --limit 5 --concurrency 2
+```
+
+The command accepts `--app-slug` or `--all`, `--execute`, `--limit`,
+`--concurrency` (maximum 5), `--force-refresh`, `--max-age-seconds`,
+`--continue-on-error`, and `--output-summary`. It reports only each app slug,
+sanitized result code (`cache_hit`, `enriched`, `skipped`, or `failed`), missing
+field names/count, and verified-claim count. Fresh fully validated results are
+reused until their normal TTL expires; `--force-refresh` bypasses reads for that
+one invocation but writes refreshed values under the same normal cache keys.
 
 ## Error handling
 

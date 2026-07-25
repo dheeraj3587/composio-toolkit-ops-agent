@@ -85,6 +85,9 @@ class NavigateRequest(_Strict):
     research: dict[str, object]
     # Vault REFERENCES only — never raw credential values.
     credential_refs: dict[str, str] = Field(default_factory=dict)
+    # Explicit local intent. The service never infers account existence from a
+    # page, research content, or a model response.
+    account_creation_requested: bool = False
 
 
 class ResumeRequest(_Strict):

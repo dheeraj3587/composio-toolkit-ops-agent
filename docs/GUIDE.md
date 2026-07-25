@@ -384,6 +384,43 @@ Because the API is not publicly exposed and owner‑only endpoints are loopback�
 actions (credential submission, reveal, live view) are performed from the host — for example via
 `docker compose -f compose.prod.yaml exec api ...` against `127.0.0.1:8000` with the internal token.
 
+### Assignment stack — self‑hosted Playwright browser service
+
+`compose.assignment.yaml` is an **override layer** applied on top of `compose.prod.yaml`
+([Compose merge rules](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/)); the
+base file is not modified.
+
+```bash
+cp .env.assignment.example .env.assignment
+docker compose \
+  -f compose.prod.yaml \
+  -f compose.assignment.yaml \
+  --env-file .env.assignment \
+  up -d --build
+```
+
+What this starts, and what it deliberately does not do:
+
+- Services: `api`, `web`, `caddy` from the base stack, plus `browser-worker` — the **isolated
+  Playwright browser service**. Chromium runs only there (`Dockerfile.browser` installs it with
+  `python -m playwright install --with-deps chromium`); the API image has no browser binary, so a
+  Chromium crash cannot take down the control plane and an API restart does not kill a live session.
+- **No browser port is published.** The RPC surface (8081) and VNC (5900) are reachable only on the
+  private `opsnet` network; only Caddy publishes ports. Interactive noVNC stays **disabled**.
+- `BROWSER_PROVIDER=playwright`, so the API speaks authenticated RPC to the service and never
+  launches Chromium itself. `PLAYWRIGHT_MAX_SESSIONS` defaults to **1** (one real Chromium process
+  per session).
+- The API and the browser service share one private credential‑vault volume and the **same**
+  `SECRET_VAULT_KEY` and `BROWSER_SERVICE_TOKEN`. Only one‑time, run‑scoped `vault://` references
+  cross the RPC boundary — never a raw credential value.
+- You.com **Search and Contents are enabled**; the expensive **Research fallback stays disabled**
+  (`YOU_RESEARCH_ENABLED=false`). You.com is retrieval only: it never drives a browser and never
+  receives a credential.
+- Browser Use remains available as a compatibility provider — set `BROWSER_PROVIDER=browser_use`
+  with `BROWSER_USE_API_KEY` to select it instead.
+- **Not certified for production.** This stack exists so the assignment flow can be demonstrated end
+  to end; it has not been through the hardening review that `compose.prod.yaml` documents.
+
 ---
 
 ## 12. Testing and quality gates

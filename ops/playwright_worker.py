@@ -87,6 +87,7 @@ from ops.browser_pages import (
 )
 from ops.browser_risk import BrowserActionRiskPolicy
 from ops.browser_snapshot import build_ranked_snapshot
+from ops.browser_target_selection import AccountState, derive_account_state, select_browser_target
 from ops.browser_worker import (
     BrowserObservation,
     BrowserSessionContext,
@@ -222,47 +223,25 @@ def select_initial_target(
     research: Any,
     trace: Any,
     patterns: Sequence[str],
+    *,
+    account_state: AccountState = "unknown",
 ) -> str | None:
-    """Choose the most DIRECT reviewed starting URL.
+    """Choose the shared account-aware reviewed starting URL for Playwright.
 
-    The trace's ``start_url`` was previously always preferred, which ignored a more
-    direct URL when research had a verified one — meaning extra navigation steps for
-    no benefit.
-
-    A research URL only outranks the trace when it is **field-level verified**: it
-    must carry an ``OperationalUrlClaim`` proving the URL literally appeared in a
-    document that was actually fetched. An unverified research field never wins,
-    which is what stops a plausible-but-unproven URL becoming the entry point.
-
-    Every candidate must still pass the host allowlist, and reaching a credential
-    page directly does NOT make it trusted — structured success must still be proven
-    by the reviewed predicate.
+    The shared selector preserves Playwright's conservative compatibility fallback:
+    an unverified developer-portal field is considered only when this app has no
+    reviewed trace.  Field-level claims, trace host validation, and strict URL
+    rejection are centralized with the Browser Use implementation.
     """
 
-    allow = tuple(patterns)
-    claims = getattr(research, "operational_url_claims", ()) or ()
-    verified: dict[str, str] = {}
-    for claim in claims:
-        field = str(getattr(claim, "field", "") or "")
-        url = str(getattr(claim, "url", "") or "")
-        if field and url and field not in verified:
-            verified[field] = url
-
-    candidates: tuple[str | None, ...] = (
-        verified.get("credential_management_url"),
-        verified.get("developer_portal_url"),
-        verified.get("login_url"),
-        # The reviewed trace is the trusted default whenever no verified claim
-        # points somewhere more direct.
-        getattr(trace, "start_url", None) if trace is not None else None,
-        # Only for a trace-less app: fall back to the unverified research field,
-        # which preserves the previous behaviour for apps with no reviewed trace.
-        getattr(research, "developer_portal_url", None) if trace is None else None,
+    return select_browser_target(
+        research=research,
+        trace=trace,
+        allowed_domains=patterns,
+        account_state=account_state,
+        is_allowed_url=is_allowed_browser_url,
+        fallback_mode="playwright",
     )
-    for candidate in candidates:
-        if isinstance(candidate, str) and candidate and navigation_allowed(candidate, allow):
-            return candidate
-    return None
 
 
 def make_egress_route_handler(
@@ -411,6 +390,9 @@ class _PwSession:
     # False in service mode, where the manager owns capacity — so the worker must
     # not release a slot it never took.
     worker_capacity_owned: bool = False
+    # True only when `browser.new_context(storage_state=...)` completed for this
+    # session. It is a local authentication fact, never a cookie/state payload.
+    restored_storage_state: bool = False
     # Confirmed vs attempted checkpoint state: `checkpoint_index` advances ONLY
     # after a verified postcondition, so a failed action cannot skip a checkpoint.
     checkpoint_index: int = 0
@@ -868,7 +850,21 @@ class PlaywrightBrowserWorker:
         profile_id: str | None,
         *,
         storage_state: dict[str, Any] | None = None,
+        app_slug: str = "",
+        account_ref: str | None = None,
+        secret_scope: str | None = None,
+        use_storage_state: bool = False,
+        live_view_mode: str = "screenshot",
     ) -> BrowserSessionContext:
+        # Accept the provider-neutral session metadata so the graph and the async
+        # run-creation path have ONE call site for every provider. In-process
+        # Chromium resolves nothing through the service RPC, so these are recorded
+        # only for logging: host policy is applied per navigation, storage state is
+        # supplied directly via ``storage_state``, and the live view is always the
+        # screenshot mode. The browser SERVICE (BrowserServiceClient) is where these
+        # values actually matter.
+        # ``app_slug`` is re-recorded on the session at navigation time.
+        del app_slug, account_ref, secret_scope, use_storage_state, live_view_mode
         self._require_configuration()
         try:
             module = importlib.import_module("playwright.async_api")
@@ -945,6 +941,9 @@ class PlaywrightBrowserWorker:
         # Only a worker-owned slot is later released by the worker; in service mode
         # the manager releases its own slot.
         session.worker_capacity_owned = capacity_owned
+        # This assignment happens only after `browser.new_context` succeeded, so
+        # it describes a successful local restore without retaining raw state.
+        session.restored_storage_state = storage_state is not None
         with self._registry_lock:
             self._sessions[handle] = session
         return BrowserSessionContext(
@@ -964,6 +963,7 @@ class PlaywrightBrowserWorker:
         research: OperationalResearch,
         *,
         sensitive_data: Mapping[str, str] | None = None,
+        account_creation_requested: bool = False,
     ) -> BrowserObservation:
         self._require_configuration()
         session = self._sessions.get(context.session_id)
@@ -977,7 +977,12 @@ class PlaywrightBrowserWorker:
         session.app_slug = research.app_slug
 
         trace = get_browser_api_trace(research.app_slug)
-        target = select_initial_target(research, trace, patterns)
+        account_state = derive_account_state(
+            restored_storage_state=session.restored_storage_state,
+            sensitive_data=sensitive_data,
+            account_creation_requested=account_creation_requested,
+        )
+        target = select_initial_target(research, trace, patterns, account_state=account_state)
         if not target or not navigation_allowed(target, patterns):
             return _blocked(target or "https://unknown.invalid/")
 

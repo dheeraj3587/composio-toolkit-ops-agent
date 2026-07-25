@@ -1,0 +1,128 @@
+# Assignment OVERRIDE for compose.prod.yaml — evaluation, not certified production.
+#
+# This file is an override layer, applied on top of the base stack per Docker's
+# multiple-compose-file merge rules (https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/):
+# mappings such as `environment` are merged key-by-key and sequences such as
+# `volumes` are appended, so compose.prod.yaml itself stays untouched.
+#
+#   cp .env.assignment.example .env.assignment
+#   docker compose -f compose.prod.yaml -f compose.assignment.yaml \
+#     --env-file .env.assignment up -d --build
+#
+# What it changes:
+#   * selects the self-hosted Playwright provider for the API;
+#   * starts the isolated browser service (Chromium lives THERE, never in the API);
+#   * shares one private credential vault volume between the API and the service so
+#     one-time browser-login `vault://` references resolve on both sides;
+#   * enables You.com Search + Contents (Research stays off).
+#
+# Deployment properties that are deliberate:
+#   * no `ports:` on browser-worker — RPC (8081) and VNC (5900) stay on the private
+#     network; only caddy publishes anything;
+#   * interactive noVNC remains disabled;
+#   * one Playwright session by default (a real Chromium process per session);
+#   * raw credentials never cross the RPC boundary — only `vault://` references do.
+
+services:
+  api:
+    environment:
+      BROWSER_PROVIDER: playwright
+      ALLOW_LIVE_BROWSER: "true"
+      # The API speaks authenticated RPC to the service and never launches Chromium.
+      BROWSER_SERVICE_URL: http://browser-worker:8081
+      BROWSER_SERVICE_TOKEN: ${BROWSER_SERVICE_TOKEN:?BROWSER_SERVICE_TOKEN is required}
+      BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-assignment-owner}
+      # The SHARED encrypted vault. The control plane writes one-time, run-scoped
+      # browser-login references here; the browser service consumes them once.
+      # NOTE: this overrides the base stack's /data/secret_vault.db, so the
+      # assignment stack keeps its credential vault on the shared volume instead.
+      SECRET_VAULT_DB_PATH: /vault/credentials.db
+      PLAYWRIGHT_IN_PROCESS_SANDBOX: "false"
+
+      YDC_API_KEY: ${YDC_API_KEY:-}
+      YOU_SEARCH_ENABLED: ${YOU_SEARCH_ENABLED:-true}
+      YOU_CONTENTS_ENABLED: ${YOU_CONTENTS_ENABLED:-true}
+      YOU_RESEARCH_ENABLED: ${YOU_RESEARCH_ENABLED:-false}
+    volumes:
+      - credential_vault:/vault
+    depends_on:
+      browser-worker:
+        condition: service_healthy
+
+  # The isolated browser service. Chromium runs HERE, so restarting the API cannot
+  # kill a live session and a Chromium crash cannot take down the control plane.
+  # Dockerfile.browser installs the binary (`python -m playwright install
+  # --with-deps chromium`); the API image intentionally has no browser.
+  browser-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.browser
+    init: true
+    ipc: host
+    shm_size: 1gb
+    pids_limit: 512
+    user: ops
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=1g,mode=1777
+    environment:
+      BROWSER_PROVIDER: playwright
+      ALLOW_LIVE_BROWSER: "true"
+      ALLOW_LIVE_VENDOR_EMAIL: "false"
+
+      # Required: with no token the service refuses EVERY request (fail closed).
+      BROWSER_SERVICE_TOKEN: ${BROWSER_SERVICE_TOKEN:?BROWSER_SERVICE_TOKEN is required}
+      BROWSER_SERVICE_PORT: "8081"
+      BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-assignment-owner}
+
+      BROWSER_SESSION_INACTIVITY_SECONDS: ${BROWSER_SESSION_INACTIVITY_SECONDS:-900}
+      BROWSER_SESSION_MAX_AGE_SECONDS: ${BROWSER_SESSION_MAX_AGE_SECONDS:-3600}
+
+      PLAYWRIGHT_MAX_SESSIONS: ${PLAYWRIGHT_MAX_SESSIONS:-1}
+      PLAYWRIGHT_DISABLE_SANDBOX: ${PLAYWRIGHT_DISABLE_SANDBOX:-true}
+
+      # Interactive remote control stays OFF for the assignment.
+      BROWSER_INTERACTIVE_HITL_ENABLED: "false"
+
+      # Storage state is encrypted at rest; with no key it is simply not persisted.
+      BROWSER_STORAGE_STATE_KEY: ${BROWSER_STORAGE_STATE_KEY:-}
+      BROWSER_STORAGE_STATE_DIR: /browser-data/storage-state
+
+      # Same key and DB path as the API, or the service would receive valid
+      # references it cannot resolve.
+      SECRET_VAULT_KEY: ${SECRET_VAULT_KEY:?SECRET_VAULT_KEY is required}
+      SECRET_VAULT_DB_PATH: /vault/credentials.db
+
+      PYTHONPATH: /app
+    volumes:
+      - browser_profiles:/browser-data
+      - credential_vault:/vault
+    networks:
+      - opsnet
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # No `ports:` on purpose: 8081 (RPC) and 5900 (VNC) are reachable only on the
+    # private opsnet network. Other containers use http://browser-worker:8081.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import json, sys, urllib.request
+          response = urllib.request.urlopen("http://127.0.0.1:8081/internal/health", timeout=30)
+          state = json.load(response).get("state")
+          sys.exit(0 if state in ("ready", "configured_not_verified", "capacity_exhausted") else 1)
+      interval: 60s
+      timeout: 40s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  browser_profiles:
+  # Private shared vault for one-time, run-scoped browser-login references.
+  credential_vault:

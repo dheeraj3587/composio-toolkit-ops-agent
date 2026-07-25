@@ -23,8 +23,14 @@ WORKDIR /app
 COPY requirements-api.txt requirements-providers.txt ./
 # The API imports the encrypted vault at startup and can wire configured
 # provider adapters at runtime. Install both the core and provider lock files in
-# the production image so health checks and Browser Use never depend on a
-# developer-machine virtual environment.
+# the production image so health checks and the selected browser provider never
+# depend on a developer-machine virtual environment.
+#
+# NOTE: no Chromium binary is installed here, deliberately. The Python package
+# alone cannot launch a browser, which is why BROWSER_PROVIDER=playwright must
+# point at the separate browser service (see Dockerfile.browser and
+# compose.assignment.yaml). Running a browser inside the control-plane container
+# would let a crash or memory spike take down the API.
 RUN python -m pip install --no-cache-dir \
     --requirement requirements-api.txt \
     --requirement requirements-providers.txt
@@ -35,14 +41,16 @@ COPY --chown=root:root data/p1 ./data/p1
 
 RUN find /app/api /app/ops /app/data/p1 -type d -exec chmod 0555 {} + \
     && find /app/api /app/ops /app/data/p1 -type f -exec chmod 0444 {} + \
-    && install -d -o ops -g ops -m 0700 /private /data
+    && install -d -o ops -g ops -m 0700 /private /data /vault
 
 USER ops
-# /private preserves the development default; /data is the production mount.
-# Both are pre-created owned by "ops" with mode 0700 so a first-run named volume
-# inherits that ownership and the application's private-file permission checks
-# (ops/private_files.py) pass under the non-root, read-only container.
-VOLUME ["/private", "/data"]
+# /private preserves the development default; /data is the production mount;
+# /vault is the SHARED credential vault the assignment stack mounts so the browser
+# service can resolve one-time `vault://` references. All are pre-created owned by
+# "ops" with mode 0700 so a first-run named volume inherits that ownership and the
+# application's private-file permission checks (ops/private_files.py) pass under
+# the non-root, read-only container.
+VOLUME ["/private", "/data", "/vault"]
 EXPOSE 8000
 STOPSIGNAL SIGTERM
 

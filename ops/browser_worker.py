@@ -13,12 +13,22 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ops.browser_api_trace_catalog import BrowserApiTrace, render_browser_api_trace
+from ops.browser_api_trace_catalog import (
+    BrowserApiTrace,
+    get_browser_api_trace,
+    render_browser_api_trace,
+)
 from ops.browser_host_policy import (
     BrowserHostDecision,
     BrowserPolicyInactiveError,
     build_browser_allowed_hosts,
     evaluate_navigation,
+)
+from ops.browser_target_selection import (
+    AccountState,
+    derive_account_state,
+    sanitize_target_url,
+    select_browser_target,
 )
 from ops.config import Settings
 from ops.models import OperationalResearch
@@ -272,6 +282,7 @@ class BrowserWorker:
         research: OperationalResearch,
         *,
         sensitive_data: Mapping[str, str] | None = None,
+        account_creation_requested: bool = False,
     ) -> BrowserObservation:
         self._require_configuration()
         if context.session_id:
@@ -281,6 +292,7 @@ class BrowserWorker:
             research=research,
             resume_signal=None,
             sensitive_data=sensitive_data,
+            account_creation_requested=account_creation_requested,
         )
 
     async def resume_after_hitl(
@@ -357,6 +369,7 @@ class BrowserWorker:
         research: OperationalResearch,
         resume_signal: str | None,
         sensitive_data: Mapping[str, str] | None = None,
+        account_creation_requested: bool = False,
     ) -> BrowserObservation:
         try:
             allowed = build_browser_allowed_hosts(
@@ -372,7 +385,16 @@ class BrowserWorker:
                 reason_code=exc.reason_code,
             ) from None
         patterns = validate_allowed_domains(allowed.patterns())
-        target_url = _official_target_url(research, patterns)
+        account_state = derive_account_state(
+            sensitive_data=sensitive_data,
+            account_creation_requested=account_creation_requested,
+        )
+        target_url = _official_target_url(
+            research,
+            patterns,
+            trace=get_browser_api_trace(research.app_slug),
+            account_state=account_state,
+        )
         # Login placeholder keys (never values) are surfaced to the task text; the
         # Browser Use v3 provider injects the values via secure ``sensitive_data``
         # placeholders the agent can type but never read.
@@ -712,28 +734,31 @@ def _official_target_url(
     allowed_domains: tuple[str, ...],
     *,
     preferred_url: str | None = None,
+    trace: BrowserApiTrace | None = None,
+    account_state: AccountState = "unknown",
 ) -> str:
-    """Select the verified official entry URL within the app's allowlist.
+    """Select the shared account-aware official entry target for Browser Use.
 
-    The verified P1 baseline leaves the specific URL fields empty, so the first
-    allowlisted evidence URL is used as the entry point when enrichment has not
-    populated a developer/setup URL.
+    ``preferred_url`` is retained for the legacy internal override call surface;
+    it is still strictly validated before use.  Normal execution delegates all
+    ordering, claim preference, trace handling, and conservative baseline fallback
+    to :mod:`ops.browser_target_selection`.
     """
 
-    for candidate in (
-        preferred_url,
-        research.developer_portal_url,
-        research.signup_url,
-        research.api_base_url,
-        *research.evidence_urls,
-    ):
-        if isinstance(candidate, str) and candidate:
-            try:
-                safe = sanitize_browser_url(candidate)
-            except ValueError:
-                continue
-            if is_allowed_browser_url(safe, allowed_domains):
-                return safe
+    if preferred_url is not None:
+        safe_preferred = sanitize_target_url(preferred_url)
+        if safe_preferred is not None and is_allowed_browser_url(safe_preferred, allowed_domains):
+            return safe_preferred
+    target = select_browser_target(
+        research=research,
+        trace=trace,
+        allowed_domains=allowed_domains,
+        account_state=account_state,
+        is_allowed_url=is_allowed_browser_url,
+        fallback_mode="browser_use",
+    )
+    if target is not None:
+        return target
     raise ProviderOperationError(
         capability="browser onboarding",
         reason_code="official_target_url_unavailable",

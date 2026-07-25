@@ -528,3 +528,22 @@ Stated plainly, because the value of this document depends on it.
 - Ship a metrics sink and dashboards; add alerting on HITL and completion rates.
 - Pin CI actions to immutable SHAs and make `browser-image` a required check.
 - Release benchmark: a scored accuracy suite across the self-serve app set.
+
+## 13. Account-aware browser start target
+
+`ops/browser_target_selection.py` is the single selector used by Browser Use and
+Playwright. It derives account state only from trusted local facts: a successful
+restored Playwright storage state (`authenticated`), supplied login credentials
+(`existing_account`), an explicit `account_creation_requested` request
+(`account_creation_required`), or `unknown`. It never asks an LLM or infers state
+from page content.
+
+The reviewed order is: authenticated → credential management, developer portal,
+trace start, login, signup; existing account → login, credential management,
+developer portal, trace start, signup; account creation → signup, login,
+developer portal, credential management, trace start; unknown → login, signup,
+developer portal, credential management, trace start. Field-level verified
+`operational_url_claim`s are preferred. Every candidate must be HTTPS, pass the
+existing app host policy, and have no userinfo, fragment, or sensitive query
+parameter. The existing trace and conservative provider-specific unverified
+fallback rules remain in force.

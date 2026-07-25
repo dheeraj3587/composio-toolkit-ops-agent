@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import importlib
 import ipaddress
+import json
 import re
 import socket
 from collections.abc import Callable, Mapping, Sequence
+from datetime import timedelta
 from html.parser import HTMLParser
-from typing import Protocol
+from typing import Protocol, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
@@ -451,6 +453,11 @@ class GeminiStructuredExtractor:
                     contents=prompt,
                     config=config,
                 )
+            except (TypeError, AttributeError, NameError, ImportError):
+                # Broken integration (renamed kwarg/attribute, missing module):
+                # trying the next model would only hide it behind a generic
+                # "all models failed" provider outage.
+                raise
             except Exception as exc:  # try the next model on unavailability/overload
                 last_error = exc
                 continue
@@ -529,6 +536,8 @@ class OperationalResearchEnricher:
         rich_discovery: RichEvidenceDiscoveryLike | None = None,
         content_fetcher_factory: Callable[[object], EvidenceContentFetcherLike] | None = None,
         research_fallback: ResearchFallbackLike | None = None,
+        outcome_cache: object | None = None,
+        outcome_cache_ttl: timedelta = timedelta(hours=24),
     ) -> None:
         self._discovery = discovery
         self._extractor = extractor
@@ -540,6 +549,11 @@ class OperationalResearchEnricher:
         # only exists once ``_enrich_rich`` runs — never at wiring time.
         self._content_fetcher_factory = content_fetcher_factory
         self._research_fallback = research_fallback
+        # The same SQLite cache/key mechanism as You Search/Contents/Research.
+        # Cached outcomes retain only validated public research and evidence docs,
+        # then are fully revalidated under the current host/claim policy on read.
+        self._outcome_cache = outcome_cache
+        self._outcome_cache_ttl = outcome_cache_ttl
 
     async def enrich(
         self,
@@ -632,21 +646,23 @@ class OperationalResearchEnricher:
         policy: OfficialURLPolicy,
         missing: list[str],
     ) -> ResearchEnrichmentOutcome:
-        """The You.com-backed pipeline: rich discovery -> content fetch ->
-        (optional) Research fallback for more candidate pages -> the SAME
-        canonical Gemini extraction and validation used by the original path.
+        """Run the You.com rich path and cache only fully validated outcomes.
 
-        You.com output never creates an ``OperationalResearch`` object by
-        itself at any point in this method — it only ever produces candidate
-        URLs that still have to be fetched, extracted by Gemini, and pass
-        ``_validate_extracted_research`` / ``_validate_operational_urls``.
+        The result cache shares the normal ``SqliteResearchCache`` schema and
+        keying helper with the You adapters.  A hit reconstructs both the research
+        projection and its evidence documents, then repeats the same identity,
+        host-policy, and field-level URL-claim validation as a fresh extraction.
+        Invalid, expired, or newly off-policy rows are misses.
         """
 
         # Imported here (not at module scope) to avoid a circular import:
         # ops.you_research imports FROM this module already.
         from ops.you_research import (
+            ResearchCache,
             ResearchHostPolicy,
             YouResearchMetrics,
+            _cached,
+            cache_key,
             has_sufficient_coverage,
             merge_research_candidates,
             use_metrics,
@@ -656,58 +672,129 @@ class OperationalResearchEnricher:
         with use_metrics(metrics):
             host_policy = ResearchHostPolicy.build(p1_record=p1_record, baseline=baseline)
             official_hosts = host_policy.include_domains
-            # host_policy's trusted set is a SUPERSET of the narrow per-app
-            # `policy` (it also includes the reviewed browser_host_policy
-            # dataset), so every step of the rich path uses this same broader
-            # policy. Falls back to the narrow policy only in the (practically
-            # unreachable, since P1 always supplies at least one host) case
-            # where host_policy trusts nothing at all.
             effective_policy = host_policy.official_url_policy or policy
-
-            discovered: tuple[object, ...] = ()
-            if self._rich_discovery is not None and official_hosts:
-                discovered = tuple(
-                    await self._rich_discovery.discover(
-                        app_name=app_name,
-                        p1_record=p1_record,
-                        baseline=baseline,
-                        official_hosts=official_hosts,
-                    )
-                )
-
-            # Research fallback runs when category coverage is INSUFFICIENT —
-            # not only when zero documents were fetched. A generic docs page can
-            # fetch fine while login / API-credential pages remain missing, so
-            # coverage (not fetch success) is the correct trigger. It only ADDS
-            # candidate pages for the same single Contents+Gemini path below.
-            if (
-                self._research_fallback is not None
-                and official_hosts
-                and not has_sufficient_coverage(discovered)  # type: ignore[arg-type]
-            ):
-                fallback_result = await self._research_fallback.research(
-                    app_name=app_name, official_hosts=official_hosts, policy=host_policy
-                )
-                if fallback_result is not None:
-                    # Both are EvidenceCandidate tuples at runtime; the local
-                    # Protocols type them as opaque objects to avoid importing
-                    # EvidenceCandidate (circular import), hence the ignores.
-                    discovered = merge_research_candidates(
-                        discovered,  # type: ignore[arg-type]
-                        fallback_result.candidates,  # type: ignore[arg-type]
-                    )
-
-            candidate_urls = _rich_candidate_urls(p1_record, discovered, effective_policy)
-            content_fetcher = (
-                self._content_fetcher_factory(host_policy)
-                if self._content_fetcher_factory is not None
-                else None
+            cache_identity = json.dumps(
+                {
+                    "baseline": baseline.model_dump(mode="json"),
+                    "p1_record": dict(p1_record),
+                    "version": "1",
+                },
+                separators=(",", ":"),
+                sort_keys=True,
             )
-            documents = await self._fetch_documents(
-                candidate_urls, effective_policy, content_fetcher
-            )
+            key = cache_key("operational-research", baseline.app_slug, cache_identity)
+            outcome_cache_hit = False
 
-            if not documents:
+            def _deserialize(
+                raw: Mapping[str, object],
+            ) -> tuple[OperationalResearch, tuple[EvidenceDocument, ...]] | None:
+                nonlocal outcome_cache_hit
+                research_payload = raw.get("research")
+                document_payloads = raw.get("documents")
+                if not isinstance(research_payload, Mapping) or not isinstance(
+                    document_payloads, list
+                ):
+                    return None
+                try:
+                    cached_research = OperationalResearch.model_validate(research_payload)
+                    cached_documents = tuple(
+                        EvidenceDocument.model_validate(document) for document in document_payloads
+                    )
+                    if len(cached_documents) > MAX_EVIDENCE_DOCUMENTS:
+                        return None
+                    allowed_evidence = _validate_extracted_research(
+                        cached_research, baseline, cached_documents, p1_record
+                    )
+                    _validate_operational_urls(
+                        cached_research,
+                        baseline,
+                        cached_documents,
+                        effective_policy,
+                        allowed_evidence,
+                    )
+                except (TypeError, ValueError):
+                    return None
+                outcome_cache_hit = True
+                return cached_research, cached_documents
+
+            def _serialize(
+                value: tuple[OperationalResearch, tuple[EvidenceDocument, ...]] | None,
+            ) -> Mapping[str, object]:
+                # `_cached` only serializes non-None results; keep the type
+                # explicit because an empty evidence result is intentionally not cached.
+                assert value is not None
+                research, documents = value
+                return {
+                    "research": research.model_dump(mode="json"),
+                    "documents": [document.model_dump(mode="json") for document in documents],
+                }
+
+            async def _compute() -> tuple[OperationalResearch, tuple[EvidenceDocument, ...]] | None:
+                discovered: tuple[object, ...] = ()
+                if self._rich_discovery is not None and official_hosts:
+                    discovered = tuple(
+                        await self._rich_discovery.discover(
+                            app_name=app_name,
+                            p1_record=p1_record,
+                            baseline=baseline,
+                            official_hosts=official_hosts,
+                        )
+                    )
+
+                # Research only supplies more candidate pages for the same guarded
+                # Contents + Gemini validation path; it never creates research by
+                # itself.
+                if (
+                    self._research_fallback is not None
+                    and official_hosts
+                    and not has_sufficient_coverage(discovered)  # type: ignore[arg-type]
+                ):
+                    fallback_result = await self._research_fallback.research(
+                        app_name=app_name, official_hosts=official_hosts, policy=host_policy
+                    )
+                    if fallback_result is not None:
+                        discovered = merge_research_candidates(
+                            discovered,  # type: ignore[arg-type]
+                            fallback_result.candidates,  # type: ignore[arg-type]
+                        )
+
+                candidate_urls = _rich_candidate_urls(p1_record, discovered, effective_policy)
+                content_fetcher = (
+                    self._content_fetcher_factory(host_policy)
+                    if self._content_fetcher_factory is not None
+                    else None
+                )
+                documents = await self._fetch_documents(
+                    candidate_urls, effective_policy, content_fetcher
+                )
+                if not documents:
+                    return None
+
+                research = await self._extractor.extract(  # type: ignore[union-attr]
+                    app_name=app_name,
+                    p1_record=p1_record,
+                    documents=documents,
+                )
+                allowed_evidence = _validate_extracted_research(
+                    research, baseline, documents, p1_record
+                )
+                _validate_operational_urls(
+                    research, baseline, documents, effective_policy, allowed_evidence
+                )
+                return research, documents
+
+            result_cache = cast("ResearchCache | None", self._outcome_cache)
+            result: tuple[OperationalResearch, tuple[EvidenceDocument, ...]] | None = await _cached(
+                result_cache,
+                key,
+                ttl=self._outcome_cache_ttl,
+                deserialize=_deserialize,
+                serialize=_serialize,
+                compute=_compute,
+            )
+            metrics_payload = metrics.as_dict()
+            metrics_payload["operational_research_cache"] = "hit" if outcome_cache_hit else "miss"
+            if result is None:
                 return ResearchEnrichmentOutcome(
                     research=baseline,
                     capability=CapabilityAvailability(
@@ -718,20 +805,9 @@ class OperationalResearchEnricher:
                     ),
                     missing_fields=missing,
                     documents_fetched=0,
-                    provider_metrics=metrics.as_dict(),
+                    provider_metrics=metrics_payload,
                 )
-
-            research = await self._extractor.extract(  # type: ignore[union-attr]
-                app_name=app_name,
-                p1_record=p1_record,
-                documents=documents,
-            )
-            allowed_evidence = _validate_extracted_research(
-                research, baseline, documents, p1_record
-            )
-            _validate_operational_urls(
-                research, baseline, documents, effective_policy, allowed_evidence
-            )
+            research, documents = result
             return ResearchEnrichmentOutcome(
                 research=research,
                 capability=CapabilityAvailability(
@@ -742,7 +818,7 @@ class OperationalResearchEnricher:
                 ),
                 missing_fields=_missing_fields(research),
                 documents_fetched=len(documents),
-                provider_metrics=metrics.as_dict(),
+                provider_metrics=metrics_payload,
             )
 
     async def _fetch_documents(

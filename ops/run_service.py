@@ -19,6 +19,7 @@ import threading
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
@@ -39,7 +40,12 @@ from ops.credential_validator import (
 )
 from ops.effect_ledger import SQLiteEffectStore
 from ops.gmail_worker import GmailWorker
-from ops.graph import DurableOperationsWorkflow, WorkflowDependencies, build_graph
+from ops.graph import (
+    DurableOperationsWorkflow,
+    WorkflowDependencies,
+    browser_account_ref,
+    build_graph,
+)
 from ops.integrator import build_integrator_bundle
 from ops.models import (
     CapabilityAvailability,
@@ -437,10 +443,13 @@ class RunService:
         # You.com is a sanitized wiring-audit ENTRY, never a live probe: a
         # normal health/startup check must never spend a You.com credit. See
         # `python -m ops.cli probe-you` for the explicit, opt-in live check.
+        # A key that is present but unused is NOT an active integration, so the
+        # audit reports You.com only when a capability flag actually enables it.
+        you_enabled = settings.any_you_feature_configured
         self._record_wiring(
             "you_com",
-            _YouComWiringMarker() if settings.you_api_key is not None else None,
-            configured=settings.you_api_key is not None,
+            _YouComWiringMarker() if you_enabled else None,
+            configured=you_enabled,
         )
 
         # Read-only credential validator (HubSpot bearer, current endpoint).
@@ -815,7 +824,10 @@ class RunService:
             follow_redirects=False,
         )
 
-        if settings.you_api_key is None:
+        # A key alone must not change runtime wiring: with every You.com flag off
+        # this builds the EXACT pre-existing Perplexity + guarded-HTTP pipeline and
+        # never opens the research cache.
+        if not settings.any_you_feature_configured:
             discovery = (
                 PerplexitySearchDiscovery(settings.perplexity_api_key)
                 if settings.perplexity_api_key is not None
@@ -828,6 +840,12 @@ class RunService:
             )
 
         you_api_key = settings.you_api_key
+        if you_api_key is None:  # pragma: no cover - every *_configured requires the key
+            raise ConfigurationRequiredError(
+                phase=2,
+                capability="You.com research",
+                reason_code="you_api_key_required",
+            )
         # One persistent research cache shared by all three You.com adapters, so
         # identical app research does not re-spend credits across enrichments.
         # The You.com adapters themselves manage their SDK client lifecycle via
@@ -906,6 +924,13 @@ class RunService:
             # calls both with the exact ResearchHostPolicy it just built.
             content_fetcher_factory=content_fetcher_factory,  # type: ignore[arg-type]
             research_fallback=research_fallback,  # type: ignore[arg-type]
+            # Cache the fully validated projection in the same SQLite cache as
+            # Search/Contents so a warm run can be resumed without a fresh Gemini
+            # extraction. Cached documents and claims are revalidated on every hit.
+            outcome_cache=research_cache,
+            outcome_cache_ttl=timedelta(
+                seconds=max(1, settings.you_contents_max_age_seconds or 86_400)
+            ),
         )
 
     def _build_credential_validator(
@@ -992,8 +1017,9 @@ class RunService:
         """Whether a browser worker should be wired for the selected provider.
 
         ``browser_use`` keeps the exact prod condition (live opt-in + an API key).
-        ``playwright`` is self-hosted, so it needs only the live opt-in — but is
-        gated to environments where the harness is importable (see the factory).
+        ``playwright`` needs the live opt-in AND an execution location: the browser
+        service (URL + token) or the explicit in-process sandbox. No Browser Use
+        key is ever required for it.
         """
 
         from ops.browser_readiness import browser_configuration_state
@@ -1454,10 +1480,13 @@ class RunService:
                     start_sensitive_data: dict[str, str] | None = None
                     if browser_login and run_provider_action:
                         start_sensitive_data = self._browser_login_payload(
-                            app_slug=str(record["app_slug"]),
+                            # The verified slug and the newly created run id are
+                            # already in scope here; the run row is not readable
+                            # yet from inside its own creating transaction.
+                            app_slug=research.app_slug,
                             # Scope the transient references to THIS run, so the
                             # service will only consume them for the matching run.
-                            scope_id=str(record["run_id"]),
+                            scope_id=run_id,
                             values=browser_login,
                         )
                     if (
@@ -1466,13 +1495,33 @@ class RunService:
                         and run_provider_action
                         and self._browser_worker is not None
                     ):
-                        # OPTION A: pre-create the live Browser Use session so the
+                        # OPTION A: pre-create the live provider session so the
                         # embedded live view is available immediately, commit the
                         # run at browser_running now, and run the durable navigate
                         # in a background thread. Run creation stays fast (no 504)
                         # and the live stream is available for the entire task.
+                        #
+                        # The same session metadata the LangGraph browser node
+                        # supplies is passed here: without app_slug the service
+                        # cannot resolve its host policy, and without secret_scope
+                        # it cannot consume this run's one-time login references.
+                        worker = self._browser_worker
+                        is_playwright = getattr(worker, "provider_name", "") == "playwright"
+                        account_ref: str | None = None
+                        if is_playwright:
+                            with contextlib.suppress(Exception):
+                                account_ref = browser_account_ref(request.company.work_email_ref)
                         try:
-                            context = asyncio.run(self._browser_worker.start(None))
+                            context = asyncio.run(
+                                worker.start(
+                                    None,
+                                    app_slug=research.app_slug,
+                                    account_ref=account_ref,
+                                    secret_scope=run_id,
+                                    use_storage_state=is_playwright,
+                                    live_view_mode="screenshot",
+                                )
+                            )
                         except Exception as exc:
                             log_event(
                                 "run.dispatch.session_error",

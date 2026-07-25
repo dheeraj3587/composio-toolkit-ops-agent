@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 !.env.production.example
+# Placeholder-only templates are tracked; the filled-in .env.assignment is not.
+!.env.assignment.example
+!.env.playwright.sandbox.example
 .venv/
 venv/
 __pycache__/

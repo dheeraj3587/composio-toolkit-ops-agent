@@ -12,13 +12,15 @@ static ``browser_host_policy`` dataset), and the underlying
 :class:`~ops.operational_research.OfficialURLPolicy` remains the final
 HTTPS/SSRF authority for anything actually fetched.
 
-SDK contract (verified against the installed ``youdotcom==2.5.0`` — see
-``tests/test_you_research.py::TestSdkContract``, which fails loudly if a future
-upgrade changes the surface):
+SDK contract (verified against the version pinned in
+``requirements-providers.txt`` — see ``tests/test_you_research.py::TestSdkContract``,
+which reads that pin and fails loudly if a future upgrade changes the surface):
 
 * ``search_post_async`` accepts ``include_domains`` as a JSON array of bare
   domains; used as the provider-side first filter, with local policy validation
-  as the actual security boundary AFTER results return.
+  as the actual security boundary AFTER results return. The field is OMITTED when
+  there is nothing to filter on — an empty array is an empty allowlist, not
+  "unfiltered".
 * ``contents.generate_async`` accepts ``max_age`` and ``crawl_timeout`` and
   ``formats`` (``markdown``/``html``/``metadata``); we request markdown only.
 * ``research_async`` accepts ``source_control`` (include_domains) and
@@ -68,6 +70,9 @@ from ops.operational_research import (
 MAX_CANDIDATE_SNIPPETS = 3
 MAX_SNIPPET_CHARACTERS = 1_000
 MAX_YOU_CONTENT_URLS = 10
+# Snippets are untrusted web text, so only a small bounded prefix ever reaches
+# the deterministic classifier.
+MAX_CLASSIFICATION_SNIPPET_CHARACTERS = 300
 
 QueryType = Literal["baseline", "access", "api_credentials", "research_fallback"]
 EvidenceCategory = Literal[
@@ -457,6 +462,37 @@ def _bounded_retry_config() -> object:
     )
 
 
+def _you_error_types() -> tuple[type[BaseException], ...]:
+    """The installed SDK's provider error base class, if it can be imported.
+
+    Imported lazily and tolerantly: this module is importable (and unit-testable)
+    without the You.com SDK present.
+    """
+
+    try:
+        errors = importlib.import_module("youdotcom.errors")
+    except Exception:
+        return ()
+    base = getattr(errors, "YouError", None)
+    if isinstance(base, type) and issubclass(base, BaseException):
+        return (base,)
+    return ()
+
+
+def _is_provider_failure(exc: BaseException) -> bool:
+    """Whether an exception is an EXPECTED provider failure worth sanitizing.
+
+    Either an SDK ``YouError`` or something carrying its one stable attribute, an
+    integer ``status_code``. A programming error (``TypeError``, ``NameError``,
+    ``AttributeError``), an ``AssertionError``, or a Pydantic contract error has
+    no ``status_code`` and therefore is NOT a provider failure — it must surface.
+    """
+
+    if isinstance(exc, _you_error_types()):
+        return True
+    return isinstance(getattr(exc, "status_code", None), int)
+
+
 async def _guard_call(
     capability: Literal["you_search", "you_contents", "you_research"],
     factory: Any,
@@ -466,8 +502,11 @@ async def _guard_call(
     """Run one provider coroutine with an outer timeout and sanitized mapping.
 
     ``factory`` must itself open and close the ``You`` client via ``async with``
-    so the client is torn down even on timeout/cancellation. Programming errors
-    propagate; provider/transport errors become a :class:`YouProviderError`.
+    so the client is torn down even on timeout/cancellation. Only timeouts,
+    transport failures, and real provider errors become a
+    :class:`YouProviderError`; everything else (broken integration, contract
+    drift, assertion failures) propagates so it is visible to tests/monitoring
+    instead of being reported as a provider outage.
     """
 
     try:
@@ -478,7 +517,10 @@ async def _guard_call(
         raise YouProviderError(
             capability=capability, reason_code=map_you_error(exc, capability=capability)
         ) from None
-    except Exception as exc:  # provider YouError (has .status_code) or other provider failure
+    except Exception as exc:
+        # Deliberately NOT a catch-all: an unknown exception is re-raised.
+        if not _is_provider_failure(exc):
+            raise
         raise YouProviderError(
             capability=capability, reason_code=map_you_error(exc, capability=capability)
         ) from None
@@ -487,7 +529,10 @@ async def _guard_call(
 # --------------------------------------------------------------------------
 # Cache helper (single-flight over the persistent cache)
 # --------------------------------------------------------------------------
-def cache_key(kind: Literal["you-search", "you-contents", "you-research"], *parts: str) -> str:
+def cache_key(
+    kind: Literal["you-search", "you-contents", "you-research", "operational-research"],
+    *parts: str,
+) -> str:
     digest = hashlib.sha256("|".join(parts).encode()).hexdigest()[:32]
     return f"{kind}:v2:{digest}"
 
@@ -522,7 +567,10 @@ async def _cached(
     lock = getattr(cache, "lock_for", None)
     acquired = lock(key) if callable(lock) else None
     if acquired is not None:
-        acquired.acquire()
+        # A per-key threading.Lock is the right single-flight primitive here (each
+        # enrichment runs in its own thread + event loop), but acquiring it must
+        # never block the loop while another thread awaits a provider call.
+        await asyncio.to_thread(acquired.acquire)
     try:
         raw = cache.get(key)
         if raw is not None:
@@ -593,14 +641,22 @@ _SUPPORT_TERMS = ("support", "help", "contact")
 _DOCS_TERMS = ("docs", "documentation", "guide", "guides")
 
 
-def _tokenize(url: str, title: str) -> str:
+def _tokenize(url: str, title: str, snippet: str = "") -> str:
     parsed = urlsplit(url)
     hostname = (parsed.hostname or "").replace(".", " ")
-    return f"{hostname} {parsed.path} {title}".casefold().replace("_", "-")
+    bounded_snippet = snippet[:MAX_CLASSIFICATION_SNIPPET_CHARACTERS]
+    return f"{hostname} {parsed.path} {title} {bounded_snippet}".casefold().replace("_", "-")
 
 
-def classify_category(url: str, title: str = "") -> EvidenceCategory:
-    haystack = _tokenize(url, title)
+def classify_category(url: str, title: str = "", snippet: str = "") -> EvidenceCategory:
+    """Classify a candidate from CODE-OWNED signals only.
+
+    The URL path, the title, and a bounded snippet are the inputs. A category a
+    provider or model returned is metadata at best — it never decides coverage on
+    its own (see ``YouResearchFallback._parse``, which re-derives the category).
+    """
+
+    haystack = _tokenize(url, title, snippet)
     if any(term in haystack for term in _LOGIN_TERMS):
         return "login"
     if any(term in haystack for term in _SIGNUP_TERMS):
@@ -778,9 +834,21 @@ class YouSearchDiscovery:
             if not isinstance(items, list):
                 return None
             try:
-                return [EvidenceCandidate.model_validate(item) for item in items]
+                cached = [EvidenceCandidate.model_validate(item) for item in items]
             except ValidationError:
                 return None  # invalid cached payload -> recompute
+            # A cached URL is NOT trusted because an older, possibly wider policy
+            # accepted it: every hit is re-validated against the CURRENT policy.
+            validated: list[EvidenceCandidate] = []
+            for candidate in cached:
+                try:
+                    policy.validate_candidate_url(candidate.source_url)
+                except ValueError:
+                    continue
+                validated.append(candidate)
+            if cached and not validated:
+                return None  # everything cached is now off-policy -> recompute
+            return validated
 
         def _serialize(value: list[EvidenceCandidate]) -> Mapping[str, object]:
             return {"items": [c.model_dump() for c in value]}
@@ -805,15 +873,20 @@ class YouSearchDiscovery:
         async def _factory() -> object:
             youdotcom = importlib.import_module("youdotcom")
             safesearch = importlib.import_module("youdotcom.models.safesearch")
+            kwargs: dict[str, Any] = {
+                "query": query,
+                "count": self._count,
+                "safesearch": safesearch.SafeSearch.STRICT,
+                "retries": _bounded_retry_config(),
+                "timeout_ms": int(self._timeout_seconds * 1000),
+            }
+            # An EMPTY include_domains is not "no filter" to the API — it is an
+            # empty allowlist. Omit the field entirely instead (the CLI probe
+            # deliberately searches without a domain filter).
+            if provider_domains:
+                kwargs["include_domains"] = list(provider_domains)
             async with youdotcom.You(api_key_auth=self._api_key.get_secret_value()) as you:
-                return await you.search_post_async(
-                    query=query,
-                    count=self._count,
-                    include_domains=list(provider_domains),
-                    safesearch=safesearch.SafeSearch.STRICT,
-                    retries=_bounded_retry_config(),
-                    timeout_ms=int(self._timeout_seconds * 1000),
-                )
+                return await you.search_post_async(**kwargs)
 
         try:
             response = await _guard_call(
@@ -860,7 +933,10 @@ class YouSearchDiscovery:
                     provider="you_search",
                     query_type=query_type,
                     rank=rank,
-                    category=classify_category(safe_url, title),
+                    # The bounded snippet participates in classification: a URL
+                    # and title alone often cannot tell a docs page apart from
+                    # the actual credential-creation surface.
+                    category=classify_category(safe_url, title, snippets[0] if snippets else ""),
                 )
             )
         if metrics is not None:
@@ -1050,9 +1126,23 @@ class YouContentsFetcher:
             if not isinstance(items, list):
                 return None
             try:
-                return tuple(EvidenceDocument.model_validate(item) for item in items)
+                cached = tuple(EvidenceDocument.model_validate(item) for item in items)
             except ValidationError:
                 return None
+            # Same rule as a fresh crawl: the cached URL must still pass the
+            # current host policy, and empty content is never evidence.
+            validated: list[EvidenceDocument] = []
+            for document in cached:
+                try:
+                    self._policy.validate_candidate_url(document.source_url)
+                except ValueError:
+                    continue
+                if not document.relevant_text.strip():
+                    continue
+                validated.append(document)
+            if cached and not validated:
+                return None
+            return tuple(validated)
 
         def _serialize(value: tuple[EvidenceDocument, ...]) -> Mapping[str, object]:
             return {"items": [d.model_dump() for d in value]}
@@ -1345,7 +1435,15 @@ class YouResearchFallback:
         content = dumped.get("content")
         if not isinstance(sources, list):
             return None
-        cited = {str(s.get("url")) for s in sources if isinstance(s, Mapping) and s.get("url")}
+        # Compare CANONICAL forms: "…/settings/api/" and "…/settings/api" are the
+        # same page, and a case-different host is the same host. Query strings are
+        # preserved because they can identify a real documentation page.
+        cited: set[str] = set()
+        for source in sources:
+            if not isinstance(source, Mapping) or not source.get("url"):
+                continue
+            with contextlib.suppress(ValueError):
+                cited.add(canonicalize(str(source.get("url"))))
         # `content` holds the structured object when output_schema is used.
         structured = content if isinstance(content, Mapping) else None
         if structured is None:
@@ -1360,7 +1458,13 @@ class YouResearchFallback:
                 continue
             url = page.get("url")
             category = page.get("category")
-            if not isinstance(url, str) or url not in cited:
+            if not isinstance(url, str):
+                continue
+            try:
+                canonical = canonicalize(url)
+            except ValueError:
+                continue
+            if canonical not in cited:
                 continue  # every candidate must appear in output.sources
             if category not in _RESEARCH_CATEGORY_ENUM:
                 continue
@@ -1368,13 +1472,17 @@ class YouResearchFallback:
                 safe_url = policy.validate_candidate_url(url)
             except ValueError:
                 continue  # off-policy host rejected even if cited
+            # The provider-supplied category is metadata only. Coverage decisions
+            # use the deterministic, code-owned classification; the provider value
+            # is kept only when our own signals are inconclusive.
+            derived = classify_category(safe_url)
             candidates.append(
                 EvidenceCandidate(
                     source_url=safe_url,
                     provider="you_research",
                     query_type="research_fallback",
                     rank=rank,
-                    category=category,
+                    category=derived if derived != "unknown" else category,
                 )
             )
         if not candidates:

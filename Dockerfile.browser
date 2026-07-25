@@ -14,10 +14,11 @@
 #   shm_size: 1gb       # avoids --disable-dev-shm-usage crashes
 #   pids_limit: 512
 #
-# This image is NOT wired into the production stack yet: the Playwright provider
-# remains opt-in (BROWSER_PROVIDER=playwright) and compose.prod.yaml is untouched.
-# The image exists so Chromium availability is a build-time fact rather than a
-# runtime surprise.
+# The Playwright provider remains opt-in (BROWSER_PROVIDER=playwright) and the
+# base production stack is untouched. This image is started by the assignment
+# override (compose.assignment.yaml, layered over compose.prod.yaml) and by the
+# evaluation sandbox (compose.playwright.sandbox.yaml), so Chromium availability
+# is a build-time fact rather than a runtime surprise.
 #
 # It now runs the browser SERVICE (browser_service.main:app) rather than a one-shot
 # probe, so Chromium's lifetime is decoupled from the API's: restarting the API no
@@ -75,11 +76,16 @@ COPY --chown=root:root browser_service ./browser_service
 COPY --chown=root:root data/p1 ./data/p1
 COPY --chown=root:root docker/browser-entrypoint.sh /usr/local/bin/browser-entrypoint.sh
 
+# /browser-data holds profiles + encrypted storage state; /vault is the SHARED
+# credential vault the control plane writes one-time browser-login references to.
+# Both are pre-created owned by "ops" mode 0700 so a first-run named volume
+# inherits that ownership under the non-root, read-only container.
 RUN find /app/api /app/ops /app/browser_service /app/data/p1 -type d -exec chmod 0555 {} + \
     && find /app/api /app/ops /app/browser_service /app/data/p1 -type f -exec chmod 0444 {} + \
     && chmod 0555 /usr/local/bin/browser-entrypoint.sh \
     && install -d -o ops -g ops -m 0700 /browser-data \
     && install -d -o ops -g ops -m 0700 /browser-data/storage-state \
+    && install -d -o ops -g ops -m 0700 /vault \
     && install -d -m 1777 /tmp/.X11-unix
 
 # Non-root: Chromium's own sandbox stays ENABLED by default. Set

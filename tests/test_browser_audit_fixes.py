@@ -265,14 +265,48 @@ def test_session_expiry_is_tracked() -> None:
 
 # --- A12: provider-aware configuration gating ---------------------------------
 def test_configuration_state_is_provider_aware() -> None:
-    # Playwright needs no Browser Use key...
+    # Playwright needs no Browser Use key, but it does need somewhere to run:
+    # the live opt-in alone is NOT configured, because the provider factory
+    # (_build_browser_worker) fails closed without a service or the sandbox flag.
     assert (
         browser_configuration_state(
             Settings(allow_live_browser=True, browser_provider="playwright")
         )
+        is False
+    )
+    assert (
+        browser_configuration_state(
+            Settings(
+                allow_live_browser=True,
+                browser_provider="playwright",
+                playwright_in_process_sandbox=True,
+            )
+        )
         is True
     )
-    # ...while Browser Use still requires one.
+    assert (
+        browser_configuration_state(
+            Settings(
+                allow_live_browser=True,
+                browser_provider="playwright",
+                browser_service_url="http://browser-worker:8081",
+                browser_service_token=SecretStr("service-token"),
+            )
+        )
+        is True
+    )
+    # A service URL without a token stays unconfigured (the service fails closed).
+    assert (
+        browser_configuration_state(
+            Settings(
+                allow_live_browser=True,
+                browser_provider="playwright",
+                browser_service_url="http://browser-worker:8081",
+            )
+        )
+        is False
+    )
+    # Browser Use still requires its key.
     assert browser_configuration_state(Settings(allow_live_browser=True)) is False
     assert (
         browser_configuration_state(

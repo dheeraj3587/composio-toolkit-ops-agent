@@ -111,6 +111,9 @@ class OperationsRequest(StrictModel):
     company: CompanyProfile
     requested_scope_policy: Literal["minimum", "recommended", "maximum"] = "maximum"
     dry_run: bool = True
+    # Explicit local intent only. It is never inferred from research, a browser
+    # page, or an LLM, and is forwarded only to the browser target selector.
+    account_creation_requested: bool = False
     outreach_recipient_override: str | None = Field(default=None, max_length=320)
 
 

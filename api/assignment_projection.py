@@ -8,6 +8,7 @@ from typing import Any, cast
 from api.models import PhaseState
 from api.service import LocalRunService
 from ops.browser_host_policy import get_browser_policy
+from ops.browser_readiness import browser_configuration_state
 from ops.models import OperationalResearch
 
 _ORIGINAL_PHASES = LocalRunService._phases
@@ -53,12 +54,25 @@ def _assignment_phases(
         else "not_started"
     )
     policy = get_browser_policy(research.app_slug) if research is not None else None
+    # Provider-aware: the shared helper decides "configured" for whichever backend
+    # is selected, so a Playwright deployment is never judged by a Browser Use key.
+    selected_provider = str(getattr(service._settings, "browser_provider", "browser_use"))
     browser_configured = bool(
-        service._settings.browser_use_api_key is not None
-        and service._settings.allow_live_browser
+        browser_configuration_state(service._settings)
         and service._settings.langgraph_aes_key is not None
         and _browser_is_wired(service)
     )
+    if selected_provider == "playwright":
+        configuration_detail = (
+            "The isolated Playwright browser service, live-browser opt-in, and "
+            "encrypted workflow configuration are required."
+        )
+        running_detail = "A policy-gated Playwright browser session is running for this assignment."
+    else:
+        configuration_detail = (
+            "Browser Use, live-browser opt-in, and encrypted workflow configuration are required."
+        )
+        running_detail = "A policy-gated Browser Use session is running for this assignment."
 
     if policy is None or not policy.active:
         browser = PhaseState(
@@ -75,10 +89,7 @@ def _assignment_phases(
             name="Browser",
             phase="5/6",
             status="configuration_required",
-            detail=(
-                "Browser Use, ALLOW_LIVE_BROWSER, and encrypted workflow configuration "
-                "are required."
-            ),
+            detail=configuration_detail,
             available=False,
         )
     elif run_status == "waiting_for_hitl" or "browser_hitl_required" in events:
@@ -114,7 +125,7 @@ def _assignment_phases(
             name="Browser",
             phase="5/6",
             status="running",
-            detail="A policy-gated Browser Use execution was recorded for this run.",
+            detail=running_detail,
             available=True,
         )
     else:

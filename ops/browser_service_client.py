@@ -204,9 +204,15 @@ class BrowserServiceClient:
         research: Any,
         *,
         sensitive_data: Mapping[str, str] | None = None,
+        account_creation_requested: bool = False,
     ) -> BrowserObservation:
         return await self._drive(
-            context, research, path="navigate", credential_refs=sensitive_data, signal=None
+            context,
+            research,
+            path="navigate",
+            credential_refs=sensitive_data,
+            signal=None,
+            account_creation_requested=account_creation_requested,
         )
 
     async def resume_after_hitl(
@@ -231,9 +237,12 @@ class BrowserServiceClient:
         path: str,
         credential_refs: Mapping[str, str] | None,
         signal: str | None,
+        account_creation_requested: bool = False,
     ) -> BrowserObservation:
         refs = _vault_references_only(credential_refs)
         body: dict[str, object] = {"credential_refs": refs}
+        if account_creation_requested:
+            body["account_creation_requested"] = True
         if research is not None:
             body["research"] = (
                 research.model_dump(mode="json") if hasattr(research, "model_dump") else research

@@ -20,6 +20,7 @@ from api.service import LocalRunService
 from ops.browser_api_trace_catalog import get_browser_api_trace
 from ops.browser_host_policy import evaluate_navigation
 from ops.browser_link_log import field_keys, log_event, url_host
+from ops.browser_target_selection import derive_account_state
 from ops.browser_worker import (
     BrowserObservation,
     BrowserObservationStatus,
@@ -61,6 +62,7 @@ async def _retained_run_assignment_task(
     research: OperationalResearch,
     resume_signal: str | None,
     sensitive_data: Mapping[str, str] | None = None,
+    account_creation_requested: bool = False,
 ) -> BrowserObservation:
     """Run a bounded task and retain successful sessions for evaluator inspection."""
 
@@ -91,7 +93,13 @@ async def _retained_run_assignment_task(
     else:
         try:
             target_url = browser_worker_module._official_target_url(
-                research, patterns, preferred_url=trace.start_url if trace is not None else None
+                research,
+                patterns,
+                trace=trace,
+                account_state=derive_account_state(
+                    sensitive_data=sensitive_data,
+                    account_creation_requested=account_creation_requested,
+                ),
             )
         except Exception as exc:
             log_event(
@@ -324,6 +332,10 @@ async def _compatible_gemini_extract(
                 contents=prompt,
                 config=config,
             )
+        except (TypeError, AttributeError, NameError, ImportError):
+            # A broken Gemini integration must surface, not be reported as an
+            # "all models failed" provider outage.
+            raise
         except Exception as exc:
             last_error = exc
             continue
@@ -337,9 +349,15 @@ async def _compatible_gemini_extract(
 
 
 def _assignment_provider_states(service: LocalRunService) -> list[ProviderState]:
-    """Report initialized runtime adapters as ready instead of amber placeholders."""
+    """Report initialized runtime adapters as ready instead of amber placeholders.
 
-    original = {state.provider: state for state in _ORIGINAL_PROVIDER_STATES(service)}
+    The browser entry follows the SELECTED provider: the core report emits exactly
+    one browser state, named ``playwright`` or ``browser_use``, so this projection
+    must never assume a fixed provider list (indexing ``browser_use`` used to raise
+    a KeyError on a Playwright deployment).
+    """
+
+    original_states = _ORIGINAL_PROVIDER_STATES(service)
     try:
         wiring = {
             str(row.get("dependency")): row
@@ -347,13 +365,14 @@ def _assignment_provider_states(service: LocalRunService) -> list[ProviderState]
             if isinstance(row, Mapping)
         }
     except Exception:
-        return list(original.values())
+        return original_states
 
     def wired(name: str) -> bool:
         row = wiring.get(name)
         return bool(row and row.get("runtime_wired") is True)
 
-    readiness = {
+    selected_browser = str(getattr(service._settings, "browser_provider", "browser_use"))
+    readiness: dict[str, tuple[bool, str]] = {
         "langgraph": (
             wired("workflow"),
             "Encrypted LangGraph workflow is initialized and available for durable run execution.",
@@ -374,22 +393,31 @@ def _assignment_provider_states(service: LocalRunService) -> list[ProviderState]
             wired("composio_preflight"),
             "Read-only Composio toolkit and connected-account preflight is initialized for each run.",
         ),
-        "browser_use": (
+        selected_browser: (
             wired("browser"),
-            "Browser Use is initialized with live execution enabled and per-app domain policy.",
+            (
+                "The isolated Playwright browser service is wired with live execution "
+                "enabled and per-app domain policy."
+                if selected_browser == "playwright"
+                else "Browser Use is initialized with live execution enabled and per-app "
+                "domain policy."
+            ),
         ),
     }
 
-    result: list[ProviderState] = []
-    for provider in ("langgraph", "vault", "perplexity", "gemini", "composio", "browser_use"):
-        current = original[provider]
-        is_ready, detail = readiness[provider]
-        result.append(
+    projected: list[ProviderState] = []
+    for current in original_states:
+        entry = readiness.get(current.provider)
+        if entry is None:
+            projected.append(current)
+            continue
+        is_ready, detail = entry
+        projected.append(
             current.model_copy(update={"status": "ready", "detail": detail})
             if is_ready
             else current
         )
-    return result
+    return projected
 
 
 async def _startup_with_async_browser(self: LocalRunService) -> None:

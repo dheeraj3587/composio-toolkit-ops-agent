@@ -173,9 +173,9 @@ class Settings(BaseModel):
     you_search_count: int = Field(default=5, ge=1, le=10)
     you_search_timeout_seconds: float = Field(default=20.0, ge=2.0, le=60.0)
     you_contents_timeout_seconds: float = Field(default=30.0, ge=2.0, le=60.0)
-    # Sent to You.com Contents as ``max_age`` (the SDK supports it in 2.5.0):
-    # cached content older than this forces a fresh crawl. Also used as the
-    # local Contents cache TTL, so the two agree.
+    # Sent to You.com Contents as ``max_age`` (supported by the pinned SDK; see
+    # requirements-providers.txt): cached content older than this forces a fresh
+    # crawl. Also used as the local Contents cache TTL, so the two agree.
     you_contents_max_age_seconds: int = Field(default=86_400, ge=0)
     you_research_timeout_seconds: float = Field(default=60.0, ge=10.0, le=180.0)
 
@@ -194,6 +194,21 @@ class Settings(BaseModel):
     @property
     def you_contents_configured(self) -> bool:
         return self.you_api_key is not None and self.you_contents_enabled
+
+    @property
+    def any_you_feature_configured(self) -> bool:
+        """Whether ANY You.com capability is actually usable.
+
+        Runtime wiring must branch on this, not on the mere presence of a key: a
+        configured ``YDC_API_KEY`` with every flag off means You.com is disabled
+        and the original Perplexity + guarded-HTTP path must be built unchanged.
+        """
+
+        return bool(
+            self.you_search_configured
+            or self.you_contents_configured
+            or self.you_research_configured
+        )
 
     @property
     def you_research_configured(self) -> bool:

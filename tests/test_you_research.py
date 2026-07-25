@@ -196,13 +196,40 @@ def _install_fake_you(monkeypatch: pytest.MonkeyPatch, configure: object = None)
 
 
 # ===========================================================================
-# SDK contract (pins REAL installed youdotcom==2.5.0)
+# SDK contract. The pin in requirements-providers.txt is the single source of
+# truth; these tests never call the You.com API.
 # ===========================================================================
-class TestSdkContract:
-    def test_version_is_2_5_0(self) -> None:
-        import importlib.metadata
+_PINNED_YOUDOTCOM_VERSION = "2.5.0"
 
-        assert importlib.metadata.version("youdotcom") == "2.5.0"
+
+def _pinned_youdotcom_version() -> str:
+    """Read the You.com SDK pin straight out of the provider lock file."""
+
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / "requirements-providers.txt").read_text(
+        encoding="utf-8"
+    )
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("youdotcom=="):
+            return stripped.split("==", 1)[1].strip()
+    raise AssertionError("requirements-providers.txt does not pin youdotcom")
+
+
+class TestSdkContract:
+    def test_requirements_pin_matches_expected_version(self) -> None:
+        # A static contract: no import, no network, no API call.
+        assert _pinned_youdotcom_version() == _PINNED_YOUDOTCOM_VERSION
+
+    def test_installed_version_matches_the_pin(self) -> None:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            installed = version("youdotcom")
+        except PackageNotFoundError:
+            pytest.skip("youdotcom is not installed in this environment")
+        assert installed == _pinned_youdotcom_version()
 
     def test_search_supports_include_domains(self) -> None:
         import inspect

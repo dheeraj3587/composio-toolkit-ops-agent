@@ -308,6 +308,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                     payload.credential_refs,
                     resolved,
                     resume_signal=None,
+                    account_creation_requested=payload.account_creation_requested,
                 )
         except SessionUnavailable as exc:
             raise _sanitized_error(exc) from None
@@ -616,6 +617,7 @@ async def _drive(
     settings: BrowserServiceSettings,
     *,
     resume_signal: str | None,
+    account_creation_requested: bool = False,
 ) -> ObservationResponse:
     """Run one navigate/resume operation and project a sanitized observation.
 
@@ -657,8 +659,11 @@ async def _drive(
         ) from None
     try:
         if resume_signal is None:
+            navigate_kwargs: dict[str, object] = {"sensitive_data": sensitive}
+            if account_creation_requested:
+                navigate_kwargs["account_creation_requested"] = True
             observation = await asyncio.wait_for(
-                worker.navigate_onboarding(context, research, sensitive_data=sensitive),
+                worker.navigate_onboarding(context, research, **navigate_kwargs),
                 timeout=settings.operation_timeout_seconds,
             )
         else:

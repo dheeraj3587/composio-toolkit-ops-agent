@@ -55,11 +55,29 @@ def test_browser_use_wiring_condition_is_unchanged(tmp_path: Path) -> None:
     assert off._browser_provider_enabled(off._settings) is False
 
 
-def test_playwright_wiring_needs_only_live_opt_in(tmp_path: Path) -> None:
-    settings = Settings(allow_live_browser=True, browser_provider="playwright")
-    svc = _svc(tmp_path, settings)
-    # No browser_use_api_key required for the self-hosted backend.
-    assert svc._browser_provider_enabled(settings) is True
+def test_playwright_wiring_needs_an_execution_location(tmp_path: Path) -> None:
+    # The live opt-in alone is NOT enough: the factory fails closed without a
+    # browser service or the explicit in-process sandbox, so the wiring condition
+    # must agree with it (otherwise health reports "configured" and every run fails).
+    live_only = Settings(allow_live_browser=True, browser_provider="playwright")
+    svc = _svc(tmp_path, live_only)
+    assert svc._browser_provider_enabled(live_only) is False
+
+    # No browser_use_api_key is required for the self-hosted backend.
+    service_backed = Settings(
+        allow_live_browser=True,
+        browser_provider="playwright",
+        browser_service_url="http://browser-worker:8081",
+        browser_service_token=SecretStr("service-token"),
+    )
+    assert svc._browser_provider_enabled(service_backed) is True
+
+    sandbox = Settings(
+        allow_live_browser=True,
+        browser_provider="playwright",
+        playwright_in_process_sandbox=True,
+    )
+    assert svc._browser_provider_enabled(sandbox) is True
 
 
 # --- factory returns the Browser Use worker for the default -------------------

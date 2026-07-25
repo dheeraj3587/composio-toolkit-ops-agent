@@ -29,6 +29,7 @@ from ops.browser_host_policy import (
     evaluate_navigation,
 )
 from ops.browser_link_log import log_event, url_host
+from ops.browser_target_selection import derive_account_state
 from ops.browser_worker import (
     BrowserObservation,
     BrowserSessionContext,
@@ -501,6 +502,7 @@ class AssignmentBrowserWorker(BrowserWorker):
         research: OperationalResearch,
         *,
         sensitive_data: Mapping[str, str] | None = None,
+        account_creation_requested: bool = False,
     ) -> BrowserObservation:
         self._assignment_research[context.session_id] = research
         return await self._run_assignment_task(
@@ -508,6 +510,7 @@ class AssignmentBrowserWorker(BrowserWorker):
             research=research,
             resume_signal=None,
             sensitive_data=sensitive_data,
+            account_creation_requested=account_creation_requested,
         )
 
     async def resume_after_hitl(
@@ -740,13 +743,20 @@ class AssignmentBrowserWorker(BrowserWorker):
         research: OperationalResearch,
         resume_signal: str | None,
         sensitive_data: Mapping[str, str] | None = None,
+        account_creation_requested: bool = False,
     ) -> BrowserObservation:
         self._require_configuration()
         allowed = assignment_allowed_hosts(research)
         patterns = validate_allowed_domains(allowed.patterns())
         trace = get_browser_api_trace(research.app_slug)
         target_url = _official_target_url(
-            research, patterns, preferred_url=trace.start_url if trace is not None else None
+            research,
+            patterns,
+            trace=trace,
+            account_state=derive_account_state(
+                sensitive_data=sensitive_data,
+                account_creation_requested=account_creation_requested,
+            ),
         )
         # Owner-submitted login credentials (if any) are injected as Browser Use v3
         # secure ``sensitive_data`` placeholders; only their key names reach the

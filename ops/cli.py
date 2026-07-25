@@ -329,7 +329,7 @@ def research_app(app_name: str, *, provider: str = "you") -> dict[str, Any]:
     effective_policy = host_policy.official_url_policy
     metrics = YouResearchMetrics()
 
-    def _build_content_fetcher() -> object:
+    def _build_content_fetcher(http_client: httpx.AsyncClient) -> object:
         primary = YouContentsFetcher(
             settings.you_api_key,  # type: ignore[arg-type]
             policy=host_policy,
@@ -341,10 +341,7 @@ def research_app(app_name: str, *, provider: str = "you") -> dict[str, Any]:
         if effective_policy is None:
             return primary
         fallback = GuardedHTTPEvidenceFetcher(
-            OfficialEvidenceFetcher(
-                httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0), follow_redirects=False),
-                effective_policy,
-            )
+            OfficialEvidenceFetcher(http_client, effective_policy)
         )
         return FallbackEvidenceContentFetcher(primary=primary, fallback=fallback)
 
@@ -363,9 +360,14 @@ def research_app(app_name: str, *, provider: str = "you") -> dict[str, Any]:
             docs_summary: list[dict[str, Any]] = []
             if found and settings.you_contents_configured and effective_policy is not None:
                 candidate_urls = _rich_candidate_urls(p1_record, found, effective_policy)
-                fetcher = _build_content_fetcher()
-                start = time.monotonic()
-                documents = await fetcher.fetch_many(candidate_urls)  # type: ignore[attr-defined]
+                # This CLI owns the guarded fallback client, so it closes it here
+                # rather than leaking its connections for the process lifetime.
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(15.0, connect=5.0), follow_redirects=False
+                ) as http_client:
+                    fetcher = _build_content_fetcher(http_client)
+                    start = time.monotonic()
+                    documents = await fetcher.fetch_many(candidate_urls)  # type: ignore[attr-defined]
                 latencies["content_fetch_ms"] = round((time.monotonic() - start) * 1000, 1)
                 docs_summary = [{"url": d.source_url, "title": d.title} for d in documents]
         return found, docs_summary, latencies

@@ -72,6 +72,7 @@ class WorkflowBrowser(Protocol):
         research: OperationalResearch,
         *,
         sensitive_data: Mapping[str, str] | None = None,
+        account_creation_requested: bool = False,
     ) -> BrowserObservation: ...
 
     async def resume_after_hitl(
@@ -454,13 +455,24 @@ class DurableOperationsWorkflow:
         thread_id = str(state.get("thread_id") or "")
         sensitive_data = self._initial_sensitive_data.get(thread_id)
         try:
-            observation = _run_async(
-                self._dependencies.browser.navigate_onboarding(
-                    _browser_context(state),
-                    research,
-                    sensitive_data=sensitive_data,
+            request = OperationsRequest.model_validate(state["request"])
+            if request.account_creation_requested:
+                observation = _run_async(
+                    self._dependencies.browser.navigate_onboarding(
+                        _browser_context(state),
+                        research,
+                        sensitive_data=sensitive_data,
+                        account_creation_requested=True,
+                    )
                 )
-            )
+            else:
+                observation = _run_async(
+                    self._dependencies.browser.navigate_onboarding(
+                        _browser_context(state),
+                        research,
+                        sensitive_data=sensitive_data,
+                    )
+                )
         except PhaseUnavailableError as exc:
             return _unavailable_update(state, exc)
         except ProviderOperationError as exc:
