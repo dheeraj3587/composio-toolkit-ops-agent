@@ -523,9 +523,15 @@ class RunService:
         # Provider capability decides which statuses are recoverable. Browser Use
         # sessions live in the cloud and can be reattached by provider session id, so
         # its waiting_for_hitl runs are left intact (unchanged behaviour). The
-        # self-hosted Playwright browser dies with the API process, so BOTH
+        # in-process Playwright browser dies with the API process, so BOTH
         # browser_running and waiting_for_hitl must be reconciled — claiming such a
         # run is resumable would be false.
+        #
+        # The browser SERVICE is the third case: Chromium is in its own container, so
+        # a session can genuinely outlive an API restart. But the capability flag
+        # alone is not evidence, so each waiting_for_hitl run is CHECKED against the
+        # service (see _browser_session_is_live); only a session the service still
+        # reports ACTIVE is left resumable.
         reattach = bool(getattr(self._browser_worker, "supports_restart_reattach", True))
         stranded_statuses = (
             ("browser_running",) if reattach else ("browser_running", "waiting_for_hitl")
@@ -533,6 +539,8 @@ class RunService:
         reason = (
             "api_restart_stranded_browser_run" if reattach else "playwright_session_lost_on_restart"
         )
+        # Only the RPC-backed provider can be asked whether a session survived.
+        verifies_sessions = callable(getattr(self._browser_worker, "reconcile_session", None))
         try:
             offset = 0
             while True:
@@ -540,17 +548,60 @@ class RunService:
                 if not batch:
                     break
                 for record in batch:
-                    if record.get("status") in stranded_statuses:
+                    status = record.get("status")
+                    run_id = str(record.get("run_id") or "")
+                    if status in stranded_statuses:
                         self._reconcile_one_stranded(
-                            str(record.get("run_id") or ""),
+                            run_id,
                             stranded_statuses=stranded_statuses,
                             reason=reason,
+                        )
+                    elif (
+                        verifies_sessions
+                        and status == "waiting_for_hitl"
+                        and self._browser_session_is_live(record) is False
+                    ):
+                        # The service says this session is gone: the run cannot be
+                        # resumed, so surface that instead of waiting forever on a
+                        # browser that no longer exists.
+                        self._reconcile_one_stranded(
+                            run_id,
+                            stranded_statuses=("waiting_for_hitl",),
+                            reason="browser_service_session_lost",
                         )
                 if len(batch) < 100:
                     break
                 offset += 100
         except Exception:  # pragma: no cover - reconciliation must never crash boot
             LOGGER.warning("startup run reconciliation was skipped after an error")
+
+    def _browser_session_is_live(self, record: Mapping[str, Any]) -> bool | None:
+        """Ask the browser service whether a persisted session id still exists.
+
+        Returns ``True`` when the service reports the session ACTIVE, ``False``
+        when it is definitively gone, and ``None`` when the answer is unknown
+        (service unreachable, or the provider cannot be queried). ``None`` must be
+        treated as "leave the run alone": tearing a run down because the service
+        was briefly unreachable would destroy a session that is actually alive.
+        """
+
+        worker = self._browser_worker
+        reconcile = getattr(worker, "reconcile_session", None)
+        if not callable(reconcile):
+            return None
+        session_id = record.get("browser_session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return False
+        try:
+            outcome = asyncio.run(reconcile(session_id))
+        except Exception:
+            return None
+        if outcome == "resumable":
+            return True
+        if outcome == "session_lost":
+            return False
+        # "unreachable" (or anything unexpected) is inconclusive, never a teardown.
+        return None
 
     def _reconcile_one_stranded(
         self,

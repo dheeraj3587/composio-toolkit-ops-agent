@@ -7,6 +7,12 @@
 #
 #   docker compose -f compose.playwright.sandbox.yaml --env-file .env.playwright.sandbox build
 #   docker compose -f compose.playwright.sandbox.yaml --env-file .env.playwright.sandbox run --rm browser-sandbox
+#   docker compose -f compose.playwright.sandbox.yaml --env-file .env.playwright.sandbox up -d browser-worker
+#
+# Two services, deliberately:
+#   browser-sandbox — one-shot probe: does Chromium launch in this image at all?
+#   browser-worker  — the long-running browser SERVICE (Chromium's own process),
+#                     which is what makes an API restart survivable.
 #
 # See docs/PLAYWRIGHT_SANDBOX.md. Never point this at an untrusted or production
 # vendor account, and never place provider secrets in this file.
@@ -50,5 +56,79 @@ services:
     # Default command proves Chromium actually launches in this image.
     command: ["python", "-m", "ops.browser_readiness"]
 
+  # The isolated browser service. Chromium lives HERE, not in the API container,
+  # so restarting the API cannot kill a live session and a Chromium crash cannot
+  # take down the control plane.
+  browser-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.browser
+    image: composio-ops-browser:sandbox
+    # Reap zombie Chromium children instead of leaking processes.
+    init: true
+    # Chromium needs a real IPC namespace and adequate shared memory.
+    ipc: host
+    shm_size: 1gb
+    pids_limit: 512
+    user: ops
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      # Chromium and Xvfb both need writable scratch space on a read_only rootfs.
+      - /tmp:rw,nosuid,nodev,size=1g,mode=1777
+    environment:
+      BROWSER_PROVIDER: playwright
+      ALLOW_LIVE_BROWSER: ${ALLOW_LIVE_BROWSER:-false}
+      ALLOW_LIVE_VENDOR_EMAIL: "false"
+      PLAYWRIGHT_MAX_SESSIONS: ${PLAYWRIGHT_MAX_SESSIONS:-2}
+      # Chromium's own sandbox stays enabled unless the host cannot support it.
+      PLAYWRIGHT_DISABLE_SANDBOX: ${PLAYWRIGHT_DISABLE_SANDBOX:-false}
+      PYTHONPATH: /app
+      # Required: with no token the service refuses EVERY request (fail closed).
+      # Supplied via --env-file, never written into this file.
+      BROWSER_SERVICE_TOKEN: ${BROWSER_SERVICE_TOKEN:-}
+      BROWSER_SERVICE_PORT: "8081"
+      BROWSER_SESSION_INACTIVITY_SECONDS: ${BROWSER_SESSION_INACTIVITY_SECONDS:-900}
+      BROWSER_SESSION_MAX_AGE_SECONDS: ${BROWSER_SESSION_MAX_AGE_SECONDS:-14400}
+      # Interactive remote control is OFF unless an operator turns it on.
+      BROWSER_INTERACTIVE_HITL_ENABLED: ${BROWSER_INTERACTIVE_HITL_ENABLED:-false}
+      BROWSER_VNC_PORT: "5900"
+      BROWSER_NOVNC_BASE_URL: http://browser-worker:8081
+      # Storage state is encrypted at rest; with no key it is simply not persisted.
+      BROWSER_STORAGE_STATE_KEY: ${BROWSER_STORAGE_STATE_KEY:-}
+      BROWSER_STORAGE_STATE_DIR: /browser-data/storage-state
+    volumes:
+      # A throwaway named volume for browser profiles and encrypted storage state.
+      # NEVER a production volume.
+      - browser_profiles:/browser-data
+    networks:
+      - opsnet
+    # No `ports:` on purpose. The RPC surface (8081) and the VNC port (5900) are
+    # reachable only on this private network / container loopback — never from the
+    # host. Reaching the service from another container uses http://browser-worker:8081.
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import json, sys, urllib.request
+          response = urllib.request.urlopen("http://127.0.0.1:8081/internal/health", timeout=30)
+          state = json.load(response).get("state")
+          sys.exit(0 if state in ("ready", "configured_not_verified", "capacity_exhausted") else 1)
+      interval: 60s
+      timeout: 40s
+      start_period: 30s
+      retries: 3
+
+networks:
+  opsnet:
+    driver: bridge
+
 volumes:
   browser_sandbox_profiles:
+  browser_profiles:
