@@ -50,9 +50,21 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
   const emailPhase = phases.get("email")
   const outputPhase = phases.get("output")
   const researchPhase = phases.get("research")
-  const canResume =
-    detail.run.status === "waiting_for_hitl" && detail.hitl_request?.resumable === true
-  const hasBrowserSession = !isPlanOnly && ["waiting_for_hitl", "browser_running"].includes(detail.run.status)
+  const browser = detail.browser ?? null
+
+  // The backend owns every browser permission. A run status alone does not prove
+  // that a session is live, a credential page is verified, or a resume is legal.
+  const hasBrowserSession =
+    !isPlanOnly &&
+    (browser
+      ? ["running", "waiting_for_hitl", "credential_page_ready"].includes(browser.lifecycle)
+      : ["waiting_for_hitl", "browser_running"].includes(detail.run.status))
+
+  // Do not show the generic resume beside a more specific credential action.
+  const canResume = browser
+    ? browser.can_resume && !browser.can_submit_login && !browser.can_submit_otp
+    : detail.run.status === "waiting_for_hitl" && detail.hitl_request?.resumable === true
+
   const canPoll = !isPlanOnly && ["outreach_sent", "waiting_for_reply"].includes(detail.run.status)
   const missingFields = Array.from(new Set([
     ...(detail.missing_fields ?? []),
@@ -119,9 +131,9 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
               {hasBrowserSession ? (
                 <HitlLiveControls
                   runId={runId}
+                  browser={browser}
                   fieldName={detail.research?.credential_fields?.[0] ?? "api_token"}
                   fieldLabel={humanize(detail.research?.credential_fields?.[0] ?? "API token")}
-                  canSubmitCredential={detail.run.status === "browser_running"}
                 />
               ) : isRetryable(browserPhase) ? (
                 <PhaseActionForm runId={runId} action="retry" capability="browser" label="Retry browser phase" />
