@@ -29,13 +29,14 @@ import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from ops.browser_api_trace_catalog import (
     BrowserApiTrace,
     BrowserApiTraceStep,
+    CheckpointPredicate,
     get_browser_api_trace,
 )
 from ops.browser_candidates import (
@@ -57,6 +58,11 @@ from ops.browser_decider import (
     validate_choice,
 )
 from ops.browser_host_policy import BrowserPolicyInactiveError, build_browser_allowed_hosts
+from ops.browser_login import (
+    LoginInspection,
+    drive_login,
+    normalize_resume_signal,
+)
 from ops.browser_loop import BrowserLoop, BrowserOperationTimeout, shared_browser_loop
 from ops.browser_worker import (
     BrowserObservation,
@@ -93,6 +99,7 @@ _MAX_AGENT_STEPS = 20
 _MAX_AGENT_SECONDS = 180.0
 _MAX_REPEATED_STATE = 3
 _MAX_MODEL_FAILURES = 2
+_MAX_ACTION_FAILURES = 3
 # Trace schema version carried on every candidate (item 4 groundwork).
 _TRACE_VERSION = "2.0"
 
@@ -264,6 +271,114 @@ class PageInspection:
     # Monotonic DOM generation this inspection was taken at (item 3).
     generation: int = 0
 
+    def accessible_names(self) -> tuple[str, ...]:
+        return tuple(element.name for element in self.elements if element.name)
+
+
+# Typed reason codes for core browser/action failures. A programming error
+# (TypeError/AttributeError/AssertionError) is NEVER mapped to one of these — it
+# must propagate so tests and monitoring see it.
+ActionReasonCode = Literal[
+    "target_not_found",
+    "target_ambiguous",
+    "target_stale",
+    "action_timeout",
+    "navigation_timeout",
+    "policy_blocked",
+    "postcondition_failed",
+    "authentication_failed",
+    "model_unavailable",
+    "model_invalid_choice",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ActionExecutionResult:
+    """The typed outcome of executing exactly one candidate action.
+
+    ``executed`` means the action ran (the checkpoint predicate is verified
+    separately by the caller); ``stale`` means the DOM changed under us and we
+    must replan; ``blocked`` means navigation left the host allowlist; ``failed``
+    means a typed action/navigation failure.
+    """
+
+    status: Literal["executed", "stale", "blocked", "failed"]
+    candidate_id: str
+    before_url: str
+    after_url: str
+    before_generation: int
+    after_generation: int
+    reason_code: ActionReasonCode | None = None
+
+
+def predicate_satisfied(predicate: CheckpointPredicate, inspection: PageInspection) -> bool:
+    """True only when every POSITIVE condition holds and no forbidden text appears.
+
+    A predicate with no positive condition can never PROVE progress and returns
+    False (the state machine then relies on ``requires_hitl`` to escalate).
+    """
+
+    path = urlsplit(inspection.url).path.casefold()
+    title = inspection.title.casefold()
+    text = inspection.visible_text.casefold()
+    names = tuple(name.casefold() for name in inspection.accessible_names())
+
+    for token in predicate.forbidden_text:
+        needle = token.casefold()
+        if needle and (needle in text or needle in title):
+            return False
+    if not predicate.has_positive_condition():
+        return False
+    if any(token.casefold() not in path for token in predicate.url_path_contains):
+        return False
+    if any(token.casefold() not in title for token in predicate.title_contains):
+        return False
+    if any(token.casefold() not in text for token in predicate.visible_text_contains):
+        return False
+    for required in predicate.required_accessible_names:
+        needle = required.casefold()
+        if not any(needle in name for name in names):
+            return False
+    return True
+
+
+def checkpoint_satisfied(checkpoint: BrowserApiTraceStep, inspection: PageInspection) -> bool:
+    """True when the checkpoint's reviewed completion predicate is proven on the page."""
+
+    return predicate_satisfied(checkpoint.completion, inspection)
+
+
+class ApprovedBrowserValueResolver:
+    """Resolves a reviewed NON-SECRET value reference to its configured value.
+
+    Only the reviewed set is resolvable; a vault reference, password, API key,
+    OTP, or magic link can never be produced here (they are not in the map).
+    """
+
+    _VAULTISH = ("vault://", "password", "secret", "token", "otp", "api_key", "apikey")
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    def resolve(self, value_ref: str) -> str | None:
+        application_name = (
+            getattr(self._settings, "company_legal_name", None) or ""
+        ) and f"{self._settings.company_legal_name} integration"
+        mapping = {
+            "company_name": getattr(self._settings, "company_legal_name", None),
+            "company_website": getattr(self._settings, "company_website", None),
+            "application_name": application_name or None,
+            "use_case": getattr(self._settings, "company_use_case", None),
+            "expected_volume": getattr(self._settings, "company_expected_volume", None),
+        }
+        value = mapping.get(value_ref)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        # Defense in depth: never emit anything that looks like a secret.
+        if any(marker in value.casefold() for marker in self._VAULTISH):
+            return None
+        return value.strip()[:500]
+
 
 class PlaywrightBrowserWorker:
     """BrowserProvider backed by local Chromium via Playwright."""
@@ -298,6 +413,8 @@ class PlaywrightBrowserWorker:
         self._capacity = threading.BoundedSemaphore(self._max_sessions)
         # The bounded action brain (deterministic-first; LLM only for ambiguity).
         self._inference = build_json_inference(self._settings)
+        # Resolves reviewed NON-SECRET form values (never a credential).
+        self._value_resolver = ApprovedBrowserValueResolver(self._settings)
         # A TTL janitor runs independently of new-session creation, so an idle
         # session is reclaimed even when no further run ever starts.
         self._janitor_stop = threading.Event()
@@ -498,8 +615,14 @@ class PlaywrightBrowserWorker:
         sensitive_data: Mapping[str, str] | None = None,
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
-        del signal, provider_session_id
+        del provider_session_id
         self._require_configuration()
+        # The resume signal is no longer discarded: only a recognized signal
+        # resumes the run; an unknown signal fails closed with a typed reason.
+        if normalize_resume_signal(signal) is None:
+            raise ProviderOperationError(
+                capability="Playwright browser", reason_code="unrecognized_resume_signal"
+            )
         session = self._sessions.get(context.session_id)
         if session is None:
             raise ProviderOperationError(
@@ -510,6 +633,9 @@ class PlaywrightBrowserWorker:
             raise ProviderOperationError(
                 capability="Playwright browser", reason_code="verified_research_required"
             )
+        # A "cancelled" resume ends the run at a human gate rather than re-driving.
+        if normalize_resume_signal(signal) == "cancelled":
+            return self._human_required(session, "The human cancelled the browser step.")
         return await self._run_action_loop(session, resolved, sensitive_data=sensitive_data)
 
     async def _run_action_loop(
@@ -542,24 +668,23 @@ class PlaywrightBrowserWorker:
         deadline = asyncio.get_running_loop().time() + _MAX_AGENT_SECONDS
         repeated: dict[str, int] = {}
         model_failures = 0
+        action_failures = 0
 
         for _step in range(_MAX_AGENT_STEPS):
             if asyncio.get_running_loop().time() >= deadline:
-                return self._failed_observation(session, "browser_operation_timeout")
+                return self._failed_observation(session, "navigation_timeout")
 
             inspection = await self._inspect_page(session)
             if not navigation_allowed(inspection.url, session.patterns):
                 return _blocked(inspection.url)
 
             # Item 5: sensitive-page and success detection happen BEFORE any capture,
-            # so a credential page is never screenshotted "just once" first.
-            success = matched_success_signals(
-                trace.success_signals,
-                url=inspection.url,
-                title=inspection.title,
-                text=inspection.visible_text,
-            )
-            if success:
+            # so a credential page is never screenshotted "just once" first. Success
+            # is proven by the STRUCTURED predicate (an approved URL/path indicator
+            # AND a specific label) — never by natural-language body text.
+            if trace.success.has_positive_condition() and predicate_satisfied(
+                trace.success, inspection
+            ):
                 session.egress_stage = "post_auth"
                 session.screenshots_disabled = True
                 session.screenshot = None
@@ -568,7 +693,7 @@ class PlaywrightBrowserWorker:
                     status="credential_page_ready",
                     current_url=inspection.url,
                     page_title=inspection.title or "Credential page",
-                    non_secret_notes=(f"Verified success signal: {success[0]}"[:1_000],),
+                    non_secret_notes=("Verified structured success predicate.",),
                 )
             if _looks_credential_bearing(inspection):
                 # Not a reviewed success, but credential-shaped: suppress capture.
@@ -590,15 +715,21 @@ class PlaywrightBrowserWorker:
                 )
 
             checkpoint = current_checkpoint(trace, session.checkpoint_index)
-            deterministic = (
-                match_checkpoint(inspection.elements, checkpoint)
-                if checkpoint is not None
-                else None
-            )
             if checkpoint is None:
                 return self._human_required(session, "The reviewed navigation trace is exhausted.")
 
-            # Policy generates the bounded candidate set; the model only chooses.
+            # A checkpoint whose completion cannot be reliably auto-verified escalates
+            # to a human rather than the agent inventing progress.
+            if checkpoint.requires_hitl:
+                return self._human_required(
+                    session,
+                    f"Checkpoint {checkpoint.order} requires a human: {checkpoint.instruction}",
+                )
+
+            deterministic = match_checkpoint(inspection.elements, checkpoint)
+
+            # Policy generates the bounded candidate set; the model only chooses. The
+            # checkpoint's reviewed non-secret value refs are now wired through.
             candidates = generate_candidates(
                 elements=inspection.elements,
                 checkpoint_signals=checkpoint.expected_signals,
@@ -606,6 +737,7 @@ class PlaywrightBrowserWorker:
                 trace_version=_TRACE_VERSION,
                 expected_postcondition=f"checkpoint_{checkpoint.order}_complete",
                 reviewed_goto_urls=(trace.start_url,),
+                allow_value_refs=checkpoint.allowed_value_refs,
             )
             if not executable_candidates(candidates):
                 # Every option needs a human (e.g. only irreversible controls exist).
@@ -635,6 +767,8 @@ class PlaywrightBrowserWorker:
                         inspection=inspection,
                         candidates=candidates,
                     )
+                except (TypeError, AttributeError, AssertionError, NameError):
+                    raise  # a programming error must surface, never be swallowed
                 except Exception:
                     model_failures += 1
                     if model_failures >= _MAX_MODEL_FAILURES:
@@ -647,12 +781,32 @@ class PlaywrightBrowserWorker:
                     return outcome
                 chosen = outcome
 
-            attempted = session.checkpoint_index
-            result = await self._execute_candidate(session, chosen, inspection)
-            if result is not None:
-                return result
-            # Checkpoint state advances ONLY after a verified postcondition below.
-            session.attempted_checkpoint_index = attempted + 1
+            execution = await self._execute_candidate(session, chosen, inspection)
+            if execution.status == "blocked":
+                return _blocked(execution.after_url)
+            if execution.status == "failed":
+                action_failures += 1
+                if action_failures >= _MAX_ACTION_FAILURES:
+                    return self._failed_observation(
+                        session, execution.reason_code or "postcondition_failed"
+                    )
+                continue  # replan on the next iteration
+            if execution.status == "stale":
+                # The DOM changed under us (navigated, or the target vanished /
+                # became ambiguous): replan against a fresh page.
+                continue
+
+            # executed: advance the state machine ONLY when the reviewed completion
+            # predicate is proven on a FRESHLY inspected page. Never advance because
+            # the click "worked", the URL changed, or the model chose an action.
+            fresh = await self._inspect_page(session)
+            if not navigation_allowed(fresh.url, session.patterns):
+                return _blocked(fresh.url)
+            if checkpoint_satisfied(checkpoint, fresh):
+                session.checkpoint_index += 1
+                session.attempted_checkpoint_index = session.checkpoint_index
+            else:
+                session.attempted_checkpoint_index = session.checkpoint_index + 1
 
         return self._human_required(session, "The bounded browser action limit was reached.")
 
@@ -761,30 +915,52 @@ class PlaywrightBrowserWorker:
         session: _PwSession,
         candidate: ActionCandidate,
         inspection: PageInspection,
-    ) -> BrowserObservation | None:
+    ) -> ActionExecutionResult:
         """Re-validate immediately before acting, then execute the candidate.
 
         Time-of-check-to-time-of-use protection: the page is re-inspected, the URL
         and generation are re-confirmed, and the target is resolved by STABLE
         role/name/type identity requiring exactly one unique match. A stale
-        positional locator from the planning inspection is never executed.
+        positional locator from the planning inspection is never executed. Returns
+        a typed :class:`ActionExecutionResult` for every outcome — never an
+        untyped None.
         """
+
+        before_url = inspection.url
+        before_gen = inspection.generation
+
+        def _result(
+            status: Literal["executed", "stale", "blocked", "failed"],
+            after_url: str,
+            after_gen: int,
+            reason: ActionReasonCode | None = None,
+        ) -> ActionExecutionResult:
+            return ActionExecutionResult(
+                status=status,
+                candidate_id=candidate.candidate_id,
+                before_url=before_url,
+                after_url=after_url,
+                before_generation=before_gen,
+                after_generation=after_gen,
+                reason_code=reason,
+            )
 
         fresh = await self._inspect_page(session)
         if not navigation_allowed(fresh.url, session.patterns):
-            return _blocked(fresh.url)
+            return _result("blocked", fresh.url, fresh.generation, "policy_blocked")
         if fresh.url != inspection.url:
-            return None  # navigated underneath us: replan on the next iteration
+            return _result("stale", fresh.url, fresh.generation, "target_stale")
 
         target_index: int | None = None
         if candidate.identity is not None:
             matches = [element for element in fresh.elements if candidate.identity.matches(element)]
-            if len(matches) != 1:
-                # Zero or ambiguous: the DOM changed. Replan rather than guess.
-                return None
+            if len(matches) == 0:
+                return _result("stale", fresh.url, fresh.generation, "target_not_found")
+            if len(matches) > 1:
+                return _result("stale", fresh.url, fresh.generation, "target_ambiguous")
             target_index = matches[0].index
 
-        async def _locked() -> None:
+        async def _locked() -> str:
             async with session.operation_lock:
                 session.last_active_at = datetime.now(UTC)
                 page = session.page
@@ -807,23 +983,22 @@ class PlaywrightBrowserWorker:
                     await page.wait_for_load_state("domcontentloaded", timeout=10_000)
                 except Exception:
                     pass
+                return _page_url(page)
 
         try:
-            await self._loop.run(_locked(), timeout=_OP_TIMEOUT_SECONDS)
+            after_url = await self._loop.run(_locked(), timeout=_OP_TIMEOUT_SECONDS)
         except BrowserOperationTimeout:
-            return self._failed_observation(session, "browser_operation_timeout")
+            return _result("failed", before_url, session.dom_generation, "action_timeout")
+        except (TypeError, AttributeError, AssertionError, NameError):
+            raise  # a programming error must surface, never be swallowed
         except Exception:
-            return None
-        return None
+            return _result("failed", before_url, session.dom_generation, "action_timeout")
+        return _result("executed", sanitize_url(after_url), session.dom_generation)
 
     def _approved_value(self, value_ref: str) -> str:
         """Resolve an approved NON-SECRET value reference from configuration."""
 
-        mapping = {
-            "company_name": getattr(self._settings, "company_legal_name", "") or "",
-            "company_website": getattr(self._settings, "company_website", "") or "",
-        }
-        return str(mapping.get(value_ref, ""))
+        return self._value_resolver.resolve(value_ref) or ""
 
     async def verify_credential_page(
         self, session: _PwSession, trace: BrowserApiTrace
@@ -861,30 +1036,33 @@ class PlaywrightBrowserWorker:
 
     async def _inject_credentials(
         self, session: _PwSession, sensitive_data: Mapping[str, str]
-    ) -> None:
-        """Fill and submit the login form by code, then drop local references."""
+    ) -> LoginInspection | None:
+        """Drive the deterministic login state machine by code.
 
-        async def _locked() -> None:
+        Handles email-first, one-page, and password-after-email flows. The
+        moment any credential could enter the DOM, egress is tightened and
+        screenshots are disabled for the session. Credential values are never
+        logged or passed to an LLM. Returns the post-attempt login inspection
+        (or None if the login step could not run).
+        """
+
+        async def _locked() -> LoginInspection | None:
             async with session.operation_lock:
                 session.last_active_at = datetime.now(UTC)
                 page = session.page
-                if not await _login_origin_is_safe(page, session.patterns):
-                    return
-                if not await _has_password_field(page):
-                    return
-                # Item 5/6: the moment a credential enters the DOM, tighten egress
-                # permanently and drop/disable screenshots for this session.
+                # Tighten BEFORE any fill: even an email/username is account data.
                 session.egress_stage = "post_auth"
                 session.screenshots_disabled = True
                 session.screenshot = None
                 session.screenshot_at = None
-                await _inject_login(page, sensitive_data)
-                await _submit_login(page)
+                return await drive_login(page, sensitive_data, session.patterns)
 
         try:
-            await self._loop.run(_locked(), timeout=_OP_TIMEOUT_SECONDS)
+            return await self._loop.run(_locked(), timeout=_OP_TIMEOUT_SECONDS)
+        except (TypeError, AttributeError, AssertionError, NameError):
+            raise  # a programming error must surface, never be swallowed
         except Exception:
-            pass
+            return None
 
     def _human_required(self, session: _PwSession, instruction: str) -> BrowserObservation:
         url = "https://unknown.invalid/"

@@ -58,8 +58,13 @@ _IRREVERSIBLE_INTENTS: tuple[tuple[str, str], ...] = (
 )
 
 # Non-secret value references a `type` candidate may use. A model never supplies
-# free text; it selects a candidate whose value comes from this reviewed mapping.
-APPROVED_VALUE_REFS: frozenset[str] = frozenset({"company_name", "company_website", "work_email"})
+# free text; it selects a candidate whose value comes from this reviewed mapping
+# (resolved by ops.playwright_worker.ApprovedBrowserValueResolver). NEVER contains
+# a vault reference, password, API key, OTP, or magic link. Kept in sync with
+# ops.browser_api_trace_catalog._ALLOWED_VALUE_REFS.
+APPROVED_VALUE_REFS: frozenset[str] = frozenset(
+    {"company_name", "company_website", "application_name", "use_case", "expected_volume"}
+)
 
 _ALLOWED_KEYS: frozenset[str] = frozenset({"Enter", "Escape", "Tab"})
 
