@@ -362,9 +362,10 @@ against different semantics.
 
 Two jobs, deliberately different:
 
-- **`ci.yml` → `backend`** stays browser-free and fast. Backend unit tests are
-  allowed to skip browser integration; real Chromium is enforced only in the
-  dedicated browser-image job.
+- **`ci.yml` → `backend`** is browser-free and fast (this branch removes its
+  Chromium install). Backend unit tests are allowed to skip browser
+  integration; real Chromium is enforced only in the dedicated browser-image
+  job.
 - **`browser-image.yml` → `browser-image`** is the mandatory real-Chromium gate:
   validates the compose file, builds `Dockerfile.browser`, proves Chromium launches
   *inside the image*, starts the browser service, waits for cached readiness,
@@ -384,17 +385,22 @@ treats a skipped check as successful.
 
 > **`browser-image.yml` is committed locally but is NOT on the remote.** The
 > integration used to push this branch lacks the GitHub Actions `workflows`
-> permission, so pushing `.github/workflows/browser-image.yml` returns
-> `403 Resource not accessible by integration`. The file (and
-> `scripts/wait_for_browser_service.py`, `scripts/assert_zero_skips.py`,
-> `scripts/assert_secret_free_log.py`, `scripts/assert_no_orphan_chromium.py`) must
-> be added by someone with that permission — a normal `git push` is enough.
+> permission, so pushing any file under `.github/workflows/` returns
+> `403 Resource not accessible by integration`. Blocked alongside it, in the
+> same local commits, is the matching `ci.yml` change that removes the
+> backend job's Chromium install — the two must land together so backend CI
+> only goes browser-free at the moment the dedicated browser-image gate
+> exists. Both workflow files must be pushed by someone with that permission
+> — a normal `git push` of this branch is enough (the four `scripts/*.py`
+> helpers are already on the remote).
 >
 > **Then make `browser-image` a required status check on the protected branch**
 > (strict mode, so the branch must be current with main). Until both happen,
 > **there is no browser-image CI gate on this repository** — the job is written and
-> locally verified, not running. The Docker-based gates likewise cannot run in the
-> authoring sandbox (no Docker), so they are validated structurally, not executed.
+> locally verified, not running, and the remote `ci.yml` still installs Chromium in
+> the backend job (so browser tests currently run there rather than skipping). The
+> Docker-based gates likewise cannot run in the authoring sandbox (no Docker), so
+> they are validated structurally, not executed.
 
 ---
 
