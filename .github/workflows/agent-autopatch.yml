@@ -1,0 +1,83 @@
+name: Agent autopatch
+
+on:
+  push:
+    branches:
+      - agent/playwright-demo-frontend-wiring
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/playwright-demo-frontend-wiring
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-providers.txt
+            requirements-dev.txt
+      - name: Apply narrow dependency contract updates
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i 's/2\.5\.0/2.4.0/g' tests/test_you_research.py docs/YOU_COM_INTEGRATION.md
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("web/package.json")
+          data = json.loads(path.read_text(encoding="utf-8"))
+          overrides = data.setdefault("overrides", {})
+          overrides.update(
+              {
+                  "brace-expansion@^1.0.0": "1.1.16",
+                  "brace-expansion@^2.0.0": "2.1.2",
+                  "brace-expansion@^3.0.0": "3.0.2",
+                  "brace-expansion@^5.0.0": "5.0.8",
+              }
+          )
+          path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+          PY
+          cd web
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm ci --no-audit --no-fund
+          npm audit --audit-level=high
+          npm run lint
+          npm run typecheck
+          npm run test
+          npm run build
+          cd ..
+          python -m pip install --requirement requirements-dev.txt
+          python -m pytest tests/test_you_research.py::TestSdkContract -q
+      - name: Commit generated lockfile and contract sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            requirements-providers.txt \
+            tests/test_you_research.py \
+            docs/YOU_COM_INTEGRATION.md \
+            web/package.json \
+            web/package-lock.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "fix: synchronize provider and frontend dependency contracts"
+          git push origin HEAD:agent/playwright-demo-frontend-wiring
