@@ -135,6 +135,8 @@ def test_create_and_detail_expose_verified_phase_two_contract(harness: ApiHarnes
         "missing_fields",
         "provider_states",
         "hitl_request",
+        # Explicit backend-authoritative browser permissions (BrowserUiState).
+        "browser",
     }
     run = created["run"]
     assert isinstance(run, dict)

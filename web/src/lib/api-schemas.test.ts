@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from "vitest"
 
 vi.mock("server-only", () => ({}))
 
-import { appResearchResponseSchema, liveViewResponseSchema } from "@/lib/api-schemas"
+import {
+  appResearchResponseSchema,
+  browserUiStateSchema,
+  liveViewResponseSchema,
+} from "@/lib/api-schemas"
 
 const RUN_ID = "run_0123456789abcdef0123456789abcdef"
 
@@ -284,5 +288,58 @@ describe("live view contract synchronization", () => {
     expect(liveViewResponseSchema.safeParse({ ...hosted, mode: "video_stream" }).success).toBe(
       false,
     )
+  })
+})
+
+describe("browser UI state contract", () => {
+  const browser = {
+    provider: "playwright",
+    lifecycle: "running",
+    live_view_mode: "screenshot",
+    live_view_available: true,
+    interaction_available: false,
+    screenshot_available: true,
+    credential_page_verified: false,
+    can_submit_login: false,
+    can_submit_otp: false,
+    can_resume: false,
+    can_submit_credential: false,
+    reason_code: "browser_session_running",
+  }
+
+  it("accepts the backend-authoritative capability payload", () => {
+    const parsed = browserUiStateSchema.safeParse(browser)
+
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.provider).toBe("playwright")
+      expect(parsed.data.interaction_available).toBe(false)
+      expect(parsed.data.can_submit_credential).toBe(false)
+    }
+  })
+
+  it("defaults every capability to false when the backend omits it", () => {
+    const parsed = browserUiStateSchema.safeParse({
+      provider: "browser_use",
+      lifecycle: "not_started",
+      live_view_mode: "unavailable",
+    })
+
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.live_view_available).toBe(false)
+      expect(parsed.data.can_resume).toBe(false)
+      expect(parsed.data.credential_page_verified).toBe(false)
+      expect(parsed.data.reason_code).toBeNull()
+    }
+  })
+
+  it("rejects an unknown lifecycle or extra capability key", () => {
+    expect(
+      browserUiStateSchema.safeParse({ ...browser, lifecycle: "totally_new" }).success,
+    ).toBe(false)
+    expect(
+      browserUiStateSchema.safeParse({ ...browser, can_do_anything: true }).success,
+    ).toBe(false)
   })
 })

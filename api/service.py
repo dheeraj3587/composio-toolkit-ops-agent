@@ -11,12 +11,14 @@ from typing import Literal, Protocol
 from pydantic import SecretStr
 from starlette.concurrency import run_in_threadpool
 
+from api.browser_ui import project_browser_ui, session_lost_recorded
 from api.models import (
     ActionReceipt,
     AppResearchResponse,
     AppSearchResponse,
     AppSummary,
     BrowserLoginInput,
+    BrowserUiState,
     CreateRunRequest,
     CredentialSubmissionRequest,
     HealthCheck,
@@ -431,6 +433,41 @@ class LocalRunService:
             resumable=True,
         )
 
+    def _browser_ui(
+        self, record: dict[str, object], hitl: HitlRequestView | None
+    ) -> BrowserUiState:
+        """Project explicit browser permissions from backend-owned facts only."""
+
+        run_id = str(record.get("run_id") or "")
+        try:
+            events = self._service.get_timeline(run_id)
+        except Exception:
+            # A timeline read failure must not fabricate progress: with no trusted
+            # events, nothing is verified and every mutation stays disabled.
+            events = []
+        event_types = {str(event.get("event_type")) for event in events}
+        run_status = str(record.get("status") or "")
+        session_id = record.get("browser_session_id")
+        session_id = session_id if isinstance(session_id, str) and session_id else None
+        # Rule 8: ask the worker whether a real frame exists, and only when a live
+        # session could plausibly have one.
+        screenshot_present = False
+        if session_id is not None and run_status in {"browser_running", "waiting_for_hitl"}:
+            try:
+                screenshot_present = self._service.get_browser_screenshot(run_id) is not None
+            except Exception:
+                screenshot_present = False
+        return project_browser_ui(
+            settings=self._settings,
+            run_status=run_status,
+            event_types=event_types,
+            browser_session_id=session_id,
+            hitl=hitl,
+            screenshot_present=screenshot_present,
+            session_lost=session_lost_recorded(events),
+            plan_only=str(record.get("execution_mode") or "") == "local_dry_run",
+        )
+
     def _detail(self, summary: RunSummary) -> RunDetailResponse:
         research = self._service.get_research(summary.run_id)
         record = self._service.storage.get_run(summary.run_id)
@@ -439,6 +476,7 @@ class LocalRunService:
         owner_only = self._storage_permissions_are_owner_only()
         route_reason_code = record.get("route_reason_code")
         route_explanation = record.get("route_explanation")
+        hitl_view = self._hitl_view(record)
         return RunDetailResponse(
             run=summary,
             research=research,
@@ -479,7 +517,8 @@ class LocalRunService:
             ),
             missing_fields=[str(item) for item in record.get("missing_fields", [])],
             provider_states=self._provider_states(),
-            hitl_request=self._hitl_view(record),
+            hitl_request=hitl_view,
+            browser=self._browser_ui(record, hitl_view),
         )
 
     def _create_sync(

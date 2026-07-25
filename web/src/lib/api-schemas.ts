@@ -50,6 +50,16 @@ const runStatus = z.enum([
   "failed",
   "completed",
 ])
+// The wired browser backend and the view it can offer. Declared here because both
+// the run-detail projection (BrowserUiState) and the live-view response use them.
+export const browserProviderSchema = z.enum(["browser_use", "playwright"])
+export const liveViewModeSchema = z.enum([
+  "hosted_url",
+  "screenshot",
+  "interactive_remote",
+  "unavailable",
+])
+
 const vaultReference = z
   .string()
   .min(12)
@@ -182,6 +192,38 @@ const providerStatus = z.strictObject({
   detail: boundedText(500),
 })
 
+// Backend-authoritative browser capabilities (api/models.py::BrowserUiState).
+// The interface renders these decisions; it never infers them from run.status.
+export const browserLifecycleSchema = z.enum([
+  "not_started",
+  "running",
+  "waiting_for_hitl",
+  "credential_page_ready",
+  "failed",
+  "session_lost",
+  "unavailable",
+])
+
+export const browserUiStateSchema = z.strictObject({
+  provider: browserProviderSchema,
+  lifecycle: browserLifecycleSchema,
+  live_view_mode: liveViewModeSchema,
+  live_view_available: z.boolean().default(false),
+  interaction_available: z.boolean().default(false),
+  screenshot_available: z.boolean().default(false),
+  credential_page_verified: z.boolean().default(false),
+  can_submit_login: z.boolean().default(false),
+  can_submit_otp: z.boolean().default(false),
+  can_resume: z.boolean().default(false),
+  can_submit_credential: z.boolean().default(false),
+  reason_code: z
+    .string()
+    .max(64)
+    .regex(/^[a-z0-9][a-z0-9_:-]{0,63}$/)
+    .nullish()
+    .default(null),
+})
+
 export const runDetailResponseSchema = z.strictObject({
   run: runSummarySchema,
   research: operationalResearchSchema.nullable(),
@@ -191,6 +233,8 @@ export const runDetailResponseSchema = z.strictObject({
   hitl_request: hitlRequest.nullish(),
   missing_fields: z.array(boundedText(120)).max(100).optional(),
   provider_states: z.array(providerStatus).max(30).optional(),
+  // Optional so an older backend still parses; always sent by this API.
+  browser: browserUiStateSchema.nullish().default(null),
 })
 
 export const runListResponseSchema = z.strictObject({
@@ -295,14 +339,6 @@ const liveViewUrl = z
       return false
     }
   })
-
-export const browserProviderSchema = z.enum(["browser_use", "playwright"])
-export const liveViewModeSchema = z.enum([
-  "hosted_url",
-  "screenshot",
-  "interactive_remote",
-  "unavailable",
-])
 
 // A bounded, same-origin RELATIVE viewer path (api/models.py::RelativeViewerPath).
 // Deliberately NOT a URL: an absolute address — including the private

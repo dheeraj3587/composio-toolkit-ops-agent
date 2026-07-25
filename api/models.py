@@ -271,6 +271,49 @@ class RunSummary(StrictApiModel):
     external_actions: bool
 
 
+# The browser session's observable lifecycle, as the backend actually recorded it.
+BrowserLifecycle = Literal[
+    "not_started",
+    "running",
+    "waiting_for_hitl",
+    "credential_page_ready",
+    "failed",
+    "session_lost",
+    "unavailable",
+]
+
+
+class BrowserUiState(StrictApiModel):
+    """Backend-authoritative browser capabilities for one run.
+
+    The interface must not infer what it may do from ``run.status``: whether a
+    credential can be submitted, whether a resume is legal, and whether the view is
+    interactive all depend on provider capability, trusted recorded events, and
+    policy opt-ins that only the backend can see. Every boolean here is a decision,
+    not a hint, and each one is false unless the backend can prove otherwise.
+    """
+
+    provider: BrowserProvider
+    lifecycle: BrowserLifecycle
+    live_view_mode: LiveViewMode
+
+    # Viewing capabilities.
+    live_view_available: bool = False
+    interaction_available: bool = False
+    screenshot_available: bool = False
+
+    # Trusted progress: set only by a recorded credential_page_ready event.
+    credential_page_verified: bool = False
+
+    # Mutation capabilities. Each requires the matching backend surface to exist.
+    can_submit_login: bool = False
+    can_submit_otp: bool = False
+    can_resume: bool = False
+    can_submit_credential: bool = False
+
+    reason_code: ReasonCode | None = None
+
+
 class RunDetailResponse(StrictApiModel):
     run: RunSummary
     research: OperationalResearch | None
@@ -280,6 +323,9 @@ class RunDetailResponse(StrictApiModel):
     missing_fields: list[str] = Field(default_factory=list)
     provider_states: list[ProviderState] = Field(default_factory=list)
     hitl_request: HitlRequestView | None = None
+    # Explicit browser permissions. Optional for contract compatibility with
+    # existing clients, but always populated by this API.
+    browser: BrowserUiState | None = None
 
 
 class RunListResponse(StrictApiModel):

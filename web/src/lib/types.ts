@@ -147,6 +147,36 @@ export interface RouteDecision {
   is_final?: boolean
 }
 
+/** The browser session lifecycle as the backend recorded it. */
+export type BrowserLifecycle =
+  | "not_started"
+  | "running"
+  | "waiting_for_hitl"
+  | "credential_page_ready"
+  | "failed"
+  | "session_lost"
+  | "unavailable"
+
+/**
+ * Backend-authoritative browser capabilities for one run
+ * (api/models.py::BrowserUiState). Each boolean is a backend decision: the
+ * interface must render these rather than infer permissions from `run.status`.
+ */
+export interface BrowserUiState {
+  provider: BrowserProvider
+  lifecycle: BrowserLifecycle
+  live_view_mode: LiveViewMode
+  live_view_available: boolean
+  interaction_available: boolean
+  screenshot_available: boolean
+  credential_page_verified: boolean
+  can_submit_login: boolean
+  can_submit_otp: boolean
+  can_resume: boolean
+  can_submit_credential: boolean
+  reason_code?: string | null
+}
+
 export interface RunDetailResponse {
   run: RunSummary
   research: OperationalResearch | null
@@ -156,6 +186,7 @@ export interface RunDetailResponse {
   hitl_request?: HitlRequest | null
   missing_fields?: string[]
   provider_states?: ProviderStatus[]
+  browser?: BrowserUiState | null
 }
 
 export interface TimelineItem {
