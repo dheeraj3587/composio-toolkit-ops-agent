@@ -373,8 +373,15 @@ failure. The zero-skip assertion is a separate, explicit check on the JUnit XML,
 because a future `skipif` could otherwise hollow the gate out while it still
 reported green.
 
-> **Make `browser-image` a required status check on the protected branch.** Until it
-> is, it runs but does not gate merges.
+> **`browser-image.yml` is committed locally but is NOT on the remote.** The
+> integration used to push this branch lacks the GitHub Actions `workflows`
+> permission, so `PUT .github/workflows/browser-image.yml` returns
+> `403 Resource not accessible by integration`. The file must be added by someone
+> with that permission (`git push` from a normal credential is enough).
+>
+> **Then make `browser-image` a required status check on the protected branch.**
+> Until both of those happen, **there is no browser-image CI gate on this
+> repository** — the job is written and locally verified, not running.
 
 ---
 
@@ -474,8 +481,11 @@ Stated plainly, because the value of this document depends on it.
    run is a follow-up.
 7. **No metrics backend.** `BrowserRunMetrics` computes the numbers and
    `emit_snapshot()` logs them; nothing scrapes or stores them yet.
-8. **`browser-image` is not yet a required status check.** That is a repository
-   setting, not something this branch can set.
+8. **The `browser-image` workflow is not on the remote and is not a required
+   check.** The pushing integration lacks the Actions `workflows` permission
+   (`403 Resource not accessible by integration`), so the file exists in local
+   history only. Someone with that permission must push it, and then mark the job
+   required in branch protection. Until then the gate does not run at all.
 9. **Chromium's own sandbox is disabled in CI** (`PLAYWRIGHT_DISABLE_SANDBOX=true`)
    because the runner cannot support it. The image keeps it **enabled** by default.
 
