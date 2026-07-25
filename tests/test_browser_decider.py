@@ -15,6 +15,7 @@ from ops.browser_api_trace_catalog import BrowserApiTraceStep
 from ops.browser_decider import (
     MAX_ELEMENTS,
     BrowserAction,
+    SnapshotElement,
     action_schema,
     build_decision_prompt,
     build_snapshot,
@@ -95,9 +96,24 @@ def test_match_checkpoint_declines_when_absent() -> None:
 
 
 # --- bounded action validation --------------------------------------------------
-def _validate(payload: dict, *, count: int = 3) -> BrowserAction:
+def _elements(count: int = 3, *, secret_index: int | None = None) -> tuple[SnapshotElement, ...]:
+    raw: list[dict[str, object]] = []
+    for index in range(count):
+        if secret_index is not None and index == secret_index:
+            raw.append({"tag": "input", "type": "password", "name": "Password"})
+        else:
+            raw.append({"tag": "button", "name": f"Control {index}"})
+    return build_snapshot(raw)
+
+
+def _validate(payload: dict, *, count: int = 3, secret_index: int | None = None) -> BrowserAction:
+    # validate_action now receives the ACTUAL elements so it can refuse typing into
+    # a credential-bearing field, not just range-check an index.
     return validate_action(
-        payload, element_count=count, allowed_hosts=_HOSTS, host_check=is_allowed_browser_url
+        payload,
+        elements=_elements(count, secret_index=secret_index),
+        allowed_hosts=_HOSTS,
+        host_check=is_allowed_browser_url,
     )
 
 
@@ -151,6 +167,45 @@ def test_validate_requires_text_for_type_and_press() -> None:
         _validate({"kind": "type", "index": 0, "text": None, "url": None, "reason": ""})
     with pytest.raises(ValueError):
         _validate({"kind": "press", "index": None, "text": None, "url": None, "reason": ""})
+
+
+def test_validate_rejects_model_typing_into_a_secret_field() -> None:
+    # Only code-owned injection may fill a credential field; a model must never.
+    with pytest.raises(ValueError, match="secret field"):
+        _validate(
+            {"kind": "type", "index": 1, "text": "hunter2", "url": None, "reason": ""},
+            secret_index=1,
+        )
+
+
+def test_validate_allows_typing_into_a_normal_field() -> None:
+    action = _validate({"kind": "type", "index": 0, "text": "acme", "url": None, "reason": ""})
+    assert action.kind == "type"
+
+
+@pytest.mark.parametrize("key", ["Enter", "Escape", "Tab", "ArrowDown"])
+def test_validate_accepts_reviewed_press_keys(key: str) -> None:
+    action = _validate({"kind": "press", "index": None, "text": key, "url": None, "reason": ""})
+    assert action.text == key
+
+
+@pytest.mark.parametrize("key", ["F12", "Control+P", "Meta+Shift+J", "a"])
+def test_validate_rejects_unreviewed_press_keys(key: str) -> None:
+    with pytest.raises(ValueError, match="reviewed allowlist"):
+        _validate({"kind": "press", "index": None, "text": key, "url": None, "reason": ""})
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://app.pipedrive.com/settings/api",  # not https
+        "https://user:pw@app.pipedrive.com/settings/api",  # embedded credentials
+        "https://app.pipedrive.com/settings/api#tok",  # fragment
+    ],
+)
+def test_validate_rejects_unsafe_goto_urls(url: str) -> None:
+    with pytest.raises(ValueError):
+        _validate({"kind": "goto", "index": None, "text": None, "url": url, "reason": ""})
 
 
 def test_report_actions_need_no_index() -> None:

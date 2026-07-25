@@ -111,6 +111,9 @@ def test_exact_requested_routes_are_registered(harness: ApiHarness) -> None:
         ("/api/runs/{run_id}/credentials", "POST"),
         ("/api/runs/{run_id}/credentials/reveal", "POST"),
         ("/api/runs/{run_id}/live-view", "GET"),
+        # Backward-compatible addition: masked PNG frames for the self-hosted
+        # Playwright live view (Browser Use keeps using live-view's hosted URL).
+        ("/api/runs/{run_id}/live-view/screenshot", "GET"),
         ("/api/runs/{run_id}/poll-email", "POST"),
         ("/api/runs/{run_id}/retry", "POST"),
         ("/api/runs/{run_id}/output", "GET"),

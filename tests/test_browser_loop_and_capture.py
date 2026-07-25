@@ -120,10 +120,40 @@ def test_capture_returns_none_without_spec_or_store() -> None:
     assert asyncio.run(worker.auto_capture_credentials("missing", "no-such-app")) is None
 
 
-def test_live_capture_reads_token_by_pattern_and_vaults_reference() -> None:
-    """Pipedrive's spec expects a 40-hex token; serve one locally and capture it."""
+_TOKEN = "a" * 40
 
-    token = "a" * 40
+
+def _serve_pipedrive(worker: PlaywrightBrowserWorker, handle: str, body: str) -> None:
+    """Route the allowlisted Pipedrive host to controlled HTML (no real vendor)."""
+
+    session = worker._sessions[handle]
+    session.patterns = ("app.pipedrive.com", "*.pipedrive.com")
+
+    async def _stub() -> None:
+        async def _handler(route: object) -> None:
+            await route.fulfill(  # type: ignore[attr-defined]
+                status=200, content_type="text/html", body=body
+            )
+
+        await session.context.route("https://app.pipedrive.com/**", _handler)
+
+    asyncio.run(worker._loop.run(_stub()))
+
+
+def _credential_page(token: str = _TOKEN) -> str:
+    # Satisfies the reviewed spec: expected heading "API" plus the reviewed
+    # input[name='api_token'] selector. A decoy input must NOT be chosen.
+    return (
+        "<html><body><h1>API</h1>"
+        "<input name='unrelated' value='not-a-token'>"
+        f"<input name='api_token' readonly value='{token}'>"
+        "</body></html>"
+    )
+
+
+def test_live_capture_uses_reviewed_selector_and_vaults_reference() -> None:
+    """The reviewed selector + heading + path prefix must all be satisfied."""
+
     worker = _worker()
     store = _FakeStore()
     try:
@@ -131,27 +161,53 @@ def test_live_capture_reads_token_by_pattern_and_vaults_reference() -> None:
     except Exception as exc:
         pytest.skip(f"Chromium not launchable: {type(exc).__name__}")
 
-    session = worker._sessions[context.session_id]
-    session.patterns = ("app.pipedrive.com", "*.pipedrive.com")
-
-    # Serve the spec URL locally: route the allowlisted host to controlled HTML so
-    # the capture path is exercised end to end without touching the real vendor.
-    async def _stub() -> None:
-        async def _handler(route: object) -> None:
-            await route.fulfill(  # type: ignore[attr-defined]
-                status=200,
-                content_type="text/html",
-                body=f"<html><body><input value='not-a-token'>"
-                f"<input value='{token}'></body></html>",
-            )
-
-        await session.context.route("https://app.pipedrive.com/**", _handler)
-
-    asyncio.run(worker._loop.run(_stub()))
-
+    _serve_pipedrive(worker, context.session_id, _credential_page())
     refs = asyncio.run(worker.auto_capture_credentials(context.session_id, "pipedrive", store))
     asyncio.run(worker.stop(context))
 
     assert refs == {"api_token": "vault://pipedrive/api_token/ref1"}
-    # The raw value went ONLY to the vault, and the pattern picked the right input.
-    assert store.puts == [("pipedrive", "api_token", token)]
+    # The raw value went ONLY to the vault, and the decoy input was not chosen.
+    assert store.puts == [("pipedrive", "api_token", _TOKEN)]
+
+
+def test_live_capture_fails_when_expected_heading_is_absent() -> None:
+    """Wrong page (no reviewed heading) must capture nothing, even with a token."""
+
+    worker = _worker()
+    store = _FakeStore()
+    try:
+        context = asyncio.run(worker.start(None))
+    except Exception as exc:
+        pytest.skip(f"Chromium not launchable: {type(exc).__name__}")
+
+    _serve_pipedrive(
+        worker,
+        context.session_id,
+        f"<html><body><h1>Billing</h1><input name='api_token' value='{_TOKEN}'></body></html>",
+    )
+    refs = asyncio.run(worker.auto_capture_credentials(context.session_id, "pipedrive", store))
+    asyncio.run(worker.stop(context))
+
+    assert refs is None and store.puts == []
+
+
+def test_live_capture_rejects_a_partial_pattern_match() -> None:
+    """fullmatch: a 40-hex substring inside a longer value is not the token."""
+
+    worker = _worker()
+    store = _FakeStore()
+    try:
+        context = asyncio.run(worker.start(None))
+    except Exception as exc:
+        pytest.skip(f"Chromium not launchable: {type(exc).__name__}")
+
+    _serve_pipedrive(
+        worker,
+        context.session_id,
+        f"<html><body><h1>API</h1><input name='api_token' value='prefix-{_TOKEN}-suffix'>"
+        "</body></html>",
+    )
+    refs = asyncio.run(worker.auto_capture_credentials(context.session_id, "pipedrive", store))
+    asyncio.run(worker.stop(context))
+
+    assert refs is None and store.puts == []

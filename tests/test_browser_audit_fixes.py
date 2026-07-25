@@ -80,11 +80,64 @@ def test_matched_success_signals_can_match_via_url_or_title() -> None:
     )
 
 
-def test_worker_submits_login_not_just_fills() -> None:
-    source = (_REPO / "ops" / "playwright_worker.py").read_text(encoding="utf-8")
-    # A fill alone never advances a login flow; the submit helper must be invoked.
-    assert "async def _submit_login" in source
-    assert "await _submit_login(session.page)" in source
+def test_submit_login_clicks_a_submit_control() -> None:
+    """Behavioral: _submit_login must actually click/press, not just exist."""
+
+    from ops.playwright_worker import _submit_login
+
+    clicked: list[str] = []
+
+    class _Locator:
+        def __init__(self, selector: str, count: int) -> None:
+            self._selector = selector
+            self._count = count
+            self.first = self
+
+        async def count(self) -> int:
+            return self._count
+
+        async def click(self, timeout: int = 0) -> None:
+            clicked.append(self._selector)
+
+        async def press(self, key: str, timeout: int = 0) -> None:
+            clicked.append(f"press:{key}")
+
+    class _Page:
+        def locator(self, selector: str) -> _Locator:
+            # Only the standard submit button exists on this page.
+            return _Locator(selector, 1 if selector == "button[type='submit']" else 0)
+
+        async def wait_for_load_state(self, state: str, timeout: int = 0) -> None:
+            clicked.append(f"wait:{state}")
+
+    assert asyncio.run(_submit_login(_Page())) is True
+    assert "button[type='submit']" in clicked
+
+
+def test_submit_login_falls_back_to_pressing_enter() -> None:
+    from ops.playwright_worker import _submit_login
+
+    pressed: list[str] = []
+
+    class _Locator:
+        def __init__(self) -> None:
+            self.first = self
+
+        async def count(self) -> int:
+            return 0  # no submit control anywhere
+
+        async def press(self, key: str, timeout: int = 0) -> None:
+            pressed.append(key)
+
+    class _Page:
+        def locator(self, selector: str) -> _Locator:
+            return _Locator()
+
+        async def wait_for_load_state(self, state: str, timeout: int = 0) -> None:
+            return None
+
+    assert asyncio.run(_submit_login(_Page())) is True
+    assert pressed == ["Enter"]
 
 
 # --- A3: live_url exists so the live-view lookup cannot 500 --------------------
@@ -192,8 +245,8 @@ def test_browser_loop_run_enforces_timeout() -> None:
 def test_session_has_its_own_operation_lock() -> None:
     from ops.playwright_worker import _PwSession
 
-    first = _PwSession(None, None, None, None)
-    second = _PwSession(None, None, None, None)
+    first = _PwSession(None, None, None, None, asyncio.Lock())
+    second = _PwSession(None, None, None, None, asyncio.Lock())
     assert first.operation_lock is not second.operation_lock
 
 
@@ -202,7 +255,7 @@ def test_session_expiry_is_tracked() -> None:
 
     from ops.playwright_worker import _PwSession
 
-    session = _PwSession(None, None, None, None)
+    session = _PwSession(None, None, None, None, asyncio.Lock())
     now = datetime.now(UTC)
     assert session.is_expired(now) is False
     assert session.is_expired(now + timedelta(hours=5)) is True  # max lifetime
