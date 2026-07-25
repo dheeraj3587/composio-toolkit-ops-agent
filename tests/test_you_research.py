@@ -1,9 +1,9 @@
-"""Tests for the You.com research/discovery/content-fetch integration (SDK 2.5.0).
+"""Tests for the You.com research/discovery/content-fetch integration (SDK 2.4.0).
 
 Offline-safe: the real You.com network is never called. SDK-level tests use a
 ``FakeYou`` context-manager double that records calls and asserts the client is
 closed. A separate ``TestSdkContract`` asserts the REAL installed
-``youdotcom==2.5.0`` still exposes the surface this module depends on, so a
+``youdotcom==2.4.0`` still exposes the surface this module depends on, so a
 future SDK upgrade fails loudly instead of silently.
 """
 
@@ -199,7 +199,7 @@ def _install_fake_you(monkeypatch: pytest.MonkeyPatch, configure: object = None)
 # SDK contract. The pin in requirements-providers.txt is the single source of
 # truth; these tests never call the You.com API.
 # ===========================================================================
-_PINNED_YOUDOTCOM_VERSION = "2.5.0"
+_PINNED_YOUDOTCOM_VERSION = "2.4.0"
 
 
 def _pinned_youdotcom_version() -> str:

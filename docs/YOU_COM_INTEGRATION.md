@@ -42,7 +42,7 @@ additional backward-compatible optional fields (`login_url`,
 `operational_url_claims`), so serialized payloads may contain additional null or
 empty fields.
 
-## SDK: pinned and verified (`youdotcom==2.5.0`)
+## SDK: pinned and verified (`youdotcom==2.4.0`)
 
 Pinned in `requirements-providers.txt`. The relevant surface was verified by
 installing the package and inspecting real signatures (`tests/test_you_research.py::TestSdkContract`
@@ -61,7 +61,7 @@ asserts these and fails loudly on a future upgrade):
 
 > Historical note: releases **before 2.4.0** (e.g. 2.2.0/2.3.0) did NOT expose
 > `include_domains`, `max_age`, or Research `source_control`/`output_schema`.
-> 2.5.0 is the pinned baseline precisely because it does.
+> 2.4.0 is the pinned baseline precisely because it does.
 
 ## Exact vs. wildcard host semantics
 
@@ -221,7 +221,7 @@ full Markdown, provider body, credential, cookie, or vault value.
 
 ## Testing
 
-* `tests/test_you_research.py` — SDK contract (2.5.0), host policy (exact vs.
+* `tests/test_you_research.py` — SDK contract (2.4.0), host policy (exact vs.
   wildcard, sensitive query, private-DNS), config, ranking/coverage, Search,
   composite, Contents, error mapping, Research fallback, missing fields,
   operational-URL claims, enricher flow, persistent cache (persistence,
