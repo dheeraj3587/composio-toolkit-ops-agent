@@ -38,15 +38,23 @@ from ops.browser_api_trace_catalog import (
     BrowserApiTraceStep,
     get_browser_api_trace,
 )
+from ops.browser_candidates import (
+    ActionCandidate,
+    executable_candidates,
+    generate_candidates,
+    render_candidates,
+    select_candidate,
+    validate_press_key,
+)
 from ops.browser_decider import (
     MAX_ELEMENTS,
-    BrowserAction,
     SnapshotElement,
-    action_schema,
-    build_decision_prompt,
+    build_choice_prompt,
     build_snapshot,
+    candidate_choice_schema,
     match_checkpoint,
-    validate_action,
+    render_snapshot,
+    validate_choice,
 )
 from ops.browser_host_policy import BrowserPolicyInactiveError, build_browser_allowed_hosts
 from ops.browser_loop import BrowserLoop, BrowserOperationTimeout, shared_browser_loop
@@ -61,6 +69,14 @@ from ops.browser_worker import (
 from ops.config import Settings
 from ops.credential_capture_specs import get_capture_spec
 from ops.inference import build_json_inference
+from ops.model_input_dlp import (
+    DROPPED,
+    contains_secret_material,
+    sanitize_element_name,
+    sanitize_page_text,
+    sanitize_reason,
+    sanitize_url,
+)
 from ops.models import OperationalResearch, validate_vault_reference
 from ops.provider_errors import ConfigurationRequiredError, ProviderOperationError
 from ops.secret_store import SecretStore
@@ -77,6 +93,8 @@ _MAX_AGENT_STEPS = 20
 _MAX_AGENT_SECONDS = 180.0
 _MAX_REPEATED_STATE = 3
 _MAX_MODEL_FAILURES = 2
+# Trace schema version carried on every candidate (item 4 groundwork).
+_TRACE_VERSION = "2.0"
 
 # Only these keyboard keys may be pressed by a model decision.
 _ALLOWED_PRESS_KEYS = frozenset(
@@ -131,16 +149,27 @@ _ACTIVE_RESOURCE_TYPES = frozenset(
 _PASSIVE_RESOURCE_TYPES = frozenset({"image", "font", "stylesheet", "media"})
 
 
-def make_route_handler(patterns: tuple[str, ...]) -> Any:
-    """Build a Playwright route handler enforcing a two-tier egress policy.
+def make_route_handler(
+    patterns: tuple[str, ...],
+    *,
+    stage_provider: Any = None,
+    asset_hosts: tuple[str, ...] = (),
+) -> Any:
+    """Build a Playwright route handler enforcing STAGED egress (item 6).
 
-    * ACTIVE requests (document navigations, fetch/XHR, websockets, event streams,
-      form posts, scripts) are ABORTED when the target host is off-allowlist — this
-      is the exfiltration boundary, not just a navigation guard.
-    * PASSIVE render-only assets (images, fonts, stylesheets, media) are allowed
-      off-allowlist so real vendor pages still render.
+    Stage ``pre_auth`` — reviewed vendor hosts plus reviewed passive asset hosts may
+    serve render-only resources (image/font/stylesheet/media); every ACTIVE request
+    kind (document, fetch/XHR, WebSocket, EventSource, script, unknown) must be on
+    the vendor allowlist.
 
-    Unknown resource types fail CLOSED (treated as active).
+    Stage ``post_auth`` — once credentials have been injected or a credential-bearing
+    page is reached, EVERY off-allowlist request is aborted regardless of kind,
+    including images, fonts, stylesheets and media. That closes the pixel/CSS/font
+    beacon channels a compromised page could use to exfiltrate a credential.
+
+    ``stage_provider`` is a zero-arg callable returning the current stage, so one
+    installed route reflects later tightening. Unknown kinds fail CLOSED, and a
+    stage_provider error is treated as post_auth (the stricter stage).
     """
 
     async def _handler(route: Any) -> None:
@@ -151,11 +180,25 @@ def make_route_handler(patterns: tuple[str, ...]) -> Any:
         except Exception:
             await route.abort()
             return
+
         if navigation_allowed(url, patterns):
             await route.continue_()
             return
-        # Off-allowlist: allow only passive, render-only assets.
-        if resource_type in _PASSIVE_RESOURCE_TYPES:
+
+        stage = "pre_auth"
+        if callable(stage_provider):
+            try:
+                stage = str(stage_provider() or "pre_auth")
+            except Exception:
+                stage = "post_auth"  # fail closed
+        if stage != "pre_auth":
+            # Authenticated / credential-bearing: nothing off-allowlist may leave.
+            await route.abort()
+            return
+
+        if resource_type in _PASSIVE_RESOURCE_TYPES and (
+            not asset_hosts or is_allowed_browser_url(url, asset_hosts)
+        ):
             await route.continue_()
             return
         await route.abort()
@@ -175,7 +218,22 @@ class _PwSession:
     operation_lock: asyncio.Lock
     patterns: tuple[str, ...] = ()
     app_slug: str = ""
+    # Confirmed vs attempted checkpoint state: `checkpoint_index` advances ONLY
+    # after a verified postcondition, so a failed action cannot skip a checkpoint.
     checkpoint_index: int = 0
+    attempted_checkpoint_index: int = 0
+    # Monotonic DOM generation: every inspection gets one, and an execution that
+    # planned against an older generation must re-resolve or replan.
+    dom_generation: int = 0
+    # Egress stage: tightened permanently once credentials are injected or a
+    # credential-bearing page is reached (item 6).
+    egress_stage: str = "pre_auth"
+    # Once a credential-bearing state is seen, screenshots are disabled for the
+    # rest of the session unless a reviewed safe state is re-established (item 5).
+    screenshots_disabled: bool = False
+    # Lifecycle state + in-flight operation count (item 7).
+    lifecycle: str = "ACTIVE"
+    active_operations: int = 0
     # Latest masked screenshot (PNG bytes) for the HITL live view.
     screenshot: bytes | None = field(default=None)
     screenshot_at: str | None = field(default=None)
@@ -203,6 +261,8 @@ class PageInspection:
     elements: tuple[SnapshotElement, ...]
     locators: tuple[Any, ...]
     fingerprint: str
+    # Monotonic DOM generation this inspection was taken at (item 3).
+    generation: int = 0
 
 
 class PlaywrightBrowserWorker:
@@ -409,8 +469,12 @@ class PlaywrightBrowserWorker:
             return _blocked(target or "https://unknown.invalid/")
 
         async def _go() -> bool:
-            # REAL enforcement: install the host guard before any navigation.
-            await session.context.route("**/*", make_route_handler(patterns))
+            # REAL enforcement: install the STAGED host guard before any navigation.
+            # The stage is read live, so post-auth tightening applies to this route.
+            await session.context.route(
+                "**/*",
+                make_route_handler(patterns, stage_provider=lambda: session.egress_stage),
+            )
             try:
                 await session.page.goto(
                     target, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
@@ -486,8 +550,9 @@ class PlaywrightBrowserWorker:
             inspection = await self._inspect_page(session)
             if not navigation_allowed(inspection.url, session.patterns):
                 return _blocked(inspection.url)
-            await self.refresh_live_view(session)
 
+            # Item 5: sensitive-page and success detection happen BEFORE any capture,
+            # so a credential page is never screenshotted "just once" first.
             success = matched_success_signals(
                 trace.success_signals,
                 url=inspection.url,
@@ -495,16 +560,28 @@ class PlaywrightBrowserWorker:
                 text=inspection.visible_text,
             )
             if success:
+                session.egress_stage = "post_auth"
+                session.screenshots_disabled = True
+                session.screenshot = None
+                session.screenshot_at = None
                 return BrowserObservation(
                     status="credential_page_ready",
                     current_url=inspection.url,
                     page_title=inspection.title or "Credential page",
                     non_secret_notes=(f"Verified success signal: {success[0]}"[:1_000],),
                 )
+            if _looks_credential_bearing(inspection):
+                # Not a reviewed success, but credential-shaped: suppress capture.
+                session.screenshots_disabled = True
+                session.screenshot = None
+                session.screenshot_at = None
 
             gate = detect_human_gate(inspection)
             if gate is not None:
                 return gate
+
+            # Only now, on a page proven non-sensitive, refresh the live view.
+            await self.refresh_live_view(session)
 
             repeated[inspection.fingerprint] = repeated.get(inspection.fingerprint, 0) + 1
             if repeated[inspection.fingerprint] > _MAX_REPEATED_STATE:
@@ -518,27 +595,45 @@ class PlaywrightBrowserWorker:
                 if checkpoint is not None
                 else None
             )
-            if deterministic is not None:
-                action = BrowserAction(
-                    kind="click",
-                    index=deterministic.index,
-                    text=None,
-                    url=None,
-                    reason="Unique reviewed checkpoint match.",
-                )
-                session.checkpoint_index += 1
-            elif self._inference is None:
+            if checkpoint is None:
+                return self._human_required(session, "The reviewed navigation trace is exhausted.")
+
+            # Policy generates the bounded candidate set; the model only chooses.
+            candidates = generate_candidates(
+                elements=inspection.elements,
+                checkpoint_signals=checkpoint.expected_signals,
+                checkpoint_order=checkpoint.order,
+                trace_version=_TRACE_VERSION,
+                expected_postcondition=f"checkpoint_{checkpoint.order}_complete",
+                reviewed_goto_urls=(trace.start_url,),
+            )
+            if not executable_candidates(candidates):
+                # Every option needs a human (e.g. only irreversible controls exist).
                 return self._human_required(
-                    session, "The deterministic navigation path is ambiguous."
+                    session, "Only actions requiring human authorization are available."
                 )
-            else:
+
+            chosen: ActionCandidate | None = None
+            if deterministic is not None:
+                # Deterministic path: prefer the policy candidate whose identity is
+                # the unique checkpoint match, so even this path is policy-bounded.
+                for candidate in executable_candidates(candidates):
+                    if candidate.identity is not None and candidate.identity.matches(deterministic):
+                        chosen = candidate
+                        break
+            if chosen is None:
+                if self._inference is None:
+                    return self._human_required(
+                        session, "The deterministic navigation path is ambiguous."
+                    )
                 try:
-                    action = await self._decide_action(
+                    outcome = await self._choose_candidate(
                         session=session,
                         research=research,
                         trace=trace,
                         checkpoint=checkpoint,
                         inspection=inspection,
+                        candidates=candidates,
                     )
                 except Exception:
                     model_failures += 1
@@ -548,10 +643,16 @@ class PlaywrightBrowserWorker:
                             "The browser decision service could not choose a safe action.",
                         )
                     continue
+                if isinstance(outcome, BrowserObservation):
+                    return outcome
+                chosen = outcome
 
-            result = await self._execute_action(session, action, inspection, trace)
+            attempted = session.checkpoint_index
+            result = await self._execute_candidate(session, chosen, inspection)
             if result is not None:
                 return result
+            # Checkpoint state advances ONLY after a verified postcondition below.
+            session.attempted_checkpoint_index = attempted + 1
 
         return self._human_required(session, "The bounded browser action limit was reached.")
 
@@ -564,10 +665,16 @@ class PlaywrightBrowserWorker:
                 page = session.page
                 url = _page_url(page)
                 try:
-                    title = await page.title()
+                    raw_title = await page.title()
                 except Exception:
-                    title = ""
-                visible = await _visible_text(page)
+                    raw_title = ""
+                raw_visible = await _visible_text(page)
+                # DLP boundary: every page-derived value is sanitized HERE, at the
+                # single source, so nothing downstream can leak it to a model.
+                title = sanitize_page_text(
+                    raw_title if isinstance(raw_title, str) else "", max_length=300
+                )
+                visible = sanitize_page_text(raw_visible)
                 raw: list[dict[str, object]] = []
                 locators: list[Any] = []
                 try:
@@ -580,109 +687,122 @@ class PlaywrightBrowserWorker:
                     raw.append(await _describe_element(locator))
                     locators.append(locator)
                 elements = build_snapshot(raw)
+                session.dom_generation += 1
                 return PageInspection(
-                    url=sanitize_browser_url(url),
-                    title=(title if isinstance(title, str) else "")[:500],
+                    url=sanitize_url(url),
+                    title=title[:500],
                     visible_text=visible,
                     elements=elements,
                     locators=tuple(locators),
                     fingerprint=_fingerprint(url, elements),
+                    generation=session.dom_generation,
                 )
 
         return await self._loop.run(_locked(), timeout=_OP_TIMEOUT_SECONDS)
 
-    async def _decide_action(
+    async def _choose_candidate(
         self,
         *,
         session: _PwSession,
         research: OperationalResearch,
         trace: BrowserApiTrace,
-        checkpoint: BrowserApiTraceStep | None,
+        checkpoint: BrowserApiTraceStep,
         inspection: PageInspection,
-    ) -> BrowserAction:
-        """Ask the bounded inference chain for ONE validated action."""
+        candidates: Sequence[ActionCandidate],
+    ) -> ActionCandidate | BrowserObservation:
+        """Ask the inference chain to CHOOSE one policy candidate.
+
+        The model receives only DLP-sanitized page text and a list of opaque
+        candidate ids; it cannot author a selector, URL, or value. The prompt is
+        asserted secret-free before it leaves the process, and is never logged or
+        persisted.
+        """
 
         if self._inference is None:  # pragma: no cover - guarded by the caller
             raise RuntimeError("no inference backend is configured")
-        prompt = build_decision_prompt(
+        options = executable_candidates(candidates)
+        if not options:
+            return self._human_required(session, "No approved action is available on this page.")
+        ids = [candidate.candidate_id for candidate in options]
+        prompt = build_choice_prompt(
             app_name=research.app_name,
-            credential_goal=trace.credential_goal,
-            checkpoint=checkpoint,
-            current_url=inspection.url,
+            credential_goal=sanitize_reason(trace.credential_goal),
+            checkpoint_instruction=sanitize_reason(checkpoint.instruction),
+            checkpoint_signals=[sanitize_reason(s) for s in checkpoint.expected_signals],
+            current_url=inspection.url,  # already sanitized by _inspect_page
             page_title=inspection.title,
-            elements=inspection.elements,
-            allowed_hosts=session.patterns,
+            rendered_candidates=render_candidates(options),
+            rendered_page=render_snapshot(inspection.elements),
         )
+        # Last-line DLP assertion: refuse to send anything that still looks like it
+        # carries credential material, rather than trusting upstream sanitization.
+        if contains_secret_material(prompt):
+            return self._human_required(
+                session, "The page could not be summarized safely for a decision."
+            )
         result = await asyncio.to_thread(
             self._inference.generate,
             prompt,
-            schema=action_schema(),
-            validate=lambda payload: validate_action(
-                payload,
-                elements=inspection.elements,
-                allowed_hosts=session.patterns,
-                host_check=is_allowed_browser_url,
-            ),
+            schema=candidate_choice_schema(ids),
+            validate=lambda payload: validate_choice(payload, candidate_ids=ids),
         )
-        return validate_action(
-            result.payload,
-            elements=inspection.elements,
-            allowed_hosts=session.patterns,
-            host_check=is_allowed_browser_url,
-        )
-
-    async def _execute_action(
-        self,
-        session: _PwSession,
-        action: BrowserAction,
-        inspection: PageInspection,
-        trace: BrowserApiTrace,
-    ) -> BrowserObservation | None:
-        """Execute one validated action. Returns an observation only when terminal."""
-
-        if action.kind == "report_hitl":
-            return self._human_required(session, action.reason or "A human action is required.")
-
-        if action.kind == "report_blocked":
-            # Verify the claim instead of trusting it.
+        choice = validate_choice(result.payload, candidate_ids=ids)
+        if choice.decision == "report_hitl":
+            return self._human_required(session, sanitize_reason(choice.reason) or "Human action.")
+        if choice.decision == "report_blocked":
             if not navigation_allowed(inspection.url, session.patterns):
                 return _blocked(inspection.url)
-            return None  # not actually blocked: keep going
+            return self._human_required(session, "The agent reported a block it cannot prove.")
+        assert choice.candidate_id is not None  # guaranteed by validate_choice
+        return select_candidate(options, choice.candidate_id)
 
-        if action.kind == "report_credential_page":
-            # A model may NOT declare success. Re-inspect and require a reviewed signal.
-            fresh = await self._inspect_page(session)
-            success = matched_success_signals(
-                trace.success_signals,
-                url=fresh.url,
-                title=fresh.title,
-                text=fresh.visible_text,
-            )
-            if success:
-                return BrowserObservation(
-                    status="credential_page_ready",
-                    current_url=fresh.url,
-                    page_title=fresh.title or "Credential page",
-                    non_secret_notes=(f"Verified success signal: {success[0]}"[:1_000],),
-                )
-            return None  # unverified claim: ignore and continue the loop
+    async def _execute_candidate(
+        self,
+        session: _PwSession,
+        candidate: ActionCandidate,
+        inspection: PageInspection,
+    ) -> BrowserObservation | None:
+        """Re-validate immediately before acting, then execute the candidate.
+
+        Time-of-check-to-time-of-use protection: the page is re-inspected, the URL
+        and generation are re-confirmed, and the target is resolved by STABLE
+        role/name/type identity requiring exactly one unique match. A stale
+        positional locator from the planning inspection is never executed.
+        """
+
+        fresh = await self._inspect_page(session)
+        if not navigation_allowed(fresh.url, session.patterns):
+            return _blocked(fresh.url)
+        if fresh.url != inspection.url:
+            return None  # navigated underneath us: replan on the next iteration
+
+        target_index: int | None = None
+        if candidate.identity is not None:
+            matches = [element for element in fresh.elements if candidate.identity.matches(element)]
+            if len(matches) != 1:
+                # Zero or ambiguous: the DOM changed. Replan rather than guess.
+                return None
+            target_index = matches[0].index
 
         async def _locked() -> None:
             async with session.operation_lock:
                 session.last_active_at = datetime.now(UTC)
                 page = session.page
-                if action.kind == "click" and action.index is not None:
-                    await inspection.locators[action.index].click(timeout=10_000)
-                elif action.kind == "type" and action.index is not None:
-                    await inspection.locators[action.index].fill(action.text or "", timeout=10_000)
-                elif action.kind == "press" and action.text:
-                    await page.keyboard.press(action.text)
-                elif action.kind == "goto" and action.url:
+                if candidate.action == "goto" and candidate.url:
                     await page.goto(
-                        action.url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
+                        candidate.url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
                     )
-                # Playwright auto-waits on actions; add only a bounded readiness wait
-                # rather than relying on networkidle (which never settles on many apps).
+                elif target_index is not None:
+                    locator = fresh.locators[target_index]
+                    if candidate.action == "click":
+                        await locator.click(timeout=10_000)
+                    elif candidate.action == "type" and candidate.value_ref:
+                        value = self._approved_value(candidate.value_ref)
+                        if value:
+                            await locator.fill(value, timeout=10_000)
+                    elif candidate.action == "press" and candidate.press_key:
+                        # Bound to the reviewed element, never page-global input.
+                        await locator.press(validate_press_key(candidate.press_key), timeout=10_000)
                 try:
                     await page.wait_for_load_state("domcontentloaded", timeout=10_000)
                 except Exception:
@@ -693,9 +813,51 @@ class PlaywrightBrowserWorker:
         except BrowserOperationTimeout:
             return self._failed_observation(session, "browser_operation_timeout")
         except Exception:
-            # A single failed action is not fatal: the next inspection decides.
             return None
         return None
+
+    def _approved_value(self, value_ref: str) -> str:
+        """Resolve an approved NON-SECRET value reference from configuration."""
+
+        mapping = {
+            "company_name": getattr(self._settings, "company_legal_name", "") or "",
+            "company_website": getattr(self._settings, "company_website", "") or "",
+        }
+        return str(mapping.get(value_ref, ""))
+
+    async def verify_credential_page(
+        self, session: _PwSession, trace: BrowserApiTrace
+    ) -> BrowserObservation | None:
+        """Re-inspect and return success ONLY when reviewed signals are present.
+
+        A model can never declare success: this is the single place the
+        ``credential_page_ready`` outcome is produced, and it requires structural
+        evidence from the reviewed trace on a freshly inspected page.
+        """
+
+        fresh = await self._inspect_page(session)
+        if not navigation_allowed(fresh.url, session.patterns):
+            return _blocked(fresh.url)
+        success = matched_success_signals(
+            trace.success_signals,
+            url=fresh.url,
+            title=fresh.title,
+            text=fresh.visible_text,
+        )
+        if not success:
+            return None
+        # A credential page is sensitive: stop screenshotting for this session and
+        # drop any frame captured before we knew what the page was (item 5).
+        session.egress_stage = "post_auth"
+        session.screenshots_disabled = True
+        session.screenshot = None
+        session.screenshot_at = None
+        return BrowserObservation(
+            status="credential_page_ready",
+            current_url=fresh.url,
+            page_title=fresh.title or "Credential page",
+            non_secret_notes=(f"Verified success signal: {success[0]}"[:1_000],),
+        )
 
     async def _inject_credentials(
         self, session: _PwSession, sensitive_data: Mapping[str, str]
@@ -710,6 +872,12 @@ class PlaywrightBrowserWorker:
                     return
                 if not await _has_password_field(page):
                     return
+                # Item 5/6: the moment a credential enters the DOM, tighten egress
+                # permanently and drop/disable screenshots for this session.
+                session.egress_stage = "post_auth"
+                session.screenshots_disabled = True
+                session.screenshot = None
+                session.screenshot_at = None
                 await _inject_login(page, sensitive_data)
                 await _submit_login(page)
 
@@ -840,12 +1008,20 @@ class PlaywrightBrowserWorker:
         session and never written to disk or logs.
         """
 
+        if session.screenshots_disabled:
+            # A credential-bearing or authenticated state was reached: no further
+            # frames are produced for this session, and any old frame is gone.
+            session.screenshot = None
+            session.screenshot_at = None
+            return False
+
         async def _shot() -> bytes | None:
-            # Mask credential-bearing fields so a screenshot can never leak a secret
-            # value (it is page pixels, and the credential page is exactly where the
-            # agent ends up). Masking failures fall back to no screenshot, never to
-            # an unmasked one.
+            # Masking alone is not relied upon: capture only happens on a page that
+            # has already been checked for credential-bearing content. Masking
+            # failures yield NO screenshot, never an unmasked one.
             async with session.operation_lock:
+                if await _has_credential_content(session.page):
+                    return None
                 return await _masked_screenshot(session.page)
 
         try:
@@ -943,7 +1119,12 @@ async def _describe_element(locator: Any) -> dict[str, object]:
         except Exception:
             name = ""
     role = await _attr("role") or tag or "element"
-    secretish = bool(_SECRETISH_FIELD.search(f"{name} {element_type} {await _attr('name')}"))
+    field_name = await _attr("name")
+    secretish = bool(_SECRETISH_FIELD.search(f"{name} {element_type} {field_name}"))
+    # Sanitize the accessible name at the source: a credential-describing name
+    # becomes a semantic placeholder, and any token-shaped text is redacted.
+    origin = "contenteditable" if tag == "div" and await _attr("contenteditable") else tag
+    name = sanitize_element_name(name, element_type=element_type, origin=origin)
     value_present = False
     if not secretish and tag in {"input", "textarea"}:
         try:
@@ -990,24 +1171,99 @@ def _classify_gate(text: str) -> HumanActionType:
 
 
 def detect_human_gate(inspection: PageInspection) -> BrowserObservation | None:
-    """Return a typed HITL observation when the page shows a hard human gate.
+    """Return a typed HITL observation only for a STRUCTURAL human gate (item 8).
 
-    CAPTCHA, OTP, MFA, passkey, billing, legal consent, and account selection are
-    never attempted by the agent — it stops and asks for the human.
+    Substring matching on body text produced false positives: a footer "Terms of
+    Service" link or a passive reCAPTCHA badge would halt an otherwise fine run. A
+    gate is now recognized only when the page presents an ACTIONABLE surface:
+
+    * an interactive challenge widget / reviewed challenge iframe, or
+    * a visible input that collects the challenge (an OTP/code field), or
+    * a genuine choice control (account selection, an explicit consent button).
+
+    Passive mentions of a gate keyword are ignored.
     """
 
-    haystack = f"{inspection.title} {inspection.visible_text}".casefold()
-    for needle, action_type in _HUMAN_GATE_PATTERNS:
-        if needle in haystack:
-            return BrowserObservation(
-                status="human_action_required",
-                current_url=inspection.url,
-                page_title=inspection.title or "Human action required",
-                human_action_type=action_type,
-                human_instruction=(
-                    f"A human must complete this step in the live browser ({action_type})."
-                ),
-            )
+    gate = classify_structural_gate(inspection)
+    if gate is None:
+        return None
+    action_type, detail = gate
+    return BrowserObservation(
+        status="human_action_required",
+        current_url=inspection.url,
+        page_title=inspection.title or "Human action required",
+        human_action_type=action_type,
+        human_instruction=sanitize_reason(detail)[:1_000],
+    )
+
+
+# Structural gate rules: (matcher on an element, action type, instruction).
+_OTP_NAME = re.compile(
+    r"(?i)one[-_ ]?time|verification code|security code|\botp\b|passcode|\bcode\b"
+)
+_CAPTCHA_NAME = re.compile(r"(?i)captcha|i'?m not a robot|are you human")
+_CONSENT_NAME = re.compile(
+    r"(?i)^(?:i )?(?:agree|accept)\b|accept (?:the )?terms|accept and continue"
+)
+_ACCOUNT_CHOICE = re.compile(
+    r"(?i)choose an account|select an account|use another account|continue as "
+)
+_BILLING_NAME = re.compile(
+    r"(?i)add (?:a )?payment|payment method|card number|billing details|upgrade plan"
+)
+_PASSKEY_NAME = re.compile(r"(?i)passkey|security key|use your (?:device|fingerprint|face)")
+_MFA_NAME = re.compile(
+    r"(?i)authenticator|two[- ]factor|2fa|approve (?:this )?sign|verify it'?s you"
+)
+
+_INTERACTIVE_ROLES = frozenset(
+    {"button", "link", "input", "select", "textarea", "iframe", "menuitem", "a"}
+)
+
+
+def _is_actionable(element: SnapshotElement) -> bool:
+    return element.role.casefold() in _INTERACTIVE_ROLES
+
+
+def classify_structural_gate(
+    inspection: PageInspection,
+) -> tuple[HumanActionType, str] | None:
+    """Identify a human gate from actionable page STRUCTURE, or None."""
+
+    for element in inspection.elements:
+        name = element.name
+        element_type = element.element_type.casefold()
+        role = element.role.casefold()
+
+        # An interactive challenge: a captcha widget/iframe or its control. A passive
+        # badge is a non-actionable node and therefore ignored.
+        if _CAPTCHA_NAME.search(name) and (_is_actionable(element) or role == "iframe"):
+            return "captcha", "An interactive CAPTCHA must be completed by a human."
+
+        # A real OTP/code entry field (an input, not prose mentioning a code).
+        if element_type in {"text", "tel", "number", "password", ""} and role in {
+            "input",
+            "textarea",
+        }:
+            if _OTP_NAME.search(name) or (element.secretish and _OTP_NAME.search(name)):
+                return "email_otp", "A one-time verification code must be entered by a human."
+
+        if _PASSKEY_NAME.search(name) and _is_actionable(element):
+            return "passkey", "A passkey or security key must be used by a human."
+
+        if _MFA_NAME.search(name) and _is_actionable(element):
+            return "device_approval", "A multi-factor approval must be completed by a human."
+
+        if _BILLING_NAME.search(name) and _is_actionable(element):
+            return "billing", "A billing decision must be made by a human."
+
+        # Explicit consent CONTROL (a button), not a footer terms LINK.
+        if _CONSENT_NAME.search(name) and role in {"button", "input"}:
+            return "legal_acceptance", "Legal acceptance must be granted by a human."
+
+        if _ACCOUNT_CHOICE.search(name) and _is_actionable(element):
+            return "account_selection", "An account choice must be made by a human."
+
     return None
 
 
@@ -1042,6 +1298,48 @@ async def _login_origin_is_safe(page: Any, patterns: tuple[str, ...]) -> bool:
         if not navigation_allowed(action, patterns):
             return False  # the form would post credentials off-allowlist
     return True
+
+
+_CREDENTIAL_SURFACE_SELECTOR = (
+    "input[type='password'], input[name*='token' i], input[name*='secret' i], "
+    "input[name*='key' i], input[name*='otp' i], code, pre, samp, kbd, textarea, "
+    "[data-secret], [data-credential], [contenteditable='true']"
+)
+
+
+def _looks_credential_bearing(inspection: PageInspection) -> bool:
+    """True when the inspected page structurally exposes credential material.
+
+    Structural, not substring-based: a secret-ish INPUT, or a dropped unsafe region
+    in the snapshot, means a credential could be rendered on this page.
+    """
+
+    if any(element.secretish for element in inspection.elements):
+        return True
+    if DROPPED in inspection.visible_text:
+        return True
+    return any(DROPPED in element.name for element in inspection.elements)
+
+
+async def _has_credential_content(page: Any) -> bool:
+    """Structural check for credential-bearing surfaces before any capture.
+
+    Covers plain-text tokens in code/pre, textarea, contenteditable and custom
+    components carrying data-secret/data-credential — cases that masking selectors
+    alone would miss. Fails CLOSED when safety cannot be established.
+    """
+
+    try:
+        locator = page.locator(_CREDENTIAL_SURFACE_SELECTOR)
+        if int(await locator.count()) > 0:
+            return True
+    except Exception:
+        return True  # cannot prove safety -> treat as sensitive
+    try:
+        text = await page.inner_text("body", timeout=3_000)
+    except Exception:
+        return True
+    return contains_secret_material(text if isinstance(text, str) else "")
 
 
 async def _masked_screenshot(page: Any) -> bytes | None:

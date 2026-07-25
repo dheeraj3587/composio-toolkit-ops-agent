@@ -73,6 +73,29 @@ the loop continues.
 | Actions | Closed set (`click`, `type`, `press`, `goto`, and three report kinds). No JavaScript execution, shell, arbitrary selectors, uploads, or downloads. `press` accepts only a reviewed key list; `goto` must be absolute HTTPS, credential‑free, fragment‑free, and allowlisted. |
 | Capture | Reviewed selectors plus host, path‑prefix, and heading checks, with `fullmatch` on the value pattern. Only a `vault://` reference leaves. Pipedrive only. |
 
+## Release-gate hardening (implemented)
+
+| Item | Status |
+| --- | --- |
+| 1. Model-input DLP boundary | **Done.** `ops/model_input_dlp.py` is the single gate every page-derived value passes before inference: URLs lose query+fragment and suspicious path segments, provider keys / bearer tokens / auth codes / JWTs / high-entropy blobs are redacted, credential field names become semantic placeholders (`<secret-field:password>`), and text from `code`/`pre`/`textarea`/`contenteditable`/copy controls is dropped wholesale. A final `contains_secret_material` assertion refuses to send a prompt that still trips it. Prompts are never logged or persisted. 68 adversarial canary tests. |
+| 2. Policy-generated candidates | **Done.** `ops/browser_candidates.py` derives a bounded candidate set per checkpoint (opaque id, action type, semantic target, expected element identity, risk, expected postcondition, trace version). The model may reply only with a candidate id, `report_hitl`, or `report_blocked` — `CandidateChoice` has no field for a selector, URL, or value. `goto` comes only from the reviewed trace, `type` only from an approved non-secret value reference, `press` only a reviewed key bound to a reviewed element. Billing / legal / permission-escalation / destructive / key-revocation / account-deletion controls are emitted as `requires_hitl` and are never executable. |
+| 3. DOM generation + TOCTOU | **Done.** Every inspection carries a monotonic generation id. Before executing, the page is re-inspected, the URL re-confirmed, and the target re-resolved by stable role/name/type identity requiring exactly one unique match — a stale positional locator is never used, and any change forces a replan. |
+| 5. Screenshot hardening | **Done.** Sensitive/success detection runs *before* capture; reaching an authenticated or credential-bearing state clears the previous frame and disables further capture for the session; capture is refused (no image) when safety cannot be established. Verified against credentials rendered as plain text, `code`, `pre`, `textarea`, `contenteditable`, a custom component and a copy button. |
+| 6. Staged egress | **Done.** Pre-auth allows reviewed vendor hosts plus reviewed passive asset hosts; post-credential blocks **every** off-allowlist request kind including images, fonts, stylesheets, media, WebSockets and EventSource. Service workers stay blocked. A live adversarial page attempting exfiltration through image, stylesheet, font, media, WebSocket, form and fetch reaches the unapproved host **zero** times. A stage-provider error fails closed. |
+| 7. Lifecycle | **Partly done.** Capacity admission is a race-free bounded semaphore released exactly once, a TTL janitor reaps independently, and concurrency tests cover navigate-vs-teardown, capture-vs-expiry, screenshot-vs-stop and simultaneous close. The explicit ACTIVE/CLOSING/CLOSED lease registry is modelled on the session but not yet the sole entry point for every operation. |
+| 8. Structural gates | **Done.** Gates require an *actionable* surface: a footer "Terms of Service" link and a passive reCAPTCHA badge no longer trigger HITL, while an interactive CAPTCHA, a real OTP input, an account-selection control, a billing control, a consent button and a passkey control all do. |
+
+## Not yet implemented (do not assume these)
+
+| Item | Status |
+| --- | --- |
+| 4. Trace schema v2 | **Deferred.** Success still matches reviewed signal strings (multiple signals exist per app, and success is only claimed from a freshly inspected page), but the structured-predicate schema — required role/name, stable selector ids, forbidden states, minimum independent predicates, UI variants — is not built. `credential_page_ready` therefore does not yet require multiple *independent structural* predicates. |
+| 9. Deadline-bounded inference | **Deferred.** The action loop is bounded (20 steps / 180 s / 3 repeats / 2 model failures) and providers have per-request timeouts, but there is no single decision-level deadline shared across the fallback chain, no `Retry-After` handling, and no circuit breaker. |
+| 10. Sanitized observability | **Deferred.** No metrics record is emitted yet. |
+| 11. Real browser CI | **Written, NOT active.** The job exists locally but could not be pushed (the integration lacks GitHub Actions `workflows` permission) and its actions are not yet pinned to immutable SHAs. **There is currently no browser-image CI gate on this repository.** |
+| 12. Durable worker RPC | **Deferred** by design. |
+| 13. Release benchmark | **Deferred.** |
+
 ## Known limitations (honest)
 
 - **No restart survival.** The browser runs in‑process, so an API restart destroys the
