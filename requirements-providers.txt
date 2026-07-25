@@ -9,7 +9,7 @@ composio==0.18.0
 
 google-genai==2.12.1
 perplexityai==0.42.0
-# You.com SDK. Verified against PyPI on 2026-07-25: 2.5.0 is the current public
-# release (2026-07-23; 2.4.0 was 2026-07-17). The pin is the single source of
-# truth for tests/test_you_research.py::TestSdkContract.
-youdotcom==2.5.0
+# You.com SDK. Version 2.4.0 exposes the Search include_domains, Contents
+# max_age, and Research source_control/output_schema surface used by
+# ops/you_research.py. The existing offline SDK contract verifies this pin.
+youdotcom==2.4.0
