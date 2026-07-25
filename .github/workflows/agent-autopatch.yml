@@ -33,13 +33,26 @@ jobs:
           print("version", version("youdotcom"))
           you = You(api_key_auth="offline-signature-probe")
 
-          targets = {
-              "search.unified_async": you.search.unified_async,
-              "contents.generate_async": you.contents.generate_async,
-              "research_async": you.research_async,
-          }
-          for name, target in targets.items():
-              print(name, inspect.signature(target))
+          def describe(label, owner, attribute):
+              target = getattr(owner, attribute, None)
+              print("target", label, "present", target is not None)
+              if target is not None:
+                  try:
+                      print("signature", label, inspect.signature(target))
+                  except (TypeError, ValueError) as exc:
+                      print("signature-error", label, type(exc).__name__)
+
+          print("you-public", [name for name in dir(you) if not name.startswith("_")])
+          print("search-public", [name for name in dir(you.search) if not name.startswith("_")])
+          print("contents-public", [name for name in dir(you.contents) if not name.startswith("_")])
+
+          describe("search.unified", you.search, "unified")
+          describe("search.unified_async", you.search, "unified_async")
+          describe("search_post_async", you, "search_post_async")
+          describe("contents.generate", you.contents, "generate")
+          describe("contents.generate_async", you.contents, "generate_async")
+          describe("research", you, "research")
+          describe("research_async", you, "research_async")
 
           for name in (
               "ContentsFormats",
@@ -54,10 +67,6 @@ jobs:
                       print("model-signature", name, inspect.signature(value))
                   except (TypeError, ValueError):
                       pass
-
-          print("search-resource", type(you.search).__module__, type(you.search).__name__)
-          print("contents-resource", type(you.contents).__module__, type(you.contents).__name__)
-          you.close()
           PY
           cat youdotcom-signatures.txt
       - uses: actions/upload-artifact@v4
