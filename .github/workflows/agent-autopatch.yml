@@ -34,7 +34,7 @@ jobs:
             requirements.txt
             requirements-providers.txt
             requirements-dev.txt
-      - name: Apply narrow dependency contract updates
+      - name: Generate narrow dependency contract updates
         shell: bash
         run: |
           set -euo pipefail
@@ -58,15 +58,7 @@ jobs:
           PY
           cd web
           npm install --package-lock-only --ignore-scripts --no-audit --no-fund
-          npm ci --no-audit --no-fund
-          npm audit --audit-level=high
-          npm run lint
-          npm run typecheck
-          npm run test
-          npm run build
           cd ..
-          python -m pip install --requirement requirements-dev.txt
-          python -m pytest tests/test_you_research.py::TestSdkContract -q
       - name: Commit generated lockfile and contract sync
         shell: bash
         run: |
@@ -84,3 +76,17 @@ jobs:
           fi
           git commit -m "fix: synchronize provider and frontend dependency contracts"
           git push origin HEAD:${{ github.head_ref }}
+      - name: Validate generated files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd web
+          npm ci --no-audit --no-fund
+          npm audit --audit-level=high
+          npm run lint
+          npm run typecheck
+          npm run test
+          npm run build
+          cd ..
+          python -m pip install --requirement requirements-dev.txt
+          python -m pytest tests/test_you_research.py::TestSdkContract -q
