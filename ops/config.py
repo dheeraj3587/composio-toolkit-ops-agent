@@ -142,6 +142,17 @@ class Settings(BaseModel):
     # cap is sized for a small VPS. --no-sandbox is opt-in (see _launch_args).
     playwright_max_sessions: int = Field(default=2, ge=1, le=10)
     playwright_disable_sandbox: bool = False
+    # The isolated browser service (Chromium in its own container). When the provider
+    # is "playwright" this is the NORMAL path: the API speaks authenticated RPC and
+    # never launches Chromium itself, which is what makes a session survive an API
+    # restart.
+    browser_service_url: str | None = None
+    browser_service_token: SecretStr | None = Field(default=None, repr=False)
+    browser_service_owner: str = "ops-assignment-user"
+    # Running Chromium INSIDE the API process is for isolated tests and local
+    # debugging only, so it must be requested explicitly rather than being a silent
+    # fallback whenever the service happens to be unconfigured.
+    playwright_in_process_sandbox: bool = False
     # Owner-only local credential submission is opt-in and loopback-only.
     allow_local_credential_submission: bool = False
 
@@ -279,6 +290,14 @@ class Settings(BaseModel):
             "playwright_max_sessions": _integer(source.get("PLAYWRIGHT_MAX_SESSIONS"), default=2),
             "playwright_disable_sandbox": _boolean(
                 source.get("PLAYWRIGHT_DISABLE_SANDBOX"), default=False
+            ),
+            "browser_service_url": _optional(source.get("BROWSER_SERVICE_URL")),
+            "browser_service_token": _secret(source.get("BROWSER_SERVICE_TOKEN")),
+            "browser_service_owner": (
+                _optional(source.get("BROWSER_SERVICE_OWNER")) or "ops-assignment-user"
+            ),
+            "playwright_in_process_sandbox": _boolean(
+                source.get("PLAYWRIGHT_IN_PROCESS_SANDBOX"), default=False
             ),
             "allow_local_credential_submission": _boolean(
                 source.get("ALLOW_LOCAL_CREDENTIAL_SUBMISSION"), default=False

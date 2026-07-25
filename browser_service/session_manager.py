@@ -43,13 +43,20 @@ class ManagedSession:
     session_id: str
     owner: str
     app_slug: str
-    # Playwright objects (owned by this service, never serialized).
-    playwright: Any = None
-    browser: Any = None
-    context: Any = None
-    page: Any = None
+    # The WORKER-side handle for the real browser. Explicit ownership: the manager
+    # closes the session through the worker rather than reaching into Playwright
+    # objects it never actually held (previously `page` was assigned a private
+    # _PwSession and context/browser/playwright stayed None, so the closer had
+    # nothing to close and the janitor leaked Chromium).
+    worker_context: Any = None
     pages: dict[str, Any] = field(default_factory=dict)
     current_page_id: str = ""
+    # Live-view availability, tracked from reality rather than assumed.
+    screenshot_available: bool = False
+    interactive_ready: bool = False
+    # The (app, account, owner) triple this session's authenticated state is bound
+    # to. None means storage state is not being persisted for this session.
+    storage_binding: Any = None
     # Lifecycle + lease accounting.
     lifecycle: SessionLifecycle = "ACTIVE"
     active_operations: int = 0
@@ -85,7 +92,9 @@ class ManagedSession:
             maximum_expires_at=self.maximum_expires_at.isoformat(),
             active_operations=self.active_operations,
             live_view_mode=self.live_view_mode,
-            live_view_available=self.live_view_mode == "interactive_remote" or True,
+            # Previously `mode == "interactive_remote" or True`, which is always
+            # True. Now reports what is actually available.
+            live_view_available=self.screenshot_available or self.interactive_ready,
             hitl_pending=self.hitl_pending,
             current_url_path=self.current_url_path,
             reason_code=self.reason_code,
@@ -115,6 +124,17 @@ class SessionManager:
         self._in_use = 0
         self._closer = closer
         self.janitor_running = False
+
+    def set_closer(self, closer: Callable[[ManagedSession], Awaitable[None]]) -> None:
+        """Install the closer after construction.
+
+        The browser worker is created lazily (so /internal/health can answer without
+        importing Playwright), but the manager must exist first. This lets the real
+        worker-backed closer be attached as soon as the worker exists, instead of
+        leaving the manager with a closer that closes nothing.
+        """
+
+        self._closer = closer
 
     # --- capacity -------------------------------------------------------------
     @property

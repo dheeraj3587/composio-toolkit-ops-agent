@@ -164,6 +164,17 @@ async def _describe(locator: Any, frame_path: tuple[str, ...]) -> dict[str, obje
             raw["selected"] = bool(await locator.evaluate("el => !!el.selected"))
         except Exception:
             pass
+    # For a NON-secret <select>, record the currently selected option's LABEL.
+    # The interactive snapshot deliberately does not collect <option> elements, so
+    # without this a select_option action had no reliable state to verify against.
+    if tag == "select" and not bool(raw.get("secretish")):
+        try:
+            selected_label = await locator.locator("option:checked").inner_text(timeout=1_000)
+        except Exception:
+            selected_label = ""
+        raw["selected_label"] = (
+            sanitize_element_name(selected_label[:120], role="option") if selected_label else None
+        )
 
     try:
         value = await locator.input_value(timeout=1_000)

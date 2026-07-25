@@ -23,13 +23,14 @@ how many short-lived caller loops come and go.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import re
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -69,10 +70,11 @@ from ops.browser_egress import (
 from ops.browser_host_policy import BrowserPolicyInactiveError, build_browser_allowed_hosts
 from ops.browser_login import (
     LoginInspection,
-    drive_login,
+    apply_resume_secrets,
     normalize_resume_signal,
 )
 from ops.browser_loop import BrowserLoop, BrowserOperationTimeout, shared_browser_loop
+from ops.browser_metrics import BrowserDecisionEvent, SelectionSource, build_decision_event
 from ops.browser_pages import (
     BrowserPageRegistry,
     DialogPolicy,
@@ -111,6 +113,9 @@ from ops.secret_store import SecretStore
 _INACTIVITY_WINDOW = timedelta(minutes=15)
 _MAXIMUM_WINDOW = timedelta(hours=4)
 _NAV_TIMEOUT_MS = 45_000
+# Per-action Playwright timeout. Playwright auto-waits for actionability, so this
+# is a ceiling on that wait rather than a substitute for it.
+_ACTION_TIMEOUT_MS = 10_000
 _MAX_SCREENSHOT_BYTES = 4_000_000
 _JANITOR_INTERVAL_SECONDS = 60.0
 _OP_TIMEOUT_SECONDS = 90.0
@@ -164,6 +169,155 @@ def navigation_allowed(url: str, patterns: tuple[str, ...]) -> bool:
     """True when ``url`` is an https URL whose host is inside the allowlist."""
 
     return is_allowed_browser_url(url, patterns)
+
+
+def _classify_action_error(exc: BaseException) -> ActionReasonCode:
+    """Map a Playwright failure onto an accurate reason code.
+
+    Previously every non-programming exception became ``action_timeout``, which
+    hid browser disconnection, renderer crashes and closed targets — all of which
+    need different operator responses. Playwright's error classes are imported
+    lazily so this module still imports without the browser installed.
+    """
+
+    try:
+        from playwright.async_api import Error as PlaywrightError
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+    except ImportError:  # pragma: no cover - Playwright is a declared dependency
+        return "action_timeout"
+
+    if isinstance(exc, PlaywrightTimeoutError):
+        return "action_timeout"
+
+    # TargetClosedError subclasses Error but is NOT re-exported from async_api
+    # (verified against the installed package), so it is imported from its real
+    # module. Its message is inspected for documented phrasing only — never page
+    # content.
+    try:
+        from playwright._impl._errors import TargetClosedError
+    except ImportError:  # pragma: no cover - older Playwright layout
+        pass
+    else:
+        if isinstance(exc, TargetClosedError):
+            return "browser_disconnected"
+
+    if isinstance(exc, PlaywrightError):
+        message = str(exc).casefold()
+        if "crash" in message:
+            return "page_crashed"
+        if any(
+            token in message
+            for token in ("closed", "disconnected", "browser has been closed", "target page")
+        ):
+            return "browser_disconnected"
+        if "timeout" in message:
+            return "action_timeout"
+        if "net::" in message or "navigation" in message:
+            return "navigation_timeout"
+
+    return "action_timeout"
+
+
+def select_initial_target(
+    research: Any,
+    trace: Any,
+    patterns: Sequence[str],
+) -> str | None:
+    """Choose the most DIRECT reviewed starting URL.
+
+    The trace's ``start_url`` was previously always preferred, which ignored a more
+    direct URL when research had a verified one — meaning extra navigation steps for
+    no benefit.
+
+    A research URL only outranks the trace when it is **field-level verified**: it
+    must carry an ``OperationalUrlClaim`` proving the URL literally appeared in a
+    document that was actually fetched. An unverified research field never wins,
+    which is what stops a plausible-but-unproven URL becoming the entry point.
+
+    Every candidate must still pass the host allowlist, and reaching a credential
+    page directly does NOT make it trusted — structured success must still be proven
+    by the reviewed predicate.
+    """
+
+    allow = tuple(patterns)
+    claims = getattr(research, "operational_url_claims", ()) or ()
+    verified: dict[str, str] = {}
+    for claim in claims:
+        field = str(getattr(claim, "field", "") or "")
+        url = str(getattr(claim, "url", "") or "")
+        if field and url and field not in verified:
+            verified[field] = url
+
+    candidates: tuple[str | None, ...] = (
+        verified.get("credential_management_url"),
+        verified.get("developer_portal_url"),
+        verified.get("login_url"),
+        # The reviewed trace is the trusted default whenever no verified claim
+        # points somewhere more direct.
+        getattr(trace, "start_url", None) if trace is not None else None,
+        # Only for a trace-less app: fall back to the unverified research field,
+        # which preserves the previous behaviour for apps with no reviewed trace.
+        getattr(research, "developer_portal_url", None) if trace is None else None,
+    )
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate and navigation_allowed(candidate, allow):
+            return candidate
+    return None
+
+
+def make_egress_route_handler(
+    *,
+    policy: BrowserEgressPolicy,
+    stage_provider: Callable[[], EgressStage],
+) -> Callable[[Any], Awaitable[None]]:
+    """Build the route handler that makes ``BrowserEgressPolicy`` the authority.
+
+    The four-stage policy already existed but was never installed: the context
+    route used the older two-stage string handler, so per-kind and per-stage host
+    sets (reviewed IdP hosts, post-auth hosts, credential-surface tightening) had
+    no effect on the network.
+
+    Unknown resource kinds fail closed inside ``policy.permits``. A stage-provider
+    error is treated as the STRICTEST stage rather than the most permissive.
+    """
+
+    async def _handler(route: Any) -> None:
+        request = route.request
+        try:
+            kind = str(request.resource_type or "").casefold()
+            url = str(request.url)
+        except Exception:
+            await route.abort(error_code="blockedbyclient")
+            return
+
+        try:
+            stage = stage_provider()
+        except Exception:
+            stage = EgressStage.CREDENTIAL_SURFACE  # fail closed: tightest stage
+
+        if policy.permits(url=url, kind=kind, stage=stage):
+            await route.continue_()
+        else:
+            await route.abort(error_code="blockedbyclient")
+
+    return _handler
+
+
+def _active_page(session: _PwSession) -> Any:
+    """The page the harness should currently operate on.
+
+    Canonical accessor: when the page registry has approved and activated a popup,
+    that popup IS the working surface. Reading ``session.page`` directly meant
+    inspection, actions, login and capture all kept using the opener while the
+    real interaction had moved to the popup.
+    """
+
+    registry = session.pages
+    if registry is not None:
+        page = registry.active_page
+        if page is not None:
+            return page
+    return session.page
 
 
 # Request kinds that can EXFILTRATE data (send it somewhere) as opposed to merely
@@ -246,6 +400,9 @@ class _PwSession:
     operation_lock: asyncio.Lock
     patterns: tuple[str, ...] = ()
     app_slug: str = ""
+    # The opaque worker-side handle (pw_...), used only to correlate sanitized
+    # decision events for one session. Never a URL, account or credential.
+    handle: str = ""
     # Confirmed vs attempted checkpoint state: `checkpoint_index` advances ONLY
     # after a verified postcondition, so a failed action cannot skip a checkpoint.
     checkpoint_index: int = 0
@@ -255,7 +412,6 @@ class _PwSession:
     dom_generation: int = 0
     # Egress stage: tightened permanently once credentials are injected or a
     # credential-bearing page is reached (item 6).
-    egress_stage: str = "pre_auth"
     # Once a credential-bearing state is seen, screenshots are disabled for the
     # rest of the session unless a reviewed safe state is re-established (item 5).
     screenshots_disabled: bool = False
@@ -321,7 +477,48 @@ ActionReasonCode = Literal[
     "authentication_failed",
     "model_unavailable",
     "model_invalid_choice",
+    # An action the candidate policy can EMIT but the executor cannot perform.
+    # Without this, such a candidate silently fell through and reported success.
+    "unsupported_candidate_action",
+    # A candidate that needs an approved value reference did not carry one, or the
+    # reference could not be resolved from reviewed configuration.
+    "approved_value_missing",
+    "approved_value_unavailable",
+    # A `goto` candidate whose reviewed URL was absent.
+    "goto_url_missing",
+    # A reviewed key was missing for a `press` candidate.
+    "press_key_missing",
+    # HTTP outcomes. Playwright treats 404/5xx as successful RESPONSES, not failed
+    # requests, so they must be read from the response status explicitly.
+    "http_not_found",
+    "http_server_error",
+    # The browser or page went away underneath us.
+    "browser_disconnected",
+    "page_crashed",
 ]
+
+
+class BrowserEventSink(Protocol):
+    """Receives sanitized decision events from the real action loop.
+
+    Injected rather than imported so the worker has no hard dependency on a metrics
+    backend, and so tests can capture exactly what a run would have emitted.
+    """
+
+    def record(self, event: BrowserDecisionEvent) -> None: ...
+
+
+class BrowserActionExpectedError(RuntimeError):
+    """A typed, expected action failure carrying its reason code.
+
+    Distinct from a programming error: these are outcomes the loop knows how to
+    report and replan around, so they are converted into a typed
+    :class:`ActionExecutionResult` rather than propagated.
+    """
+
+    def __init__(self, reason_code: ActionReasonCode) -> None:
+        self.reason_code: ActionReasonCode = reason_code
+        super().__init__(reason_code)
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,6 +538,10 @@ class ActionExecutionResult:
     before_generation: int
     after_generation: int
     reason_code: ActionReasonCode | None = None
+    # For `select_option`: the RESOLVED option label the executor actually asked
+    # for, so postcondition verification compares against what was requested
+    # rather than against an approved-value REFERENCE name.
+    expected_selected_label: str | None = None
 
 
 def predicate_satisfied(predicate: CheckpointPredicate, inspection: PageInspection) -> bool:
@@ -384,11 +585,27 @@ def _predicate_present(predicate: ElementPredicate, inspection: PageInspection) 
     return any(predicate.matches(element) for element in inspection.elements)
 
 
+def _unique_target(
+    predicate: ElementPredicate | None, inspection: PageInspection
+) -> SnapshotElement | None:
+    """Resolve a postcondition target to EXACTLY one element, else None.
+
+    Ambiguity must fail the postcondition rather than pick a match: two identical
+    checkboxes would otherwise let the wrong one prove the transition.
+    """
+
+    if predicate is None:
+        return None
+    matches = [element for element in inspection.elements if predicate.matches(element)]
+    return matches[0] if len(matches) == 1 else None
+
+
 def postcondition_satisfied(
     postcondition: CandidatePostcondition,
     *,
     before: PageInspection,
     after: PageInspection,
+    expected_selected_label: str | None = None,
 ) -> bool:
     """Verify an ACTION's own state transition (Phase 2, section 3/5).
 
@@ -431,15 +648,23 @@ def postcondition_satisfied(
         ):
             return True
 
+    # Checked/selected assertions are TARGET-BOUND: they must hold for the element
+    # the action was performed on. Scanning every element let an unrelated control
+    # that already had the desired state prove a no-op.
     if postcondition.checked_state is not None:
-        for element in after.elements:
-            if element.checked is postcondition.checked_state:
-                return True
+        target = _unique_target(postcondition.target, after)
+        if target is not None and target.checked is postcondition.checked_state:
+            return True
 
-    if postcondition.selected_value is not None:
-        needle = postcondition.selected_value.casefold()
-        for element in after.elements:
-            if element.selected and needle in element.name.casefold():
+    # For a select, the expected LABEL comes from the executor (the resolved option
+    # text), because the approved-value reference name is not the option's label.
+    needle_source = expected_selected_label or postcondition.selected_value
+    if needle_source:
+        target = _unique_target(postcondition.target, after)
+        if target is not None:
+            needle = needle_source.casefold()
+            observed = (target.selected_label or "").casefold()
+            if observed and needle in observed:
                 return True
 
     return False
@@ -503,9 +728,22 @@ class PlaywrightBrowserWorker:
         settings: Settings | None = None,
         secret_store: SecretStore | None = None,
         loop: BrowserLoop | None = None,
+        headless: bool = True,
+        service_mode: bool = False,
+        event_sink: BrowserEventSink | None = None,
     ) -> None:
         self._settings = settings or Settings.from_env()
         self._secret_store = secret_store
+        # Headed Chromium is required for interactive HITL: a headless browser
+        # renders nothing on the VNC desktop, so remote control would show an empty
+        # screen. Headless remains the default everywhere else.
+        self._headless = headless
+        # In service mode the browser-service SessionManager owns capacity and TTL,
+        # so the worker's own janitor is not started — two independent reapers with
+        # two capacity counters would disagree about what is alive.
+        self._service_mode = service_mode
+        # Sanitized decision events from the REAL action loop (never page content).
+        self._event_sink = event_sink
         # All Playwright work runs on ONE persistent loop so a session survives
         # the orchestrator's separate per-node asyncio.run loops.
         self._loop = loop or shared_browser_loop()
@@ -527,10 +765,12 @@ class PlaywrightBrowserWorker:
         # A TTL janitor runs independently of new-session creation, so an idle
         # session is reclaimed even when no further run ever starts.
         self._janitor_stop = threading.Event()
-        self._janitor_thread = threading.Thread(
-            target=self._janitor_loop, name="playwright-session-janitor", daemon=True
-        )
-        self._janitor_thread.start()
+        self._janitor_thread: threading.Thread | None = None
+        if not service_mode:
+            self._janitor_thread = threading.Thread(
+                target=self._janitor_loop, name="playwright-session-janitor", daemon=True
+            )
+            self._janitor_thread.start()
 
     def _janitor_loop(self) -> None:
         while not self._janitor_stop.wait(_JANITOR_INTERVAL_SECONDS):
@@ -603,7 +843,12 @@ class PlaywrightBrowserWorker:
                 reason_code="live_browser_opt_in_required",
             )
 
-    async def start(self, profile_id: str | None) -> BrowserSessionContext:
+    async def start(
+        self,
+        profile_id: str | None,
+        *,
+        storage_state: dict[str, Any] | None = None,
+    ) -> BrowserSessionContext:
         self._require_configuration()
         try:
             module = importlib.import_module("playwright.async_api")
@@ -627,10 +872,18 @@ class PlaywrightBrowserWorker:
         async def _launch() -> tuple[Any, Any, Any, Any, asyncio.Lock]:
             playwright = await module.async_playwright().start()
             try:
-                browser = await playwright.chromium.launch(headless=True, args=self._launch_args())
+                browser = await playwright.chromium.launch(
+                    headless=self._headless, args=self._launch_args()
+                )
                 # Service workers are blocked: during a secret-bearing session a
                 # worker could persist and relay data outside the page lifecycle.
-                context = await browser.new_context(service_workers="block")
+                # storage_state is a VALIDATED dict supplied by the service (never a
+                # caller-supplied filesystem path), so previously-authenticated
+                # cookies can be restored without a fresh login.
+                context = await browser.new_context(
+                    service_workers="block",
+                    **({"storage_state": storage_state} if storage_state else {}),
+                )
                 page = await context.new_page()
                 # Created HERE so the lock is bound to the browser-owned loop.
                 operation_lock = asyncio.Lock()
@@ -658,6 +911,7 @@ class PlaywrightBrowserWorker:
         session = _PwSession(playwright, browser, context, page, operation_lock)
         session.created_at = now
         session.last_active_at = now
+        session.handle = handle
         with self._registry_lock:
             self._sessions[handle] = session
         return BrowserSessionContext(
@@ -690,7 +944,7 @@ class PlaywrightBrowserWorker:
         session.app_slug = research.app_slug
 
         trace = get_browser_api_trace(research.app_slug)
-        target = trace.start_url if trace is not None else research.developer_portal_url
+        target = select_initial_target(research, trace, patterns)
         if not target or not navigation_allowed(target, patterns):
             return _blocked(target or "https://unknown.invalid/")
 
@@ -699,12 +953,9 @@ class PlaywrightBrowserWorker:
         await self._install_interaction_guards(session, patterns)
 
         async def _go() -> bool:
-            # REAL enforcement: install the STAGED host guard before any navigation.
-            # The stage is read live, so post-auth tightening applies to this route.
-            await session.context.route(
-                "**/*",
-                make_route_handler(patterns, stage_provider=lambda: session.egress_stage),
-            )
+            # The staged egress route was already installed at CONTEXT level by
+            # _install_interaction_guards (which fails closed), so navigation is
+            # never reached with an unguarded network.
             try:
                 await session.page.goto(
                     target, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
@@ -798,7 +1049,7 @@ class PlaywrightBrowserWorker:
             if trace.success.has_positive_condition() and predicate_satisfied(
                 trace.success, inspection
             ):
-                session.egress_stage = "post_auth"
+                session.egress.advance_to(EgressStage.CREDENTIAL_SURFACE)
                 session.screenshots_disabled = True
                 session.screenshot = None
                 session.screenshot_at = None
@@ -861,6 +1112,9 @@ class PlaywrightBrowserWorker:
                 )
 
             chosen: ActionCandidate | None = None
+            # Where the decision came from, recorded for the sanitized metric event.
+            selection_source: SelectionSource = "deterministic"
+            decision_started = asyncio.get_running_loop().time()
             if deterministic is not None:
                 # Deterministic path: prefer the policy candidate whose identity is
                 # the unique checkpoint match, so even this path is policy-bounded.
@@ -869,6 +1123,7 @@ class PlaywrightBrowserWorker:
                         chosen = candidate
                         break
             if chosen is None:
+                selection_source = "llm"
                 if self._inference is None:
                     return self._human_required(
                         session, "The deterministic navigation path is ambiguous."
@@ -911,6 +1166,18 @@ class PlaywrightBrowserWorker:
                 )
 
             execution = await self._execute_candidate(session, chosen, inspection)
+            # Emit the sanitized decision event from the REAL loop, so metrics and
+            # replay fixtures describe actual runs rather than reconstructed ones.
+            self._emit_decision(
+                session=session,
+                checkpoint_order=checkpoint.order,
+                inspection=inspection,
+                candidates=candidates,
+                chosen=chosen,
+                selection_source=selection_source,
+                execution=execution,
+                latency_ms=(asyncio.get_running_loop().time() - decision_started) * 1000.0,
+            )
             if execution.status == "blocked":
                 return _blocked(execution.after_url)
             if execution.status == "failed":
@@ -941,7 +1208,14 @@ class PlaywrightBrowserWorker:
             # specific postcondition holds, or — when it asserted none — the
             # interactive surface structurally changed.
             transitioned = (
-                postcondition_satisfied(chosen.postcondition, before=inspection, after=fresh)
+                postcondition_satisfied(
+                    chosen.postcondition,
+                    before=inspection,
+                    after=fresh,
+                    # The label the executor actually requested, so a select is
+                    # verified against the option text rather than a reference name.
+                    expected_selected_label=execution.expected_selected_label,
+                )
                 if not chosen.postcondition.is_empty()
                 else structural_change(inspection, fresh)
             )
@@ -965,7 +1239,7 @@ class PlaywrightBrowserWorker:
         async def _locked() -> PageInspection:
             async with session.operation_lock:
                 session.last_active_at = datetime.now(UTC)
-                page = session.page
+                page = _active_page(session)
                 url = _page_url(page)
                 try:
                     raw_title = await page.title()
@@ -1074,6 +1348,46 @@ class PlaywrightBrowserWorker:
         assert choice.candidate_id is not None  # guaranteed by validate_choice
         return select_candidate(options, choice.candidate_id)
 
+    def _emit_decision(
+        self,
+        *,
+        session: _PwSession,
+        checkpoint_order: int,
+        inspection: PageInspection,
+        candidates: Sequence[ActionCandidate],
+        chosen: ActionCandidate | None,
+        selection_source: SelectionSource,
+        execution: ActionExecutionResult,
+        latency_ms: float,
+    ) -> None:
+        """Record one sanitized decision. Never page content, never a raw URL.
+
+        The URL is fingerprinted inside ``build_decision_event``, candidate ids are
+        opaque by construction, and a sink failure is swallowed: observability must
+        never break a run.
+        """
+
+        sink = self._event_sink
+        if sink is None:
+            return
+        provider = None
+        if selection_source == "llm" and self._inference is not None:
+            provider = getattr(self._inference, "last_provider", None)
+        event = build_decision_event(
+            session_id=session.handle,
+            checkpoint_order=checkpoint_order,
+            url=inspection.url,
+            candidate_ids=[candidate.candidate_id for candidate in candidates],
+            selected_candidate_id=chosen.candidate_id if chosen is not None else None,
+            selection_source=selection_source,
+            result_code=execution.reason_code or execution.status,
+            latency_ms=latency_ms,
+            inference_provider=provider if isinstance(provider, str) else None,
+            action_type=chosen.action if chosen is not None else None,
+        )
+        with contextlib.suppress(Exception):
+            sink.record(event)
+
     async def _execute_candidate(
         self,
         session: _PwSession,
@@ -1093,6 +1407,10 @@ class PlaywrightBrowserWorker:
         before_url = inspection.url
         before_gen = inspection.generation
 
+        # Set by the select_option branch so the caller can verify the option that
+        # was actually requested (never the approved-value reference name).
+        selected_label: dict[str, str] = {}
+
         def _result(
             status: Literal["executed", "stale", "blocked", "failed"],
             after_url: str,
@@ -1107,6 +1425,7 @@ class PlaywrightBrowserWorker:
                 before_generation=before_gen,
                 after_generation=after_gen,
                 reason_code=reason,
+                expected_selected_label=selected_label.get("label"),
             )
 
         fresh = await self._inspect_page(session)
@@ -1124,39 +1443,92 @@ class PlaywrightBrowserWorker:
                 return _result("stale", fresh.url, fresh.generation, "target_ambiguous")
             target_index = matches[0].index
 
+        def _approved_or_raise() -> str:
+            """Resolve an approved value reference, or fail with a typed reason."""
+
+            if not candidate.value_ref:
+                raise BrowserActionExpectedError("approved_value_missing")
+            value = self._approved_value(candidate.value_ref)
+            if not value:
+                raise BrowserActionExpectedError("approved_value_unavailable")
+            return value
+
         async def _locked() -> str:
             async with session.operation_lock:
                 session.last_active_at = datetime.now(UTC)
-                page = session.page
-                if candidate.action == "goto" and candidate.url:
-                    await page.goto(
+                page = _active_page(session)
+                action = candidate.action
+
+                if action == "goto":
+                    if not candidate.url:
+                        raise BrowserActionExpectedError("goto_url_missing")
+                    response = await page.goto(
                         candidate.url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
                     )
-                elif target_index is not None:
+                    # Playwright reports 404/5xx as a successful RESPONSE, so the
+                    # status must be inspected explicitly or an error page would be
+                    # treated as a completed navigation.
+                    if response is not None:
+                        status_code = int(response.status)
+                        if status_code >= 500:
+                            raise BrowserActionExpectedError("http_server_error")
+                        if status_code == 404:
+                            raise BrowserActionExpectedError("http_not_found")
+                elif target_index is None:
+                    # Every remaining action needs a resolved element.
+                    raise BrowserActionExpectedError("target_not_found")
+                else:
                     locator = fresh.locators[target_index]
-                    if candidate.action == "click":
-                        await locator.click(timeout=10_000)
-                    elif candidate.action == "type" and candidate.value_ref:
-                        value = self._approved_value(candidate.value_ref)
-                        if value:
-                            await locator.fill(value, timeout=10_000)
-                    elif candidate.action == "press" and candidate.press_key:
+                    if action == "click":
+                        await locator.click(timeout=_ACTION_TIMEOUT_MS)
+                    elif action in {"fill", "type"}:
+                        # `type` is the Phase 1 alias for `fill`; both go through the
+                        # approved-reference resolver, never model-supplied text.
+                        await locator.fill(_approved_or_raise(), timeout=_ACTION_TIMEOUT_MS)
+                    elif action == "press":
+                        if not candidate.press_key:
+                            raise BrowserActionExpectedError("press_key_missing")
                         # Bound to the reviewed element, never page-global input.
-                        await locator.press(validate_press_key(candidate.press_key), timeout=10_000)
-                try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=10_000)
-                except Exception:
-                    pass
+                        await locator.press(
+                            validate_press_key(candidate.press_key), timeout=_ACTION_TIMEOUT_MS
+                        )
+                    elif action == "select_option":
+                        label = _approved_or_raise()
+                        # Recorded so verification compares the requested LABEL, not
+                        # the reference name that produced it.
+                        selected_label["label"] = label
+                        await locator.select_option(label=label, timeout=_ACTION_TIMEOUT_MS)
+                    elif action == "check":
+                        await locator.check(timeout=_ACTION_TIMEOUT_MS)
+                    elif action == "uncheck":
+                        await locator.uncheck(timeout=_ACTION_TIMEOUT_MS)
+                    elif action == "scroll_into_view":
+                        await locator.scroll_into_view_if_needed(timeout=_ACTION_TIMEOUT_MS)
+                    elif action == "focus":
+                        await locator.focus(timeout=_ACTION_TIMEOUT_MS)
+                    else:
+                        # An action the policy can emit but this executor cannot
+                        # perform must NEVER report success.
+                        raise BrowserActionExpectedError("unsupported_candidate_action")
+
+                with contextlib.suppress(Exception):
+                    await page.wait_for_load_state("domcontentloaded", timeout=_ACTION_TIMEOUT_MS)
                 return _page_url(page)
 
         try:
             after_url = await self._loop.run(_locked(), timeout=_OP_TIMEOUT_SECONDS)
         except BrowserOperationTimeout:
             return _result("failed", before_url, session.dom_generation, "action_timeout")
+        except BrowserActionExpectedError as exc:
+            return _result("failed", before_url, session.dom_generation, exc.reason_code)
         except (TypeError, AttributeError, AssertionError, NameError):
             raise  # a programming error must surface, never be swallowed
-        except Exception:
-            return _result("failed", before_url, session.dom_generation, "action_timeout")
+        except Exception as exc:
+            # Classify rather than collapsing everything into action_timeout, which
+            # hid disconnection, crashes and closed targets.
+            return _result(
+                "failed", before_url, session.dom_generation, _classify_action_error(exc)
+            )
         return _result("executed", sanitize_url(after_url), session.dom_generation)
 
     def _approved_value(self, value_ref: str) -> str:
@@ -1177,17 +1549,17 @@ class PlaywrightBrowserWorker:
         fresh = await self._inspect_page(session)
         if not navigation_allowed(fresh.url, session.patterns):
             return _blocked(fresh.url)
-        success = matched_success_signals(
-            trace.success_signals,
-            url=fresh.url,
-            title=fresh.title,
-            text=fresh.visible_text,
-        )
-        if not success:
+        # ONE authoritative success definition. This previously used the legacy
+        # `trace.success_signals` + matched_success_signals() while the action loop
+        # used the structured `trace.success` predicate — two incompatible notions
+        # of success, so a page could be "successful" in one and not the other.
+        if not (
+            trace.success.has_positive_condition() and predicate_satisfied(trace.success, fresh)
+        ):
             return None
         # A credential page is sensitive: stop screenshotting for this session and
         # drop any frame captured before we knew what the page was (item 5).
-        session.egress_stage = "post_auth"
+        session.egress.advance_to(EgressStage.CREDENTIAL_SURFACE)
         session.screenshots_disabled = True
         session.screenshot = None
         session.screenshot_at = None
@@ -1195,7 +1567,7 @@ class PlaywrightBrowserWorker:
             status="credential_page_ready",
             current_url=fresh.url,
             page_title=fresh.title or "Credential page",
-            non_secret_notes=(f"Verified success signal: {success[0]}"[:1_000],),
+            non_secret_notes=("Verified the reviewed structured success predicate.",),
         )
 
     async def _inject_credentials(
@@ -1213,7 +1585,7 @@ class PlaywrightBrowserWorker:
         async def _locked() -> LoginInspection | None:
             async with session.operation_lock:
                 session.last_active_at = datetime.now(UTC)
-                page = session.page
+                page = _active_page(session)
                 # Phase 2: NEVER inject into an unreviewed frame origin. A login
                 # field inside a third-party iframe is refused even when the main
                 # frame is approved.
@@ -1228,12 +1600,16 @@ class PlaywrightBrowserWorker:
                         reason_code="login_frame_unreviewed",
                     )
                 # Tighten BEFORE any fill: even an email/username is account data.
-                session.egress_stage = "post_auth"
                 session.egress.advance_to(EgressStage.AUTHENTICATING)
                 session.screenshots_disabled = True
                 session.screenshot = None
                 session.screenshot_at = None
-                return await drive_login(page, sensitive_data, session.patterns)
+                # apply_resume_secrets, not drive_login: it handles a resume-time
+                # OTP or verification link (which drive_login ignores entirely) and
+                # otherwise delegates to drive_login for email/password.
+                return await apply_resume_secrets(
+                    page=page, sensitive_data=sensitive_data, patterns=session.patterns
+                )
 
         try:
             return await self._loop.run(_locked(), timeout=_OP_TIMEOUT_SECONDS)
@@ -1253,19 +1629,51 @@ class PlaywrightBrowserWorker:
         """
 
         session.egress_policy = build_egress_policy(patterns)
+        policy = session.egress_policy
         registry = BrowserPageRegistry(url_allowed=lambda url: navigation_allowed(url, patterns))
+        dialog_policy = DialogPolicy()
+        # Downloads are refused by default; a trace may approve one later.
+        download_policy = DownloadPolicy()
 
         async def _wire() -> None:
+            # The FOUR-STAGE policy is the network authority, installed at CONTEXT
+            # level so it also covers popups and any page opened later. The single
+            # source of stage truth is session.egress.stage.
+            await session.context.route(
+                "**/*",
+                make_egress_route_handler(
+                    policy=policy, stage_provider=lambda: session.egress.stage
+                ),
+            )
             registry.register(session.page, active=True)
-            install_dialog_handler(session.page, DialogPolicy(), session.dialog_records)
-            # Downloads are refused by default; a trace may approve one later.
-            install_download_guard(session.page, DownloadPolicy(), session.download_records)
+            install_dialog_handler(session.page, dialog_policy, session.dialog_records)
+            install_download_guard(session.page, download_policy, session.download_records)
+
+            async def _configure_new_page(popup: Any) -> None:
+                """Admit a popup only after policy approval, then guard it too."""
+
+                activated, _reason = await registry.consider_popup(
+                    popup, opener_page_id=registry.active_page_id
+                )
+                if not activated:
+                    return
+                # An approved popup becomes a working surface, so it needs the SAME
+                # protections as the opener rather than being unguarded.
+                install_dialog_handler(popup, dialog_policy, session.dialog_records)
+                install_download_guard(popup, download_policy, session.download_records)
+
+                def _on_close() -> None:
+                    # Fall back to the opener rather than leaving a closed page active.
+                    with contextlib.suppress(Exception):
+                        registry.close_page(popup)
+
+                popup.on("close", lambda _page=None: _on_close())
 
             def _on_page(popup: Any) -> None:
                 # The newest page is NEVER trusted automatically: validate first.
                 # The handler runs on the browser loop, which owns these objects.
                 asyncio.ensure_future(  # noqa: RUF006 - fire-and-forget on the browser loop
-                    registry.consider_popup(popup, opener_page_id=registry.active_page_id)
+                    _configure_new_page(popup)
                 )
 
             session.context.on("page", _on_page)
@@ -1275,7 +1683,13 @@ class PlaywrightBrowserWorker:
         except (TypeError, AttributeError, AssertionError, NameError):
             raise  # a programming error must surface
         except Exception:
-            pass  # guards are best-effort to install; the host route guard still applies
+            # Popup, dialog, download and egress guards are SECURITY controls, not
+            # telemetry. Continuing without them would leave an unguarded browser,
+            # so this fails closed instead of proceeding.
+            raise ProviderOperationError(
+                capability="Playwright interaction guards",
+                reason_code="interaction_guard_install_failed",
+            ) from None
         session.pages = registry
 
     def _pending_interaction_gate(self, session: _PwSession) -> BrowserObservation | None:
@@ -1306,7 +1720,7 @@ class PlaywrightBrowserWorker:
     def _human_required(self, session: _PwSession, instruction: str) -> BrowserObservation:
         url = "https://unknown.invalid/"
         try:
-            url = sanitize_browser_url(_page_url(session.page))
+            url = sanitize_browser_url(_page_url(_active_page(session)))
         except Exception:
             pass
         return BrowserObservation(
@@ -1320,7 +1734,7 @@ class PlaywrightBrowserWorker:
     def _failed_observation(self, session: _PwSession, reason_code: str) -> BrowserObservation:
         url = "https://unknown.invalid/"
         try:
-            url = sanitize_browser_url(_page_url(session.page))
+            url = sanitize_browser_url(_page_url(_active_page(session)))
         except Exception:
             pass
         return BrowserObservation(
@@ -1368,7 +1782,7 @@ class PlaywrightBrowserWorker:
         async def _capture() -> str | None:
             async with session.operation_lock:
                 session.last_active_at = datetime.now(UTC)
-                page = session.page
+                page = _active_page(session)
                 try:
                     await page.goto(
                         spec.url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
@@ -1437,9 +1851,10 @@ class PlaywrightBrowserWorker:
             # has already been checked for credential-bearing content. Masking
             # failures yield NO screenshot, never an unmasked one.
             async with session.operation_lock:
-                if await _has_credential_content(session.page):
+                live = _active_page(session)
+                if await _has_credential_content(live):
                     return None
-                return await _masked_screenshot(session.page)
+                return await _masked_screenshot(live)
 
         try:
             image = await self._loop.run(_shot(), timeout=_OP_TIMEOUT_SECONDS)
@@ -1484,7 +1899,7 @@ class PlaywrightBrowserWorker:
     async def close(self) -> None:
         # Stop the janitor first so it cannot race the final teardown.
         self._janitor_stop.set()
-        if self._janitor_thread.is_alive():
+        if self._janitor_thread is not None and self._janitor_thread.is_alive():
             self._janitor_thread.join(timeout=5.0)
         with self._registry_lock:
             sessions = list(self._sessions.values())
@@ -1983,4 +2398,11 @@ def _blocked(url: str) -> BrowserObservation:
     )
 
 
-__all__ = ["PlaywrightBrowserWorker", "make_route_handler", "navigation_allowed"]
+__all__ = [
+    "BrowserActionExpectedError",
+    "PlaywrightBrowserWorker",
+    "make_egress_route_handler",
+    "make_route_handler",
+    "navigation_allowed",
+    "select_initial_target",
+]

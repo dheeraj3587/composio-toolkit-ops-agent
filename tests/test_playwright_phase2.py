@@ -369,21 +369,34 @@ def test_select_option_verifies_the_selected_value() -> None:
 
 
 def test_checkbox_verifies_checked_state() -> None:
+    """The checked assertion must be bound to the checkbox that was acted on.
+
+    A bare ``checked_state=True`` is deliberately NO LONGER sufficient: it used to
+    be satisfied by any already-checked control anywhere on the page, so a no-op
+    could be mistaken for a real transition.
+    """
+
     async def _c(page: Any, _reached: list[str]) -> object:
         before_elements, _ = await build_ranked_snapshot(page, reviewed_patterns=_PATTERNS)
         before = _inspection(page.url, elements=before_elements)
         await page.check("[data-testid=read]")
         after_elements, _ = await build_ranked_snapshot(page, reviewed_patterns=_PATTERNS)
         after = _inspection(page.url, elements=after_elements, fingerprint="fp2")
-        post = CandidatePostcondition(checked_state=True)
+
+        bound = CandidatePostcondition(target=ElementPredicate(test_id="read"), checked_state=True)
+        untargeted = CandidatePostcondition(checked_state=True)
         return (
             await page.locator("[data-testid=read]").is_checked(),
-            postcondition_satisfied(post, before=before, after=after),
+            postcondition_satisfied(bound, before=before, after=after),
+            postcondition_satisfied(untargeted, before=before, after=after),
         )
 
-    checked, verified = _launch("/checkbox", _c)
+    checked, verified_bound, verified_untargeted = _launch("/checkbox", _c)
     assert checked is True
-    assert verified is True
+    # Bound to the acted-on element: verified.
+    assert verified_bound is True
+    # Unbound: refused, because it cannot prove WHICH element changed.
+    assert verified_untargeted is False
 
 
 # ===========================================================================

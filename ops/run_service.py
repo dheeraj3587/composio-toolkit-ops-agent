@@ -10,6 +10,7 @@ explicit retry/resume actions guarded by runtime policy.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -1001,23 +1002,106 @@ class RunService:
         # so a Playwright deployment is never judged by a Browser Use key.
         return browser_configuration_state(settings)
 
+    def _browser_login_payload(
+        self, *, app_slug: str, values: Mapping[str, SecretStr]
+    ) -> dict[str, str]:
+        """Build the credential payload for the ACTIVE browser provider.
+
+        Browser Use receives raw values in-process, exactly as before. The browser
+        SERVICE must never receive a raw value over RPC, so each permitted secret is
+        first stored as a transient ``vault://`` reference and only the reference
+        travels. Without this the client silently dropped raw values and login could
+        not work at all.
+        """
+
+        raw = {name: secret.get_secret_value() for name, secret in values.items()}
+        worker = self._browser_worker
+        if getattr(worker, "provider_name", "") != "playwright":
+            return raw
+        if not callable(getattr(worker, "reconcile_session", None)):
+            # In-process Playwright: same process, no RPC boundary to cross.
+            return raw
+        return self._store_transient_browser_secrets(app_slug=app_slug, values=raw)
+
+    def _store_transient_browser_secrets(
+        self, *, app_slug: str, values: Mapping[str, str]
+    ) -> dict[str, str]:
+        """Vault each permitted secret and return opaque references only.
+
+        A field outside the reviewed set is refused rather than stored, and a value
+        that cannot be vaulted is omitted (the service then reports a typed login
+        failure) rather than being sent in the clear.
+        """
+
+        from ops.browser_service_client import ALLOWED_BROWSER_SECRET_FIELDS
+
+        store = self._secret_store
+        if store is None:
+            raise ConfigurationRequiredError(
+                phase=5,
+                capability="browser service secrets",
+                reason_code="secret_vault_required_for_browser_service",
+            )
+        references: dict[str, str] = {}
+        for name, value in values.items():
+            if name not in ALLOWED_BROWSER_SECRET_FIELDS or not value:
+                continue
+            with contextlib.suppress(Exception):
+                references[name] = store.put(
+                    app_slug=app_slug,
+                    # Namespaced so a browser-login secret is distinguishable from a
+                    # captured integration credential in the vault.
+                    kind=f"browser_login_{name}",
+                    value=value,
+                )
+        return references
+
     def _build_browser_worker(self, settings: Settings) -> BrowserWorker:
-        """Select the browser backend. Default resolves the (possibly assignment-
-        patched) ``BrowserWorker`` in this module's namespace, so the Browser Use
-        path is byte-for-byte unchanged. ``playwright`` selects the self-hosted
-        harness, failing closed with a clear reason if it is not yet available."""
+        """Select the browser backend.
+
+        Default resolves the (possibly assignment-patched) ``BrowserWorker`` in this
+        module's namespace, so the Browser Use path is byte-for-byte unchanged.
+
+        For ``playwright`` the NORMAL path is now the isolated browser service over
+        authenticated RPC. Previously this always returned the in-process worker, so
+        the service, its RPC auth, restart reattachment, health and lifecycle manager
+        were never used by the real application. Running Chromium inside the API is
+        still possible but must be requested explicitly via
+        ``playwright_in_process_sandbox`` — it is for isolated tests and local
+        debugging, not a silent fallback when the service is unconfigured.
+        """
 
         provider = getattr(settings, "browser_provider", "browser_use")
         if provider == "playwright":
-            try:
-                from ops.playwright_worker import PlaywrightBrowserWorker
-            except ImportError:
+            if getattr(settings, "playwright_in_process_sandbox", False):
+                try:
+                    from ops.playwright_worker import PlaywrightBrowserWorker
+                except ImportError:
+                    raise ConfigurationRequiredError(
+                        phase=5,
+                        capability="Playwright browser provider",
+                        reason_code="playwright_provider_unavailable",
+                    ) from None
+                return cast("BrowserWorker", PlaywrightBrowserWorker(settings=settings))
+
+            if not settings.browser_service_url or settings.browser_service_token is None:
+                # Fail closed with an actionable reason rather than quietly starting
+                # a browser in the control plane.
                 raise ConfigurationRequiredError(
                     phase=5,
-                    capability="Playwright browser provider",
-                    reason_code="playwright_provider_unavailable",
-                ) from None
-            return cast("BrowserWorker", PlaywrightBrowserWorker(settings=settings))
+                    capability="Playwright browser service",
+                    reason_code="browser_service_configuration_required",
+                )
+            from ops.browser_service_client import BrowserServiceClient
+
+            return cast(
+                "BrowserWorker",
+                BrowserServiceClient(
+                    base_url=settings.browser_service_url,
+                    token=settings.browser_service_token,
+                    owner=settings.browser_service_owner,
+                ),
+            )
         return BrowserWorker(settings=settings)
 
     def _record_wiring(
@@ -1349,10 +1433,9 @@ class RunService:
                     # never persisted to state, checkpoints, the ledger, or logs.
                     start_sensitive_data: dict[str, str] | None = None
                     if browser_login and run_provider_action:
-                        start_sensitive_data = {
-                            name: secret.get_secret_value()
-                            for name, secret in browser_login.items()
-                        }
+                        start_sensitive_data = self._browser_login_payload(
+                            app_slug=record["app_slug"], values=browser_login
+                        )
                     if (
                         self._async_browser_enabled
                         and is_self_serve

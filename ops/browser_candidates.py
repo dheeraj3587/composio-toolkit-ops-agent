@@ -89,6 +89,10 @@ class CandidatePostcondition:
     auto-waiting — never ``networkidle`` as a success proxy and never a sleep.
     """
 
+    # The element the action was performed ON. Required for checked/selected
+    # assertions: without it an UNRELATED checkbox or select elsewhere on the page
+    # could satisfy the postcondition, so a no-op would look like a real transition.
+    target: ElementPredicate | None = None
     url_changed: bool = False
     url_matches: tuple[str, ...] = ()
     element_appears: tuple[ElementPredicate, ...] = ()
@@ -108,6 +112,9 @@ class CandidatePostcondition:
             or self.text_appears
             or self.selected_value is not None
             or self.checked_state is not None
+            # A target-only postcondition is asserted for select_option, where the
+            # expected label is supplied by the executor at verification time.
+            or self.target is not None
         )
 
 
@@ -460,6 +467,11 @@ def generate_candidates(
                     checkpoint_order=checkpoint_order,
                     value_ref=ref,
                     hint_index=element.index,
+                    # Bound to THIS select, so an unrelated selected option
+                    # elsewhere cannot satisfy the assertion. The expected LABEL is
+                    # supplied by the executor at verification time (the reference
+                    # name is not the option text).
+                    postcondition=CandidatePostcondition(target=_predicate_of(element)),
                 )
             )
             break
@@ -489,7 +501,11 @@ def generate_candidates(
                 trace_version=trace_version,
                 checkpoint_order=checkpoint_order,
                 hint_index=element.index,
-                postcondition=CandidatePostcondition(checked_state=desired),
+                # Bound to THIS checkbox: any-element matching previously let an
+                # unrelated already-checked box satisfy a no-op.
+                postcondition=CandidatePostcondition(
+                    target=_predicate_of(element), checked_state=desired
+                ),
             )
         )
         break
@@ -542,6 +558,23 @@ def generate_candidates(
             break
 
     return tuple(candidates[:max_candidates])
+
+
+def _predicate_of(element: SnapshotElement) -> ElementPredicate:
+    """Build a postcondition predicate that identifies exactly THIS element.
+
+    Used to bind ``checked_state``/``selected_value`` to the element that was acted
+    on. Identity-shaped (role/name/type/frame/test id), so a postcondition can
+    never smuggle in an authored selector.
+    """
+
+    return ElementPredicate(
+        role=element.role,
+        name=element.name,
+        element_type=element.element_type,
+        frame_path=tuple(element.frame_path),
+        test_id=element.test_id,
+    )
 
 
 def _identity_of(element: SnapshotElement) -> ElementIdentity:

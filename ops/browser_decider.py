@@ -108,6 +108,11 @@ class SnapshotElement:
     href_path: str | None = None
     test_id: str | None = None
     nearby_heading: str | None = None
+    # For a NON-secret <select>: the currently selected option's visible label.
+    # Needed because ``selected`` is only meaningful on <option> elements, which the
+    # interactive-element snapshot deliberately does not collect — so without this
+    # there was nothing reliable to verify a select_option action against.
+    selected_label: str | None = None
 
     def render(self) -> str:
         parts = [f"[{self.index}] {self.role}"]
@@ -197,6 +202,11 @@ def build_snapshot(raw_elements: Sequence[Mapping[str, object]]) -> tuple[Snapsh
                 href_path=(_text(raw.get("href_path") or "")[:300] or None),
                 test_id=(_text(raw.get("test_id") or "")[:120] or None),
                 nearby_heading=(_text(raw.get("nearby_heading") or "")[:_MAX_NAME] or None),
+                # A select's chosen option label. Suppressed for a secret-ish
+                # control so no value can ride out through this field.
+                selected_label=(
+                    None if secretish else (_text(raw.get("selected_label") or "")[:120] or None)
+                ),
             )
         )
     return tuple(elements)

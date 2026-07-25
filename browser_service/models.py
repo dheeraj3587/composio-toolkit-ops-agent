@@ -42,6 +42,10 @@ class CreateSessionRequest(_Strict):
     live_view_mode: LiveViewMode = "screenshot"
     # Whether the service may restore previously saved authenticated state.
     use_storage_state: bool = False
+    # An OPAQUE account reference used to bind stored state. Deliberately not an
+    # email address: the binding fingerprint must not be derived from, or reveal,
+    # a real account identifier.
+    account_ref: str | None = Field(default=None, max_length=200)
 
 
 class SessionSummary(_Strict):

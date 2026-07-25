@@ -257,20 +257,43 @@ class LocalRunService:
             ),
             # Report under the SELECTED provider's identity. Browser Use keeps its
             # exact previous wording/behaviour; Playwright is judged by its own
-            # requirements (no Browser Use key) and reported as
-            # configured_not_verified because the API image intentionally has no
-            # Chromium — readiness is proven by the separate browser image's probe.
+            # requirements (no Browser Use key). Readiness for the service-backed
+            # Playwright path comes from the SERVICE's own cached probe — the API
+            # image has no Chromium and must never try to launch one here.
             state(
                 selected_browser,
                 configured=browser_configured,
                 enabled=live_browser_enabled,
-                detail=(
-                    "Live browser execution is policy-disabled."
-                    if not live_browser_enabled
-                    else "Browser configuration is present but has not been verified."
+                detail=self._browser_provider_detail(
+                    provider=selected_browser,
+                    settings=settings,
+                    live_enabled=live_browser_enabled,
                 ),
             ),
         ]
+
+    @staticmethod
+    def _browser_provider_detail(*, provider: str, settings: Settings, live_enabled: bool) -> str:
+        """Provider health detail. Never launches a browser from the API path."""
+
+        if not live_enabled:
+            return "Live browser execution is policy-disabled."
+        if provider != "playwright":
+            return "Browser configuration is present but has not been verified."
+        if getattr(settings, "playwright_in_process_sandbox", False):
+            return (
+                "In-process Playwright sandbox is enabled (tests and local debugging "
+                "only); Chromium runs inside this process rather than the browser service."
+            )
+        if not settings.browser_service_url or settings.browser_service_token is None:
+            return (
+                "The Playwright provider requires BROWSER_SERVICE_URL and "
+                "BROWSER_SERVICE_TOKEN, or the explicit in-process sandbox flag."
+            )
+        return (
+            "Chromium runs in the isolated browser service; its readiness is reported "
+            "by that service's own cached probe rather than by this image."
+        )
 
     @staticmethod
     def _browser_phase_detail(*, provider: str, configured: bool) -> str:

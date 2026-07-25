@@ -55,6 +55,29 @@ _RESUME_SIGNALS: frozenset[str] = frozenset(
         "cancelled",
     }
 )
+# Backward-compatible aliases. The public resume endpoint defaults to "completed",
+# so without this mapping every existing caller's resume failed closed on the
+# Playwright path while working fine on Browser Use.
+_RESUME_ALIASES: dict[str, str] = {"completed": "human_completed"}
+
+
+@dataclass(frozen=True, slots=True)
+class LoginSurface:
+    """Where the login form actually lives.
+
+    A login form inside an iframe cannot be reached with ``page.locator(...)``,
+    which only searches the main frame. Carrying the resolved frame (plus its
+    reviewed host chain) is what lets the state machine fill the RIGHT surface
+    instead of silently finding nothing.
+    """
+
+    frame_path: tuple[str, ...]
+    frame_url: str
+    frame: Any
+
+    @property
+    def is_main_frame(self) -> bool:
+        return not self.frame_path
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +91,9 @@ class LoginInspection:
     submit_control: ElementIdentity | None
     current_url: str
     reason_code: str
+    # The reviewed frame the form was found in; () means the main frame. Defaulted
+    # so existing constructions keep working unchanged.
+    frame_path: tuple[str, ...] = ()
 
 
 # --- Selectors and text patterns (structure-first, never body-text guessing) ---
@@ -153,76 +179,220 @@ async def _visible_body_text(page: Any) -> str:
     return text[:8_000] if isinstance(text, str) else ""
 
 
+def reviewed_login_surfaces(page: Any, patterns: Sequence[str]) -> list[LoginSurface]:
+    """The main frame plus every REVIEWED child frame, as fillable surfaces.
+
+    An unreviewed frame is excluded entirely: it is neither inspected nor filled,
+    so a third-party login iframe can never receive a credential.
+    """
+
+    from ops.browser_host_policy import host_matches_patterns
+    from ops.browser_snapshot import frame_chain, frame_host
+
+    allow = tuple(patterns)
+    surfaces: list[LoginSurface] = []
+    try:
+        frames = list(page.frames)
+    except Exception:
+        return [LoginSurface(frame_path=(), frame_url=getattr(page, "url", "") or "", frame=page)]
+
+    for frame in frames:
+        try:
+            chain = frame_chain(frame)
+        except Exception:
+            continue
+        if not chain:
+            # The main frame; its own host is validated by the caller's guard.
+            surfaces.append(
+                LoginSurface(frame_path=(), frame_url=getattr(frame, "url", "") or "", frame=frame)
+            )
+            continue
+        host = frame_host(frame)
+        if not host or not host_matches_patterns(host, allow):
+            continue  # unreviewed origin: never inspected, never filled
+        surfaces.append(
+            LoginSurface(frame_path=chain, frame_url=getattr(frame, "url", "") or "", frame=frame)
+        )
+    if not surfaces:
+        surfaces.append(
+            LoginSurface(frame_path=(), frame_url=getattr(page, "url", "") or "", frame=page)
+        )
+    return surfaces
+
+
+def resolve_reviewed_frame(
+    page: Any, frame_path: Sequence[str], patterns: Sequence[str]
+) -> Any | None:
+    """Re-resolve the surface identified by ``frame_path``, or None.
+
+    Called immediately before filling, so the frame is verified reviewed at the
+    moment of use rather than only at inspection time.
+    """
+
+    target = tuple(frame_path)
+    for surface in reviewed_login_surfaces(page, patterns):
+        if surface.frame_path == target:
+            return surface.frame
+    return None
+
+
+async def _inspect_surface(surface: Any, url: str) -> tuple[LoginState, str, dict[str, Any]]:
+    """Classify ONE surface. Returns (state, reason, identity fields)."""
+
+    email_n = await _count_visible_enabled(surface, _EMAIL_SELECTOR)
+    password_n = await _count_visible_enabled(surface, _PASSWORD_SELECTOR)
+    otp_n = await _count_visible_enabled(surface, _OTP_SELECTOR)
+    body = await _visible_body_text(surface)
+
+    email_field = await _first_identity(surface, _EMAIL_SELECTOR, "input") if email_n else None
+    password_field = (
+        await _first_identity(surface, _PASSWORD_SELECTOR, "input") if password_n else None
+    )
+    submit_control = await _first_identity(surface, _SUBMIT_SELECTOR, "button")
+
+    otp_fields: tuple[ElementIdentity, ...] = ()
+    if otp_n and password_n == 0:  # an OTP field on a surface WITHOUT a password field
+        ident = await _first_identity(surface, _OTP_SELECTOR, "input")
+        otp_fields = (ident,) if ident is not None else ()
+
+    account_choice = await _count_visible_enabled(surface, _ACCOUNT_CHOICE_SELECTOR)
+    fields = {
+        "email_field": email_field,
+        "password_field": password_field,
+        "otp_fields": otp_fields,
+        "submit_control": submit_control,
+    }
+
+    if password_n > 1:
+        return "unknown", "multiple_password_forms", fields
+    if _AUTH_FAIL.search(body) and (password_n or email_n):
+        return "authentication_failed", "authentication_failed", fields
+    if otp_fields:
+        return "otp_required", "otp_required", fields
+    if account_choice and password_n == 0 and email_n == 0:
+        return "account_selection_required", "account_selection_required", fields
+    if password_n == 0 and email_n == 0 and _MAGIC_LINK.search(body):
+        return "magic_link_required", "magic_link_required", fields
+    if email_n >= 1 and password_n >= 1:
+        return "credentials_ready", "credentials_ready", fields
+    if password_n >= 1:
+        return "password_required", "password_required", fields
+    if email_n >= 1:
+        return "email_required", "email_required", fields
+    del url  # kept for signature symmetry; the caller owns URL-based reasoning
+    return "unknown", "no_recognized_login_surface", fields
+
+
+# Login states that mean "a form is present here", used to detect ambiguity across
+# multiple reviewed surfaces.
+_FORM_STATES: frozenset[str] = frozenset(
+    {"credentials_ready", "password_required", "email_required", "otp_required"}
+)
+
+# Reasons that classify a surface DEFINITIVELY even though the state is "unknown".
+# Without this, an ambiguity finding was overwritten by the generic no-surface
+# fallback and the operator lost the actual explanation.
+_DEFINITE_UNKNOWN_REASONS: frozenset[str] = frozenset({"multiple_password_forms"})
+
+
 async def inspect_login(page: Any, patterns: Sequence[str]) -> LoginInspection:
     """Deterministically classify the current login surface.
 
     Never types anything; only observes structure (visible/enabled fields) and a
     bounded slice of body text for failure/magic-link detection.
+
+    Searches the main frame AND reviewed child frames, because a login form inside
+    an iframe is invisible to ``page.locator(...)``. When more than one reviewed
+    surface exposes a form the result is ``multiple_login_surfaces`` — ambiguity is
+    escalated, never guessed.
     """
 
-    del patterns  # host safety is enforced separately before any fill
     url = getattr(page, "url", "") or "https://unknown.invalid/"
-    email_n = await _count_visible_enabled(page, _EMAIL_SELECTOR)
-    password_n = await _count_visible_enabled(page, _PASSWORD_SELECTOR)
-    otp_n = await _count_visible_enabled(page, _OTP_SELECTOR)
-    body = await _visible_body_text(page)
+    surfaces = reviewed_login_surfaces(page, patterns)
 
-    email_field = await _first_identity(page, _EMAIL_SELECTOR, "input") if email_n else None
-    password_field = (
-        await _first_identity(page, _PASSWORD_SELECTOR, "input") if password_n else None
-    )
-    submit_control = await _first_identity(page, _SUBMIT_SELECTOR, "button")
+    findings: list[tuple[LoginSurface, LoginState, str, dict[str, Any]]] = []
+    for surface in surfaces:
+        state, reason, fields = await _inspect_surface(surface.frame, url)
+        findings.append((surface, state, reason, fields))
 
-    otp_fields: tuple[ElementIdentity, ...] = ()
-    if otp_n and password_n == 0:  # an OTP field on a page WITHOUT a password field
-        ident = await _first_identity(page, _OTP_SELECTOR, "input")
-        otp_fields = (ident,) if ident is not None else ()
-
-    account_choice = await _count_visible_enabled(page, _ACCOUNT_CHOICE_SELECTOR)
-
-    def result(state: LoginState, reason: str) -> LoginInspection:
+    with_forms = [item for item in findings if item[1] in _FORM_STATES]
+    if len(with_forms) > 1:
+        # Two reviewed surfaces both offering a login form: a human must choose.
         return LoginInspection(
-            state=state,
-            email_field=email_field,
-            password_field=password_field,
-            otp_fields=otp_fields,
-            submit_control=submit_control,
+            state="unknown",
+            email_field=None,
+            password_field=None,
+            otp_fields=(),
+            submit_control=None,
             current_url=url,
-            reason_code=reason,
+            reason_code="multiple_login_surfaces",
         )
 
-    if password_n > 1:
-        return result("unknown", "multiple_password_forms")
-    if _AUTH_FAIL.search(body) and (password_n or email_n):
-        return result("authentication_failed", "authentication_failed")
-    if otp_fields:
-        return result("otp_required", "otp_required")
-    if account_choice and password_n == 0 and email_n == 0:
-        return result("account_selection_required", "account_selection_required")
-    if password_n == 0 and email_n == 0 and _MAGIC_LINK.search(body):
-        return result("magic_link_required", "magic_link_required")
-    if email_n >= 1 and password_n >= 1:
-        return result("credentials_ready", "credentials_ready")
-    if password_n >= 1:
-        return result("password_required", "password_required")
-    if email_n >= 1:
-        return result("email_required", "email_required")
-    if not _AUTH_PATH.search(urlsplit(url).path):
-        return result("authenticated", "authenticated")
-    return result("unknown", "no_recognized_login_surface")
+    def _build(
+        surface: LoginSurface, state: LoginState, reason: str, fields: dict[str, Any]
+    ) -> LoginInspection:
+        return LoginInspection(
+            state=state,
+            email_field=fields["email_field"],
+            password_field=fields["password_field"],
+            otp_fields=fields["otp_fields"],
+            submit_control=fields["submit_control"],
+            current_url=url,
+            reason_code=reason,
+            frame_path=surface.frame_path,
+        )
+
+    if with_forms:
+        return _build(*with_forms[0])
+
+    # An ambiguous surface (e.g. two password forms) is a DEFINITE finding even
+    # though its state is "unknown": its reason code must survive rather than being
+    # replaced by the generic no-surface fallback below.
+    for surface, state, reason, fields in findings:
+        if reason in _DEFINITE_UNKNOWN_REASONS:
+            return _build(surface, state, reason, fields)
+
+    # No form anywhere. Prefer a definite non-form classification from any surface
+    # (auth failure, magic link, account selection) before falling back.
+    for surface, state, reason, fields in findings:
+        if state != "unknown":
+            return _build(surface, state, reason, fields)
+
+    main = findings[0] if findings else None
+    fallback_fields: dict[str, Any] = {
+        "email_field": None,
+        "password_field": None,
+        "otp_fields": (),
+        "submit_control": None,
+    }
+    # NOT "authenticated": the absence of login controls is not evidence of a
+    # successful login — an error page, a loading skeleton or a blank page all look
+    # like this. `authenticated` must come from a reviewed checkpoint predicate.
+    return _build(
+        main[0] if main else LoginSurface(frame_path=(), frame_url=url, frame=page),
+        "unknown",
+        "no_recognized_login_surface",
+        main[3] if main else fallback_fields,
+    )
 
 
-async def _origin_safe_and_unique(page: Any, patterns: Sequence[str]) -> bool:
-    """Credentials may be filled only on an approved origin with a single form."""
+async def _origin_safe_and_unique(page: Any, patterns: Sequence[str], surface: Any = None) -> bool:
+    """Credentials may be filled only on an approved origin with a single form.
+
+    ``surface`` is the resolved frame the form lives in (defaults to the page). The
+    page's own URL is still validated, so a reviewed iframe on an unreviewed page
+    is refused.
+    """
 
     from ops.playwright_worker import navigation_allowed
 
+    target = surface if surface is not None else page
     if not navigation_allowed(getattr(page, "url", "") or "", tuple(patterns)):
         return False
-    if await _count_visible_enabled(page, _PASSWORD_SELECTOR) != 1:
+    if await _count_visible_enabled(target, _PASSWORD_SELECTOR) != 1:
         return False
     try:
-        action = await page.locator("form:has(input[type='password'])").first.get_attribute(
+        action = await target.locator("form:has(input[type='password'])").first.get_attribute(
             "action", timeout=2_000
         )
     except Exception:
@@ -247,45 +417,80 @@ async def _fill_first(page: Any, selector: str, value: str) -> bool:
         return False
 
 
-async def _click_submit(page: Any) -> bool:
+async def _click_submit(surface: Any) -> bool:
     try:
-        locator = page.locator(_SUBMIT_SELECTOR)
+        locator = surface.locator(_SUBMIT_SELECTOR)
         if int(await locator.count()) >= 1:
             await locator.first.click(timeout=5_000)
-            await _settle(page)
+            await _settle(surface)
             return True
     except Exception:
         pass
     try:
-        await page.locator(_PASSWORD_SELECTOR).first.press("Enter", timeout=5_000)
-        await _settle(page)
+        await surface.locator(_PASSWORD_SELECTOR).first.press("Enter", timeout=5_000)
+        await _settle(surface)
         return True
     except Exception:
         return False
 
 
-async def _click_email_continue(page: Any) -> bool:
+async def _click_email_continue(surface: Any) -> bool:
     try:
-        locator = page.locator(_SUBMIT_SELECTOR)
+        locator = surface.locator(_SUBMIT_SELECTOR)
         if int(await locator.count()) >= 1:
             await locator.first.click(timeout=5_000)
-            await _settle(page)
+            await _settle(surface)
             return True
     except Exception:
         pass
     try:
-        await page.locator(_EMAIL_SELECTOR).first.press("Enter", timeout=5_000)
-        await _settle(page)
+        await surface.locator(_EMAIL_SELECTOR).first.press("Enter", timeout=5_000)
+        await _settle(surface)
         return True
     except Exception:
         return False
 
 
-async def _settle(page: Any) -> None:
+async def _settle(surface: Any) -> None:
+    """Wait for the DOM to be ready — deliberately NOT ``networkidle``.
+
+    A site with a persistent WebSocket or a background poll may never reach network
+    idle, so using it as a generic settle condition stalls the whole login for the
+    full timeout. ``domcontentloaded`` plus Playwright's own auto-waiting on the
+    next action is both faster and correct; callers that need a specific transition
+    use :func:`wait_for_login_state_change`.
+    """
+
     try:
-        await page.wait_for_load_state("networkidle", timeout=15_000)
+        await surface.wait_for_load_state("domcontentloaded", timeout=5_000)
     except Exception:
         pass
+
+
+async def wait_for_login_state_change(
+    page: Any,
+    *,
+    previous: LoginState,
+    patterns: Sequence[str],
+    timeout_seconds: float = 10.0,
+) -> LoginInspection:
+    """Poll the login state until it leaves ``previous`` or the budget expires.
+
+    Waits for an OBSERVED state transition rather than a network condition, so it
+    works on sites that never go idle. Bounded, and never a fixed sleep — the
+    interval only yields control between structural inspections.
+    """
+
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.5, timeout_seconds)
+    while loop.time() < deadline:
+        current = await inspect_login(page, patterns)
+        if current.state != previous:
+            return current
+        await asyncio.sleep(0.1)
+    return await inspect_login(page, patterns)
 
 
 async def drive_login(
@@ -305,9 +510,25 @@ async def drive_login(
 
     inspection = await inspect_login(page, patterns)
 
+    # Resolve the REVIEWED surface the form lives in. All fills go through this,
+    # so an iframe login form is actually reachable — and an unreviewed frame is
+    # never resolved in the first place.
+    surface = resolve_reviewed_frame(page, inspection.frame_path, patterns)
+    if surface is None:
+        return LoginInspection(
+            state="unknown",
+            email_field=None,
+            password_field=None,
+            otp_fields=(),
+            submit_control=None,
+            current_url=getattr(page, "url", "") or "https://unknown.invalid/",
+            reason_code="login_frame_unreviewed",
+            frame_path=inspection.frame_path,
+        )
+
     # One-page email + password.
     if inspection.state == "credentials_ready":
-        if not await _origin_safe_and_unique(page, patterns):
+        if not await _origin_safe_and_unique(page, patterns, surface):
             return LoginInspection(
                 state="unknown",
                 email_field=inspection.email_field,
@@ -316,52 +537,66 @@ async def drive_login(
                 submit_control=inspection.submit_control,
                 current_url=getattr(page, "url", "") or "https://unknown.invalid/",
                 reason_code="login_origin_unsafe",
+                frame_path=inspection.frame_path,
             )
         if email:
-            await _fill_first(page, _EMAIL_SELECTOR, email)
+            await _fill_first(surface, _EMAIL_SELECTOR, email)
         if password:
-            await _fill_first(page, _PASSWORD_SELECTOR, password)
-        await _click_submit(page)
+            await _fill_first(surface, _PASSWORD_SELECTOR, password)
+        await _click_submit(surface)
         return await inspect_login(page, patterns)
 
     # Email-first: submit the email, then handle the resulting password page.
     if inspection.state == "email_required":
         if email:
-            await _fill_first(page, _EMAIL_SELECTOR, email)
-            await _click_email_continue(page)
+            await _fill_first(surface, _EMAIL_SELECTOR, email)
+            await _click_email_continue(surface)
             after = await inspect_login(page, patterns)
-            if after.state == "password_required" and password:
-                if not await _origin_safe_and_unique(page, patterns):
+            next_surface = resolve_reviewed_frame(page, after.frame_path, patterns)
+            if after.state == "password_required" and password and next_surface is not None:
+                if not await _origin_safe_and_unique(page, patterns, next_surface):
                     return after
-                await _fill_first(page, _PASSWORD_SELECTOR, password)
-                await _click_submit(page)
+                await _fill_first(next_surface, _PASSWORD_SELECTOR, password)
+                await _click_submit(next_surface)
                 return await inspect_login(page, patterns)
             return after
         return inspection
 
     # Password page (email already submitted earlier).
     if inspection.state == "password_required":
-        if password and await _origin_safe_and_unique(page, patterns):
-            await _fill_first(page, _PASSWORD_SELECTOR, password)
-            await _click_submit(page)
+        if password and await _origin_safe_and_unique(page, patterns, surface):
+            await _fill_first(surface, _PASSWORD_SELECTOR, password)
+            await _click_submit(surface)
             return await inspect_login(page, patterns)
         return inspection
 
     return inspection
 
 
-async def inject_otp(page: Any, value: str, inspection: LoginInspection) -> bool:
+async def inject_otp(
+    page: Any, value: str, inspection: LoginInspection, patterns: Sequence[str] = ()
+) -> bool:
     """Fill an OTP by code — one whole-code field, or per-character fields.
 
     The OTP value is never logged, never sent to an LLM, and is not retained. A
     numeric or alphanumeric code is supported. Returns True when the code was
     entered and submitted.
+
+    Operates on the REVIEWED surface recorded in the inspection, so an OTP field
+    inside a reviewed iframe is reachable. ``patterns`` is optional for backward
+    compatibility: without it, only the main frame is used (Phase 1 behaviour).
     """
 
     if not value or not inspection.otp_fields:
         return False
+    surface: Any = page
+    if inspection.frame_path and patterns:
+        resolved = resolve_reviewed_frame(page, inspection.frame_path, patterns)
+        if resolved is None:
+            return False  # never type an OTP into an unreviewed frame
+        surface = resolved
     try:
-        single = page.locator(_OTP_SELECTOR)
+        single = surface.locator(_OTP_SELECTOR)
         count = int(await single.count())
     except Exception:
         return False
@@ -387,7 +622,7 @@ async def inject_otp(page: Any, value: str, inspection: LoginInspection) -> bool
                     ok = False
                     break
             if ok:
-                await _submit_otp(page)
+                await _submit_otp(surface)
                 return True
 
     # Single field holding the whole code.
@@ -395,31 +630,98 @@ async def inject_otp(page: Any, value: str, inspection: LoginInspection) -> bool
         await single.first.fill(value, timeout=3_000)
     except Exception:
         return False
-    await _submit_otp(page)
+    await _submit_otp(surface)
     return True
 
 
-async def _submit_otp(page: Any) -> None:
+async def _submit_otp(surface: Any) -> None:
     try:
-        locator = page.locator(_SUBMIT_SELECTOR)
+        locator = surface.locator(_SUBMIT_SELECTOR)
         if int(await locator.count()) >= 1:
             await locator.first.click(timeout=5_000)
         else:
-            await page.locator(_OTP_SELECTOR).first.press("Enter", timeout=5_000)
+            await surface.locator(_OTP_SELECTOR).first.press("Enter", timeout=5_000)
     except Exception:
         pass
-    await _settle(page)
+    await _settle(surface)
 
 
 def normalize_resume_signal(signal: str | None) -> ResumeSignal | None:
-    """Return a recognized resume signal, or None to fail closed on unknown input."""
+    """Return a recognized resume signal, or None to fail closed on unknown input.
+
+    ``completed`` is accepted as an alias for ``human_completed``: the public API's
+    resume endpoint defaults to it, so without the alias every existing caller's
+    resume was silently rejected by the Playwright path. Browser Use behaviour is
+    untouched.
+    """
 
     if not signal:
         return None
     normalized = signal.strip().casefold()
+    if normalized in _RESUME_ALIASES:
+        normalized = _RESUME_ALIASES[normalized]
     if normalized in _RESUME_SIGNALS:
         return normalized  # type: ignore[return-value]
     return None
+
+
+async def apply_resume_secrets(
+    *,
+    page: Any,
+    sensitive_data: Mapping[str, str],
+    patterns: Sequence[str],
+) -> LoginInspection:
+    """Apply a resume-time secret (OTP or verification link), else drive login.
+
+    This is the missing link that made autonomous OTP/magic-link resolution a
+    no-op on the Playwright path: ``drive_login`` only ever reads email/password,
+    so ``login_otp`` and ``login_verification_url`` were carried into the worker
+    and then ignored.
+
+    Both values are code-owned: they are used by deterministic Playwright calls,
+    dropped immediately, and never enter a prompt, log, audit event, decision
+    event, screenshot or run state.
+    """
+
+    inspection = await inspect_login(page, patterns)
+
+    def _refused(reason: str) -> LoginInspection:
+        return LoginInspection(
+            state="unknown",
+            email_field=inspection.email_field,
+            password_field=inspection.password_field,
+            otp_fields=inspection.otp_fields,
+            submit_control=inspection.submit_control,
+            current_url=getattr(page, "url", "") or "https://unknown.invalid/",
+            reason_code=reason,
+            frame_path=inspection.frame_path,
+        )
+
+    otp = sensitive_data.get("login_otp")
+    if otp:
+        # The OTP surface must be PROVEN, not assumed: typing a code into an
+        # unverified page could send it somewhere it does not belong.
+        if inspection.state != "otp_required":
+            return _refused("otp_surface_not_verified")
+        entered = await inject_otp(page, otp, inspection, patterns)
+        del otp  # drop the value as soon as it has been used
+        if not entered:
+            return _refused("otp_injection_failed")
+        return await inspect_login(page, patterns)
+
+    verification_url = sensitive_data.get("login_verification_url")
+    if verification_url:
+        if not magic_link_is_safe(verification_url, patterns):
+            return _refused("verification_link_blocked")
+        try:
+            await page.goto(verification_url, wait_until="domcontentloaded", timeout=15_000)
+        except Exception:
+            del verification_url
+            return _refused("verification_link_navigation_failed")
+        del verification_url
+        return await inspect_login(page, patterns)
+
+    return await drive_login(page, sensitive_data, patterns)
 
 
 def magic_link_is_safe(url: str, patterns: Sequence[str]) -> bool:
@@ -438,10 +740,15 @@ def magic_link_is_safe(url: str, patterns: Sequence[str]) -> bool:
 __all__ = [
     "LoginInspection",
     "LoginState",
+    "LoginSurface",
     "ResumeSignal",
+    "apply_resume_secrets",
     "drive_login",
     "inject_otp",
     "inspect_login",
     "magic_link_is_safe",
     "normalize_resume_signal",
+    "resolve_reviewed_frame",
+    "reviewed_login_surfaces",
+    "wait_for_login_state_change",
 ]

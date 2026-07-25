@@ -19,8 +19,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import AsyncIterator
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, status
 from fastapi.responses import JSONResponse
@@ -59,17 +61,100 @@ def _sanitized_error(exc: SessionUnavailable) -> HTTPException:
     return HTTPException(status_code=code, detail=exc.reason_code)
 
 
-async def _close_session_resources(session: ManagedSession) -> None:
-    """Close Playwright objects in dependency order, best effort."""
+# How long a cached Chromium readiness result stays fresh. The probe launches a
+# browser, so it must not run per request.
+_READINESS_TTL_SECONDS = 300.0
 
-    for closer in (
-        getattr(session.context, "close", None),
-        getattr(session.browser, "close", None),
-        getattr(session.playwright, "stop", None),
-    ):
-        if callable(closer):
-            with contextlib.suppress(Exception):
-                await closer()
+
+@dataclass
+class _ReadinessCache:
+    """One cached readiness result, refreshed under a single lock."""
+
+    chromium_installed: bool = False
+    context_launch_ok: bool = False
+    reason_code: str = "readiness_not_probed"
+    detail: str = ""
+    checked_at: float | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def is_stale(self) -> bool:
+        if self.checked_at is None:
+            return True
+        return (time.monotonic() - self.checked_at) >= _READINESS_TTL_SECONDS
+
+    def update(
+        self, *, chromium_installed: bool, context_launch_ok: bool, reason_code: str, detail: str
+    ) -> None:
+        self.chromium_installed = chromium_installed
+        self.context_launch_ok = context_launch_ok
+        self.reason_code = reason_code
+        self.detail = detail
+        self.checked_at = time.monotonic()
+
+
+def _storage_binding(payload: CreateSessionRequest, owner: str) -> Any:
+    """The (app, account, owner) triple stored state is bound to."""
+
+    from ops.browser_storage_state import StorageStateBinding
+
+    return StorageStateBinding(
+        app_slug=payload.app_slug,
+        # An opaque reference, never a raw email address.
+        account_ref=payload.account_ref or payload.profile_id or "default",
+        owner=owner,
+    )
+
+
+def _state_store(settings: BrowserServiceSettings) -> Any:
+    from ops.browser_storage_state import EncryptedStorageStateStore
+
+    key = settings.storage_state_key.get_secret_value() if settings.storage_state_key else None
+    return EncryptedStorageStateStore(settings.storage_state_dir, key)
+
+
+def _load_storage_state(
+    payload: CreateSessionRequest, owner: str, settings: BrowserServiceSettings
+) -> dict[str, object] | None:
+    """Decrypt previously saved authenticated state for this exact binding.
+
+    Returns None when persistence is disabled, nothing is stored, or the blob is
+    expired/undecryptable — the caller then simply performs a fresh login. The
+    request only ever names an app and an opaque account reference, never a path.
+    """
+
+    if not payload.use_storage_state:
+        return None
+    store = _state_store(settings)
+    if not store.enabled:
+        return None
+    try:
+        return cast("dict[str, object] | None", store.load(_storage_binding(payload, owner)))
+    except Exception:
+        # A binding mismatch or corrupt blob must never block session creation.
+        return None
+
+
+def make_session_closer(worker_factory: Any) -> Any:
+    """Build the manager's closer, which stops the REAL worker session.
+
+    Previously the closer walked ``session.context``/``browser``/``playwright``,
+    none of which were ever populated — so the janitor and service shutdown closed
+    nothing and leaked Chromium. Ownership is now explicit: the manager holds the
+    worker-side ``BrowserSessionContext`` and stops it through the worker.
+    """
+
+    async def _close(session: ManagedSession) -> None:
+        context = session.worker_context
+        if context is None:
+            return
+        worker = worker_factory()
+        if worker is None:
+            return
+        with contextlib.suppress(Exception):
+            await worker.stop(context)
+        session.worker_context = None
+
+    return _close
 
 
 def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
@@ -82,13 +167,16 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         inactivity_seconds=resolved.inactivity_seconds,
         maximum_age_seconds=resolved.maximum_age_seconds,
         drain_seconds=resolved.drain_seconds,
-        closer=_close_session_resources,
     )
 
     @contextlib.asynccontextmanager
     async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         janitor = asyncio.create_task(manager.run_janitor(_JANITOR_INTERVAL_SECONDS))
         app.state.janitor_task = janitor
+        # One readiness probe at startup, so the first health call is already
+        # answered from cache rather than launching a browser inline.
+        with contextlib.suppress(Exception):
+            await _refresh_readiness(force=True)
         try:
             yield
         finally:
@@ -111,14 +199,27 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
     # The worker is created lazily: importing Playwright must not be required for
     # /internal/health to answer "chromium not installed".
     app.state.worker = None
+    app.state.readiness = _ReadinessCache()
 
     def _worker() -> Any:
         if app.state.worker is None:
             from ops.config import Settings
             from ops.playwright_worker import PlaywrightBrowserWorker
 
-            app.state.worker = PlaywrightBrowserWorker(settings=Settings.from_env(dotenv_path=None))
+            app.state.worker = PlaywrightBrowserWorker(
+                settings=Settings.from_env(dotenv_path=None),
+                # Headed ONLY when interactive HITL is enabled: a headless browser
+                # renders nothing on the VNC desktop, so the previous hard-coded
+                # headless launch made interactive HITL structurally impossible.
+                headless=not resolved.interactive_hitl_enabled,
+                # The service manager owns capacity and TTL; two independent
+                # limits and two janitors would disagree.
+                service_mode=True,
+            )
         return app.state.worker
+
+    # Attach the real worker-backed closer now that the factory exists.
+    manager.set_closer(make_session_closer(lambda: app.state.worker))
 
     # ---------------------------------------------------------------- sessions
     @app.post(
@@ -141,11 +242,19 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         # Launch the real browser for this session.
         try:
             worker = _worker()
-            context = await worker.start(payload.profile_id)
-            session.page = getattr(worker, "_sessions", {}).get(context.session_id)
+            storage_state = _load_storage_state(payload, auth.owner, resolved)
+            context = await worker.start(
+                payload.profile_id,
+                storage_state=storage_state if payload.use_storage_state else None,
+            )
+            # EXPLICIT ownership: the manager can now close the real session, and
+            # nothing reaches into the worker's private session dictionary.
+            session.worker_context = context
             session.reason_code = "session_started"
-            # Remember the worker-side handle so operations address the same browser.
             session.current_page_id = context.session_id
+            session.screenshot_available = True
+            if payload.use_storage_state:
+                session.storage_binding = _storage_binding(payload, auth.owner)
         except Exception as exc:  # sanitized: never surface provider text
             await manager.close(session.session_id, reason_code="browser_launch_failed")
             LOGGER.warning("browser launch failed: %s", type(exc).__name__)
@@ -364,80 +473,131 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             # Idempotent delete: already gone is success.
             return JSONResponse({"reason_code": "session_not_found"})
         assert_session_owner(session_owner=session.owner, caller_owner=auth.owner)
-        worker = _worker()
-        handle = session.current_page_id
-        worker_session = getattr(worker, "_sessions", {}).get(handle)
-        if worker_session is not None:
-            with contextlib.suppress(Exception):
-                from ops.browser_worker import BrowserSessionContext
-
-                await worker.stop(
-                    BrowserSessionContext(
-                        profile_id=handle,
-                        session_id=handle,
-                        live_view_available=False,
-                        allowed_domains=(),
-                        created_at=session.created_at.isoformat(),
-                        inactivity_expires_at=session.maximum_expires_at.isoformat(),
-                        maximum_expires_at=session.maximum_expires_at.isoformat(),
-                    )
-                )
+        # ONE teardown path: manager.close() runs the worker-backed closer, which
+        # stops the real session. This endpoint used to stop the browser itself AND
+        # then close the manager session, so with a working closer the browser was
+        # stopped twice — and the janitor path stopped it zero times.
         reason = await manager.close(session_id, reason_code="closed_by_api")
         return JSONResponse({"reason_code": reason})
 
     # ------------------------------------------------------------------ health
-    @app.get("/internal/health", response_model=HealthResponse)
-    async def health(request: Request) -> HealthResponse:
-        """Provider-aware health. Deliberately UNAUTHENTICATED but secret-free.
+    async def _refresh_readiness(*, force: bool = False) -> None:
+        """Probe Chromium at most once per interval, under a single lock.
 
-        It reports only capability state (never a session id, URL, or token) so a
-        container healthcheck can call it without holding the RPC token.
+        The probe LAUNCHES a browser, so running it per request (as the Docker
+        healthcheck does, every 60s, forever) burned a Chromium start each time and
+        could exhaust resources. One cached result is refreshed in the background.
         """
 
-        del request
-        state: ProviderHealthState = "configured_not_verified"
-        reason = "token_configured" if resolved.token_configured else "token_missing"
-        chromium_installed = False
-        context_ok = False
-        detail = ""
-
-        if not resolved.token_configured:
-            state = "not_configured"
-        else:
+        cache: _ReadinessCache = app.state.readiness
+        if not force and not cache.is_stale():
+            return
+        async with cache.lock:
+            if not force and not cache.is_stale():
+                return
             try:
                 from ops.browser_readiness import probe_playwright
 
                 readiness = await probe_playwright(timeout_seconds=25.0)
-                chromium_installed = readiness.reason_code != "playwright_not_installed"
-                context_ok = readiness.ok
-                if readiness.ok:
-                    state = "ready"
-                    reason = "chromium_launch_verified"
-                else:
-                    state = "degraded"
-                    reason = readiness.reason_code
-                    detail = readiness.detail[:200]
+                cache.update(
+                    chromium_installed=readiness.reason_code != "playwright_not_installed",
+                    context_launch_ok=readiness.ok,
+                    reason_code=(
+                        "chromium_launch_verified" if readiness.ok else readiness.reason_code
+                    ),
+                    detail=readiness.detail[:200] if not readiness.ok else "",
+                )
             except Exception as exc:  # pragma: no cover - defensive
-                state = "degraded"
-                reason = f"probe_failed:{type(exc).__name__}"
+                cache.update(
+                    chromium_installed=False,
+                    context_launch_ok=False,
+                    reason_code=f"probe_failed:{type(exc).__name__}",
+                    detail="",
+                )
+
+    def _health_from_cache() -> HealthResponse:
+        cache: _ReadinessCache = app.state.readiness
+        state: ProviderHealthState
+        if not resolved.token_configured:
+            # Fail closed: with no token the service refuses every RPC, so it is not
+            # merely unverified — it is unconfigured.
+            state, reason = "not_configured", "token_missing"
+        elif cache.checked_at is None:
+            state, reason = "configured_not_verified", "readiness_not_probed"
+        elif cache.context_launch_ok:
+            state, reason = "ready", cache.reason_code
+        else:
+            state, reason = "degraded", cache.reason_code
 
         if manager.capacity_in_use >= manager.capacity_total and state == "ready":
-            state = "capacity_exhausted"
-            reason = "all_session_slots_in_use"
+            state, reason = "capacity_exhausted", "all_session_slots_in_use"
 
         return HealthResponse(
             state=state,
             reason_code=reason,
             version=__version__,
-            chromium_installed=chromium_installed,
-            context_launch_ok=context_ok,
+            chromium_installed=cache.chromium_installed,
+            context_launch_ok=cache.context_launch_ok,
             capacity_total=manager.capacity_total,
             capacity_in_use=manager.capacity_in_use,
             janitor_running=manager.janitor_running,
-            detail=detail,
+            detail=cache.detail,
         )
 
+    @app.get("/internal/live")
+    async def live() -> JSONResponse:
+        """Cheap liveness: the process and event loop are responsive.
+
+        Launches nothing. This is what a frequent container healthcheck should call.
+        """
+
+        return JSONResponse({"status": "live", "version": __version__})
+
+    @app.get("/internal/ready", response_model=HealthResponse)
+    async def ready() -> HealthResponse:
+        """Cached Chromium readiness plus capacity and janitor state."""
+
+        await _refresh_readiness()
+        return _health_from_cache()
+
+    @app.get("/internal/health", response_model=HealthResponse)
+    async def health(request: Request) -> HealthResponse:
+        """Provider-aware health. Deliberately UNAUTHENTICATED but secret-free.
+
+        Reports only capability state (never a session id, URL, or token) so a
+        container healthcheck can call it without holding the RPC token. Backed by
+        the CACHED readiness result rather than a fresh Chromium launch.
+        """
+
+        del request
+        await _refresh_readiness()
+        return _health_from_cache()
+
     return app
+
+
+async def _save_storage_state(worker: Any, session: ManagedSession, store: Any) -> None:
+    """Capture and encrypt the browser's authenticated state, best effort.
+
+    Uses the WORKER's own context rather than reaching for Playwright objects the
+    manager never held. A failure here must not fail the run: the next run simply
+    logs in again.
+    """
+
+    if session.worker_context is None or not getattr(store, "enabled", False):
+        return
+    handle = session.current_page_id
+    pw_session = getattr(worker, "_sessions", {}).get(handle)
+    context = getattr(pw_session, "context", None)
+    if context is None:
+        return
+    try:
+        state = await context.storage_state()
+    except Exception:
+        return
+    if isinstance(state, dict) and session.storage_binding is not None:
+        with contextlib.suppress(Exception):
+            store.save(session.storage_binding, state)
 
 
 async def _drive(
@@ -508,6 +668,17 @@ async def _drive(
     session.hitl_pending = observation.status == "human_action_required"
     session.current_url_path = _url_path(observation.current_url)
     session.touch()
+
+    # Persist authenticated state ONLY after a reviewed success, and invalidate it
+    # the moment authentication fails. Storage state is bearer credential material,
+    # so it is encrypted at rest and never logged.
+    if session.storage_binding is not None:
+        store = _state_store(settings)
+        if observation.status in {"credential_page_ready", "succeeded"}:
+            await _save_storage_state(worker, session, store)
+        elif observation.status == "failed":
+            with contextlib.suppress(Exception):
+                store.invalidate(session.storage_binding, reason_code="authentication_failed")
     return ObservationResponse(
         status=observation.status,
         current_url=observation.current_url,

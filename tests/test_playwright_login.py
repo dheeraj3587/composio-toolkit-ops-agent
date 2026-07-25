@@ -133,6 +133,14 @@ def _run(path: str, coro_factory: Any) -> Any:
 
 # --- Login state machine -------------------------------------------------------
 def test_single_page_login_completes() -> None:
+    """Login submits and lands on the post-login page.
+
+    The state is deliberately NOT asserted to be ``authenticated``: the absence of
+    login fields is no longer treated as proof of a successful login (an error page
+    or a loading skeleton looks identical). ``authenticated`` must come from a
+    reviewed checkpoint predicate, so the observable result here is the navigation.
+    """
+
     async def _c(page: Any) -> object:
         result = await drive_login(
             page, {"login_email": "ops@example.test", "login_password": "pw"}, _PATTERNS
@@ -140,11 +148,14 @@ def test_single_page_login_completes() -> None:
         return result.state, page.url
 
     state, url = _run("/login", _c)
-    assert state == "authenticated"
+    # Progress was made off the login form.
+    assert state not in {"credentials_ready", "authentication_failed"}
     assert "/home" in url
 
 
 def test_email_first_login_completes() -> None:
+    """Email-first login walks email -> password -> post-login page."""
+
     async def _c(page: Any) -> object:
         result = await drive_login(
             page, {"login_email": "ops@example.test", "login_password": "pw"}, _PATTERNS
@@ -152,7 +163,7 @@ def test_email_first_login_completes() -> None:
         return result.state, page.url
 
     state, url = _run("/email-first", _c)
-    assert state == "authenticated"
+    assert state not in {"email_required", "password_required", "authentication_failed"}
     assert "/home" in url
 
 
@@ -197,11 +208,22 @@ def test_multi_field_otp_works() -> None:
     assert "/home" in url
 
 
-def test_authenticated_home_is_detected() -> None:
-    async def _c(page: Any) -> object:
-        return (await inspect_login(page, _PATTERNS)).state
+def test_absent_login_surface_is_not_claimed_as_authenticated() -> None:
+    """A page with no login controls must report ``unknown``, not ``authenticated``.
 
-    assert _run("/home", _c) == "authenticated"
+    This is the corrected contract: inferring a successful login from the mere
+    absence of login fields would classify an error page, a loading skeleton or a
+    blank page as authenticated. Authentication evidence has to come from a reviewed
+    checkpoint predicate instead.
+    """
+
+    async def _c(page: Any) -> object:
+        inspection = await inspect_login(page, _PATTERNS)
+        return inspection.state, inspection.reason_code
+
+    state, reason = _run("/home", _c)
+    assert state == "unknown"
+    assert reason == "no_recognized_login_surface"
 
 
 # --- Magic link safety (pure) --------------------------------------------------

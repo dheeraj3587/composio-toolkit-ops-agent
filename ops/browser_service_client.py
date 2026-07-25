@@ -27,6 +27,7 @@ import httpx
 from pydantic import SecretStr
 
 from ops.browser_worker import BrowserObservation, BrowserSessionContext
+from ops.models import validate_vault_reference
 from ops.provider_errors import ConfigurationRequiredError, ProviderOperationError
 
 LOGGER = logging.getLogger("composio_ops.browser_service_client")
@@ -385,23 +386,51 @@ class BrowserServiceClient:
         )
 
 
-def _vault_references_only(values: Mapping[str, str] | None) -> dict[str, str]:
-    """Keep ONLY ``vault://`` references; a raw value never crosses the RPC.
+# The only credential field names that may cross the RPC boundary. An unknown name
+# is refused rather than forwarded, so a new secret cannot be added by accident.
+_ALLOWED_BROWSER_SECRET_FIELDS: frozenset[str] = frozenset(
+    {"login_email", "login_password", "login_otp", "login_verification_url"}
+)
 
-    If a caller accidentally passes a literal credential, it is dropped here
-    rather than transmitted — fail closed on the safe side.
+
+def _vault_references_only(values: Mapping[str, str] | None) -> dict[str, str]:
+    """Validate that every credential is an opaque ``vault://`` reference.
+
+    Previously a raw value was silently DROPPED here. That looked safe but broke
+    login in a way nobody could diagnose: the service received an empty mapping and
+    reported a generic navigation failure, with no indication that credentials had
+    been discarded. Raw values are now a typed ERROR, so the caller learns it must
+    store a transient reference first.
+
+    An unrecognised field name is likewise refused rather than forwarded.
     """
 
     if not values:
         return {}
-    return {
-        name: value
-        for name, value in values.items()
-        if isinstance(value, str) and value.startswith("vault://")
-    }
+    refs: dict[str, str] = {}
+    for name, value in values.items():
+        if name not in _ALLOWED_BROWSER_SECRET_FIELDS:
+            raise ProviderOperationError(
+                capability="browser service secrets",
+                reason_code="browser_secret_field_not_allowed",
+            )
+        if not (isinstance(value, str) and value.startswith("vault://")):
+            raise ProviderOperationError(
+                capability="browser service secrets",
+                reason_code="raw_credentials_not_allowed_over_rpc",
+            )
+        try:
+            refs[name] = validate_vault_reference(value)
+        except ValueError:
+            raise ProviderOperationError(
+                capability="browser service secrets",
+                reason_code="malformed_vault_reference",
+            ) from None
+    return refs
 
 
 __all__ = [
+    "ALLOWED_BROWSER_SECRET_FIELDS",
     "OWNER_HEADER",
     "SUPPORTED_SERVICE_MAJOR",
     "TOKEN_HEADER",
@@ -410,3 +439,6 @@ __all__ = [
     "ProviderHealthState",
     "ReconcileOutcome",
 ]
+
+# Public alias for tests and callers that need to know the permitted field set.
+ALLOWED_BROWSER_SECRET_FIELDS = _ALLOWED_BROWSER_SECRET_FIELDS

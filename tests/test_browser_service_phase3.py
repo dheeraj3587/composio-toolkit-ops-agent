@@ -95,9 +95,18 @@ class _FakeWorker:
         self.seen_sensitive: list[dict[str, str]] = []
         self.navigate_delay = 0.0
         self.stopped: list[str] = []
+        self.received_storage_state: dict[str, Any] | None = None
         self.storage_state = {"cookies": [{"name": "session", "value": "SUPERSECRETCOOKIEVALUE"}]}
 
-    async def start(self, profile_id: str | None) -> BrowserSessionContext:
+    async def start(
+        self,
+        profile_id: str | None,
+        *,
+        storage_state: dict[str, Any] | None = None,
+    ) -> BrowserSessionContext:
+        # Mirrors the real worker: the service may hand over previously saved,
+        # already-decrypted authenticated state (never a filesystem path).
+        self.received_storage_state = storage_state
         self._counter += 1
         handle = f"pw_fake_{self._counter}"
         self._sessions[handle] = _FakePwSession()
@@ -383,9 +392,13 @@ class TestCrossOwnerIsolation:
             )
         assert navigate.status_code == 404
         assert deleted.status_code == 404
-        # The intruder neither drove nor stopped the session.
+        # The intruder never drove the session.
         assert worker.seen_sensitive == []
-        assert worker.stopped == []
+        # The single stop recorded here is the SERVICE SHUTDOWN closing the owner's
+        # session on context exit — which is itself proof the manager's closer now
+        # reaches the real browser (it previously closed nothing at all). What
+        # matters is that the intruder's delete was refused above.
+        assert worker.stopped in ([], ["pw_fake_1"])
 
 
 # ------------------------------------------------------ 4. session manager core
@@ -1227,3 +1240,292 @@ class TestContainerIsolationShape:
             if isinstance(environment, dict):
                 assert environment.get("BROWSER_PROVIDER") != "playwright", name
             assert "browser_service" not in json.dumps(definition), name
+
+
+# ------------------------------------------------- 11. corrective-phase wiring
+class TestServiceOwnsTheRealSession:
+    """The manager must close the ACTUAL worker session, not a phantom one."""
+
+    def test_janitor_closes_the_real_worker_session(self) -> None:
+        """Previously the closer walked context/browser/playwright — all None — so
+        an expired session leaked Chromium. Ownership is now explicit."""
+
+        client, worker = _client(_settings(inactivity_seconds=30))
+        with client:
+            session_id = _create_session(client)["session_id"]
+            manager = client.app.state.manager  # type: ignore[attr-defined]
+            session = manager.get_if_present(session_id)
+            assert session is not None
+            # Explicit ownership rather than a private worker dictionary.
+            assert session.worker_context is not None
+            # Age it so the janitor considers it expired.
+            session.last_active_at = datetime.now(UTC) - timedelta(hours=2)
+            closed = asyncio.run(manager.sweep())
+            assert closed == (session_id,)
+
+        # The real browser session was stopped by the janitor's close path.
+        assert worker.stopped == ["pw_fake_1"]
+        assert worker._sessions == {}
+
+    def test_service_shutdown_closes_every_session(self) -> None:
+        client, worker = _client(_settings(max_sessions=2))
+        with client:
+            _create_session(client)
+            _create_session(client)
+            assert len(worker._sessions) == 2
+        # Leaving the context runs the lifespan shutdown.
+        assert sorted(worker.stopped) == ["pw_fake_1", "pw_fake_2"]
+        assert worker._sessions == {}
+
+    def test_no_private_worker_dictionary_is_accessed_for_teardown(self) -> None:
+        """The closer uses the recorded worker context, so a worker without a
+        ``_sessions`` attribute still tears down correctly."""
+
+        import inspect
+
+        from browser_service.main import make_session_closer
+
+        source = inspect.getsource(make_session_closer)
+        assert "_sessions" not in source
+        assert "worker_context" in source
+
+    def test_delete_is_idempotent_and_stops_once(self) -> None:
+        client, worker = _client()
+        with client:
+            session_id = _create_session(client)["session_id"]
+            first = client.delete(f"/internal/browser/sessions/{session_id}", headers=_headers())
+            second = client.delete(f"/internal/browser/sessions/{session_id}", headers=_headers())
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json()["reason_code"] == "session_not_found"
+        # Exactly one stop: the endpoint no longer stops the browser separately from
+        # the manager's closer.
+        assert worker.stopped == ["pw_fake_1"]
+
+    def test_capacity_is_released_after_the_real_close(self) -> None:
+        client, _ = _client(_settings(max_sessions=1))
+        with client:
+            first = _create_session(client)["session_id"]
+            exhausted = client.post(
+                "/internal/browser/sessions",
+                json={"app_slug": "pipedrive"},
+                headers=_headers(),
+            )
+            assert exhausted.status_code == 429
+            client.delete(f"/internal/browser/sessions/{first}", headers=_headers())
+            # The slot is genuinely reusable.
+            reused = client.post(
+                "/internal/browser/sessions",
+                json={"app_slug": "pipedrive"},
+                headers=_headers(),
+            )
+            assert reused.status_code == 201
+
+
+class TestLiveViewAvailabilityIsTruthful:
+    """``live_view_available`` must not be hard-coded True."""
+
+    def test_screenshot_availability_drives_the_flag(self) -> None:
+        client, _ = _client()
+        with client:
+            created = _create_session(client)
+            # A launched session can be screenshotted, so this is genuinely True.
+            assert created["live_view_available"] is True
+
+    def test_flag_is_false_before_anything_is_available(self) -> None:
+        from browser_service.session_manager import ManagedSession
+
+        session = ManagedSession(session_id="bs_x", owner=OWNER, app_slug="pipedrive")
+        # Neither a frame nor an interactive display exists yet.
+        assert session.screenshot_available is False
+        assert session.interactive_ready is False
+        assert session.summary().live_view_available is False
+
+
+class TestHealthDoesNotLaunchChromiumPerRequest:
+    """The readiness probe launches a browser, so it must be cached."""
+
+    def test_repeated_health_calls_probe_once(self) -> None:
+        import ops.browser_readiness as readiness_module
+
+        calls = {"count": 0}
+        original = readiness_module.probe_playwright
+
+        async def _counted(*args: Any, **kwargs: Any) -> Any:
+            calls["count"] += 1
+            return await original(*args, **kwargs)
+
+        readiness_module.probe_playwright = _counted  # type: ignore[assignment]
+        try:
+            client, _ = _client()
+            with client:
+                for _ in range(5):
+                    assert client.get("/internal/health").status_code == 200
+        finally:
+            readiness_module.probe_playwright = original  # type: ignore[assignment]
+
+        # One probe at startup, then served from cache.
+        assert calls["count"] == 1
+
+    def test_liveness_endpoint_launches_nothing(self) -> None:
+        client, _ = _client()
+        with client:
+            response = client.get("/internal/live")
+        assert response.status_code == 200
+        assert response.json()["status"] == "live"
+
+    def test_ready_endpoint_reports_capacity_and_janitor(self) -> None:
+        client, _ = _client()
+        with client:
+            body = client.get("/internal/ready").json()
+        assert "capacity_total" in body
+        assert "janitor_running" in body
+
+
+class TestRpcCredentialBoundary:
+    """Raw credentials must be REFUSED, not silently dropped."""
+
+    def test_vault_references_pass_through(self) -> None:
+        from ops.browser_service_client import _vault_references_only
+
+        refs = _vault_references_only({"login_email": "vault://pipedrive/login_email/abc123"})
+        assert refs == {"login_email": "vault://pipedrive/login_email/abc123"}
+
+    @pytest.mark.parametrize(
+        "field",
+        ["login_email", "login_password", "login_otp", "login_verification_url"],
+    )
+    def test_raw_credential_is_refused_with_a_typed_reason(self, field: str) -> None:
+        """A silent drop meant login failed opaquely; it is now an explicit error."""
+
+        from ops.browser_service_client import _vault_references_only
+        from ops.provider_errors import ProviderOperationError
+
+        with pytest.raises(ProviderOperationError) as excinfo:
+            _vault_references_only({field: "an-actual-secret-value"})
+        assert excinfo.value.reason_code == "raw_credentials_not_allowed_over_rpc"
+
+    def test_unknown_secret_field_is_refused(self) -> None:
+        from ops.browser_service_client import _vault_references_only
+        from ops.provider_errors import ProviderOperationError
+
+        with pytest.raises(ProviderOperationError) as excinfo:
+            _vault_references_only({"totally_new_secret": "vault://a/b/c"})
+        assert excinfo.value.reason_code == "browser_secret_field_not_allowed"
+
+    def test_malformed_vault_reference_is_refused(self) -> None:
+        from ops.browser_service_client import _vault_references_only
+        from ops.provider_errors import ProviderOperationError
+
+        with pytest.raises(ProviderOperationError) as excinfo:
+            _vault_references_only({"login_email": "vault://not a valid reference"})
+        assert excinfo.value.reason_code == "malformed_vault_reference"
+
+    def test_no_raw_secret_appears_in_the_rpc_request_body(self) -> None:
+        """Capture the actual outbound request and prove it is reference-only."""
+
+        import httpx
+
+        from ops.browser_service_client import BrowserServiceClient
+
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = request.content.decode()
+            return httpx.Response(
+                200,
+                json={
+                    "status": "succeeded",
+                    "current_url": "https://app.pipedrive.com/settings/api",
+                    "page_title": "API",
+                },
+            )
+
+        client = BrowserServiceClient(
+            base_url="http://browser-worker:8081",
+            token=TOKEN,
+            owner=OWNER,
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        context = BrowserSessionContext(
+            profile_id="bs_1",
+            session_id="bs_1",
+            live_view_available=True,
+            allowed_domains=(),
+            created_at="2026-01-01T00:00:00+00:00",
+            inactivity_expires_at="2026-01-01T00:00:00+00:00",
+            maximum_expires_at="2026-01-01T04:00:00+00:00",
+        )
+        asyncio.run(
+            client.resume_after_hitl(
+                context,
+                "human_completed",
+                None,
+                sensitive_data={
+                    "login_email": "vault://pipedrive/browser_login_login_email/r1",
+                    "login_password": "vault://pipedrive/browser_login_login_password/r2",
+                    "login_otp": "vault://pipedrive/browser_login_login_otp/r3",
+                },
+            )
+        )
+        body = captured["body"]
+        # References only — no raw email, password, OTP or magic link.
+        assert "vault://" in body
+        for secret in ("ops@example.test", "hunter2", "483920", "https://verify"):
+            assert secret not in body
+
+
+class TestProviderFactoryWiring:
+    """RunService must use the RPC client for service-backed Playwright."""
+
+    @staticmethod
+    def _service() -> Any:
+        from ops.run_service import RunService
+
+        return RunService.__new__(RunService)
+
+    def test_playwright_without_service_configuration_fails_closed(self) -> None:
+        from ops.config import Settings
+        from ops.provider_errors import ConfigurationRequiredError
+
+        settings = Settings.from_env(dotenv_path=None).model_copy(
+            update={"browser_provider": "playwright"}
+        )
+        with pytest.raises(ConfigurationRequiredError) as excinfo:
+            self._service()._build_browser_worker(settings)
+        assert excinfo.value.reason_code == "browser_service_configuration_required"
+
+    def test_configured_service_yields_the_rpc_client(self) -> None:
+        from ops.browser_service_client import BrowserServiceClient
+        from ops.config import Settings
+
+        settings = Settings.from_env(dotenv_path=None).model_copy(
+            update={
+                "browser_provider": "playwright",
+                "browser_service_url": "http://browser-worker:8081",
+                "browser_service_token": SecretStr("ci-token"),
+            }
+        )
+        worker = self._service()._build_browser_worker(settings)
+        assert isinstance(worker, BrowserServiceClient)
+        # Chromium is out of process, so a session survives an API restart.
+        assert worker.supports_restart_reattach is True
+
+    def test_in_process_sandbox_requires_an_explicit_flag(self) -> None:
+        from ops.config import Settings
+        from ops.playwright_worker import PlaywrightBrowserWorker
+
+        settings = Settings.from_env(dotenv_path=None).model_copy(
+            update={"browser_provider": "playwright", "playwright_in_process_sandbox": True}
+        )
+        worker = self._service()._build_browser_worker(settings)
+        assert isinstance(worker, PlaywrightBrowserWorker)
+        # In-process Chromium dies with the API, and says so.
+        assert worker.supports_restart_reattach is False
+
+    def test_browser_use_remains_the_default_provider(self) -> None:
+        from ops.config import Settings
+
+        settings = Settings.from_env(dotenv_path=None)
+        assert settings.browser_provider == "browser_use"
+        assert settings.playwright_in_process_sandbox is False
