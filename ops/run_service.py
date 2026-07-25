@@ -72,6 +72,7 @@ from ops.provider_errors import (
     ProviderOperationError,
 )
 from ops.redaction import redact_data, redact_text
+from ops.research_cache import SqliteResearchCache
 from ops.routing import RoutingDecision, decide_access
 from ops.secret_store import SecretStoreError, SQLiteSecretStore
 from ops.state import AccessRoute, OperationsState, RunStatus, validate_status_transition
@@ -285,9 +286,12 @@ def _missing_operational_fields(research: Mapping[str, object]) -> list[str]:
         "authorization_url",
         "token_url",
         "credential_fields",
+        "credential_creation_instructions",
         "scopes",
         "developer_portal_url",
         "signup_url",
+        "login_url",
+        "credential_management_url",
         "production_approval_required",
         "contact_email",
         "contact_url",
@@ -295,7 +299,7 @@ def _missing_operational_fields(research: Mapping[str, object]) -> list[str]:
     missing: list[str] = []
     for name in candidates:
         value = research.get(name)
-        if value is None or value == "" or value == []:
+        if value is None or value == "" or value == [] or value == ():
             missing.append(name)
     return missing
 
@@ -340,12 +344,12 @@ class RunService:
         # Resources owned and closed by this service when built at startup.
         self._http_client: httpx.AsyncClient | None = None
         self._validation_http_client: httpx.AsyncClient | None = None
-        # Shared You.com HTTP client (Contents SDK + the direct Research REST
-        # call). One scoped client is reused across an app's whole enrichment
-        # rather than one per call, per the "do not create a You client for
-        # every small internal operation" requirement. Only built when
-        # YDC_API_KEY is configured; stays None otherwise.
-        self._you_http_client: httpx.AsyncClient | None = None
+        # Persistent research cache shared by the You.com adapters (Search /
+        # Contents / Research). The adapters manage their own SDK client
+        # lifecycle per call via ``async with``; no You.com async client is
+        # stored on the service (that would be unsafe across the per-enrichment
+        # ``asyncio.run`` event loops). Only built when YDC_API_KEY is present.
+        self._research_cache: SqliteResearchCache | None = None
         self._browser_worker: BrowserWorker | None = None
         self._gmail_worker: GmailWorker | None = None
         # In-memory marker of the last inbound reply id handled per run, so the
@@ -772,6 +776,15 @@ class RunService:
             )
 
         you_api_key = settings.you_api_key
+        # One persistent research cache shared by all three You.com adapters, so
+        # identical app research does not re-spend credits across enrichments.
+        # The You.com adapters themselves manage their SDK client lifecycle via
+        # ``async with`` per call — no persistent async client is stored here
+        # (that would be unsafe across the per-enrichment asyncio.run loops).
+        if self._research_cache is None:
+            self._research_cache = SqliteResearchCache(settings.research_cache_db_path)
+        research_cache = self._research_cache
+
         discovery_providers: list[object] = []
         if settings.you_search_configured:
             discovery_providers.append(
@@ -780,6 +793,7 @@ class RunService:
                     count=settings.you_search_count,
                     timeout_seconds=settings.you_search_timeout_seconds,
                     max_calls=settings.you_max_search_calls_per_enrichment,
+                    cache=research_cache,
                 )
             )
         if settings.perplexity_api_key is not None:
@@ -794,12 +808,9 @@ class RunService:
 
         content_fetcher_factory = None
         if settings.you_contents_configured:
-            self._you_http_client = httpx.AsyncClient(
-                timeout=httpx.Timeout(30.0, connect=10.0),
-                follow_redirects=False,
-            )
             contents_timeout = settings.you_contents_timeout_seconds
             contents_max_age = settings.you_contents_max_age_seconds
+            contents_max_pages = settings.you_max_contents_pages_per_enrichment
             guarded_http_client = self._http_client
 
             def _build_content_fetcher(host_policy: ResearchHostPolicy) -> object:
@@ -808,6 +819,8 @@ class RunService:
                     policy=host_policy,
                     max_age=contents_max_age,
                     request_timeout=contents_timeout,
+                    max_pages=contents_max_pages,
+                    cache=research_cache,
                 )
                 fallback_policy = host_policy.official_url_policy
                 if fallback_policy is None:
@@ -821,17 +834,10 @@ class RunService:
 
         research_fallback = None
         if settings.you_research_configured:
-            if self._you_http_client is None:
-                self._you_http_client = httpx.AsyncClient(
-                    timeout=httpx.Timeout(
-                        max(30.0, settings.you_research_timeout_seconds), connect=10.0
-                    ),
-                    follow_redirects=False,
-                )
             research_fallback = YouResearchFallback(
                 you_api_key,
-                http_client=self._you_http_client,
                 timeout_seconds=settings.you_research_timeout_seconds,
+                cache=research_cache,
             )
 
         return OperationalResearchEnricher(
@@ -1000,7 +1006,7 @@ class RunService:
         self._workflow = None
         if workflow is not None:
             workflow.close()
-        for client_attr in ("_http_client", "_validation_http_client", "_you_http_client"):
+        for client_attr in ("_http_client", "_validation_http_client"):
             client = getattr(self, client_attr, None)
             if isinstance(client, httpx.AsyncClient):
                 try:
@@ -1008,6 +1014,12 @@ class RunService:
                 except RuntimeError:  # pragma: no cover - already within a loop
                     pass
                 setattr(self, client_attr, None)
+        if self._research_cache is not None:
+            try:
+                self._research_cache.close()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+            self._research_cache = None
         if self._browser_worker is not None:
             try:
                 asyncio.run(self._browser_worker.close())
@@ -1049,6 +1061,7 @@ class RunService:
         research_source = "verified_p1_snapshot"
         enrichment_attempts = 0
         enrichment_documents = 0
+        enrichment_metrics: dict[str, object] = {}
         enrichment_capability: CapabilityAvailability | None = None
         if isinstance(lookup, P1LookupFound):
             research = to_operational_research(lookup.record)
@@ -1065,6 +1078,7 @@ class RunService:
                 research = outcome.research
                 enrichment_capability = outcome.capability
                 enrichment_documents = outcome.documents_fetched
+                enrichment_metrics = dict(outcome.provider_metrics)
                 if outcome.capability.status == "ready":
                     enrichment_attempts = 1
                     research_source = "official_evidence_combined"
@@ -1177,6 +1191,9 @@ class RunService:
                             "documents_fetched": enrichment_documents,
                             "missing_fields": _missing_operational_fields(research_payload),
                             "confidence": research_payload.get("confidence"),
+                            # Sanitized provider metrics (counts/latency/provider
+                            # name); never query text, page content, or the key.
+                            "provider_metrics": enrichment_metrics,
                             "external_actions": False,
                         },
                     )
@@ -1953,10 +1970,15 @@ class RunService:
                     baseline=baseline,
                 )
             )
+        except (TypeError, AttributeError, ImportError, ModuleNotFoundError, NameError):
+            # A broken integration (wrong kwarg, renamed SDK attribute, missing
+            # module) must reach monitoring/tests, not be silently degraded to a
+            # provider outage. It may surface as a sanitized HTTP 500 upstream.
+            raise
         except Exception:
-            # A provider/transport/extraction failure must never turn an
-            # otherwise valid run request into an untyped HTTP 500. Preserve the
-            # verified P1 baseline and expose only a stable, sanitized reason.
+            # An EXPECTED provider/transport/extraction/validation failure must
+            # never turn an otherwise valid run request into an untyped HTTP 500.
+            # Preserve the verified P1 baseline and expose only a stable reason.
             return ResearchEnrichmentOutcome(
                 research=baseline,
                 capability=CapabilityAvailability(

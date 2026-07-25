@@ -84,7 +84,7 @@ def score_candidates(
         # positive by definition (there is no basis to trust it).
         precision = 0.0
     else:
-        policy = ResearchHostPolicy(app.approved_hosts)
+        policy = ResearchHostPolicy.from_domains(app.approved_hosts)
         on_policy = 0
         for candidate in candidates:
             try:

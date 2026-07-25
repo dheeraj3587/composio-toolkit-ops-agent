@@ -149,25 +149,32 @@ class Settings(BaseModel):
     # and extraction). It never operates a browser, never receives credentials,
     # and never controls the default browser provider above. Every flag here
     # requires ``you_api_key`` to be configured (see the ``*_configured``
-    # properties below) so the integration is fully inert without a key.
-    you_search_enabled: bool = True
-    you_contents_enabled: bool = True
-    # Research is the most expensive, least-bounded capability. Kept OFF by
-    # default even when a key is present; an operator opts in explicitly.
+    # properties below).
+    #
+    # SAFE DEFAULT: all three capabilities default to DISABLED. A configured
+    # API key alone must never start spending credits — an operator opts into
+    # each capability explicitly (staged rollout: Search, then Contents, then
+    # the expensive Research fallback). ``.env`` may enable them deliberately.
+    you_search_enabled: bool = False
+    you_contents_enabled: bool = False
     you_research_enabled: bool = False
 
     you_search_count: int = Field(default=5, ge=1, le=10)
     you_search_timeout_seconds: float = Field(default=20.0, ge=2.0, le=60.0)
     you_contents_timeout_seconds: float = Field(default=30.0, ge=2.0, le=60.0)
-    # Local cache-freshness bound only. The You.com Contents API in the pinned
-    # SDK version has no ``max_age`` request parameter, so this never reaches
-    # the provider; it only decides whether a cached page is still usable.
+    # Sent to You.com Contents as ``max_age`` (the SDK supports it in 2.5.0):
+    # cached content older than this forces a fresh crawl. Also used as the
+    # local Contents cache TTL, so the two agree.
     you_contents_max_age_seconds: int = Field(default=86_400, ge=0)
     you_research_timeout_seconds: float = Field(default=60.0, ge=10.0, le=180.0)
 
     you_max_search_calls_per_enrichment: int = Field(default=2, ge=1, le=4)
     you_max_contents_pages_per_enrichment: int = Field(default=8, ge=1, le=10)
     you_max_research_calls_per_enrichment: int = Field(default=1, ge=0, le=1)
+
+    # Persistent research cache (SQLite). Shared by Search/Contents/Research so
+    # identical app research does not re-spend credits. Never stores secrets.
+    research_cache_db_path: Path = Path("./private/research_cache.db")
 
     @property
     def you_search_configured(self) -> bool:
@@ -179,7 +186,13 @@ class Settings(BaseModel):
 
     @property
     def you_research_configured(self) -> bool:
-        return self.you_api_key is not None and self.you_research_enabled
+        # A zero per-enrichment budget disables Research even when the flag and
+        # key are present — the budget is the hard ceiling, not just the flag.
+        return (
+            self.you_api_key is not None
+            and self.you_research_enabled
+            and self.you_max_research_calls_per_enrichment > 0
+        )
 
     company_legal_name: str | None = None
     company_website: str | None = None
@@ -270,8 +283,8 @@ class Settings(BaseModel):
             "allow_local_credential_submission": _boolean(
                 source.get("ALLOW_LOCAL_CREDENTIAL_SUBMISSION"), default=False
             ),
-            "you_search_enabled": _boolean(source.get("YOU_SEARCH_ENABLED"), default=True),
-            "you_contents_enabled": _boolean(source.get("YOU_CONTENTS_ENABLED"), default=True),
+            "you_search_enabled": _boolean(source.get("YOU_SEARCH_ENABLED"), default=False),
+            "you_contents_enabled": _boolean(source.get("YOU_CONTENTS_ENABLED"), default=False),
             "you_research_enabled": _boolean(source.get("YOU_RESEARCH_ENABLED"), default=False),
             "you_search_count": _integer(source.get("YOU_SEARCH_COUNT"), default=5),
             "you_search_timeout_seconds": _float(
@@ -326,6 +339,9 @@ class Settings(BaseModel):
             ),
             "provider_effects_db_path": Path(
                 source.get("PROVIDER_EFFECTS_DB_PATH", "./private/provider_effects.db")
+            ),
+            "research_cache_db_path": Path(
+                source.get("RESEARCH_CACHE_DB_PATH", "./private/research_cache.db")
             ),
         }
         return cls.model_validate(values)

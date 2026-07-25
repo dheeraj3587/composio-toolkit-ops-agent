@@ -19,6 +19,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import httpx
 from cryptography.fernet import Fernet
 from pydantic import ValidationError
 
@@ -254,29 +255,35 @@ def doctor(*, db_path: str | Path | None = None) -> tuple[dict[str, Any], bool]:
 
 
 def research_app(app_name: str, *, provider: str = "you") -> dict[str, Any]:
-    """Sanitized research-debug view of the discovery + content-fetch layer only.
+    """Sanitized research-debug view of the PRODUCTION research pipeline.
 
-    Never runs Gemini extraction, never touches the browser, and never
-    displays an API key, full document text, credentials, vault values,
-    cookies, or a browser session. ``provider`` selects which discovery
-    provider(s) to exercise: "you" (You.com Search only), "perplexity"
-    (Perplexity only), or "auto" (You.com first, Perplexity as fallback —
-    the same composite order ``RunService`` wires in production).
+    Exercises the same wiring ``RunService`` uses: You.com Search discovery,
+    then You.com Contents for content extraction, with the guarded HTTP fetcher
+    as a per-URL fallback. ``--provider auto`` also adds the Perplexity discovery
+    fallback. Never runs Gemini extraction, never touches the browser, and never
+    displays an API key, full document text, snippets, credentials, vault values,
+    cookies, or a browser session.
     """
 
     from ops.config import load_settings
     from ops.operational_research import (
-        MAX_EVIDENCE_DOCUMENTS,
         OfficialEvidenceFetcher,
         PerplexitySearchDiscovery,
         _missing_fields,  # noqa: SLF001 - internal reuse within the same package
+        _rich_candidate_urls,  # noqa: SLF001 - internal reuse within the same package
     )
     from ops.p1_adapter import lookup_p1_record, to_operational_research
+    from ops.research_cache import SqliteResearchCache
     from ops.you_research import (
         CompositeEvidenceDiscovery,
+        FallbackEvidenceContentFetcher,
+        GuardedHTTPEvidenceFetcher,
         LegacyDiscoveryAdapter,
         ResearchHostPolicy,
+        YouContentsFetcher,
+        YouResearchMetrics,
         YouSearchDiscovery,
+        use_metrics,
     )
 
     lookup = lookup_p1_record(app_name)
@@ -290,6 +297,7 @@ def research_app(app_name: str, *, provider: str = "you") -> dict[str, Any]:
 
     host_policy = ResearchHostPolicy.build(p1_record=p1_record, baseline=baseline)
     official_domains = host_policy.include_domains
+    cache = SqliteResearchCache(settings.research_cache_db_path)
 
     providers: list[object] = []
     if provider in ("you", "auto") and settings.you_search_configured:
@@ -299,6 +307,7 @@ def research_app(app_name: str, *, provider: str = "you") -> dict[str, Any]:
                 count=settings.you_search_count,
                 timeout_seconds=settings.you_search_timeout_seconds,
                 max_calls=settings.you_max_search_calls_per_enrichment,
+                cache=cache,
             )
         )
     if provider in ("perplexity", "auto") and settings.perplexity_api_key is not None:
@@ -307,6 +316,7 @@ def research_app(app_name: str, *, provider: str = "you") -> dict[str, Any]:
         )
 
     if not providers:
+        cache.close()
         return {
             "app_name": baseline.app_name,
             "app_slug": baseline.app_slug,
@@ -316,60 +326,61 @@ def research_app(app_name: str, *, provider: str = "you") -> dict[str, Any]:
         }
 
     composite = CompositeEvidenceDiscovery(providers)  # type: ignore[arg-type]
+    effective_policy = host_policy.official_url_policy
+    metrics = YouResearchMetrics()
 
-    async def _run() -> tuple[tuple[object, ...], dict[str, float]]:
-        latencies: dict[str, float] = {}
-        start = time.monotonic()
-        found = await composite.discover(
-            app_name=baseline.app_name,
-            p1_record=p1_record,
-            baseline=baseline,
-            official_hosts=official_domains,
+    def _build_content_fetcher() -> object:
+        primary = YouContentsFetcher(
+            settings.you_api_key,  # type: ignore[arg-type]
+            policy=host_policy,
+            max_age=settings.you_contents_max_age_seconds,
+            request_timeout=settings.you_contents_timeout_seconds,
+            max_pages=settings.you_max_contents_pages_per_enrichment,
+            cache=cache,
         )
-        latencies["discovery_ms"] = round((time.monotonic() - start) * 1000, 1)
-        return found, latencies
+        if effective_policy is None:
+            return primary
+        fallback = GuardedHTTPEvidenceFetcher(
+            OfficialEvidenceFetcher(
+                httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0), follow_redirects=False),
+                effective_policy,
+            )
+        )
+        return FallbackEvidenceContentFetcher(primary=primary, fallback=fallback)
 
-    candidates, latencies = asyncio.run(_run())
+    async def _run() -> tuple[tuple[object, ...], list[dict[str, Any]], dict[str, float]]:
+        latencies: dict[str, float] = {}
+        with use_metrics(metrics):
+            start = time.monotonic()
+            found = await composite.discover(
+                app_name=baseline.app_name,
+                p1_record=p1_record,
+                baseline=baseline,
+                official_hosts=official_domains,
+            )
+            latencies["discovery_ms"] = round((time.monotonic() - start) * 1000, 1)
 
-    documents_summary: list[dict[str, Any]] = []
-    if candidates and settings.google_genai_api_key is not None:
-        pass  # extraction is deliberately never run by this diagnostic command
-    if candidates:
-        urls = [getattr(candidate, "source_url", "") for candidate in candidates][
-            :MAX_EVIDENCE_DOCUMENTS
-        ]
-        try:
-
-            async def _fetch() -> tuple[tuple[Any, ...], float]:
-                import httpx
-
+            docs_summary: list[dict[str, Any]] = []
+            if found and settings.you_contents_configured and effective_policy is not None:
+                candidate_urls = _rich_candidate_urls(p1_record, found, effective_policy)
+                fetcher = _build_content_fetcher()
                 start = time.monotonic()
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(15.0, connect=5.0), follow_redirects=False
-                ) as client:
-                    fallback_policy = host_policy.official_url_policy
-                    if fallback_policy is None:
-                        return (), 0.0
-                    fetcher = OfficialEvidenceFetcher(client, fallback_policy)
-                    docs = []
-                    for url in urls:
-                        try:
-                            docs.append(await fetcher.fetch(url))
-                        except Exception:  # noqa: BLE001 - best-effort diagnostic fetch
-                            continue
-                return tuple(docs), round((time.monotonic() - start) * 1000, 1)
+                documents = await fetcher.fetch_many(candidate_urls)  # type: ignore[attr-defined]
+                latencies["content_fetch_ms"] = round((time.monotonic() - start) * 1000, 1)
+                docs_summary = [{"url": d.source_url, "title": d.title} for d in documents]
+        return found, docs_summary, latencies
 
-            documents, fetch_ms = asyncio.run(_fetch())
-            latencies["content_fetch_ms"] = fetch_ms
-            documents_summary = [{"url": doc.source_url, "title": doc.title} for doc in documents]
-        except Exception:  # noqa: BLE001 - the probe must never crash the CLI
-            documents_summary = []
+    try:
+        candidates, documents_summary, latencies = asyncio.run(_run())
+    finally:
+        cache.close()
 
     return {
         "app_name": baseline.app_name,
         "app_slug": baseline.app_slug,
         "provider_requested": provider,
-        "provider_used": getattr(composite, "last_provider_used", None),
+        "provider_used": metrics.discovery_provider_used
+        or getattr(composite, "last_provider_used", None),
         "official_domains": list(official_domains),
         "candidates": [
             {
@@ -382,7 +393,8 @@ def research_app(app_name: str, *, provider: str = "you") -> dict[str, Any]:
         "documents_fetched": documents_summary,
         "missing_baseline_fields": _missing_fields(baseline),
         "latencies_ms": latencies,
-        "cache_hits": 0,
+        "cache_hits": metrics.research_cache_hits,
+        "cache_misses": metrics.research_cache_misses,
     }
 
 
@@ -407,7 +419,10 @@ def probe_you() -> dict[str, Any]:
     async def _probe() -> tuple[bool, str, float]:
         start = time.monotonic()
         try:
-            response = await discovery._search(query="you.com API documentation")  # noqa: SLF001
+            # One cheap, unfiltered Search call for reachability only.
+            response = await discovery._search(  # noqa: SLF001
+                query="you.com API documentation", provider_domains=()
+            )
         except YouProviderError as exc:
             return False, exc.reason_code, round((time.monotonic() - start) * 1000, 1)
         del response  # the probe only needs success/failure, never the payload
@@ -419,69 +434,6 @@ def probe_you() -> dict[str, Any]:
         "reason_code": reason,
         "latency_ms": latency_ms,
     }
-
-
-def accuracy_scorecard(
-    app_names: list[str], *, db_path: str | Path | None = None
-) -> dict[str, Any]:
-    """Phase D: run the full discovery+extraction+navigation pipeline per app.
-
-    LIVE ONLY — launches a real browser session against the app's real,
-    reviewed hosts. Refuses to run unless ``ALLOW_LIVE_BROWSER=true``. Never
-    injects a credential value: it measures how far anonymous navigation
-    reaches (developer portal / credential page) using whichever discovery
-    +browser provider is configured, exactly as ``RunService`` would wire
-    them in production. Testing an actual authenticated flow still requires
-    the existing owner credential-submission path — this command does not
-    reinvent that.
-    """
-
-    from ops.browser_scorecard import ScorecardReport, run_scorecard_for_app
-    from ops.config import load_settings
-    from ops.p1_adapter import lookup_p1_record, to_operational_research
-    from ops.run_service import RunService
-
-    settings = load_settings()
-    if not settings.allow_live_browser:
-        return {
-            "error": "live_browser_disabled",
-            "detail": "Set ALLOW_LIVE_BROWSER=true to run a real accuracy scorecard.",
-        }
-
-    service = RunService(storage=_storage(db_path), settings=settings)
-    enricher = service._build_research_enricher(settings)  # noqa: SLF001 - identical prod wiring
-    try:
-        worker = service._build_browser_worker(settings)  # noqa: SLF001 - identical prod wiring
-    except Exception as exc:  # noqa: BLE001 - report, never crash the CLI
-        return {"error": "browser_worker_unavailable", "detail": _redact_text(str(exc))}
-
-    async def _run_all() -> ScorecardReport:
-        runs = []
-        for app_name in app_names:
-            lookup = lookup_p1_record(app_name)
-            if lookup.status != "found" or lookup.record is None:
-                continue
-            baseline = to_operational_research(lookup.record)
-            p1_record = lookup.record.model_dump(mode="json")
-            run = await run_scorecard_for_app(
-                app_slug=baseline.app_slug,
-                app_name=baseline.app_name,
-                p1_record=p1_record,
-                baseline=baseline,
-                # NavigationWorker declares `context: object` so it can
-                # structurally accept EITHER BrowserWorker or
-                # PlaywrightBrowserWorker; BrowserWorker itself correctly
-                # narrows to BrowserSessionContext, which mypy's Protocol
-                # contravariance check flags even though calling through
-                # this exact object is what the Protocol exists for.
-                worker=worker,  # type: ignore[arg-type]
-                enricher=enricher,
-            )
-            runs.append(run)
-        return ScorecardReport(runs=tuple(runs))
-
-    report = asyncio.run(_run_all())
-    return report.as_dict()
 
 
 def _default_company(args: argparse.Namespace) -> CompanyProfile:
@@ -547,12 +499,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit, opt-in live You.com Search reachability check (spends one call).",
     )
 
-    scorecard_parser = subparsers.add_parser(
-        "accuracy-scorecard",
-        help="Phase D: LIVE per-app discovery+navigation accuracy run (requires ALLOW_LIVE_BROWSER=true).",
-    )
-    scorecard_parser.add_argument("app_name", nargs="+")
-
     return parser
 
 
@@ -598,11 +544,6 @@ def main(argv: list[str] | None = None) -> int:
             result = probe_you()
             _emit(result)
             return EXIT_OK if result.get("status") == "ready" else EXIT_ERROR
-
-        if args.command == "accuracy-scorecard":
-            result = accuracy_scorecard(args.app_name, db_path=args.db_path)
-            _emit(result)
-            return EXIT_OK if "error" not in result else EXIT_ERROR
 
         if args.command == "run":
             request = OperationsRequest(

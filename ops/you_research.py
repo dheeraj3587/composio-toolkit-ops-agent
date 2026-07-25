@@ -2,63 +2,54 @@
 optional bounded Research fallback — layered AHEAD of Perplexity and the
 guarded HTTP fetcher in the OperationalResearch pipeline.
 
-Boundary, stated once here because every class in this module exists to
-enforce it: You.com is a research/retrieval provider, never a browser
-automation provider. It never receives credentials, never selects the browser
-provider, and a URL it returns is NEVER trusted just because You.com returned
-it — every candidate is re-validated against :class:`ResearchHostPolicy`
-(itself built only from already-trusted sources: the verified P1 record, a
-verified baseline, and the reviewed static ``browser_host_policy`` dataset),
-and :class:`~ops.operational_research.OfficialURLPolicy` remains the final
+Boundary, stated once because every class here enforces it: You.com is a
+research/retrieval provider, never a browser automation provider. It never
+receives credentials, never selects the browser provider, and a URL it returns
+is NEVER trusted just because You.com returned it — every candidate is
+re-validated against :class:`ResearchHostPolicy` (built only from already-
+trusted sources: the verified P1 record, a verified baseline, and the reviewed
+static ``browser_host_policy`` dataset), and the underlying
+:class:`~ops.operational_research.OfficialURLPolicy` remains the final
 HTTPS/SSRF authority for anything actually fetched.
 
-SDK contract notes (verified by installing ``youdotcom==2.2.0`` and
-inspecting the REAL signatures, not by trusting documentation prose — pinned
-by ``tests/test_you_research.py::test_sdk_contract_*``):
+SDK contract (verified against the installed ``youdotcom==2.5.0`` — see
+``tests/test_you_research.py::TestSdkContract``, which fails loudly if a future
+upgrade changes the surface):
 
-* ``you.search.unified_async`` and ``you.contents.generate_async`` are real
-  ``async def`` coroutines; no thread-pool wrapping is needed.
-* The installed SDK's ``search.unified`` has NO ``include_domains`` /
-  ``exclude_domains`` / ``boost_domains`` parameter at all (confirmed absent
-  from ``SearchRequest`` itself, by source inspection). Domain trust for
-  Search is therefore enforced ENTIRELY downstream, in this module, never at
-  the request layer. This is a documented, deliberate limitation of the
-  pinned SDK version, not an oversight.
-* The installed SDK's ``contents.generate`` has NO ``max_age`` request
-  parameter. ``max_age`` here is a local cache-freshness bound only; it is
-  never sent to You.com.
-* There is no standalone ``you.research(...)`` method in this SDK version;
-  the only Research surface is a mismatched ``ResearchTool`` nested inside
-  the Agents API, with no ``output_schema`` / ``source_control`` / cited
-  ``output.sources`` — none of the guarantees this integration requires.
-  :class:`YouResearchFallback` therefore calls the documented REST endpoint
-  directly over a guarded ``httpx`` client, the same pattern already used by
-  ``OfficialEvidenceFetcher``, rather than inventing a compatibility shim
-  around a mismatched SDK object.
-* ``YouError`` (the SDK's exception base) exposes ``.status_code``; nothing
-  else from a provider exception (``.message``, ``.body``, ``.headers``) is
-  ever logged or surfaced — see :func:`map_you_error`.
-* The SDK applies NO retry on its own unless a ``RetryConfig`` is explicitly
-  supplied (verified from source). This module never supplies one, so the
-  bounded retry implemented here (:func:`run_with_bounded_retry`) is the only
-  retry layer — no double-retry risk.
+* ``search_post_async`` accepts ``include_domains`` as a JSON array of bare
+  domains; used as the provider-side first filter, with local policy validation
+  as the actual security boundary AFTER results return.
+* ``contents.generate_async`` accepts ``max_age`` and ``crawl_timeout`` and
+  ``formats`` (``markdown``/``html``/``metadata``); we request markdown only.
+* ``research_async`` accepts ``source_control`` (include_domains) and
+  ``output_schema`` and returns ``output.sources`` — so Research fallback uses
+  the SDK directly (no raw REST shim needed at this version).
+* Every SDK call auto-retries by default; we pass ONE explicit bounded
+  ``RetryConfig`` so retries are deterministic (429/5xx + connection errors,
+  bounded elapsed time) and never stack a second custom retry layer on top.
+* The ``You`` client is always used as an ``async with`` context manager so its
+  httpx client is closed within the same event loop that created it (the app
+  invokes enrichment via ``asyncio.run`` from sync code, so a persistent
+  loop-bound client would be unsafe).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import importlib
-import random
 import re
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+import threading
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Literal, Protocol, cast, runtime_checkable
+from typing import Any, Literal, Protocol, TypeVar, runtime_checkable
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, ValidationError, field_validator
 
 from ops.browser_host_policy import get_browser_policy
 from ops.models import OperationalResearch, StrictModel, validate_https_url
@@ -69,7 +60,6 @@ from ops.operational_research import (
     EvidenceDocument,
     HostResolver,
     OfficialURLPolicy,
-    extract_https_urls,
 )
 
 # --------------------------------------------------------------------------
@@ -78,8 +68,6 @@ from ops.operational_research import (
 MAX_CANDIDATE_SNIPPETS = 3
 MAX_SNIPPET_CHARACTERS = 1_000
 MAX_YOU_CONTENT_URLS = 10
-YOU_MAX_RETRIES = 2
-_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 QueryType = Literal["baseline", "access", "api_credentials", "research_fallback"]
 EvidenceCategory = Literal[
@@ -96,7 +84,6 @@ EvidenceCategory = Literal[
     "unknown",
 ]
 
-# Diversification caps so a result set is not e.g. eight login pages.
 _CATEGORY_CAPS: dict[str, int] = {
     "login": 2,
     "signup": 2,
@@ -107,27 +94,40 @@ _CATEGORY_CAPS: dict[str, int] = {
     "scopes": 1,
     "rate_limits": 1,
 }
-# Categories that satisfy the composite discovery's "enough coverage" test.
 _ACCESS_CATEGORIES = frozenset({"login", "signup"})
-_PORTAL_CATEGORIES = frozenset({"developer_portal"})
-_CREDENTIAL_CATEGORIES = frozenset({"api_authentication", "credential_creation", "oauth"})
+_PORTAL_OR_API_DOCS = frozenset({"developer_portal", "api_authentication"})
+_CREDENTIAL_SURFACE = frozenset({"credential_creation", "oauth"})
+# Categories a Research candidate page may be classified into (section 19).
+_RESEARCH_CATEGORY_ENUM = frozenset(
+    {
+        "login",
+        "signup",
+        "developer_portal",
+        "api_authentication",
+        "credential_creation",
+        "oauth",
+        "scopes",
+        "rate_limits",
+        "general_docs",
+    }
+)
+
+SEARCH_CACHE_TTL = timedelta(hours=24)
+RESEARCH_CACHE_TTL = timedelta(days=7)
 
 
 class EvidenceCandidate(StrictModel):
-    """A discovered page plus enough metadata to rank and audit it.
+    """A discovered page plus bounded metadata to rank and audit it.
 
-    Deliberately NOT a full search-response passthrough: only a URL, a
-    bounded title, up to three bounded snippets, and small classification
-    metadata ever leave the discovery layer. Nothing here is a trust
-    decision — a candidate still has to pass :class:`ResearchHostPolicy`
-    before it can become a fetch target.
+    Not a full search-response passthrough: only a URL, a bounded title, up to
+    three bounded snippets, and small classification metadata leave discovery.
+    A candidate is never a trust decision — it must still pass
+    :class:`ResearchHostPolicy` before it can become a fetch target.
     """
 
     source_url: str
     title: str = Field(default="", max_length=500)
-    snippets: tuple[Annotated[str, Field(max_length=MAX_SNIPPET_CHARACTERS)], ...] = Field(
-        default=(), max_length=MAX_CANDIDATE_SNIPPETS
-    )
+    snippets: tuple[str, ...] = Field(default=(), max_length=MAX_CANDIDATE_SNIPPETS)
     provider: Literal["p1", "you_search", "perplexity", "you_research"]
     query_type: QueryType
     rank: int = Field(ge=0)
@@ -135,19 +135,17 @@ class EvidenceCandidate(StrictModel):
 
     _validate_source_url = field_validator("source_url")(validate_https_url)
 
+    @field_validator("snippets")
+    @classmethod
+    def _bound_snippets(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(s[:MAX_SNIPPET_CHARACTERS] for s in value[:MAX_CANDIDATE_SNIPPETS])
+
 
 # --------------------------------------------------------------------------
 # Protocols
 # --------------------------------------------------------------------------
 class RichEvidenceDiscovery(Protocol):
-    """The candidate-returning discovery boundary (superset of EvidenceDiscovery).
-
-    Kept as a SEPARATE protocol from :class:`~ops.operational_research.EvidenceDiscovery`
-    rather than changing that protocol's call shape, because the old shape is
-    depended on directly by ``OperationalResearchEnricher``'s existing code
-    path and by its existing tests. Old implementations are adapted forward
-    via :class:`LegacyDiscoveryAdapter`, never the reverse.
-    """
+    """Candidate-returning discovery (superset of the legacy EvidenceDiscovery)."""
 
     async def discover(
         self,
@@ -161,8 +159,6 @@ class RichEvidenceDiscovery(Protocol):
 
 @runtime_checkable
 class EvidenceContentFetcher(Protocol):
-    """Fetch bounded evidence documents for a batch of already-policy-checked URLs."""
-
     async def fetch_many(self, urls: Sequence[str]) -> tuple[EvidenceDocument, ...]: ...
 
 
@@ -172,6 +168,61 @@ class ResearchCache(Protocol):
     def get(self, key: str) -> Mapping[str, object] | None: ...
 
     def put(self, key: str, value: Mapping[str, object], *, expires_at: datetime) -> None: ...
+
+
+# --------------------------------------------------------------------------
+# Sanitized metrics (one instance per enrichment attempt, via a contextvar)
+# --------------------------------------------------------------------------
+@dataclass(slots=True)
+class YouResearchMetrics:
+    """Sanitized counters for one enrichment attempt. No payload, ever."""
+
+    you_search_calls: int = 0
+    you_search_latency_ms: float = 0.0
+    you_search_results_returned: int = 0
+    you_search_results_policy_accepted: int = 0
+    you_contents_calls: int = 0
+    you_contents_pages_requested: int = 0
+    you_contents_pages_returned: int = 0
+    you_contents_latency_ms: float = 0.0
+    you_research_calls: int = 0
+    you_research_latency_ms: float = 0.0
+    research_cache_hits: int = 0
+    research_cache_misses: int = 0
+    discovery_provider_used: str | None = None
+
+    def as_dict(self) -> dict[str, int | float | str | None]:
+        return {
+            "you_search_calls": self.you_search_calls,
+            "you_search_latency_ms": round(self.you_search_latency_ms, 1),
+            "you_search_results_returned": self.you_search_results_returned,
+            "you_search_results_policy_accepted": self.you_search_results_policy_accepted,
+            "you_contents_calls": self.you_contents_calls,
+            "you_contents_pages_requested": self.you_contents_pages_requested,
+            "you_contents_pages_returned": self.you_contents_pages_returned,
+            "you_contents_latency_ms": round(self.you_contents_latency_ms, 1),
+            "you_research_calls": self.you_research_calls,
+            "you_research_latency_ms": round(self.you_research_latency_ms, 1),
+            "research_cache_hits": self.research_cache_hits,
+            "research_cache_misses": self.research_cache_misses,
+            "discovery_provider_used": self.discovery_provider_used,
+        }
+
+
+_metrics_var: ContextVar[YouResearchMetrics | None] = ContextVar("you_metrics", default=None)
+
+
+@contextlib.contextmanager
+def use_metrics(metrics: YouResearchMetrics) -> Iterator[YouResearchMetrics]:
+    token = _metrics_var.set(metrics)
+    try:
+        yield metrics
+    finally:
+        _metrics_var.reset(token)
+
+
+def _metrics() -> YouResearchMetrics | None:
+    return _metrics_var.get()
 
 
 # --------------------------------------------------------------------------
@@ -190,25 +241,48 @@ def _hostname_of(url: str) -> str:
 class ResearchHostPolicy:
     """The hosts You.com may be trusted to have discovered official pages on.
 
-    The trusted set comes ONLY from already-reviewed data — never from a
-    search result approving its own domain, and never by algorithmically
-    widening a host (``developers.vendor.com`` does not imply ``*.vendor.com``
-    unless that broader root is already explicitly reviewed in
-    :mod:`ops.browser_host_policy`). URL-shape and SSRF enforcement is
-    delegated to :class:`~ops.operational_research.OfficialURLPolicy` — this
-    class only decides WHICH hosts that policy trusts.
+    Trust comes ONLY from already-reviewed data. Hosts are tracked as EXACT
+    hosts and WILDCARD domains separately and handed to
+    :class:`OfficialURLPolicy` with the explicit exact/wildcard rules — never
+    the legacy exact-or-subdomain widening — so ``developers.example.com`` can
+    never silently grant ``anything.developers.example.com``.
     """
 
-    def __init__(self, hosts: Sequence[str], *, resolver: HostResolver | None = None) -> None:
-        normalized = {h.strip().rstrip(".").casefold() for h in hosts if h.strip()}
-        exact = {h for h in normalized if not h.startswith("*.")}
-        wildcard = {h[2:] for h in normalized if h.startswith("*.") and len(h) > 2}
-        self._exact_hosts: frozenset[str] = frozenset(exact)
-        self._wildcard_domains: frozenset[str] = frozenset(wildcard)
-        all_hosts = exact | wildcard  # OfficialURLPolicy already treats a host as
-        # "exact-or-subdomain", so a wildcard root is supplied as its bare domain.
-        self._official_policy: OfficialURLPolicy | None = (
-            OfficialURLPolicy(sorted(all_hosts), resolver=resolver) if all_hosts else None
+    def __init__(
+        self,
+        exact_hosts: Sequence[str] = (),
+        wildcard_domains: Sequence[str] = (),
+        *,
+        resolver: HostResolver | None = None,
+    ) -> None:
+        self._exact_hosts = frozenset(
+            h.strip().rstrip(".").casefold() for h in exact_hosts if h.strip()
+        )
+        self._wildcard_domains = frozenset(
+            d.strip().rstrip(".").removeprefix("*.").casefold()
+            for d in wildcard_domains
+            if d.strip()
+        )
+        if self._exact_hosts or self._wildcard_domains:
+            self._official_policy: OfficialURLPolicy | None = OfficialURLPolicy(
+                exact_hosts=sorted(self._exact_hosts),
+                wildcard_domains=sorted(self._wildcard_domains),
+                resolver=resolver,
+            )
+        else:
+            self._official_policy = None
+
+    @classmethod
+    def from_domains(
+        cls, domains: Sequence[str], *, resolver: HostResolver | None = None
+    ) -> ResearchHostPolicy:
+        """Build from a flat list where ``*.x`` entries are wildcard domains and
+        everything else is an exact host (the inverse of ``include_domains``)."""
+
+        return cls(
+            exact_hosts=[d for d in domains if not d.startswith("*.")],
+            wildcard_domains=[d[2:] for d in domains if d.startswith("*.")],
+            resolver=resolver,
         )
 
     @classmethod
@@ -218,61 +292,67 @@ class ResearchHostPolicy:
         p1_record: Mapping[str, object],
         baseline: OperationalResearch,
         app_slug: str | None = None,
-        extra_reviewed_hosts: Sequence[str] = (),
         resolver: HostResolver | None = None,
     ) -> ResearchHostPolicy:
-        """Build the trusted set from verified P1 data, baseline, and reviewed policy."""
+        """Build the trusted set from verified P1 data, baseline, and reviewed policy.
 
-        hosts: list[str] = []
+        P1-derived and baseline-derived hosts are treated as EXACT hosts (a
+        specific reviewed page's host), never widened. Wildcard breadth comes
+        ONLY from the reviewed ``browser_host_policy`` ``vendor_wildcard_domains``.
+        """
+
+        exact: list[str] = []
+        wildcard: list[str] = []
         primary = p1_record.get("primary_docs_url")
         if isinstance(primary, str):
-            hosts.append(_hostname_of(primary))
+            exact.append(_hostname_of(primary))
         evidence = p1_record.get("evidence_urls")
         if isinstance(evidence, list):
-            hosts.extend(_hostname_of(value) for value in evidence if isinstance(value, str))
+            exact.extend(_hostname_of(v) for v in evidence if isinstance(v, str))
         for value in (baseline.developer_portal_url, baseline.signup_url):
             if isinstance(value, str):
-                hosts.append(_hostname_of(value))
+                exact.append(_hostname_of(value))
         slug = app_slug or (baseline.app_slug or None)
         if slug:
             reviewed = get_browser_policy(slug)
             if reviewed is not None:
-                # Reused verbatim: reviewed=False (inactive) apps are still
-                # trustworthy for READING public docs; only launching a
-                # browser session there is gated separately and unaffected.
-                hosts.extend(reviewed.exact_hosts)
-                hosts.extend(f"*.{domain}" for domain in reviewed.vendor_wildcard_domains)
-        hosts.extend(extra_reviewed_hosts)
-        return cls([h for h in hosts if h], resolver=resolver)
-
-    @property
-    def include_domains(self) -> tuple[str, ...]:
-        """The flat, request-shaped trusted domain list (exact + ``*.``-wildcard)."""
-
-        return tuple(
-            sorted({*self._exact_hosts, *(f"*.{domain}" for domain in self._wildcard_domains)})
+                exact.extend(reviewed.exact_hosts)
+                wildcard.extend(reviewed.vendor_wildcard_domains)
+        return cls(
+            exact_hosts=[h for h in exact if h],
+            wildcard_domains=[d for d in wildcard if d],
+            resolver=resolver,
         )
 
     @property
-    def official_url_policy(self) -> OfficialURLPolicy | None:
-        """The underlying HTTPS/SSRF authority, for handing to a content fetcher."""
+    def include_domains(self) -> tuple[str, ...]:
+        """Flat trusted domain list for building a policy or a debug view."""
 
+        return tuple(sorted({*self._exact_hosts, *(f"*.{d}" for d in self._wildcard_domains)}))
+
+    @property
+    def provider_include_domains(self) -> tuple[str, ...]:
+        """Bare domains for You.com's request-level ``include_domains`` filter.
+
+        A reviewed wildcard ``*.pipedrive.com`` is sent as the bare
+        ``pipedrive.com`` (the SDK/API expects bare domains, never ``*.``
+        notation). This is only a first-pass provider filter; local
+        :meth:`validate_candidate_url` still enforces the actual exact/wildcard
+        rule on every returned result.
+        """
+
+        return tuple(sorted(self._exact_hosts | self._wildcard_domains))
+
+    @property
+    def official_url_policy(self) -> OfficialURLPolicy | None:
         return self._official_policy
 
     def validate_candidate_url(self, url: str) -> str:
-        """Shape-validate and canonicalize a candidate URL without network I/O.
-
-        Delegates entirely to :meth:`OfficialURLPolicy.sanitize_candidate` —
-        this class never re-implements HTTPS/port/userinfo/query enforcement.
-        """
-
         if self._official_policy is None:
             raise ValueError("no reviewed official host is trusted for this app yet")
         return self._official_policy.sanitize_candidate(url)
 
     async def validate_for_request(self, url: str) -> str:
-        """Shape-validate AND resolve DNS to reject private/special networks."""
-
         if self._official_policy is None:
             raise ValueError("no reviewed official host is trusted for this app yet")
         return await self._official_policy.validate_for_request(url)
@@ -282,106 +362,8 @@ class ResearchHostPolicy:
 
 
 # --------------------------------------------------------------------------
-# Sanitized provider-error mapping + bounded retry
+# Sanitized provider-error mapping + one bounded SDK retry layer
 # --------------------------------------------------------------------------
-def map_you_error(
-    exc: Exception, *, capability: Literal["you_search", "you_contents", "you_research"]
-) -> str:
-    """Map any You.com provider exception to a stable, sanitized reason code.
-
-    Reads ONLY ``exc.status_code`` (the one stable attribute every ``YouError``
-    exposes). ``.message``/``.body``/``.headers``/the raw exception text are
-    never read here and must never be logged or surfaced by callers.
-    """
-
-    if isinstance(exc, TimeoutError | asyncio.TimeoutError):
-        return f"{capability}_timeout"
-    status = getattr(exc, "status_code", None)
-    if status == 401:
-        return f"{capability}_unauthorized"
-    if status == 402:
-        return f"{capability}_credit_exhausted"
-    if status == 403:
-        return f"{capability}_forbidden"
-    if status == 422:
-        return (
-            f"{capability}_invalid_schema"
-            if capability == "you_research"
-            else f"{capability}_invalid_request"
-        )
-    if status == 429:
-        return f"{capability}_rate_limited"
-    return f"{capability}_failed"
-
-
-def _is_retryable(exc: Exception) -> bool:
-    """Retry only 429, selected transient 5xx, and network connection failures."""
-
-    status = getattr(exc, "status_code", None)
-    if status in _RETRYABLE_STATUS_CODES:
-        return True
-    return status is None and isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout)
-
-
-def _retry_after_seconds(exc: Exception) -> float | None:
-    headers = getattr(exc, "headers", None)
-    if headers is None:
-        return None
-    value = headers.get("retry-after") if hasattr(headers, "get") else None
-    if value is None:
-        return None
-    try:
-        return max(0.0, float(value))
-    except (TypeError, ValueError):
-        return None
-
-
-# Signals that the INTEGRATION itself is broken (wrong kwarg, renamed/missing
-# module, bad attribute access) rather than a provider/network failure. These
-# must never be silently retried or swallowed — see section 10's explicit
-# "do not swallow programming errors such as TypeError" requirement, applied
-# here too since this is where every SDK call actually happens.
-_PROGRAMMING_ERRORS: tuple[type[Exception], ...] = (
-    TypeError,
-    AttributeError,
-    NameError,
-    ImportError,
-    ModuleNotFoundError,
-)
-
-
-async def run_with_bounded_retry(
-    call: Callable[[], Awaitable[object]],
-    *,
-    capability: Literal["you_search", "you_contents", "you_research"],
-    max_retries: int = YOU_MAX_RETRIES,
-) -> object:
-    """Run ``call`` with a bounded, jittered retry — the ONLY retry layer.
-
-    The SDK itself retries nothing by default (verified from source), so this
-    is deliberately the single place attempts are bounded. Raises
-    :class:`YouProviderError` carrying only a sanitized reason code — never
-    the underlying provider exception or its payload. A programming error
-    (see :data:`_PROGRAMMING_ERRORS`) is never caught here; it propagates.
-    """
-
-    last_reason = f"{capability}_failed"
-    for attempt in range(max_retries + 1):
-        try:
-            return await call()
-        except _PROGRAMMING_ERRORS:
-            raise
-        except Exception as exc:  # provider/network failures only; mapped to a reason code
-            last_reason = map_you_error(exc, capability=capability)
-            if attempt >= max_retries or not _is_retryable(exc):
-                raise YouProviderError(capability=capability, reason_code=last_reason) from None
-            retry_after = _retry_after_seconds(exc)
-            base_delay = min(retry_after if retry_after is not None else float(2**attempt), 10.0)
-            jitter = base_delay * (0.85 + random.random() * 0.3)
-            await asyncio.sleep(jitter)
-    raise YouProviderError(capability=capability, reason_code=last_reason)  # pragma: no cover
-
-
 class YouProviderError(RuntimeError):
     """A sanitized You.com failure. Never carries provider payload or the API key."""
 
@@ -391,8 +373,178 @@ class YouProviderError(RuntimeError):
         super().__init__(f"{capability} failed: {reason_code}")
 
 
+# Signals the INTEGRATION is broken (wrong kwarg, renamed module, bad attribute)
+# rather than a provider/network failure. These are never mapped to a provider
+# reason code, never retried, and never degraded to the baseline — they must
+# reach monitoring/tests. (Section 12.)
+_PROGRAMMING_ERRORS: tuple[type[Exception], ...] = (
+    TypeError,
+    AttributeError,
+    NameError,
+    ImportError,
+    ModuleNotFoundError,
+)
+
+# Transient transport failures worth surfacing as a sanitized transient reason.
+# (PoolTimeout is deliberately excluded — it signals local resource pressure.)
+_TRANSIENT_TRANSPORT: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.RemoteProtocolError,
+)
+_TIMEOUT_AND_TRANSPORT: tuple[type[Exception], ...] = (TimeoutError, *_TRANSIENT_TRANSPORT)
+
+
+def map_you_error(
+    exc: Exception, *, capability: Literal["you_search", "you_contents", "you_research"]
+) -> str:
+    """Map a You.com provider exception to a stable, sanitized reason code.
+
+    Reads only ``exc.status_code`` (the one stable attribute every ``YouError``
+    exposes). ``.message``/``.body``/``.headers`` and the raw exception text are
+    never read for logging or user-facing output.
+    """
+
+    if isinstance(exc, TimeoutError):
+        return f"{capability}_timeout"
+    status = getattr(exc, "status_code", None)
+    if status == 400:
+        return f"{capability}_invalid_request"
+    if status == 401:
+        return f"{capability}_unauthorized"
+    if status == 402:
+        return f"{capability}_credit_exhausted"
+    if status == 403:
+        return f"{capability}_forbidden"
+    if status == 404:
+        return f"{capability}_not_found"
+    if status == 422:
+        return (
+            f"{capability}_invalid_schema"
+            if capability == "you_research"
+            else f"{capability}_invalid_request"
+        )
+    if status == 429:
+        return f"{capability}_rate_limited"
+    if isinstance(exc, _TRANSIENT_TRANSPORT):
+        return f"{capability}_timeout"
+    return f"{capability}_failed"
+
+
+def _bounded_retry_config() -> object:
+    """One explicit, bounded RetryConfig — the SDK's retry layer, made deterministic.
+
+    Only 429 and selected transient 5xx (plus connection errors) retry, with a
+    bounded total elapsed time. Client 4xx (400/401/402/403/404/422) are NOT in
+    the override set, so they never retry. This is the ONLY retry layer; no
+    custom retry loop wraps the SDK call.
+    """
+
+    retries = importlib.import_module("youdotcom.utils.retries")
+    return retries.RetryConfig(
+        strategy="backoff",
+        backoff=retries.BackoffStrategy(
+            initial_interval=500,
+            max_interval=8_000,
+            exponent=1.5,
+            max_elapsed_time=20_000,
+            jitter_ms=250,
+        ),
+        retry_connection_errors=True,
+        status_codes_override=["429", "500", "502", "503", "504"],
+    )
+
+
+async def _guard_call(
+    capability: Literal["you_search", "you_contents", "you_research"],
+    factory: Any,
+    *,
+    timeout_seconds: float,
+) -> Any:
+    """Run one provider coroutine with an outer timeout and sanitized mapping.
+
+    ``factory`` must itself open and close the ``You`` client via ``async with``
+    so the client is torn down even on timeout/cancellation. Programming errors
+    propagate; provider/transport errors become a :class:`YouProviderError`.
+    """
+
+    try:
+        return await asyncio.wait_for(factory(), timeout=timeout_seconds)
+    except _PROGRAMMING_ERRORS:
+        raise
+    except _TIMEOUT_AND_TRANSPORT as exc:
+        raise YouProviderError(
+            capability=capability, reason_code=map_you_error(exc, capability=capability)
+        ) from None
+    except Exception as exc:  # provider YouError (has .status_code) or other provider failure
+        raise YouProviderError(
+            capability=capability, reason_code=map_you_error(exc, capability=capability)
+        ) from None
+
+
 # --------------------------------------------------------------------------
-# Candidate classification, scoring, ranking, and diversification
+# Cache helper (single-flight over the persistent cache)
+# --------------------------------------------------------------------------
+def cache_key(kind: Literal["you-search", "you-contents", "you-research"], *parts: str) -> str:
+    digest = hashlib.sha256("|".join(parts).encode()).hexdigest()[:32]
+    return f"{kind}:v2:{digest}"
+
+
+_CacheT = TypeVar("_CacheT")
+
+
+async def _cached(
+    cache: ResearchCache | None,
+    key: str,
+    *,
+    ttl: timedelta,
+    deserialize: Callable[[Mapping[str, object]], _CacheT | None],
+    serialize: Callable[[_CacheT], Mapping[str, object]],
+    compute: Callable[[], Awaitable[_CacheT]],
+) -> _CacheT:
+    """Return a cached value or compute+store it, single-flighting concurrent
+    identical requests via the cache's per-key lock (see research_cache.py)."""
+
+    if cache is None:
+        return await compute()
+
+    metrics = _metrics()
+    raw = cache.get(key)
+    if raw is not None:
+        value = deserialize(raw)
+        if value is not None:
+            if metrics is not None:
+                metrics.research_cache_hits += 1
+            return value
+
+    lock = getattr(cache, "lock_for", None)
+    acquired = lock(key) if callable(lock) else None
+    if acquired is not None:
+        acquired.acquire()
+    try:
+        raw = cache.get(key)
+        if raw is not None:
+            value = deserialize(raw)
+            if value is not None:
+                if metrics is not None:
+                    metrics.research_cache_hits += 1
+                return value
+        if metrics is not None:
+            metrics.research_cache_misses += 1
+        result = await compute()
+        if result is not None:  # negative results (e.g. Research found nothing) are not cached
+            with contextlib.suppress(Exception):
+                cache.put(key, serialize(result), expires_at=datetime.now(UTC) + ttl)
+        return result
+    finally:
+        if acquired is not None:
+            acquired.release()
+
+
+# --------------------------------------------------------------------------
+# Category classification, scoring, ranking, diversification
 # --------------------------------------------------------------------------
 _PATH_WEIGHTS: dict[str, int] = {
     "login": 30,
@@ -411,7 +563,7 @@ _PATH_WEIGHTS: dict[str, int] = {
     "settings": 15,
     "scopes": 25,
 }
-_PENALTY_TERMS: tuple[str, ...] = (
+_PENALTY_TERMS = (
     "blog",
     "community",
     "forum",
@@ -443,9 +595,6 @@ _DOCS_TERMS = ("docs", "documentation", "guide", "guides")
 
 def _tokenize(url: str, title: str) -> str:
     parsed = urlsplit(url)
-    # The subdomain often carries the signal for a root path (e.g.
-    # ``developers.example.com/``, ``api.example.com/``), so the hostname is
-    # part of the haystack too, not just the path and title.
     hostname = (parsed.hostname or "").replace(".", " ")
     return f"{hostname} {parsed.path} {title}".casefold().replace("_", "-")
 
@@ -494,8 +643,6 @@ def _score(url: str, title: str, snippets: Sequence[str]) -> int:
 
 
 def canonicalize(url: str) -> str:
-    """Canonical form for cross-provider dedup: lowercase host, no fragment/trailing slash."""
-
     parsed = urlsplit(url.strip())
     hostname = (parsed.hostname or "").rstrip(".").casefold()
     path = parsed.path or "/"
@@ -506,15 +653,13 @@ def canonicalize(url: str) -> str:
 
 
 def deduplicate_and_rank_candidates(
-    candidates: Sequence[EvidenceCandidate],
-    *,
-    limit: int = MAX_EVIDENCE_DOCUMENTS,
+    candidates: Sequence[EvidenceCandidate], *, limit: int = MAX_EVIDENCE_DOCUMENTS
 ) -> tuple[EvidenceCandidate, ...]:
     """Deduplicate by canonical URL, rank by relevance score, then diversify.
 
-    Ranking is relevance-only; it never substitutes for the security decision
-    a domain policy makes elsewhere — a low-scoring candidate that already
-    passed :class:`ResearchHostPolicy` is just as safe as a high-scoring one.
+    Ranking is relevance-only; it never substitutes for the security decision a
+    domain policy makes — a low-scoring candidate that already passed
+    :class:`ResearchHostPolicy` is exactly as safe as a high-scoring one.
     """
 
     best: dict[str, tuple[int, EvidenceCandidate]] = {}
@@ -540,28 +685,35 @@ def deduplicate_and_rank_candidates(
     return tuple(selected)
 
 
+def merge_research_candidates(
+    discovered: Sequence[EvidenceCandidate], extra: Sequence[EvidenceCandidate]
+) -> tuple[EvidenceCandidate, ...]:
+    """Combine discovery candidates with Research-fallback candidates, deduped/ranked."""
+
+    return deduplicate_and_rank_candidates([*discovered, *extra])
+
+
 def coverage_categories(candidates: Sequence[EvidenceCandidate]) -> frozenset[str]:
     return frozenset(candidate.category for candidate in candidates)
 
 
 def has_sufficient_coverage(candidates: Sequence[EvidenceCandidate]) -> bool:
-    """True once candidates include an access page, a portal/API page, and a
-    credential page — the composite discovery's threshold for skipping the
-    next (more expensive, or lower-trust) provider in the chain."""
+    """Sufficient only with an ACCESS page, a PORTAL/API-docs surface, AND a
+    CREDENTIAL surface. login+credential alone is NOT sufficient — a developer
+    /API documentation surface is required too (section 17)."""
 
     categories = coverage_categories(candidates)
-    return (
-        bool(categories & _ACCESS_CATEGORIES)
-        and bool(categories & (_PORTAL_CATEGORIES | _CREDENTIAL_CATEGORIES))
-        and bool(categories & _CREDENTIAL_CATEGORIES)
-    )
+    has_access = bool(categories & _ACCESS_CATEGORIES)
+    has_portal_or_api_docs = bool(categories & _PORTAL_OR_API_DOCS)
+    has_credential_surface = bool(categories & _CREDENTIAL_SURFACE)
+    return has_access and has_portal_or_api_docs and has_credential_surface
 
 
 # --------------------------------------------------------------------------
 # YouSearchDiscovery
 # --------------------------------------------------------------------------
 class YouSearchDiscovery:
-    """Primary discovery provider: You.com Web Search, two bounded queries."""
+    """Primary discovery provider: You.com Web Search (POST), two bounded queries."""
 
     def __init__(
         self,
@@ -570,13 +722,13 @@ class YouSearchDiscovery:
         count: int = 5,
         timeout_seconds: float = 20.0,
         max_calls: int = 2,
-        http_client: httpx.AsyncClient | None = None,
+        cache: ResearchCache | None = None,
     ) -> None:
         self._api_key = api_key if isinstance(api_key, SecretStr) else SecretStr(api_key)
         self._count = count
         self._timeout_seconds = timeout_seconds
         self._max_calls = max_calls
-        self._http_client = http_client
+        self._cache = cache
 
     async def discover(
         self,
@@ -589,7 +741,8 @@ class YouSearchDiscovery:
         del p1_record, baseline
         if not official_hosts:
             return ()
-        policy = ResearchHostPolicy(official_hosts)
+        policy = ResearchHostPolicy.from_domains(official_hosts)
+        provider_domains = policy.provider_include_domains
         queries: tuple[tuple[QueryType, str], ...] = (
             (
                 "access",
@@ -605,44 +758,92 @@ class YouSearchDiscovery:
         discovered: list[EvidenceCandidate] = []
         for query_type, query in queries[: self._max_calls]:
             try:
-                response = await self._search(query=query)
+                candidates = await self._search_query(query, query_type, provider_domains, policy)
             except YouProviderError:
                 continue  # one query failing must not fail discovery entirely
-            discovered.extend(self._convert_results(response, query_type=query_type, policy=policy))
+            discovered.extend(candidates)
         return deduplicate_and_rank_candidates(discovered)
 
-    async def _search(self, *, query: str) -> object:
-        async def _call() -> object:
+    async def _search_query(
+        self,
+        query: str,
+        query_type: QueryType,
+        provider_domains: tuple[str, ...],
+        policy: ResearchHostPolicy,
+    ) -> list[EvidenceCandidate]:
+        key = cache_key("you-search", query, ",".join(provider_domains), str(self._count))
+
+        def _deserialize(raw: Mapping[str, object]) -> list[EvidenceCandidate] | None:
+            items = raw.get("items")
+            if not isinstance(items, list):
+                return None
+            try:
+                return [EvidenceCandidate.model_validate(item) for item in items]
+            except ValidationError:
+                return None  # invalid cached payload -> recompute
+
+        def _serialize(value: list[EvidenceCandidate]) -> Mapping[str, object]:
+            return {"items": [c.model_dump() for c in value]}
+
+        async def _compute() -> list[EvidenceCandidate]:
+            response = await self._search(query=query, provider_domains=provider_domains)
+            return self._convert_results(response, query_type=query_type, policy=policy)
+
+        return await _cached(
+            self._cache,
+            key,
+            ttl=SEARCH_CACHE_TTL,
+            deserialize=_deserialize,
+            serialize=_serialize,
+            compute=_compute,
+        )
+
+    async def _search(self, *, query: str, provider_domains: tuple[str, ...]) -> object:
+        metrics = _metrics()
+        started = datetime.now(UTC)
+
+        async def _factory() -> object:
             youdotcom = importlib.import_module("youdotcom")
-            safesearch_module = importlib.import_module("youdotcom.models.safesearch")
-            you = youdotcom.You(api_key_auth=self._api_key.get_secret_value())
-            return await asyncio.wait_for(
-                you.search.unified_async(
+            safesearch = importlib.import_module("youdotcom.models.safesearch")
+            async with youdotcom.You(api_key_auth=self._api_key.get_secret_value()) as you:
+                return await you.search_post_async(
                     query=query,
                     count=self._count,
-                    safesearch=safesearch_module.SafeSearch.STRICT,
+                    include_domains=list(provider_domains),
+                    safesearch=safesearch.SafeSearch.STRICT,
+                    retries=_bounded_retry_config(),
                     timeout_ms=int(self._timeout_seconds * 1000),
-                ),
-                timeout=self._timeout_seconds,
-            )
+                )
 
-        return await run_with_bounded_retry(_call, capability="you_search")
+        try:
+            response = await _guard_call(
+                "you_search", _factory, timeout_seconds=self._timeout_seconds + 5
+            )
+        finally:
+            if metrics is not None:
+                metrics.you_search_calls += 1
+                metrics.you_search_latency_ms += (
+                    datetime.now(UTC) - started
+                ).total_seconds() * 1000
+        return response
 
     def _convert_results(
         self, response: object, *, query_type: QueryType, policy: ResearchHostPolicy
     ) -> list[EvidenceCandidate]:
+        metrics = _metrics()
         results = getattr(response, "results", None)
         web_results = list(getattr(results, "web", None) or ())
+        if metrics is not None:
+            metrics.you_search_results_returned += len(web_results)
         candidates: list[EvidenceCandidate] = []
         for rank, item in enumerate(web_results):
             url = getattr(item, "url", None)
             if not isinstance(url, str) or not url:
                 continue
             try:
-                validated = validate_https_url(url)
-                safe_url = policy.validate_candidate_url(validated)
+                safe_url = policy.validate_candidate_url(validate_https_url(url))
             except ValueError:
-                continue  # off-policy or malformed — never trusted just because You.com returned it
+                continue  # off-policy — never trusted just because You.com returned it
             title = (getattr(item, "title", None) or "")[:500]
             raw_snippets = list(getattr(item, "snippets", None) or ())
             description = getattr(item, "description", None)
@@ -662,9 +863,9 @@ class YouSearchDiscovery:
                     category=classify_category(safe_url, title),
                 )
             )
-        # News results are intentionally ignored for this use case UNLESS a
-        # first-party migration announcement is the only lead — that judgment
-        # call is out of scope for an automated pipeline, so news is skipped.
+        if metrics is not None:
+            metrics.you_search_results_policy_accepted += len(candidates)
+        # News results are intentionally ignored for this use case.
         return candidates
 
 
@@ -672,12 +873,7 @@ class YouSearchDiscovery:
 # Legacy-protocol adapter + composite discovery
 # --------------------------------------------------------------------------
 class LegacyDiscoveryAdapter:
-    """Adapt an old :class:`EvidenceDiscovery` (URL-only) into :class:`RichEvidenceDiscovery`.
-
-    Used to fold ``PerplexitySearchDiscovery`` into the same composite chain
-    as :class:`YouSearchDiscovery` without changing Perplexity's own call
-    shape or touching any test that constructs it directly.
-    """
+    """Adapt an old :class:`EvidenceDiscovery` (URL-only) into RichEvidenceDiscovery."""
 
     def __init__(
         self, legacy: EvidenceDiscovery, *, provider: Literal["perplexity"] = "perplexity"
@@ -695,7 +891,7 @@ class LegacyDiscoveryAdapter:
     ) -> tuple[EvidenceCandidate, ...]:
         del p1_record, baseline
         urls = await self._legacy.discover(app_name=app_name)
-        policy = ResearchHostPolicy(official_hosts) if official_hosts else None
+        policy = ResearchHostPolicy.from_domains(official_hosts) if official_hosts else None
         candidates: list[EvidenceCandidate] = []
         for rank, url in enumerate(urls):
             try:
@@ -719,12 +915,11 @@ class LegacyDiscoveryAdapter:
 
 
 class CompositeEvidenceDiscovery:
-    """You.com first; Perplexity (or any other provider) only fills gaps.
+    """You.com first; Perplexity (or another provider) only fills coverage gaps.
 
-    A provider that raises is skipped, never fatal to the whole enrichment —
-    except a genuine programming error (``TypeError`` etc.), which is not
-    caught here and propagates, exactly so a broken integration is visible
-    rather than silently swallowed.
+    A provider that raises an EXPECTED provider/transport error is skipped, never
+    fatal. A programming error (TypeError etc.) is NOT caught here — a broken
+    integration must be visible, not silently swallowed (section 12).
     """
 
     def __init__(
@@ -735,9 +930,14 @@ class CompositeEvidenceDiscovery:
     ) -> None:
         self._providers = tuple(providers)
         self._minimum_candidates_before_stopping = minimum_candidates_before_stopping
-        # Sanitized, in-memory only — which provider actually supplied the
-        # candidates used on the most recent call. No secrets, no payload.
         self.last_provider_used: str | None = None
+
+    def _provider_label(self, provider: RichEvidenceDiscovery) -> str:
+        if isinstance(provider, YouSearchDiscovery):
+            return "you_search"
+        if isinstance(provider, LegacyDiscoveryAdapter):
+            return "perplexity"
+        return type(provider).__name__
 
     async def discover(
         self,
@@ -758,27 +958,53 @@ class CompositeEvidenceDiscovery:
                     official_hosts=official_hosts,
                 )
             except _PROGRAMMING_ERRORS:
-                raise  # a broken integration must be visible, never silently swallowed
-            except (YouProviderError, ValueError, RuntimeError, OSError):
-                continue  # expected provider-shaped failures only
+                raise
+            except (YouProviderError, ValueError, OSError, httpx.RequestError):
+                continue
             if found:
-                used.append(type(provider).__name__)
+                used.append(self._provider_label(provider))
             collected.extend(found)
             ranked = deduplicate_and_rank_candidates(collected)
             if has_sufficient_coverage(ranked) and len(ranked) >= min(
                 self._minimum_candidates_before_stopping, len(collected)
             ):
-                self.last_provider_used = "+".join(used) or None
+                self._record_used(used)
                 return ranked
-        self.last_provider_used = "+".join(used) or None
+        self._record_used(used)
         return deduplicate_and_rank_candidates(collected)
+
+    def _record_used(self, used: Sequence[str]) -> None:
+        label = "+".join(used) or None
+        self.last_provider_used = label
+        metrics = _metrics()
+        if metrics is not None and label is not None:
+            metrics.discovery_provider_used = label
 
 
 # --------------------------------------------------------------------------
 # Content fetchers: You Contents -> guarded HTTP fallback (per URL)
 # --------------------------------------------------------------------------
+# Control characters to strip from fetched Markdown (keep tab/newline/CR).
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def normalize_markdown(text: str) -> str:
+    """Normalize fetched Markdown WITHOUT altering its factual content.
+
+    Only removes null/unsafe control characters and normalizes newlines. It does
+    NOT delete or rewrite instruction-shaped lines — fetched content is untrusted
+    EVIDENCE handed to Gemini as source material (the extraction prompt tells the
+    model to never obey instructions inside evidence), so silently editing the
+    text would both be a false sense of safety and could corrupt real facts.
+    """
+
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = _CONTROL_CHARS.sub("", cleaned)
+    return cleaned[:MAX_EXCERPT_CHARACTERS]
+
+
 class YouContentsFetcher:
-    """Fetch clean Markdown for already policy-approved official URLs, in bounded batches."""
+    """Fetch clean Markdown for already policy-approved official URLs, in one bounded batch."""
 
     def __init__(
         self,
@@ -788,100 +1014,123 @@ class YouContentsFetcher:
         crawl_timeout: int = 10,
         max_age: int | None = 86_400,
         request_timeout: float = 30.0,
+        max_pages: int = 8,
+        cache: ResearchCache | None = None,
     ) -> None:
         self._api_key = api_key if isinstance(api_key, SecretStr) else SecretStr(api_key)
         self._policy = policy
         self._crawl_timeout = crawl_timeout
         self._max_age = max_age
         self._request_timeout = request_timeout
+        self._max_pages = min(max_pages, MAX_YOU_CONTENT_URLS)
+        self._cache = cache
 
     async def fetch_many(self, urls: Sequence[str]) -> tuple[EvidenceDocument, ...]:
-        bounded = list(dict.fromkeys(urls))[:MAX_YOU_CONTENT_URLS]
+        bounded = list(dict.fromkeys(urls))[: self._max_pages]
         safe_urls: list[str] = []
         for url in bounded:
             try:
-                safe_urls.append(await self._policy.validate_for_request(url))
+                # Host-policy validation (HTTPS/port/host-allowlist/sensitive-query),
+                # NOT DNS-resolution SSRF. You.com Contents crawls the page on ITS
+                # servers, so our resolver's view is irrelevant to what You.com
+                # fetches — the meaningful control here is the reviewed host
+                # allowlist. DNS-based SSRF protection remains on the guarded HTTP
+                # fallback (GuardedHTTPEvidenceFetcher -> OfficialEvidenceFetcher),
+                # where WE perform the fetch.
+                safe_urls.append(self._policy.validate_candidate_url(url))
             except ValueError:
-                continue  # never sent to You.com if it fails our own policy first
+                continue  # never sent to You.com if it fails our own host policy first
         if not safe_urls:
             return ()
 
+        key = cache_key("you-contents", "|".join(sorted(safe_urls)), str(self._max_age))
+
+        def _deserialize(raw: Mapping[str, object]) -> tuple[EvidenceDocument, ...] | None:
+            items = raw.get("items")
+            if not isinstance(items, list):
+                return None
+            try:
+                return tuple(EvidenceDocument.model_validate(item) for item in items)
+            except ValidationError:
+                return None
+
+        def _serialize(value: tuple[EvidenceDocument, ...]) -> Mapping[str, object]:
+            return {"items": [d.model_dump() for d in value]}
+
+        async def _compute() -> tuple[EvidenceDocument, ...]:
+            return await self._generate_documents(safe_urls)
+
+        ttl = timedelta(seconds=self._max_age if self._max_age and self._max_age > 0 else 86_400)
+        return await _cached(
+            self._cache,
+            key,
+            ttl=ttl,
+            deserialize=_deserialize,
+            serialize=_serialize,
+            compute=_compute,
+        )
+
+    async def _generate_documents(self, safe_urls: list[str]) -> tuple[EvidenceDocument, ...]:
+        metrics = _metrics()
+        started = datetime.now(UTC)
+
+        async def _factory() -> object:
+            youdotcom = importlib.import_module("youdotcom")
+            formats = importlib.import_module("youdotcom.models.contentsformats")
+            async with youdotcom.You(api_key_auth=self._api_key.get_secret_value()) as you:
+                return await you.contents.generate_async(
+                    urls=safe_urls,
+                    formats=[formats.ContentsFormats.MARKDOWN],
+                    crawl_timeout=self._crawl_timeout,
+                    max_age=self._max_age,
+                    retries=_bounded_retry_config(),
+                    timeout_ms=int(self._request_timeout * 1000),
+                )
+
         try:
-            responses = await self._generate(safe_urls)
+            responses = await _guard_call(
+                "you_contents", _factory, timeout_seconds=self._request_timeout + 5
+            )
         except YouProviderError:
             return ()
+        finally:
+            if metrics is not None:
+                metrics.you_contents_calls += 1
+                metrics.you_contents_pages_requested += len(safe_urls)
+                metrics.you_contents_latency_ms += (
+                    datetime.now(UTC) - started
+                ).total_seconds() * 1000
 
+        pages = list(responses) if isinstance(responses, list) else list(responses or ())
         documents: list[EvidenceDocument] = []
-        for page in responses:
+        for page in pages:
             document = self._to_document(page)
             if document is not None:
                 documents.append(document)
+        if metrics is not None:
+            metrics.you_contents_pages_returned += len(documents)
         return tuple(documents)
-
-    async def _generate(self, urls: list[str]) -> list[object]:
-        async def _call() -> object:
-            youdotcom = importlib.import_module("youdotcom")
-            formats_module = importlib.import_module("youdotcom.models.contentsformats")
-            you = youdotcom.You(api_key_auth=self._api_key.get_secret_value())
-            return await asyncio.wait_for(
-                you.contents.generate_async(
-                    urls=urls,
-                    formats=[
-                        formats_module.ContentsFormats.MARKDOWN,
-                        formats_module.ContentsFormats.METADATA,
-                    ],
-                    crawl_timeout=self._crawl_timeout,
-                    timeout_ms=int(self._request_timeout * 1000),
-                ),
-                timeout=self._request_timeout,
-            )
-
-        result = await run_with_bounded_retry(_call, capability="you_contents")
-        # The pinned SDK's contents.generate_async is typed to always return a
-        # list (verified by the SDK contract test); this is a narrowing cast; it does not assume anything not already verified.
-        if result is None:
-            return []
-        return cast("list[object]", result)
 
     def _to_document(self, page: object) -> EvidenceDocument | None:
         returned_url = getattr(page, "url", None)
         if not isinstance(returned_url, str) or not returned_url:
             return None
         try:
-            # The URL You.com actually fetched must independently pass our
-            # policy again — a redirect during crawling must not smuggle in
-            # an off-policy host.
+            # The URL You.com actually fetched must independently pass policy
+            # again — a redirect during crawling must not smuggle an off-policy
+            # host into the evidence set.
             safe_url = self._policy.validate_candidate_url(returned_url)
         except ValueError:
             return None
         markdown = getattr(page, "markdown", None)
         if not isinstance(markdown, str) or not markdown.strip():
             return None  # empty Markdown is rejected, not passed through as evidence
-        metadata = getattr(page, "metadata", None)
-        title = (
-            getattr(page, "title", None)
-            or getattr(metadata, "site_name", None)
-            or "Official documentation"
-        )
+        title = getattr(page, "title", None) or "Official documentation"
         return EvidenceDocument(
             source_url=safe_url,
             title=str(title)[:500],
-            relevant_text=_strip_injection_markers(markdown)[:MAX_EXCERPT_CHARACTERS],
+            relevant_text=normalize_markdown(markdown),
         )
-
-
-_INJECTION_MARKERS = re.compile(
-    r"(?im)^\s*(ignore (all|previous) instructions|system prompt|you are now|disregard the above)\b.*$"
-)
-
-
-def _strip_injection_markers(markdown: str) -> str:
-    """Cosmetic-only: drop lines shaped like a prompt-injection directive for
-    DISPLAY. This is not a trust boundary — fetched text is untrusted evidence
-    fed to Gemini's structured extraction regardless, never executed as an
-    instruction by anything in this pipeline."""
-
-    return _INJECTION_MARKERS.sub("[removed: instruction-shaped text]", markdown)
 
 
 class GuardedHTTPEvidenceFetcher:
@@ -901,7 +1150,7 @@ class GuardedHTTPEvidenceFetcher:
 
 
 class FallbackEvidenceContentFetcher:
-    """You Contents first; the guarded HTTP fetcher fills whatever it missed."""
+    """You Contents first; the guarded HTTP fetcher fills whatever it missed (per URL)."""
 
     def __init__(self, primary: EvidenceContentFetcher, fallback: EvidenceContentFetcher) -> None:
         self._primary = primary
@@ -909,7 +1158,7 @@ class FallbackEvidenceContentFetcher:
 
     async def fetch_many(self, urls: Sequence[str]) -> tuple[EvidenceDocument, ...]:
         primary_documents = await self._primary.fetch_many(urls)
-        fetched = {canonicalize(document.source_url) for document in primary_documents}
+        fetched = {canonicalize(d.source_url) for d in primary_documents}
         missing = [url for url in urls if canonicalize(url) not in fetched]
         fallback_documents = await self._fallback.fetch_many(missing) if missing else ()
         return merge_documents(primary_documents, fallback_documents)
@@ -930,171 +1179,219 @@ def merge_documents(
 
 
 # --------------------------------------------------------------------------
-# Optional You Research fallback (disabled by default; direct REST call)
+# Optional You Research fallback (disabled by default; SDK research())
 # --------------------------------------------------------------------------
+YOU_RESEARCH_SCHEMA_VERSION = "candidate_pages_v1"
 YOU_RESEARCH_SCHEMA: dict[str, object] = {
     "type": "object",
     "additionalProperties": False,
-    "required": [
-        "login_url",
-        "signup_url",
-        "developer_portal_url",
-        "credential_management_url",
-        "authentication_method",
-        "credential_creation_steps",
-        "source_urls",
-        "confidence",
-    ],
+    "required": ["candidate_pages", "confidence"],
     "properties": {
-        "login_url": {"type": ["string", "null"]},
-        "signup_url": {"type": ["string", "null"]},
-        "developer_portal_url": {"type": ["string", "null"]},
-        "credential_management_url": {"type": ["string", "null"]},
-        "authentication_method": {"type": ["string", "null"]},
-        "credential_creation_steps": {"type": "array", "items": {"type": "string"}},
-        "source_urls": {"type": "array", "items": {"type": "string"}},
+        "candidate_pages": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["url", "category"],
+                "properties": {
+                    "url": {"type": "string"},
+                    "category": {
+                        "type": "string",
+                        "enum": sorted(_RESEARCH_CATEGORY_ENUM),
+                    },
+                },
+            },
+        },
         "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
     },
 }
-_RESEARCH_ENDPOINT = "https://api.you.com/v1/research"
 
 
 @dataclass(frozen=True, slots=True)
 class ResearchFallbackResult:
-    """Untrusted candidate source URLs from You Research, ready for You Contents.
+    """Untrusted candidate pages from You Research, ready for You Contents.
 
-    Deliberately does NOT carry ``credential_creation_steps``/``authentication_method``
-    prose forward as trusted fact — see the module docstring: Research is only
-    ever allowed to point at MORE pages for the SAME canonical Gemini
-    extraction + validation path, never to author an ``OperationalResearch``
-    field directly.
+    Research NEVER authors an OperationalResearch field — it only points at MORE
+    official pages for the SAME canonical Gemini extraction + validation path.
     """
 
-    candidate_urls: tuple[str, ...]
+    candidates: tuple[EvidenceCandidate, ...]
     confidence: Literal["high", "medium", "low"]
+
+    @property
+    def candidate_urls(self) -> tuple[str, ...]:
+        return tuple(c.source_url for c in self.candidates)
 
 
 class YouResearchFallback:
-    """Last-resort discovery: multi-step Research, called at most once per enrichment.
+    """Last-resort discovery: one bounded Research call, at most once per enrichment.
 
-    Uses the documented REST endpoint directly (see the module docstring for
-    why the installed SDK's mismatched ``ResearchTool`` object is not used).
-    Disabled by default; the caller decides whether Search + Contents were
-    already sufficient before ever constructing/invoking this.
+    Uses the SDK ``research_async`` with ``source_control.include_domains`` and a
+    minimal ``output_schema`` (candidate pages only). Disabled by default; the
+    caller decides (via ``has_sufficient_coverage``) whether to invoke it.
     """
 
     def __init__(
         self,
         api_key: SecretStr | str,
         *,
-        http_client: httpx.AsyncClient,
         timeout_seconds: float = 60.0,
+        cache: ResearchCache | None = None,
     ) -> None:
         self._api_key = api_key if isinstance(api_key, SecretStr) else SecretStr(api_key)
-        self._http_client = http_client
         self._timeout_seconds = timeout_seconds
+        self._cache = cache
 
     async def research(
         self, *, app_name: str, official_hosts: tuple[str, ...], policy: ResearchHostPolicy
     ) -> ResearchFallbackResult | None:
         if not official_hosts:
             return None
+        provider_domains = policy.provider_include_domains
+        key = cache_key(
+            "you-research",
+            app_name.casefold(),
+            ",".join(provider_domains),
+            YOU_RESEARCH_SCHEMA_VERSION,
+        )
 
-        async def _call() -> httpx.Response:
-            response = await self._http_client.post(
-                _RESEARCH_ENDPOINT,
-                json={
-                    "input": (
+        def _deserialize(raw: Mapping[str, object]) -> ResearchFallbackResult | None:
+            items = raw.get("candidates")
+            confidence = raw.get("confidence")
+            if not isinstance(items, list) or confidence not in ("high", "medium", "low"):
+                return None
+            try:
+                candidates = tuple(EvidenceCandidate.model_validate(i) for i in items)
+            except ValidationError:
+                return None
+            # Re-validate each cached candidate against the CURRENT policy.
+            revalidated = []
+            for c in candidates:
+                try:
+                    policy.validate_candidate_url(c.source_url)
+                except ValueError:
+                    return None
+                revalidated.append(c)
+            return ResearchFallbackResult(candidates=tuple(revalidated), confidence=confidence)
+
+        def _serialize(value: ResearchFallbackResult | None) -> Mapping[str, object]:
+            # _cached only calls serialize on a non-None result (negative
+            # results are never cached), so ``value`` is a real result here.
+            assert value is not None
+            return {
+                "candidates": [c.model_dump() for c in value.candidates],
+                "confidence": value.confidence,
+            }
+
+        async def _compute() -> ResearchFallbackResult | None:
+            return await self._research_call(app_name, provider_domains, policy)
+
+        return await _cached(
+            self._cache,
+            key,
+            ttl=RESEARCH_CACHE_TTL,
+            deserialize=_deserialize,
+            serialize=_serialize,
+            compute=_compute,
+        )
+
+    async def _research_call(
+        self, app_name: str, provider_domains: tuple[str, ...], policy: ResearchHostPolicy
+    ) -> ResearchFallbackResult | None:
+        metrics = _metrics()
+        started = datetime.now(UTC)
+
+        async def _factory() -> object:
+            youdotcom = importlib.import_module("youdotcom")
+            researchop = importlib.import_module("youdotcom.models.researchop")
+            async with youdotcom.You(api_key_auth=self._api_key.get_secret_value()) as you:
+                return await you.research_async(
+                    input=(
                         f"Find the official login, signup, developer portal, API credential "
                         f"management, and authentication documentation pages for {app_name}. "
                         "Only cite official first-party pages."
                     ),
-                    "research_effort": "standard",
-                    "source_control": {"include_domains": list(official_hosts)},
-                    "output_schema": YOU_RESEARCH_SCHEMA,
-                },
-                headers={
-                    "X-API-Key": self._api_key.get_secret_value(),
-                    "Content-Type": "application/json",
-                },
-                timeout=self._timeout_seconds,
-            )
-            if response.status_code >= 400:
-                raise _HttpStatusError(response.status_code, response.headers)
-            return response
+                    research_effort=researchop.ResearchEffort.STANDARD,
+                    source_control=researchop.SourceControl(include_domains=list(provider_domains)),
+                    output_schema=YOU_RESEARCH_SCHEMA,
+                    retries=_bounded_retry_config(),
+                    timeout_ms=int(self._timeout_seconds * 1000),
+                )
 
         try:
-            response = await run_with_bounded_retry(_call, capability="you_research")
+            response = await _guard_call(
+                "you_research", _factory, timeout_seconds=self._timeout_seconds + 5
+            )
         except YouProviderError:
             return None
+        finally:
+            if metrics is not None:
+                metrics.you_research_calls += 1
+                metrics.you_research_latency_ms += (
+                    datetime.now(UTC) - started
+                ).total_seconds() * 1000
 
+        return self._parse(response, policy)
+
+    def _parse(self, response: object, policy: ResearchHostPolicy) -> ResearchFallbackResult | None:
+        output = getattr(response, "output", None)
+        if output is None:
+            return None
         try:
-            payload = response.json()  # type: ignore[attr-defined]
-        except ValueError:
+            dumped = output.model_dump()
+        except AttributeError:
             return None
-        return self._validate(payload, policy)
-
-    def _validate(
-        self, payload: Mapping[str, object], policy: ResearchHostPolicy
-    ) -> ResearchFallbackResult | None:
-        output = payload.get("output")
-        if not isinstance(output, Mapping):
+        sources = dumped.get("sources")
+        content = dumped.get("content")
+        if not isinstance(sources, list):
             return None
-        content = output.get("content")
-        sources = output.get("sources")
-        if not isinstance(content, Mapping) or not isinstance(sources, list):
+        cited = {str(s.get("url")) for s in sources if isinstance(s, Mapping) and s.get("url")}
+        # `content` holds the structured object when output_schema is used.
+        structured = content if isinstance(content, Mapping) else None
+        if structured is None:
             return None
-        cited_urls = {
-            str(source.get("url"))
-            for source in sources
-            if isinstance(source, Mapping) and source.get("url")
-        }
-
-        confidence = content.get("confidence")
+        confidence = structured.get("confidence")
         if confidence not in ("high", "medium", "low"):
             return None
 
-        candidate_urls: list[str] = []
-        for value in content.get("source_urls") or ():
-            if not isinstance(value, str) or value not in cited_urls:
-                continue  # every source_url must appear in output.sources
-            try:
-                # Shape AND host-policy enforcement together: an untrusted
-                # Research response cannot smuggle in an off-policy host just
-                # because it labeled the URL a "source".
-                safe = policy.validate_candidate_url(value)
-            except ValueError:
+        candidates: list[EvidenceCandidate] = []
+        for rank, page in enumerate(structured.get("candidate_pages") or ()):
+            if not isinstance(page, Mapping):
                 continue
-            candidate_urls.append(safe)
-        if not candidate_urls:
+            url = page.get("url")
+            category = page.get("category")
+            if not isinstance(url, str) or url not in cited:
+                continue  # every candidate must appear in output.sources
+            if category not in _RESEARCH_CATEGORY_ENUM:
+                continue
+            try:
+                safe_url = policy.validate_candidate_url(url)
+            except ValueError:
+                continue  # off-policy host rejected even if cited
+            candidates.append(
+                EvidenceCandidate(
+                    source_url=safe_url,
+                    provider="you_research",
+                    query_type="research_fallback",
+                    rank=rank,
+                    category=category,
+                )
+            )
+        if not candidates:
             return None
-        return ResearchFallbackResult(candidate_urls=tuple(candidate_urls), confidence=confidence)
-
-
-class _HttpStatusError(Exception):
-    """Sanitized stand-in exposing only ``.status_code``/``.headers`` for mapping."""
-
-    def __init__(self, status_code: int, headers: httpx.Headers) -> None:
-        self.status_code = status_code
-        self.headers = headers
-        super().__init__(f"HTTP {status_code}")
+        return ResearchFallbackResult(candidates=tuple(candidates), confidence=confidence)
 
 
 # --------------------------------------------------------------------------
-# NOTE: ``extract_https_urls`` (documented-evidence URL extraction used for
-# operational-URL validation) lives in ``ops.operational_research`` — that
-# module is the lower-level base this one builds on, and
-# ``OperationalResearchEnricher._validate_extracted_research`` needs the same
-# helper without this module importing back into it (which would be
-# circular, since this module already imports FROM operational_research).
-# --------------------------------------------------------------------------
-# In-memory research cache (credit protection)
+# In-memory research cache (unit tests only; production uses SqliteResearchCache)
 # --------------------------------------------------------------------------
 class InMemoryResearchCache:
-    """A simple process-local :class:`ResearchCache`. No secrets are ever cached."""
+    """A process-local :class:`ResearchCache` for isolated unit tests. No secrets."""
 
     def __init__(self) -> None:
         self._store: dict[str, tuple[Mapping[str, object], datetime]] = {}
+        self._locks: dict[str, threading.Lock] = {}
+        self._guard = threading.Lock()
 
     def get(self, key: str) -> Mapping[str, object] | None:
         entry = self._store.get(key)
@@ -1109,19 +1406,17 @@ class InMemoryResearchCache:
     def put(self, key: str, value: Mapping[str, object], *, expires_at: datetime) -> None:
         self._store[key] = (dict(value), expires_at)
 
-
-def cache_key(kind: Literal["you-search", "you-contents", "you-research"], *parts: str) -> str:
-    digest = hashlib.sha256("|".join(parts).encode()).hexdigest()[:32]
-    return f"{kind}:v1:{digest}"
-
-
-SEARCH_CACHE_TTL = timedelta(hours=24)
-CONTENTS_CACHE_TTL = timedelta(hours=24)
-RESEARCH_CACHE_TTL = timedelta(days=7)
+    def lock_for(self, key: str) -> threading.Lock:
+        with self._guard:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[key] = lock
+            return lock
 
 
 # --------------------------------------------------------------------------
-# Observability (sanitized only)
+# Observability helper
 # --------------------------------------------------------------------------
 ProviderHealth = Literal[
     "configured_not_verified",
@@ -1131,42 +1426,6 @@ ProviderHealth = Literal[
     "not_configured",
     "disabled",
 ]
-
-
-@dataclass(slots=True)
-class YouResearchMetrics:
-    """Sanitized counters for one enrichment attempt. No payload, ever."""
-
-    you_search_calls: int = 0
-    you_search_latency_ms: float = 0.0
-    you_search_results_returned: int = 0
-    you_search_results_policy_accepted: int = 0
-    you_contents_calls: int = 0
-    you_contents_pages_requested: int = 0
-    you_contents_pages_returned: int = 0
-    you_contents_latency_ms: float = 0.0
-    you_research_calls: int = 0
-    you_research_latency_ms: float = 0.0
-    research_cache_hits: int = 0
-    research_cache_misses: int = 0
-    discovery_provider_used: str | None = None
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "you_search_calls": self.you_search_calls,
-            "you_search_latency_ms": self.you_search_latency_ms,
-            "you_search_results_returned": self.you_search_results_returned,
-            "you_search_results_policy_accepted": self.you_search_results_policy_accepted,
-            "you_contents_calls": self.you_contents_calls,
-            "you_contents_pages_requested": self.you_contents_pages_requested,
-            "you_contents_pages_returned": self.you_contents_pages_returned,
-            "you_contents_latency_ms": self.you_contents_latency_ms,
-            "you_research_calls": self.you_research_calls,
-            "you_research_latency_ms": self.you_research_latency_ms,
-            "research_cache_hits": self.research_cache_hits,
-            "research_cache_misses": self.research_cache_misses,
-            "discovery_provider_used": self.discovery_provider_used,
-        }
 
 
 def provider_health_state(
@@ -1191,8 +1450,8 @@ __all__ = [
     "MAX_CANDIDATE_SNIPPETS",
     "MAX_SNIPPET_CHARACTERS",
     "MAX_YOU_CONTENT_URLS",
-    "YOU_MAX_RETRIES",
     "YOU_RESEARCH_SCHEMA",
+    "YOU_RESEARCH_SCHEMA_VERSION",
     "CompositeEvidenceDiscovery",
     "EvidenceCandidate",
     "EvidenceContentFetcher",
@@ -1214,10 +1473,11 @@ __all__ = [
     "classify_category",
     "coverage_categories",
     "deduplicate_and_rank_candidates",
-    "extract_https_urls",
     "has_sufficient_coverage",
     "map_you_error",
     "merge_documents",
+    "merge_research_candidates",
+    "normalize_markdown",
     "provider_health_state",
-    "run_with_bounded_retry",
+    "use_metrics",
 ]

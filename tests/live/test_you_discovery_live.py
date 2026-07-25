@@ -1,25 +1,20 @@
-"""Opt-in LIVE evaluation of the You.com (and, for comparison, Perplexity)
-discovery layer against the reviewed dataset.
+"""Opt-in LIVE You.com Search discovery evaluation against the reviewed dataset.
 
 Disabled by default. Run explicitly with:
 
-    RUN_LIVE_YOU_TESTS=1 python -m pytest tests/live/test_you_discovery_live.py
+    RUN_LIVE_YOU_TESTS=1 python -m pytest tests/live/test_you_discovery_live.py -q -s
 
-Requirements enforced by this file itself (not by CI configuration):
+Hard-coded budget (not env-configurable, so a stray export cannot inflate it):
+at most 3 reviewed apps, at most 2 Search queries per app, count 3 per query —
+so at most 6 Search calls total. No browser, no email, no Research.
 
-* Skipped entirely unless ``RUN_LIVE_YOU_TESTS=1`` is set — never runs in
-  normal CI, and never runs just because a key happens to be present.
-* A STRICT call budget: at most three apps from the dataset, one discovery
-  call each, ``count`` capped at 3. This is a real, credit-spending call —
-  the budget exists to bound cost, not just latency.
-* Prints ONLY the sanitized report (`ops.you_eval.EvalReport.as_dict`) —
-  never a raw query string beyond the app name, never a full provider
-  response, never a snippet's full text.
-* Never imports or constructs a browser worker of any kind.
+Prints ONLY the sanitized ``EvalReport`` (slugs, scores, counts, latency) —
+never a raw query beyond the app name, never a provider body, never a snippet.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 
@@ -28,17 +23,22 @@ import pytest
 from ops.config import Settings
 from ops.operational_research import PerplexitySearchDiscovery
 from ops.you_eval import EvalReport, load_dataset, score_candidates
-from ops.you_research import LegacyDiscoveryAdapter, ResearchHostPolicy, YouSearchDiscovery
+from ops.you_research import (
+    CompositeEvidenceDiscovery,
+    LegacyDiscoveryAdapter,
+    ResearchHostPolicy,
+    YouSearchDiscovery,
+)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_LIVE_YOU_TESTS") != "1",
     reason="opt-in live evaluation: set RUN_LIVE_YOU_TESTS=1 to run",
 )
 
-# Strict, hard-coded budget — not configurable via env, so a careless export
-# of a high value cannot silently balloon the number of live calls made.
 _MAX_LIVE_APPS = 3
 _LIVE_SEARCH_COUNT = 3
+_MAX_QUERIES_PER_APP = 2
+_CREDENTIAL_CATEGORIES = {"developer_portal", "api_authentication", "credential_creation", "oauth"}
 
 
 def _baseline_for(app_slug: str, app_name: str) -> object:
@@ -78,21 +78,21 @@ def test_live_you_search_discovery_precision_and_recall(settings: Settings) -> N
         pytest.skip("YDC_API_KEY not configured; live You.com evaluation unavailable")
 
     dataset = load_dataset()
-    # Only real, non-fictitious apps with reviewed hosts — the budget stays
-    # small and predictable regardless of how large the dataset grows later.
     apps = [app for app in dataset if app.approved_hosts][:_MAX_LIVE_APPS]
     assert apps, "dataset must contain at least one reviewed app to evaluate"
 
     discovery = YouSearchDiscovery(
-        settings.you_api_key, count=_LIVE_SEARCH_COUNT, timeout_seconds=15.0, max_calls=1
+        settings.you_api_key,
+        count=_LIVE_SEARCH_COUNT,
+        timeout_seconds=15.0,
+        max_calls=_MAX_QUERIES_PER_APP,
     )
 
-    import asyncio
-
     results = []
+    credential_hits = 0
     for app in apps:
         baseline = _baseline_for(app.app_slug, app.app_name)
-        official_hosts = ResearchHostPolicy(app.approved_hosts).include_domains
+        official_hosts = ResearchHostPolicy.from_domains(app.approved_hosts).include_domains
         start = time.monotonic()
         candidates = asyncio.run(
             discovery.discover(
@@ -104,35 +104,33 @@ def test_live_you_search_discovery_precision_and_recall(settings: Settings) -> N
         )
         latency_ms = round((time.monotonic() - start) * 1000, 1)
         results.append(score_candidates(app, candidates, latency_ms=latency_ms))
+        if any(c.category in _CREDENTIAL_CATEGORIES for c in candidates):
+            credential_hits += 1
 
     report = EvalReport(results=tuple(results))
-    print(report.as_dict())  # sanitized only: slugs, scores, counts, latency — noqa: T201
+    print(report.as_dict())  # sanitized only  # noqa: T201
 
-    # A live discovery run against real, well-known developer platforms
-    # should find SOME on-policy evidence for most apps, and never return
-    # something scored on a host outside the reviewed set.
-    assert report.average_official_host_precision >= 0.5
-    for result in results:
-        assert result.official_host_precision >= 0.0  # sanity: score computed, not NaN
+    # Local policy filters every returned candidate, so on-policy precision must
+    # be exactly 1.0 (section 29).
+    assert report.average_official_host_precision == 1.0
+    # At least 2 of 3 apps return a developer/API/credential category.
+    assert credential_hits >= min(2, len(apps))
 
 
 def test_live_you_then_perplexity_fallback_frequency(settings: Settings) -> None:
-    """Reports (does not assert a fixed value) how often Perplexity had to
-    run at all when You.com is tried first — informs whether the fallback
-    order in docs/YOU_COM_INTEGRATION.md should change."""
+    """Reports how often Perplexity had to run when You.com is tried first."""
 
     if settings.you_api_key is None or settings.perplexity_api_key is None:
         pytest.skip("both YDC_API_KEY and PERPLEXITY_API_KEY are required for this comparison")
 
-    from ops.you_research import CompositeEvidenceDiscovery
-
     dataset = load_dataset()
     apps = [app for app in dataset if app.approved_hosts][:_MAX_LIVE_APPS]
 
-    import asyncio
-
     you = YouSearchDiscovery(
-        settings.you_api_key, count=_LIVE_SEARCH_COUNT, timeout_seconds=15.0, max_calls=1
+        settings.you_api_key,
+        count=_LIVE_SEARCH_COUNT,
+        timeout_seconds=15.0,
+        max_calls=_MAX_QUERIES_PER_APP,
     )
     perplexity = LegacyDiscoveryAdapter(PerplexitySearchDiscovery(settings.perplexity_api_key))
     composite = CompositeEvidenceDiscovery([you, perplexity])
@@ -140,7 +138,7 @@ def test_live_you_then_perplexity_fallback_frequency(settings: Settings) -> None
     fallback_used = 0
     for app in apps:
         baseline = _baseline_for(app.app_slug, app.app_name)
-        official_hosts = ResearchHostPolicy(app.approved_hosts).include_domains
+        official_hosts = ResearchHostPolicy.from_domains(app.approved_hosts).include_domains
         asyncio.run(
             composite.discover(
                 app_name=app.app_name,
@@ -149,7 +147,7 @@ def test_live_you_then_perplexity_fallback_frequency(settings: Settings) -> None
                 official_hosts=official_hosts,
             )
         )
-        if composite.last_provider_used and "Legacy" in composite.last_provider_used:
+        if composite.last_provider_used and "perplexity" in composite.last_provider_used:
             fallback_used += 1
 
     fallback_frequency = fallback_used / len(apps)
@@ -158,19 +156,15 @@ def test_live_you_then_perplexity_fallback_frequency(settings: Settings) -> None
 
 
 def test_live_evaluation_never_imports_browser_worker() -> None:
-    import sys
-
-    assert "ops.browser_worker" not in sys.modules or True  # importing it elsewhere is fine;
-    # the real guarantee is structural: this module's own imports (above)
-    # contain no browser worker of any kind, verified by inspection here.
     import ast
     import inspect
+    import sys
 
     tree = ast.parse(inspect.getsource(sys.modules[__name__]))
-    imported_names = {
+    imported = {
         alias.name
         for node in ast.walk(tree)
         if isinstance(node, ast.ImportFrom)
         for alias in node.names
     } | {node.names[0].name for node in ast.walk(tree) if isinstance(node, ast.Import)}
-    assert not any("browser" in name.casefold() for name in imported_names)
+    assert not any("browser" in name.casefold() for name in imported)

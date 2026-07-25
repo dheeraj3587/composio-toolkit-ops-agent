@@ -9,4 +9,4 @@ composio==0.18.0
 
 google-genai==2.12.1
 perplexityai==0.42.0
-youdotcom==2.2.0
+youdotcom==2.5.0
