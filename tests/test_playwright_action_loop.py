@@ -13,7 +13,6 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from ops.browser_decider import BrowserAction
 from ops.browser_loop import BrowserLoop, BrowserOperationTimeout
 from ops.config import Settings
 from ops.models import OperationalResearch
@@ -143,8 +142,7 @@ def test_loop_reports_hitl_for_a_captcha_page() -> None:
         handle,
         {
             "/settings/api": (
-                "<html><body><h1>Security check</h1>"
-                "<p>Please complete the CAPTCHA to continue</p></body></html>"
+                "<html><body><h1>Security check</h1><button>I'm not a robot</button></body></html>"
             )
         },
     )
@@ -203,14 +201,10 @@ def test_model_cannot_declare_success_without_a_reviewed_signal() -> None:
 
     trace = get_browser_api_trace("pipedrive")
     assert trace is not None
-    inspection = asyncio.run(worker._inspect_page(session))
-    action = BrowserAction(
-        kind="report_credential_page", index=None, text=None, url=None, reason="trust me"
-    )
-    result = asyncio.run(worker._execute_action(session, action, inspection, trace))
+    # Success can ONLY come from verify_credential_page, which requires reviewed
+    # structural evidence. A Dashboard page has none, so it returns None.
+    result = asyncio.run(worker.verify_credential_page(session, trace))
     asyncio.run(worker.stop(context))  # type: ignore[arg-type]
-
-    # No reviewed signal on a Dashboard page -> the claim is refused (None = keep going).
     assert result is None
 
 
@@ -250,43 +244,105 @@ def test_snapshot_from_a_real_page_excludes_secret_values() -> None:
     assert any(secret_flags)
 
 
-# --- Human gate detection (pure) ----------------------------------------------
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        ("Please complete the captcha", "captcha"),
-        ("Enter the verification code we sent", "email_otp"),
-        ("Use your passkey to continue", "passkey"),
-        ("Add a payment method", "billing"),
-        ("Accept the terms to continue", "legal_acceptance"),
-        ("Choose an account", "account_selection"),
-    ],
-)
-def test_detect_human_gate_types(text: str, expected: str) -> None:
+# --- Human gate detection is STRUCTURAL, not substring-based (item 8) ---------
+def _inspection(elements: tuple, *, text: str = "", title: str = "") -> object:
     from ops.playwright_worker import PageInspection
 
-    inspection = PageInspection(
+    return PageInspection(
         url=f"https://{_HOST}/x",
-        title="",
+        title=title,
         visible_text=text,
-        elements=(),
+        elements=elements,
         locators=(),
         fingerprint="f",
     )
+
+
+def _snap(*specs: dict) -> tuple:
+    from ops.browser_decider import build_snapshot
+
+    return build_snapshot(list(specs))
+
+
+def test_footer_terms_of_service_link_does_not_trigger_hitl() -> None:
+    # A footer LINK is not a consent control: the old substring rule halted here.
+    inspection = _inspection(
+        _snap({"tag": "a", "name": "Terms of Service"}),
+        text="By using this site you accept the Terms of Service.",
+    )
+    assert detect_human_gate(inspection) is None
+
+
+def test_passive_recaptcha_badge_does_not_trigger_hitl() -> None:
+    # The badge is a non-actionable div, not an interactive challenge.
+    inspection = _inspection(
+        _snap({"tag": "div", "name": "protected by reCAPTCHA"}),
+        text="This site is protected by reCAPTCHA and the Google Privacy Policy.",
+    )
+    assert detect_human_gate(inspection) is None
+
+
+def test_interactive_captcha_triggers_hitl() -> None:
+    inspection = _inspection(
+        _snap({"tag": "iframe", "name": "reCAPTCHA challenge"}), text="Security check"
+    )
     gate = detect_human_gate(inspection)
-    assert gate is not None and gate.human_action_type == expected
+    assert gate is not None and gate.human_action_type == "captcha"
+
+
+def test_captcha_checkbox_control_triggers_hitl() -> None:
+    inspection = _inspection(_snap({"tag": "button", "name": "I'm not a robot"}))
+    gate = detect_human_gate(inspection)
+    assert gate is not None and gate.human_action_type == "captcha"
+
+
+def test_real_otp_input_field_triggers_hitl() -> None:
+    inspection = _inspection(
+        _snap({"tag": "input", "type": "text", "name": "One-time code"}),
+        text="Enter the code we sent you",
+    )
+    gate = detect_human_gate(inspection)
+    assert gate is not None and gate.human_action_type == "email_otp"
+
+
+def test_prose_mentioning_a_code_without_an_input_does_not_trigger_hitl() -> None:
+    # Marketing copy that merely says "verification code" must not halt the run.
+    inspection = _inspection(
+        _snap({"tag": "a", "name": "Learn about verification codes"}),
+        text="Read how we use a verification code to protect your account.",
+    )
+    assert detect_human_gate(inspection) is None
+
+
+def test_account_selection_interface_triggers_hitl() -> None:
+    inspection = _inspection(_snap({"tag": "button", "name": "Choose an account"}))
+    gate = detect_human_gate(inspection)
+    assert gate is not None and gate.human_action_type == "account_selection"
+
+
+def test_billing_control_triggers_hitl() -> None:
+    inspection = _inspection(_snap({"tag": "button", "name": "Add payment method"}))
+    gate = detect_human_gate(inspection)
+    assert gate is not None and gate.human_action_type == "billing"
+
+
+def test_explicit_consent_button_triggers_hitl() -> None:
+    inspection = _inspection(_snap({"tag": "button", "name": "I agree"}))
+    gate = detect_human_gate(inspection)
+    assert gate is not None and gate.human_action_type == "legal_acceptance"
+
+
+def test_passkey_control_triggers_hitl() -> None:
+    inspection = _inspection(_snap({"tag": "button", "name": "Use your passkey"}))
+    gate = detect_human_gate(inspection)
+    assert gate is not None and gate.human_action_type == "passkey"
 
 
 def test_detect_human_gate_returns_none_on_a_normal_page() -> None:
-    from ops.playwright_worker import PageInspection
-
-    inspection = PageInspection(
-        url=f"https://{_HOST}/settings",
+    inspection = _inspection(
+        _snap({"tag": "a", "name": "Deals"}, {"tag": "a", "name": "Contacts"}),
+        text="Your workspace settings",
         title="Settings",
-        visible_text="Your workspace settings",
-        elements=(),
-        locators=(),
-        fingerprint="f",
     )
     assert detect_human_gate(inspection) is None
 
