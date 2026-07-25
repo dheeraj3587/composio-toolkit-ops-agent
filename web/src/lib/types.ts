@@ -229,10 +229,21 @@ export interface RunOutputResponse {
   integrator_bundle: IntegratorOutput
 }
 
+/**
+ * Live view for a browser run. Two modes, chosen by the wired provider:
+ * - `hosted_url`: Browser Use supplies a signed `live_url` to open/embed.
+ * - `screenshot`: the self-hosted Playwright harness has no hosted URL, so the
+ *   client polls `screenshot_url` for masked PNG frames (cache-busted by
+ *   `captured_at`), and stops polling once the run leaves an active browser state.
+ * Every new field is optional, so the existing Browser Use shape still parses.
+ */
 export interface LiveViewResponse {
   run_id: string
   available: boolean
+  mode?: "hosted_url" | "screenshot" | "unavailable"
   live_url?: string | null
+  screenshot_url?: string | null
+  captured_at?: string | null
 }
 
 export type RunPhaseAction = "resume" | "poll-email" | "retry"

@@ -182,7 +182,17 @@ class PhaseState(StrictApiModel):
 
 
 class ProviderState(StrictApiModel):
-    provider: Literal["langgraph", "vault", "perplexity", "gemini", "composio", "browser_use"]
+    provider: Literal[
+        "langgraph",
+        "vault",
+        "perplexity",
+        "gemini",
+        "composio",
+        "browser_use",
+        # The self-hosted harness reports under its own identity so a Playwright
+        # deployment is never described as Browser Use.
+        "playwright",
+    ]
     status: Literal[
         "not_configured",
         "disabled",
@@ -267,16 +277,26 @@ class TimelineResponse(StrictApiModel):
 
 
 class LiveViewResponse(StrictApiModel):
-    """Owner-only, loopback-only ephemeral live-view URL.
+    """Owner-only, loopback-only ephemeral live view.
 
     This is the single, deliberate place a signed Browser Use live URL crosses
     the API boundary. It is read live from the in-memory worker and is never
     persisted to run state, checkpoints, the ledger, logs, or Git.
+
+    Two modes, chosen by the wired provider (all new fields default so the
+    existing Browser Use response shape is unchanged):
+
+    * ``hosted_url`` — Browser Use supplies a signed ``live_url``.
+    * ``screenshot`` — the self-hosted Playwright harness has no hosted URL, so the
+      client polls ``screenshot_url`` for masked PNG frames instead.
     """
 
     run_id: str
     available: bool
+    mode: Literal["hosted_url", "screenshot", "unavailable"] = "unavailable"
     live_url: str | None = None
+    screenshot_url: str | None = None
+    captured_at: str | None = None
 
 
 class ResumeRequest(StrictApiModel):

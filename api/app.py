@@ -555,6 +555,34 @@ def create_app(
         _require_owner_action(request)
         return await run_service.get_live_view(run_id)
 
+    @application.get(
+        "/api/runs/{run_id}/live-view/screenshot",
+        responses=common_responses,
+    )
+    async def live_view_screenshot(
+        run_id: RunId,
+        request: Request,
+        run_service: ServiceDependency,
+    ) -> Response:
+        """Owner-only masked PNG frame for the self-hosted Playwright live view.
+
+        Uses the SAME authorization gate as the live-view endpoint. The image is
+        served from worker memory with no-store caching and is never persisted.
+        """
+
+        _require_owner_action(request)
+        image, captured_at = await run_service.get_live_screenshot(run_id)
+        return Response(
+            content=image,
+            media_type="image/png",
+            headers={
+                "Cache-Control": "no-store, max-age=0",
+                "Pragma": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+                "X-Captured-At": captured_at,
+            },
+        )
+
     @application.post(
         "/api/runs/{run_id}/poll-email",
         response_model=ActionReceipt,

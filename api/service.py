@@ -36,6 +36,7 @@ from api.models import (
     TimelineEvent,
     TimelineResponse,
 )
+from ops.browser_readiness import browser_configuration_state
 from ops.config import Settings, load_settings
 from ops.models import CompanyProfile, OperationalResearch, OperationsRequest
 from ops.run_service import CredentialSubmissionError
@@ -107,6 +108,8 @@ class RunService(Protocol):
     ) -> ActionReceipt: ...
 
     async def get_live_view(self, run_id: str) -> LiveViewResponse: ...
+
+    async def get_live_screenshot(self, run_id: str) -> tuple[bytes, str]: ...
 
     async def poll_email(self, run_id: str) -> ActionReceipt: ...
 
@@ -214,6 +217,10 @@ class LocalRunService:
             return ProviderState(provider=provider, status=status, detail=detail)  # type: ignore[arg-type]
 
         live_browser_enabled = bool(getattr(settings, "allow_live_browser", False))
+        # Provider-aware: the shared helper decides "configured" for whichever
+        # backend is selected, so Playwright never requires a Browser Use key.
+        selected_browser = str(getattr(settings, "browser_provider", "browser_use"))
+        browser_configured = browser_configuration_state(settings)
         gmail_configured = bool(
             settings.composio_api_key is not None and settings.composio_gmail_connected_account_id
         )
@@ -248,9 +255,14 @@ class LocalRunService:
                     else "Gmail configuration has not been verified against the pinned schema."
                 ),
             ),
+            # Report under the SELECTED provider's identity. Browser Use keeps its
+            # exact previous wording/behaviour; Playwright is judged by its own
+            # requirements (no Browser Use key) and reported as
+            # configured_not_verified because the API image intentionally has no
+            # Chromium — readiness is proven by the separate browser image's probe.
             state(
-                "browser_use",
-                configured=settings.browser_use_api_key is not None,
+                selected_browser,
+                configured=browser_configured,
                 enabled=live_browser_enabled,
                 detail=(
                     "Live browser execution is policy-disabled."
@@ -288,10 +300,8 @@ class LocalRunService:
             )
         )
         has_checkpoint_key = self._settings.langgraph_aes_key is not None
-        has_browser_configuration = bool(
-            self._settings.browser_use_api_key is not None
-            and getattr(self._settings, "allow_live_browser", False)
-        )
+        # Provider-aware: a Playwright deployment needs no Browser Use key.
+        has_browser_configuration = browser_configuration_state(self._settings)
         has_email_configuration = bool(
             self._settings.composio_api_key is not None
             and self._settings.composio_gmail_connected_account_id
@@ -708,12 +718,47 @@ class LocalRunService:
     def _live_view_sync(self, run_id: str) -> LiveViewResponse:
         if self._service.get_run(run_id) is None:
             raise RunNotFoundError(run_id)
+        # Browser Use keeps its exact existing behavior: a signed hosted URL.
         live_url = self._service.get_browser_live_url(run_id)
-        return LiveViewResponse(run_id=run_id, available=live_url is not None, live_url=live_url)
+        if live_url is not None:
+            return LiveViewResponse(
+                run_id=run_id, available=True, mode="hosted_url", live_url=live_url
+            )
+        # Self-hosted Playwright has no hosted URL; the client polls masked frames.
+        shot = self._service.get_browser_screenshot(run_id)
+        if shot is not None:
+            _, captured_at = shot
+            return LiveViewResponse(
+                run_id=run_id,
+                available=True,
+                mode="screenshot",
+                screenshot_url=f"/api/runs/{run_id}/live-view/screenshot",
+                captured_at=captured_at,
+            )
+        return LiveViewResponse(run_id=run_id, available=False, mode="unavailable")
 
     async def get_live_view(self, run_id: str) -> LiveViewResponse:
         self._require_started()
         return await run_in_threadpool(self._live_view_sync, run_id)
+
+    def _live_screenshot_sync(self, run_id: str) -> tuple[bytes, str]:
+        if self._service.get_run(run_id) is None:
+            raise RunNotFoundError(run_id)
+        shot = self._service.get_browser_screenshot(run_id)
+        if shot is None:
+            raise PhaseUnavailableError(
+                run_id=run_id,
+                action="live_view_screenshot",
+                available_in=("phase_5",),
+                error="configuration_required",
+            )
+        return shot
+
+    async def get_live_screenshot(self, run_id: str) -> tuple[bytes, str]:
+        """Return the newest masked PNG frame for this run's browser session."""
+
+        self._require_started()
+        return await run_in_threadpool(self._live_screenshot_sync, run_id)
 
     async def poll_email(self, run_id: str) -> ActionReceipt:
         await self.get_run(run_id)
@@ -761,10 +806,8 @@ class LocalRunService:
             "research": bool(
                 self._settings.perplexity_api_key and self._settings.google_genai_api_key
             ),
-            "browser": bool(
-                self._settings.browser_use_api_key
-                and getattr(self._settings, "allow_live_browser", False)
-            ),
+            # Provider-aware retry eligibility (no Browser Use key for Playwright).
+            "browser": browser_configuration_state(self._settings),
             "email": bool(
                 self._settings.composio_api_key
                 and self._settings.composio_gmail_connected_account_id

@@ -1,0 +1,54 @@
+# Playwright SANDBOX compose — evaluation only, never production.
+#
+# This file exists so the self-hosted browser harness can be exercised against a
+# real Chromium build in isolation. It is deliberately NOT part of the production
+# stack: compose.prod.yaml is untouched, no production volume is mounted, no port
+# is published, and live browsing is OFF by default.
+#
+#   docker compose -f compose.playwright.sandbox.yaml --env-file .env.playwright.sandbox build
+#   docker compose -f compose.playwright.sandbox.yaml --env-file .env.playwright.sandbox run --rm browser-sandbox
+#
+# See docs/PLAYWRIGHT_SANDBOX.md. Never point this at an untrusted or production
+# vendor account, and never place provider secrets in this file.
+
+services:
+  browser-sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.browser
+    image: composio-ops-browser:sandbox
+    # Reap zombie Chromium children instead of leaking processes.
+    init: true
+    # Chromium needs a real IPC namespace and adequate shared memory; without the
+    # larger /dev/shm it crashes or is forced onto --disable-dev-shm-usage.
+    ipc: host
+    shm_size: 1gb
+    pids_limit: 512
+    # Non-root (the image's `ops` user) with no privilege escalation.
+    user: ops
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=1g,mode=1777
+    environment:
+      # Self-hosted provider selected, but live browsing stays OFF by default: the
+      # readiness probe and offline tests do not need it.
+      BROWSER_PROVIDER: playwright
+      ALLOW_LIVE_BROWSER: ${ALLOW_LIVE_BROWSER:-false}
+      ALLOW_LIVE_VENDOR_EMAIL: "false"
+      PLAYWRIGHT_MAX_SESSIONS: ${PLAYWRIGHT_MAX_SESSIONS:-2}
+      # Chromium's own sandbox stays enabled unless the host cannot support it.
+      PLAYWRIGHT_DISABLE_SANDBOX: ${PLAYWRIGHT_DISABLE_SANDBOX:-false}
+      PYTHONPATH: /app
+    volumes:
+      # A throwaway named volume for browser profiles. NEVER a production volume.
+      - browser_sandbox_profiles:/browser-data
+    # No `ports:` on purpose — nothing is exposed to the host or network.
+    # Default command proves Chromium actually launches in this image.
+    command: ["python", "-m", "ops.browser_readiness"]
+
+volumes:
+  browser_sandbox_profiles:
