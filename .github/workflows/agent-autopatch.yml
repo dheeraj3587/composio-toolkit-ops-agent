@@ -29,12 +29,12 @@ jobs:
           import inspect
           from importlib.metadata import version
           from youdotcom import You, models
+          from youdotcom.utils import retries
 
           print("version", version("youdotcom"))
           you = You(api_key_auth="offline-signature-probe")
 
-          def describe(label, owner, attribute):
-              target = getattr(owner, attribute, None)
+          def describe(label, target):
               print("target", label, "present", target is not None)
               if target is not None:
                   try:
@@ -42,17 +42,15 @@ jobs:
                   except (TypeError, ValueError) as exc:
                       print("signature-error", label, type(exc).__name__)
 
-          print("you-public", [name for name in dir(you) if not name.startswith("_")])
-          print("search-public", [name for name in dir(you.search) if not name.startswith("_")])
-          print("contents-public", [name for name in dir(you.contents) if not name.startswith("_")])
+          describe("search.unified_async", getattr(you.search, "unified_async", None))
+          describe("search_post_async", getattr(you, "search_post_async", None))
+          describe("contents.generate_async", getattr(you.contents, "generate_async", None))
+          describe("research_async", getattr(you, "research_async", None))
+          describe("RetryConfig", retries.RetryConfig)
+          describe("BackoffStrategy", retries.BackoffStrategy)
 
-          describe("search.unified", you.search, "unified")
-          describe("search.unified_async", you.search, "unified_async")
-          describe("search_post_async", you, "search_post_async")
-          describe("contents.generate", you.contents, "generate")
-          describe("contents.generate_async", you.contents, "generate_async")
-          describe("research", you, "research")
-          describe("research_async", you, "research_async")
+          print("RetryConfig-annotations", getattr(retries.RetryConfig, "__annotations__", {}))
+          print("BackoffStrategy-annotations", getattr(retries.BackoffStrategy, "__annotations__", {}))
 
           for name in (
               "ContentsFormats",
@@ -62,11 +60,6 @@ jobs:
           ):
               value = getattr(models, name, None)
               print("model", name, value)
-              if value is not None:
-                  try:
-                      print("model-signature", name, inspect.signature(value))
-                  except (TypeError, ValueError):
-                      pass
           PY
           cat youdotcom-signatures.txt
       - uses: actions/upload-artifact@v4
