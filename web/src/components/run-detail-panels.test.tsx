@@ -14,9 +14,13 @@ const research: OperationalResearch = {
   authorization_url: null,
   token_url: null,
   credential_fields: [],
+  credential_creation_instructions: [],
   scopes: [],
   developer_portal_url: null,
   signup_url: null,
+  login_url: null,
+  credential_management_url: null,
+  operational_url_claims: [],
   access_route: "self_serve",
   production_approval_required: false,
   contact_email: null,
@@ -49,6 +53,46 @@ describe("safe run detail panels", () => {
     expect(screen.getByText(research.api_type)).toBeInTheDocument()
     expect(container.querySelector("img")).toBeNull()
     expect(container.querySelector("script")).toBeNull()
+  })
+
+  it("renders the operational entry points and bounded credential steps", () => {
+    const enriched: OperationalResearch = {
+      ...research,
+      login_url: "https://app.pipedrive.com/auth/login",
+      credential_management_url: "https://app.pipedrive.com/settings/api",
+      credential_creation_instructions: Array.from(
+        { length: 8 },
+        (_unused, index) => `Step ${index + 1}: open the settings page.`,
+      ),
+      operational_url_claims: [
+        {
+          field: "credential_management_url",
+          url: "https://app.pipedrive.com/settings/api",
+          source_url: "https://developers.pipedrive.com/docs/api/v1",
+        },
+      ],
+    }
+
+    render(<ResearchPanel research={enriched} />)
+
+    expect(screen.getByText("Official login page")).toBeInTheDocument()
+    expect(screen.getByText("Credential management page")).toBeInTheDocument()
+    expect(screen.getByText(enriched.login_url as string)).toBeInTheDocument()
+    // Only the first six steps are shown, and never the extraction internals.
+    expect(screen.getByText("Step 6: open the settings page.")).toBeInTheDocument()
+    expect(screen.queryByText("Step 7: open the settings page.")).not.toBeInTheDocument()
+    expect(screen.queryByText(/source_url|operational_url_claim/i)).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("https://developers.pipedrive.com/docs/api/v1"),
+    ).not.toBeInTheDocument()
+  })
+
+  it("omits operational entry points the backend did not report", () => {
+    render(<ResearchPanel research={research} />)
+
+    expect(screen.queryByText("Official login page")).not.toBeInTheDocument()
+    expect(screen.queryByText("Credential management page")).not.toBeInTheDocument()
+    expect(screen.queryByText("Credential creation steps")).not.toBeInTheDocument()
   })
 
   it("has no credential reveal control", () => {

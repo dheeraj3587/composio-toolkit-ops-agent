@@ -37,6 +37,31 @@ BoundedHttpUrl = Annotated[
     StringConstraints(min_length=8, max_length=2048),
 ]
 
+# The wired browser backend. A Playwright deployment is never reported as
+# Browser Use, so a client can render only what the backend actually supports.
+BrowserProvider = Literal["browser_use", "playwright"]
+
+# How the owner can watch (and possibly drive) a live browser session.
+LiveViewMode = Literal["hosted_url", "screenshot", "interactive_remote", "unavailable"]
+
+# A bounded, same-origin RELATIVE viewer path. Deliberately not a URL type: the
+# private browser-service/noVNC address must never cross the API boundary, so an
+# absolute URL (of any host) is rejected by construction.
+RelativeViewerPath = Annotated[
+    str,
+    StringConstraints(
+        pattern=r"^/api/runs/[A-Za-z0-9_-]{1,180}/live-view/(?:screenshot|interactive)$",
+        min_length=1,
+        max_length=300,
+    ),
+]
+
+# A sanitized, value-free explanation code (never provider or page text).
+ReasonCode = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z0-9][a-z0-9_:-]{0,63}$", min_length=1, max_length=64),
+]
+
 
 def _validate_http_url(value: str) -> str:
     """Accept a bounded parsed HTTP URL without embedded credentials."""
@@ -279,24 +304,79 @@ class TimelineResponse(StrictApiModel):
 class LiveViewResponse(StrictApiModel):
     """Owner-only, loopback-only ephemeral live view.
 
-    This is the single, deliberate place a signed Browser Use live URL crosses
-    the API boundary. It is read live from the in-memory worker and is never
-    persisted to run state, checkpoints, the ledger, logs, or Git.
+    This is the single, deliberate place a signed live-session URL crosses the API
+    boundary. It is read live from the in-memory worker and is never persisted to
+    run state, checkpoints, the ledger, logs, or Git.
 
-    Two modes, chosen by the wired provider (all new fields default so the
-    existing Browser Use response shape is unchanged):
+    ``provider`` and ``mode`` are ALWAYS present so a client renders what the wired
+    backend actually offers instead of assuming a hosted URL:
 
-    * ``hosted_url`` — Browser Use supplies a signed ``live_url``.
+    * ``hosted_url`` — a hosted provider (Browser Use) supplies a signed
+      ``live_url``, which the owner can interact with directly.
     * ``screenshot`` — the self-hosted Playwright harness has no hosted URL, so the
-      client polls ``screenshot_url`` for masked PNG frames instead.
+      client polls ``screenshot_url`` for masked PNG frames. Frames are viewable
+      but not interactive, so ``interaction_available`` is False.
+    * ``interactive_remote`` — a same-origin interactive viewer path. It is only
+      ever advertised once that path is served end to end.
+    * ``unavailable`` — no viewer exists, so no viewer URL may be present.
+
+    ``screenshot_url``/``interactive_url`` are bounded RELATIVE same-origin API
+    paths for this exact run. A private browser-service address (the noVNC host on
+    the internal network) must never cross this boundary.
     """
 
     run_id: str
+    provider: BrowserProvider
     available: bool
-    mode: Literal["hosted_url", "screenshot", "unavailable"] = "unavailable"
+    mode: LiveViewMode = "unavailable"
     live_url: str | None = None
-    screenshot_url: str | None = None
+    screenshot_url: RelativeViewerPath | None = None
+    interactive_url: RelativeViewerPath | None = None
     captured_at: str | None = None
+    # Whether the owner can actually drive the browser through this view.
+    interaction_available: bool = False
+    reason_code: ReasonCode | None = None
+
+    @field_validator("live_url")
+    @classmethod
+    def live_url_is_hosted_https(cls, value: str | None) -> str | None:
+        """A hosted live URL is absolute HTTPS; its signed query is left intact."""
+
+        return _validate_http_url(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def _validate_mode_contract(self) -> LiveViewResponse:
+        viewer_urls = {
+            "hosted_url": self.live_url,
+            "screenshot": self.screenshot_url,
+            "interactive_remote": self.interactive_url,
+        }
+        if self.mode == "unavailable":
+            present = sorted(name for name, url in viewer_urls.items() if url is not None)
+            if present:
+                raise ValueError(
+                    "an unavailable live view must not carry a viewer URL "
+                    f"(got: {', '.join(present)})"
+                )
+            if self.available or self.interaction_available:
+                raise ValueError("an unavailable live view cannot be available or interactive")
+        else:
+            if viewer_urls[self.mode] is None:
+                raise ValueError(f"live view mode '{self.mode}' requires its matching viewer URL")
+            if not self.available:
+                raise ValueError(f"live view mode '{self.mode}' must report available=true")
+            # Masked frames can be viewed but not driven, so a screenshot view must
+            # never claim interaction. Only a hosted or interactive viewer may.
+            if self.mode == "screenshot" and self.interaction_available:
+                raise ValueError("a screenshot live view is not interactive")
+        for name, url in viewer_urls.items():
+            if (
+                name != "hosted_url"
+                and url is not None
+                and not url.startswith(f"/api/runs/{self.run_id}/")
+            ):
+                raise ValueError("a viewer path must address this run on the same origin")
+        return self
 
 
 class ResumeRequest(StrictApiModel):

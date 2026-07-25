@@ -57,11 +57,33 @@ const vaultReference = z
   .regex(/^vault:\/\/[a-z0-9-]+\/[a-z0-9_-]+\/[A-Za-z0-9_-]+$/)
 
 const scopeRequirement = z.strictObject({
-  name: boundedText(200),
+  // Matches the backend ScopeRequirement bound (ops/models.py: max_length=300).
+  name: boundedText(300),
   description: optionalText(2_000).optional(),
   required: z.boolean().nullable().optional(),
   source_url: httpUrl,
 })
+
+// Field-level evidence for the newer operational URLs (ops/models.py:
+// OperationalUrlClaim). Defaults to an empty list on the backend.
+const operationalUrlField = z.enum([
+  "api_base_url",
+  "authorization_url",
+  "token_url",
+  "developer_portal_url",
+  "signup_url",
+  "login_url",
+  "credential_management_url",
+  "contact_url",
+])
+
+const operationalUrlClaim = z.strictObject({
+  field: operationalUrlField,
+  url: httpUrl,
+  source_url: httpUrl,
+})
+
+export { operationalUrlClaim, operationalUrlField }
 
 export const operationalResearchSchema = z.strictObject({
   app_name: boundedText(200),
@@ -73,9 +95,17 @@ export const operationalResearchSchema = z.strictObject({
   authorization_url: nullableHttpUrl,
   token_url: nullableHttpUrl,
   credential_fields: z.array(boundedText(120)).max(50),
+  // Bounded, non-secret prose describing how to create the credential. Omitted
+  // from the response when empty, so it defaults to an empty list here. Bounds
+  // mirror ops/models.py (20 steps, 500 characters each).
+  credential_creation_instructions: z.array(boundedText(500)).max(20).default([]),
   scopes: z.array(scopeRequirement).max(100),
   developer_portal_url: nullableHttpUrl,
   signup_url: nullableHttpUrl,
+  login_url: nullableHttpUrl,
+  credential_management_url: nullableHttpUrl,
+  // Bound mirrors ops/models.py::OperationalResearch (max_length=32).
+  operational_url_claims: z.array(operationalUrlClaim).max(32).default([]),
   access_route: accessRoute,
   production_approval_required: nullableBoolean,
   contact_email: nullableText(320),
@@ -249,8 +279,8 @@ export const actionReceiptSchema = z.strictObject({
   detail: optionalText(500).optional(),
 })
 
-// The signed Browser Use live-view URL may carry an opaque signature query, so
-// the token-bearing-query rejection is intentionally not applied here. It is a
+// A signed hosted live-view URL may carry an opaque signature query, so the
+// token-bearing-query rejection is intentionally not applied here. It is a
 // short-lived owner-only URL and is never persisted client-side.
 const liveViewUrl = z
   .string()
@@ -266,11 +296,106 @@ const liveViewUrl = z
     }
   })
 
-export const liveViewResponseSchema = z.strictObject({
-  run_id: runId,
-  available: z.boolean(),
-  live_url: liveViewUrl.nullable().optional(),
-})
+export const browserProviderSchema = z.enum(["browser_use", "playwright"])
+export const liveViewModeSchema = z.enum([
+  "hosted_url",
+  "screenshot",
+  "interactive_remote",
+  "unavailable",
+])
+
+// A bounded, same-origin RELATIVE viewer path (api/models.py::RelativeViewerPath).
+// Deliberately NOT a URL: an absolute address — including the private
+// browser-service/noVNC host on the internal network — is rejected outright, so
+// the browser can only ever be pointed back at this origin.
+const relativeViewerPath = (endpoint: "screenshot" | "interactive") =>
+  z
+    .string()
+    .min(1)
+    .max(300)
+    .regex(new RegExp(`^/api/runs/[A-Za-z0-9_-]{1,180}/live-view/${endpoint}$`))
+
+// Provider- and mode-aware live view (api/models.py::LiveViewResponse). The
+// mode-specific requirements are mirrored here so a drifting backend response is
+// rejected as invalid rather than rendered as a broken viewer.
+export const liveViewResponseSchema = z
+  .strictObject({
+    run_id: runId,
+    provider: browserProviderSchema,
+    available: z.boolean(),
+    mode: liveViewModeSchema,
+    live_url: liveViewUrl.nullish().default(null),
+    screenshot_url: relativeViewerPath("screenshot").nullish().default(null),
+    interactive_url: relativeViewerPath("interactive").nullish().default(null),
+    captured_at: isoTimestamp.nullish().default(null),
+    interaction_available: z.boolean(),
+    reason_code: z
+      .string()
+      .max(64)
+      .regex(/^[a-z0-9][a-z0-9_:-]{0,63}$/)
+      .nullish()
+      .default(null),
+  })
+  .superRefine((value, context) => {
+    const viewerUrls = {
+      hosted_url: { field: "live_url", url: value.live_url },
+      screenshot: { field: "screenshot_url", url: value.screenshot_url },
+      interactive_remote: { field: "interactive_url", url: value.interactive_url },
+    } as const
+
+    if (value.mode === "unavailable") {
+      for (const { field, url } of Object.values(viewerUrls)) {
+        if (url) {
+          context.addIssue({
+            code: "custom",
+            path: [field],
+            message: "An unavailable live view must not carry a viewer URL.",
+          })
+        }
+      }
+      if (value.available || value.interaction_available) {
+        context.addIssue({
+          code: "custom",
+          path: ["available"],
+          message: "An unavailable live view cannot be available or interactive.",
+        })
+      }
+      return
+    }
+
+    if (!viewerUrls[value.mode].url) {
+      context.addIssue({
+        code: "custom",
+        path: ["mode"],
+        message: `Live view mode '${value.mode}' requires its matching viewer URL.`,
+      })
+    }
+    if (!value.available) {
+      context.addIssue({
+        code: "custom",
+        path: ["available"],
+        message: `Live view mode '${value.mode}' must report available=true.`,
+      })
+    }
+    // Masked frames can be viewed but not driven.
+    if (value.mode === "screenshot" && value.interaction_available) {
+      context.addIssue({
+        code: "custom",
+        path: ["interaction_available"],
+        message: "A screenshot live view is not interactive.",
+      })
+    }
+    // A viewer path must address THIS run on this origin.
+    for (const path of [value.screenshot_url, value.interactive_url]) {
+      if (path && !path.startsWith(`/api/runs/${value.run_id}/`)) {
+        context.addIssue({
+          code: "custom",
+          path: ["run_id"],
+          message: "A viewer path must address this run on the same origin.",
+        })
+      }
+    }
+  })
 
 export const appSearchItemSchema = z.strictObject({
   app_name: boundedText(200),

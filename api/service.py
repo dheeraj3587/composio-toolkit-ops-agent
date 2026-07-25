@@ -767,24 +767,45 @@ class LocalRunService:
     def _live_view_sync(self, run_id: str) -> LiveViewResponse:
         if self._service.get_run(run_id) is None:
             raise RunNotFoundError(run_id)
-        # Browser Use keeps its exact existing behavior: a signed hosted URL.
+        # Browser Use keeps its exact existing behavior: a signed hosted URL the
+        # owner can interact with directly.
         live_url = self._service.get_browser_live_url(run_id)
         if live_url is not None:
             return LiveViewResponse(
-                run_id=run_id, available=True, mode="hosted_url", live_url=live_url
+                run_id=run_id,
+                provider="browser_use",
+                available=True,
+                mode="hosted_url",
+                live_url=live_url,
+                interaction_available=True,
+                reason_code="hosted_session_live",
             )
         # Self-hosted Playwright has no hosted URL; the client polls masked frames.
+        # Frames are viewable but not drivable, so interaction is not advertised.
         shot = self._service.get_browser_screenshot(run_id)
         if shot is not None:
             _, captured_at = shot
             return LiveViewResponse(
                 run_id=run_id,
+                provider="playwright",
                 available=True,
                 mode="screenshot",
                 screenshot_url=f"/api/runs/{run_id}/live-view/screenshot",
                 captured_at=captured_at,
+                interaction_available=False,
+                reason_code="screenshot_frames_available",
             )
-        return LiveViewResponse(run_id=run_id, available=False, mode="unavailable")
+        return LiveViewResponse(
+            run_id=run_id,
+            # Report the configured backend truthfully even with no live session.
+            provider="playwright"
+            if self._settings.browser_provider == "playwright"
+            else "browser_use",
+            available=False,
+            mode="unavailable",
+            interaction_available=False,
+            reason_code="no_active_browser_session",
+        )
 
     async def get_live_view(self, run_id: str) -> LiveViewResponse:
         self._require_started()

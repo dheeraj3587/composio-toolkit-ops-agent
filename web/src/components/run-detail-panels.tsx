@@ -107,6 +107,31 @@ export function ResearchPanel({ research }: { research: OperationalResearch | nu
             {research.auth_methods.length ? research.auth_methods.map((method) => <Badge key={method} variant="outline" className="rounded-md">{method}</Badge>) : <span className="text-sm text-muted-foreground">Not reported</span>}
           </div>
         </div>
+        {/* Operational entry points, shown only when the backend reported them.
+            Field-level extraction internals (operational_url_claims) stay out of
+            the interface; only the resolved page is offered as a safe link. */}
+        {research.login_url ? (
+          <div>
+            <span className="data-label">Official login page</span>
+            <p className="mt-1 min-w-0 text-xs"><SafeLink href={research.login_url}>{research.login_url}</SafeLink></p>
+          </div>
+        ) : null}
+        {research.credential_management_url ? (
+          <div>
+            <span className="data-label">Credential management page</span>
+            <p className="mt-1 min-w-0 text-xs"><SafeLink href={research.credential_management_url}>{research.credential_management_url}</SafeLink></p>
+          </div>
+        ) : null}
+        {research.credential_creation_instructions?.length ? (
+          <div className="sm:col-span-2">
+            <span className="data-label">Credential creation steps</span>
+            <ol className="mt-2 list-decimal space-y-1 pl-4 text-xs leading-5 text-muted-foreground">
+              {research.credential_creation_instructions.slice(0, 6).map((step) => (
+                <li key={step}>{step}</li>
+              ))}
+            </ol>
+          </div>
+        ) : null}
         <div className="sm:col-span-2">
           <span className="data-label">Official evidence</span>
           <ul className="mt-2 space-y-2 text-xs">

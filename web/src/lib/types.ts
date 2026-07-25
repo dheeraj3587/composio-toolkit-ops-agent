@@ -49,6 +49,27 @@ export interface ScopeRequirement {
   source_url: string
 }
 
+/** Mirrors ops/models.py::OperationalUrlField exactly. */
+export type OperationalUrlField =
+  | "api_base_url"
+  | "authorization_url"
+  | "token_url"
+  | "developer_portal_url"
+  | "signup_url"
+  | "login_url"
+  | "credential_management_url"
+  | "contact_url"
+
+/** @deprecated Use {@link OperationalUrlField}. */
+export type OperationalUrlFieldName = OperationalUrlField
+
+/** Field-level evidence that an operational URL is documented on `source_url`. */
+export interface OperationalUrlClaim {
+  field: OperationalUrlField
+  url: string
+  source_url: string
+}
+
 export interface OperationalResearch {
   app_name: string
   app_slug: string
@@ -59,9 +80,13 @@ export interface OperationalResearch {
   authorization_url: string | null
   token_url: string | null
   credential_fields: string[]
+  credential_creation_instructions: string[]
   scopes: ScopeRequirement[]
   developer_portal_url: string | null
   signup_url: string | null
+  login_url: string | null
+  credential_management_url: string | null
+  operational_url_claims: OperationalUrlClaim[]
   access_route: AccessRoute
   production_approval_required: boolean | null
   contact_email: string | null
@@ -229,21 +254,37 @@ export interface RunOutputResponse {
   integrator_bundle: IntegratorOutput
 }
 
+/** The browser backend the API actually has wired (api/models.py::BrowserProvider). */
+export type BrowserProvider = "browser_use" | "playwright"
+
+/** How the owner can watch, and possibly drive, a live browser session. */
+export type LiveViewMode = "hosted_url" | "screenshot" | "interactive_remote" | "unavailable"
+
 /**
- * Live view for a browser run. Two modes, chosen by the wired provider:
- * - `hosted_url`: Browser Use supplies a signed `live_url` to open/embed.
- * - `screenshot`: the self-hosted Playwright harness has no hosted URL, so the
+ * Live view for a browser run. The viewer URL present depends on `mode`:
+ * - `hosted_url`: a hosted provider (Browser Use) supplies a signed `live_url`,
+ *   which the owner can interact with directly.
+ * - `screenshot`: the self-hosted Playwright service has no hosted URL, so the
  *   client polls `screenshot_url` for masked PNG frames (cache-busted by
- *   `captured_at`), and stops polling once the run leaves an active browser state.
- * Every new field is optional, so the existing Browser Use shape still parses.
+ *   `captured_at`). Frames are viewable only, so `interaction_available` is false.
+ * - `interactive_remote`: a same-origin interactive viewer path, advertised only
+ *   once that path is served end to end.
+ * - `unavailable`: no viewer exists and no viewer URL is present.
+ *
+ * `screenshot_url`/`interactive_url` are bounded same-origin RELATIVE API paths.
+ * A private browser-service (noVNC) address never crosses the API boundary.
  */
 export interface LiveViewResponse {
   run_id: string
+  provider: BrowserProvider
   available: boolean
-  mode?: "hosted_url" | "screenshot" | "unavailable"
+  mode: LiveViewMode
   live_url?: string | null
   screenshot_url?: string | null
+  interactive_url?: string | null
   captured_at?: string | null
+  interaction_available: boolean
+  reason_code?: string | null
 }
 
 export type RunPhaseAction = "resume" | "poll-email" | "retry"

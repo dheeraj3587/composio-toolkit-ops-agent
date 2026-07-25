@@ -1531,22 +1531,32 @@ class TestProviderFactoryWiring:
 
         return RunService.__new__(RunService)
 
-    def test_playwright_without_service_configuration_fails_closed(self) -> None:
+    @staticmethod
+    def _baseline_settings() -> Any:
+        """Settings from an EXPLICITLY empty environment.
+
+        ``dotenv_path=None`` skips loading ``.env`` but still reads ``os.environ``,
+        which any earlier ``load_dotenv`` in the same process has already mutated.
+        These tests assert the code's own defaults and wiring rules, so the
+        environment must be empty rather than "whatever this machine exports".
+        """
+
         from ops.config import Settings
+
+        return Settings.from_env(env={}, dotenv_path=None)
+
+    def test_playwright_without_service_configuration_fails_closed(self) -> None:
         from ops.provider_errors import ConfigurationRequiredError
 
-        settings = Settings.from_env(dotenv_path=None).model_copy(
-            update={"browser_provider": "playwright"}
-        )
+        settings = self._baseline_settings().model_copy(update={"browser_provider": "playwright"})
         with pytest.raises(ConfigurationRequiredError) as excinfo:
             self._service()._build_browser_worker(settings)
         assert excinfo.value.reason_code == "browser_service_configuration_required"
 
     def test_configured_service_yields_the_rpc_client(self) -> None:
         from ops.browser_service_client import BrowserServiceClient
-        from ops.config import Settings
 
-        settings = Settings.from_env(dotenv_path=None).model_copy(
+        settings = self._baseline_settings().model_copy(
             update={
                 "browser_provider": "playwright",
                 "browser_service_url": "http://browser-worker:8081",
@@ -1559,10 +1569,9 @@ class TestProviderFactoryWiring:
         assert worker.supports_restart_reattach is True
 
     def test_in_process_sandbox_requires_an_explicit_flag(self) -> None:
-        from ops.config import Settings
         from ops.playwright_worker import PlaywrightBrowserWorker
 
-        settings = Settings.from_env(dotenv_path=None).model_copy(
+        settings = self._baseline_settings().model_copy(
             update={"browser_provider": "playwright", "playwright_in_process_sandbox": True}
         )
         worker = self._service()._build_browser_worker(settings)
@@ -1571,9 +1580,7 @@ class TestProviderFactoryWiring:
         assert worker.supports_restart_reattach is False
 
     def test_browser_use_remains_the_default_provider(self) -> None:
-        from ops.config import Settings
-
-        settings = Settings.from_env(dotenv_path=None)
+        settings = self._baseline_settings()
         assert settings.browser_provider == "browser_use"
         assert settings.playwright_in_process_sandbox is False
 

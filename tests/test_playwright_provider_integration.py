@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from cryptography.fernet import Fernet
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from api.models import LiveViewResponse, ProviderState
 from ops.browser_readiness import browser_configuration_state
@@ -91,26 +92,180 @@ def test_screenshot_lookup_requires_a_session(tmp_path: Path) -> None:
     assert service.get_browser_screenshot(run_id) is None
 
 
-def test_live_view_response_defaults_stay_backward_compatible() -> None:
-    # The pre-existing Browser Use shape (run_id/available/live_url) still validates
-    # without the new fields, so no client breaks.
-    legacy = LiveViewResponse(run_id="run_1", available=True, live_url="https://x.example/s")
-    assert legacy.mode == "unavailable"  # default; hosted mode is set explicitly
-    assert legacy.screenshot_url is None and legacy.captured_at is None
-
+def test_live_view_modes_are_provider_aware_and_self_consistent() -> None:
+    # Browser Use keeps its hosted, interactive shape.
     hosted = LiveViewResponse(
-        run_id="run_1", available=True, mode="hosted_url", live_url="https://x.example/s"
+        run_id="run_1",
+        provider="browser_use",
+        available=True,
+        mode="hosted_url",
+        live_url="https://x.example/s",
+        interaction_available=True,
     )
-    assert hosted.mode == "hosted_url"
+    assert hosted.mode == "hosted_url" and hosted.interaction_available is True
+    assert hosted.screenshot_url is None and hosted.interactive_url is None
 
+    # Playwright reports viewable-but-not-drivable masked frames.
     shot = LiveViewResponse(
         run_id="run_1",
+        provider="playwright",
         available=True,
         mode="screenshot",
         screenshot_url="/api/runs/run_1/live-view/screenshot",
         captured_at="2026-07-25T00:00:00+00:00",
     )
-    assert shot.live_url is None and shot.screenshot_url is not None
+    assert shot.live_url is None and shot.interaction_available is False
+
+    idle = LiveViewResponse(
+        run_id="run_1",
+        provider="playwright",
+        available=False,
+        reason_code="no_active_browser_session",
+    )
+    assert idle.mode == "unavailable" and idle.available is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # A mode without its matching viewer URL.
+        {"provider": "browser_use", "available": True, "mode": "hosted_url"},
+        {"provider": "playwright", "available": True, "mode": "screenshot"},
+        {"provider": "playwright", "available": True, "mode": "interactive_remote"},
+        # An unavailable view must not carry a viewer URL at all.
+        {
+            "provider": "browser_use",
+            "available": False,
+            "mode": "unavailable",
+            "live_url": "https://x.example/s",
+        },
+        {
+            "provider": "playwright",
+            "available": False,
+            "mode": "unavailable",
+            "screenshot_url": "/api/runs/run_1/live-view/screenshot",
+        },
+        # A viewer mode that denies availability, and frames claiming interaction.
+        {
+            "provider": "playwright",
+            "available": False,
+            "mode": "screenshot",
+            "screenshot_url": "/api/runs/run_1/live-view/screenshot",
+        },
+        {
+            "provider": "playwright",
+            "available": True,
+            "mode": "screenshot",
+            "screenshot_url": "/api/runs/run_1/live-view/screenshot",
+            "interaction_available": True,
+        },
+        # A viewer path for a DIFFERENT run.
+        {
+            "provider": "playwright",
+            "available": True,
+            "mode": "screenshot",
+            "screenshot_url": "/api/runs/run_2/live-view/screenshot",
+        },
+    ],
+)
+def test_live_view_rejects_inconsistent_mode_and_url_combinations(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        LiveViewResponse(run_id="run_1", **payload)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "http://browser-worker:8081/vnc.html?session=pw_1&token=t",
+        "https://browser-worker.opsnet/vnc.html",
+        "http://127.0.0.1:6080/vnc.html",
+        "/api/runs/run_1/live-view/../../internal",
+    ],
+)
+def test_live_view_rejects_private_browser_service_addresses(address: str) -> None:
+    """The private noVNC/browser-service address must never cross the API boundary."""
+
+    for field in ("screenshot_url", "interactive_url"):
+        with pytest.raises(ValidationError):
+            LiveViewResponse(
+                run_id="run_1",
+                provider="playwright",
+                available=True,
+                mode="screenshot" if field == "screenshot_url" else "interactive_remote",
+                **{field: address},  # type: ignore[arg-type]
+            )
+
+
+class _FakeCoreService:
+    """Minimal core-service surface the live-view projection actually reads."""
+
+    def __init__(self, *, live_url: str | None, screenshot: tuple[bytes, str] | None) -> None:
+        self._live_url = live_url
+        self._screenshot = screenshot
+
+    def get_run(self, run_id: str) -> dict[str, object]:
+        return {"run_id": run_id}
+
+    def get_browser_live_url(self, run_id: str) -> str | None:
+        del run_id
+        return self._live_url
+
+    def get_browser_screenshot(self, run_id: str) -> tuple[bytes, str] | None:
+        del run_id
+        return self._screenshot
+
+
+def _projected_live_view(
+    *,
+    live_url: str | None,
+    screenshot: tuple[bytes, str] | None,
+    browser_provider: str = "browser_use",
+) -> LiveViewResponse:
+    from api.service import LocalRunService
+
+    service = LocalRunService(
+        core_service=_FakeCoreService(live_url=live_url, screenshot=screenshot),  # type: ignore[arg-type]
+        settings=Settings(browser_provider=browser_provider),  # type: ignore[arg-type]
+    )
+    return service._live_view_sync("run_1")  # noqa: SLF001 - projection under test
+
+
+def test_browser_use_live_view_stays_hosted_and_interactive() -> None:
+    view = _projected_live_view(
+        live_url="https://live.browser-use.example/session", screenshot=None
+    )
+
+    assert view.provider == "browser_use"
+    assert view.mode == "hosted_url"
+    assert view.interaction_available is True
+    assert view.live_url == "https://live.browser-use.example/session"
+
+
+def test_playwright_live_view_is_screenshot_only() -> None:
+    view = _projected_live_view(
+        live_url=None,
+        screenshot=(b"\x89PNG frame", "2026-07-25T00:00:00+00:00"),
+        browser_provider="playwright",
+    )
+
+    assert view.provider == "playwright"
+    assert view.mode == "screenshot"
+    # interactive_remote is never advertised until that path is served end to end.
+    assert view.interaction_available is False
+    assert view.screenshot_url == "/api/runs/run_1/live-view/screenshot"
+    assert view.interactive_url is None
+
+
+def test_idle_live_view_reports_the_configured_provider_without_a_viewer() -> None:
+    view = _projected_live_view(live_url=None, screenshot=None, browser_provider="playwright")
+
+    assert view.provider == "playwright"
+    assert view.mode == "unavailable"
+    assert view.available is False
+    assert view.live_url is None and view.screenshot_url is None
+    assert view.reason_code == "no_active_browser_session"
 
 
 def test_screenshot_route_is_registered_and_owner_gated() -> None:
@@ -137,9 +292,22 @@ def test_configuration_state_helper_is_provider_aware() -> None:
         )
         is True
     )
+    # Playwright needs no Browser Use key, but it does need a browser service
+    # (or the explicit in-process sandbox) — the same rule the factory enforces.
     assert (
         browser_configuration_state(
             Settings(allow_live_browser=True, browser_provider="playwright")
+        )
+        is False
+    )
+    assert (
+        browser_configuration_state(
+            Settings(
+                allow_live_browser=True,
+                browser_provider="playwright",
+                browser_service_url="http://browser-worker:8081",
+                browser_service_token=SecretStr("service-token"),
+            )
         )
         is True
     )
