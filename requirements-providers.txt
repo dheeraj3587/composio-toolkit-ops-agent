@@ -9,7 +9,7 @@ composio==0.18.0
 
 google-genai==2.12.1
 perplexityai==0.42.0
-# You.com SDK. PyPI lists 2.4.0 as the current published release. This version
-# exposes search_post_async include_domains, Contents max_age, and Research
-# source_control/output_schema used by ops/you_research.py.
-youdotcom==2.4.0
+# You.com SDK. Verified against PyPI on 2026-07-25: 2.5.0 is the current public
+# release (2026-07-23; 2.4.0 was 2026-07-17). The pin is the single source of
+# truth for tests/test_you_research.py::TestSdkContract.
+youdotcom==2.5.0
