@@ -303,38 +303,40 @@ class TestAuthentication:
         assert "/home" in url
 
     def test_multi_field_otp_is_split_across_inputs(self) -> None:
-        """Six single-character inputs must receive one digit each, in order."""
+        """Six single-character inputs must receive one digit each, in order.
+
+        The evidence is the SUBMITTED FORM BODY rather than a DOM read. Reading the
+        inputs concurrently races ``inject_otp`` (which fills the fields and submits
+        in one operation) and intermittently observes a partially filled form — the
+        request body is the deterministic record of what was actually typed where.
+        """
 
         async def scenario(app: BrowserTestApp) -> tuple[bool, list[str], str]:
             async with browser_page(app) as fx:
+                submitted: list[str] = []
+                fx.page.on(
+                    "request",
+                    lambda request: (
+                        submitted.append(request.post_data or "")
+                        if request.method == "POST"
+                        else None
+                    ),
+                )
                 await fx.page.goto(app.url("/otp-multiple"), wait_until="domcontentloaded")
                 inspection = await inspect_login(fx.page, app.host_patterns)
-                # Read the per-field values BEFORE injection submits and navigates.
-                values: list[str] = []
-
-                async def _capture() -> None:
-                    await asyncio.sleep(0.05)
-                    with contextlib.suppress(Exception):
-                        values.extend(
-                            [
-                                await fx.page.input_value(f"input[name='code{index}']")
-                                for index in range(6)
-                            ]
-                        )
-
-                capture = asyncio.create_task(_capture())
                 injected = await inject_otp(fx.page, OTP_CODE, inspection)
-                await capture
                 await fx.page.wait_for_load_state("domcontentloaded")
-                return injected, values, str(fx.page.url)
+                return injected, submitted, str(fx.page.url)
 
-        injected, values, url = _run(scenario)
+        injected, submitted, url = _run(scenario)
         assert injected is True
         # The server only redirects to /home when all six digits joined equal the
         # code, which is itself proof the split was correct and ordered.
         assert "/home" in url
-        if values:
-            assert "".join(values) == OTP_CODE
+        # And the request body shows exactly one digit per field, in field order.
+        assert submitted, "the OTP form was never submitted"
+        fields = dict(pair.split("=", 1) for pair in submitted[0].split("&") if "=" in pair)
+        assert [fields[f"code{index}"] for index in range(6)] == list(OTP_CODE)
 
     def test_magic_link_is_accepted_only_for_a_reviewed_host(self) -> None:
         async def scenario(app: BrowserTestApp) -> tuple[bool, bool, str]:
