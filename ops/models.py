@@ -29,6 +29,29 @@ def validate_vault_reference(value: str) -> str:
     return value
 
 
+_SENSITIVE_URL_TOKENS = ("access_token", "api_key", "code", "key", "password", "secret", "token")
+
+
+def validate_operational_url(value: str | None) -> str | None:
+    """Validate an operational (not merely evidence-citation) HTTPS URL.
+
+    Beyond ``validate_https_url``, this rejects a query string or fragment that
+    carries an access/session token, API key, auth code, password, or secret —
+    exactly the shape of a browser-generated or emailed one-time link. These two
+    fields are meant to hold a stable, documented ENTRY POINT (a login page, a
+    credential-management page), never a live, single-use session artifact.
+    """
+
+    if value is None:
+        return None
+    validated = validate_https_url(value)
+    parsed = urlsplit(validated)
+    haystack = f"{parsed.query} {parsed.fragment}".casefold()
+    if any(token in haystack for token in _SENSITIVE_URL_TOKENS):
+        raise ValueError("operational URL must not carry sensitive query or fragment material")
+    return validated
+
+
 def validate_https_url(value: str) -> str:
     """Validate a bounded HTTPS URL without performing network I/O.
 
@@ -99,9 +122,22 @@ class OperationalResearch(StrictModel):
     authorization_url: str | None
     token_url: str | None
     credential_fields: list[str]
+    # Bounded, non-secret prose describing HOW to create the credential (e.g.
+    # "Open Settings > Private apps > Create app"). Never a rendered credential
+    # value, never long research prose, never a browser-generated session URL.
+    credential_creation_instructions: tuple[Annotated[str, Field(max_length=500)], ...] = Field(
+        default=(), max_length=20
+    )
     scopes: list[ScopeRequirement]
     developer_portal_url: str | None
     signup_url: str | None
+    # A stable, documented sign-in entry point — distinct from the developer
+    # portal or signup page, which may not be where an EXISTING user logs in.
+    login_url: str | None = None
+    # The stable page where API keys/tokens are viewed or created — distinct
+    # from developer_portal_url, which may be a docs/marketing landing page
+    # rather than the actual in-app settings screen.
+    credential_management_url: str | None = None
     access_route: AccessRoute
     production_approval_required: bool | None
     contact_email: str | None
@@ -120,6 +156,11 @@ class OperationalResearch(StrictModel):
     @classmethod
     def validate_optional_urls(cls, value: str | None) -> str | None:
         return validate_https_url(value) if value is not None else None
+
+    @field_validator("login_url", "credential_management_url")
+    @classmethod
+    def validate_operational_entry_urls(cls, value: str | None) -> str | None:
+        return validate_operational_url(value)
 
     _validate_evidence_urls = field_validator("evidence_urls")(
         lambda values: [validate_https_url(value) for value in values]

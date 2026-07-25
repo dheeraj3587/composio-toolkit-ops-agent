@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import importlib
 import ipaddress
+import re
 import socket
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from html.parser import HTMLParser
 from typing import Protocol
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -87,6 +88,36 @@ class EvidenceExtractor(Protocol):
 
 class HostResolver(Protocol):
     async def resolve(self, hostname: str) -> tuple[str, ...]: ...
+
+
+# Minimal STRUCTURAL protocols describing what OperationalResearchEnricher
+# needs from the richer You.com-backed dependencies, defined locally rather
+# than imported from ``ops.you_research`` — that module already imports FROM
+# this one, so importing it back here at module scope would be circular.
+# Any object with matching methods satisfies these without inheriting them.
+class RichEvidenceDiscoveryLike(Protocol):
+    async def discover(
+        self,
+        *,
+        app_name: str,
+        p1_record: Mapping[str, object],
+        baseline: OperationalResearch,
+        official_hosts: tuple[str, ...],
+    ) -> Sequence[object]: ...
+
+
+class EvidenceContentFetcherLike(Protocol):
+    async def fetch_many(self, urls: Sequence[str]) -> tuple[EvidenceDocument, ...]: ...
+
+
+class ResearchFallbackResultLike(Protocol):
+    candidate_urls: tuple[str, ...]
+
+
+class ResearchFallbackLike(Protocol):
+    async def research(
+        self, *, app_name: str, official_hosts: tuple[str, ...], policy: object
+    ) -> ResearchFallbackResultLike | None: ...
 
 
 class SystemHostResolver:
@@ -398,9 +429,23 @@ def _render_extraction_prompt(
     import json
 
     return (
-        "Extract operational API access facts using only the official evidence. "
-        "Use null or unknown for unsupported facts. Never invent scopes. Every scope "
-        "must cite one supplied source URL. Return only the supplied JSON schema.\n\n"
+        "Extract operational API access facts using ONLY facts explicitly supported "
+        "by the supplied official evidence below. Prioritize finding, when supported: "
+        "the official login URL; the official signup URL; the developer portal URL; "
+        "the API settings/credentials page URL; the API base URL; the authentication "
+        "method; the OAuth authorization URL; the OAuth token URL; the credential type; "
+        "the steps required to create the credential; required scopes; production "
+        "approval requirements; and a support/contact path.\n\n"
+        "Do not infer a dashboard or settings URL from a marketing website. Do not "
+        "invent a settings path. Do not transform a documentation URL into an "
+        "application URL. Use null or unknown when evidence is missing — never guess.\n\n"
+        "Every URL field must be either (a) one of the supplied or fetched evidence "
+        "URLs, or (b) a URL that literally appears in the evidence text (for example a "
+        "docs page stating 'Log in at https://app.vendor.com/login' documents that exact "
+        "operational URL even though it differs from the docs page's own address). Never "
+        "invent a URL that appears nowhere in the supplied material.\n\n"
+        "Never invent scopes. Every scope must cite one supplied source URL. Return only "
+        "the supplied JSON schema.\n\n"
         f"APP\n{app_name}\n\n"
         f"P1 RECORD\n{json.dumps(dict(p1_record), sort_keys=True)}\n\n"
         "EVIDENCE PACK\n"
@@ -409,7 +454,18 @@ def _render_extraction_prompt(
 
 
 class OperationalResearchEnricher:
-    """Orchestrate discovery, guarded fetches, and structured extraction."""
+    """Orchestrate discovery, guarded fetches, and structured extraction.
+
+    ``rich_discovery``/``content_fetcher``/``research_fallback`` are additive,
+    optional dependencies (default ``None``). When none of them are supplied
+    — the exact shape every pre-existing caller and test uses — ``enrich()``
+    runs the ORIGINAL code path below byte-for-byte. Only when a caller (in
+    practice, ``RunService`` once ``YDC_API_KEY`` is configured) supplies
+    them does the richer You.com-backed path in ``_enrich_rich`` run instead.
+    This keeps the integration fully backward-compatible without a You.com
+    key, per the non-negotiable requirement, by construction rather than by
+    a feature flag check scattered through the method body.
+    """
 
     def __init__(
         self,
@@ -418,11 +474,20 @@ class OperationalResearchEnricher:
         extractor: EvidenceExtractor | None,
         http_client: httpx.AsyncClient,
         resolver: HostResolver | None = None,
+        rich_discovery: RichEvidenceDiscoveryLike | None = None,
+        content_fetcher_factory: Callable[[object], EvidenceContentFetcherLike] | None = None,
+        research_fallback: ResearchFallbackLike | None = None,
     ) -> None:
         self._discovery = discovery
         self._extractor = extractor
         self._http_client = http_client
         self._resolver = resolver
+        self._rich_discovery = rich_discovery
+        # A FACTORY, not a fixed instance: the content fetcher has to be built
+        # freshly per app because it needs that app's ResearchHostPolicy, which
+        # only exists once ``_enrich_rich`` runs — never at wiring time.
+        self._content_fetcher_factory = content_fetcher_factory
+        self._research_fallback = research_fallback
 
     async def enrich(
         self,
@@ -453,6 +518,17 @@ class OperationalResearchEnricher:
             )
 
         policy = OfficialURLPolicy.from_p1_record(p1_record, resolver=self._resolver)
+
+        if self._rich_discovery is not None or self._content_fetcher_factory is not None:
+            return await self._enrich_rich(
+                app_name=app_name,
+                p1_record=p1_record,
+                baseline=baseline,
+                policy=policy,
+                missing=missing,
+            )
+
+        # ---- Original code path: unchanged in every line below. ----
         fetcher = OfficialEvidenceFetcher(self._http_client, policy)
         discovered = await self._discovery.discover(app_name=app_name) if self._discovery else ()
         candidates = _candidate_urls(p1_record, discovered, policy)
@@ -495,6 +571,143 @@ class OperationalResearchEnricher:
             documents_fetched=len(documents),
         )
 
+    async def _enrich_rich(
+        self,
+        *,
+        app_name: str,
+        p1_record: Mapping[str, object],
+        baseline: OperationalResearch,
+        policy: OfficialURLPolicy,
+        missing: list[str],
+    ) -> ResearchEnrichmentOutcome:
+        """The You.com-backed pipeline: rich discovery -> content fetch ->
+        (optional) Research fallback for more candidate pages -> the SAME
+        canonical Gemini extraction and validation used by the original path.
+
+        You.com output never creates an ``OperationalResearch`` object by
+        itself at any point in this method — it only ever produces candidate
+        URLs that still have to be fetched, extracted by Gemini, and pass
+        ``_validate_extracted_research`` / ``_validate_operational_urls``.
+        """
+
+        # Imported here (not at module scope) to avoid a circular import:
+        # ops.you_research imports FROM this module already.
+        from ops.you_research import ResearchHostPolicy
+
+        host_policy = ResearchHostPolicy.build(p1_record=p1_record, baseline=baseline)
+        official_hosts = host_policy.include_domains
+        # host_policy's trusted set is a SUPERSET of the narrow per-app
+        # `policy` (it also includes the reviewed browser_host_policy
+        # dataset), so every step of the rich path — candidate selection,
+        # content fetching, AND the documented-URL validation — has to use
+        # this same broader policy, or a candidate that discovery correctly
+        # trusted would be rejected two steps later for an inconsistent
+        # reason. Falls back to the narrow policy only in the (practically
+        # unreachable, since P1 always supplies at least one host) case
+        # where host_policy trusts nothing at all.
+        effective_policy = host_policy.official_url_policy or policy
+
+        discovered: Sequence[object] = ()
+        if self._rich_discovery is not None and official_hosts:
+            discovered = await self._rich_discovery.discover(
+                app_name=app_name,
+                p1_record=p1_record,
+                baseline=baseline,
+                official_hosts=official_hosts,
+            )
+
+        candidate_urls = _rich_candidate_urls(p1_record, discovered, effective_policy)
+        content_fetcher = (
+            self._content_fetcher_factory(host_policy)
+            if self._content_fetcher_factory is not None
+            else None
+        )
+        documents = await self._fetch_documents(candidate_urls, effective_policy, content_fetcher)
+
+        if not documents and self._research_fallback is not None and official_hosts:
+            fallback_result = await self._research_fallback.research(
+                app_name=app_name, official_hosts=official_hosts, policy=host_policy
+            )
+            if fallback_result is not None:
+                extra_urls = tuple(
+                    url for url in fallback_result.candidate_urls if url not in candidate_urls
+                )
+                if extra_urls:
+                    documents = await self._fetch_documents(
+                        extra_urls, effective_policy, content_fetcher
+                    )
+
+        if not documents:
+            return ResearchEnrichmentOutcome(
+                research=baseline,
+                capability=CapabilityAvailability(
+                    capability="operational_research",
+                    status="failed",
+                    reason_code="official_evidence_unavailable",
+                    detail="No allowlisted official evidence page could be fetched safely.",
+                ),
+                missing_fields=missing,
+                documents_fetched=0,
+            )
+
+        research = await self._extractor.extract(  # type: ignore[union-attr]
+            app_name=app_name,
+            p1_record=p1_record,
+            documents=documents,
+        )
+        allowed_evidence = _validate_extracted_research(research, baseline, documents, p1_record)
+        _validate_operational_urls(
+            research, baseline, documents, effective_policy, allowed_evidence
+        )
+        return ResearchEnrichmentOutcome(
+            research=research,
+            capability=CapabilityAvailability(
+                capability="operational_research",
+                status="ready",
+                reason_code="official_evidence_enriched",
+                detail="Operational fields were extracted from fetched allowlisted evidence.",
+            ),
+            missing_fields=_missing_fields(research),
+            documents_fetched=len(documents),
+        )
+
+    async def _fetch_documents(
+        self,
+        candidate_urls: Sequence[str],
+        policy: OfficialURLPolicy,
+        content_fetcher: EvidenceContentFetcherLike | None,
+    ) -> tuple[EvidenceDocument, ...]:
+        if not candidate_urls:
+            return ()
+        if content_fetcher is not None:
+            return await content_fetcher.fetch_many(candidate_urls)
+        # rich_discovery supplied candidates but no content fetcher was
+        # configured: fall back to the plain guarded per-URL HTTP fetch so
+        # the rich discovery path still produces documents.
+        fetcher = OfficialEvidenceFetcher(self._http_client, policy)
+        collected: list[EvidenceDocument] = []
+        for candidate in candidate_urls:
+            if len(collected) == MAX_EVIDENCE_DOCUMENTS:
+                break
+            try:
+                collected.append(await fetcher.fetch(candidate))
+            except (httpx.HTTPError, OSError, ValueError):
+                continue
+        return tuple(collected)
+
+
+def _rich_candidate_urls(
+    p1_record: Mapping[str, object],
+    discovered: Sequence[object],
+    policy: OfficialURLPolicy,
+) -> tuple[str, ...]:
+    """Extract ``.source_url`` from EvidenceCandidate-shaped objects, then
+    reuse the exact same P1-first, deduplicated, policy-sanitized selection
+    already used by the original :func:`_candidate_urls`."""
+
+    urls = [str(getattr(candidate, "source_url", "")) for candidate in discovered]
+    return _candidate_urls(p1_record, [url for url in urls if url], policy)
+
 
 def _candidate_urls(
     p1_record: Mapping[str, object],
@@ -520,6 +733,34 @@ def _candidate_urls(
     return tuple(result)
 
 
+_HTTPS_URL_IN_TEXT = re.compile(r"https://[^\s)\]\"'<>]+")
+
+
+def extract_https_urls(text: str) -> tuple[str, ...]:
+    """Pull literal HTTPS URLs out of fetched evidence TEXT (not the page's own URL).
+
+    A documentation page may say "Log in at https://app.vendor.com/login" —
+    that operational URL is not the evidence page's own URL, so it has to be
+    recognized as text before it can be checked against a host policy. This
+    is a bounded regex scan, not a security boundary by itself: every URL it
+    returns still has to pass :meth:`OfficialURLPolicy.sanitize_candidate`
+    before it is trusted for anything.
+    """
+
+    found: list[str] = []
+    for match in _HTTPS_URL_IN_TEXT.finditer(text[:MAX_EXCERPT_CHARACTERS]):
+        candidate = match.group(0).rstrip(".,;:!?)]}”'\"")
+        try:
+            validate_https_url(candidate)
+        except ValueError:
+            continue
+        if candidate not in found:
+            found.append(candidate)
+        if len(found) >= 50:
+            break
+    return tuple(found)
+
+
 def _normalize_url(value: str) -> str | None:
     """Canonicalize an HTTPS URL for citation comparison.
 
@@ -543,7 +784,16 @@ def _validate_extracted_research(
     baseline: OperationalResearch,
     documents: Sequence[EvidenceDocument],
     p1_record: Mapping[str, object],
-) -> None:
+) -> set[str]:
+    """Validate identity/evidence/scope citations; return the trusted evidence set.
+
+    The returned set is reused by :func:`_validate_operational_urls` (the
+    rich-pipeline-only addition below) so both checks agree on what "trusted"
+    means without recomputing it twice. Unchanged in behavior and signature
+    for existing callers — the return value was previously implicit ``None``
+    and no caller inspected it, so this is additive only.
+    """
+
     if research.app_slug != baseline.app_slug or research.app_name != baseline.app_name:
         raise ValueError("structured extraction changed the canonical app identity")
 
@@ -585,6 +835,65 @@ def _validate_extracted_research(
         cited_from_fetched = normalized is not None and normalized in fetched
         if not cited_from_fetched and scope.name not in trusted_scope_names:
             raise ValueError("structured extraction cited an unsupported scope source")
+
+    return allowed_evidence
+
+
+# Operational (not merely evidence-citation) URL fields. Only exercised by the
+# rich (You.com-backed) pipeline below — the pre-existing default pipeline
+# does not call this, so nothing about its current behavior changes.
+_OPERATIONAL_URL_FIELDS: tuple[str, ...] = (
+    "developer_portal_url",
+    "signup_url",
+    "authorization_url",
+    "token_url",
+    "login_url",
+    "credential_management_url",
+)
+
+
+def _validate_operational_urls(
+    research: OperationalResearch,
+    baseline: OperationalResearch,
+    documents: Sequence[EvidenceDocument],
+    policy: OfficialURLPolicy,
+    allowed_evidence: set[str],
+) -> None:
+    """Reject an operational URL Gemini did not actually get from evidence.
+
+    A documentation page may say "Log in at https://app.vendor.com/login"
+    without that URL ever being an evidence page's OWN url — so, beyond the
+    trusted evidence-citation set, a URL literally documented inside fetched
+    text is also accepted, provided its host still passes ``policy``. Gemini
+    reaffirming a value the verified baseline ALREADY had is accepted too;
+    only a genuinely NEW, undocumented URL is rejected.
+    """
+
+    documented: set[str] = set()
+    for document in documents:
+        for url in extract_https_urls(document.relevant_text):
+            try:
+                safe = policy.sanitize_candidate(url)
+            except ValueError:
+                continue
+            normalized = _normalize_url(safe)
+            if normalized is not None:
+                documented.add(normalized)
+    allowed_operational = allowed_evidence | documented
+
+    for field_name in _OPERATIONAL_URL_FIELDS:
+        value = getattr(research, field_name)
+        if value is None:
+            continue
+        normalized = _normalize_url(value)
+        baseline_value = getattr(baseline, field_name, None)
+        reaffirms_baseline = (
+            isinstance(baseline_value, str) and _normalize_url(baseline_value) == normalized
+        )
+        if normalized is None or (normalized not in allowed_operational and not reaffirms_baseline):
+            raise ValueError(
+                f"structured extraction produced an undocumented operational URL for {field_name}"
+            )
 
 
 def _missing_fields(research: OperationalResearch) -> list[str]:

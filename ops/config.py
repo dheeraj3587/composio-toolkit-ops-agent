@@ -91,6 +91,7 @@ class Settings(BaseModel):
     )
 
     perplexity_api_key: SecretStr | None = Field(default=None, repr=False)
+    you_api_key: SecretStr | None = Field(default=None, repr=False)
     google_genai_api_key: SecretStr | None = Field(default=None, repr=False)
     openrouter_api_key: SecretStr | None = Field(default=None, repr=False)
     groq_api_key: SecretStr | None = Field(default=None, repr=False)
@@ -144,6 +145,42 @@ class Settings(BaseModel):
     # Owner-only local credential submission is opt-in and loopback-only.
     allow_local_credential_submission: bool = False
 
+    # You.com is a RESEARCH/RETRIEVAL provider only (official-document discovery
+    # and extraction). It never operates a browser, never receives credentials,
+    # and never controls the default browser provider above. Every flag here
+    # requires ``you_api_key`` to be configured (see the ``*_configured``
+    # properties below) so the integration is fully inert without a key.
+    you_search_enabled: bool = True
+    you_contents_enabled: bool = True
+    # Research is the most expensive, least-bounded capability. Kept OFF by
+    # default even when a key is present; an operator opts in explicitly.
+    you_research_enabled: bool = False
+
+    you_search_count: int = Field(default=5, ge=1, le=10)
+    you_search_timeout_seconds: float = Field(default=20.0, ge=2.0, le=60.0)
+    you_contents_timeout_seconds: float = Field(default=30.0, ge=2.0, le=60.0)
+    # Local cache-freshness bound only. The You.com Contents API in the pinned
+    # SDK version has no ``max_age`` request parameter, so this never reaches
+    # the provider; it only decides whether a cached page is still usable.
+    you_contents_max_age_seconds: int = Field(default=86_400, ge=0)
+    you_research_timeout_seconds: float = Field(default=60.0, ge=10.0, le=180.0)
+
+    you_max_search_calls_per_enrichment: int = Field(default=2, ge=1, le=4)
+    you_max_contents_pages_per_enrichment: int = Field(default=8, ge=1, le=10)
+    you_max_research_calls_per_enrichment: int = Field(default=1, ge=0, le=1)
+
+    @property
+    def you_search_configured(self) -> bool:
+        return self.you_api_key is not None and self.you_search_enabled
+
+    @property
+    def you_contents_configured(self) -> bool:
+        return self.you_api_key is not None and self.you_contents_enabled
+
+    @property
+    def you_research_configured(self) -> bool:
+        return self.you_api_key is not None and self.you_research_enabled
+
     company_legal_name: str | None = None
     company_website: str | None = None
     company_work_email_ref: str | None = None
@@ -195,6 +232,7 @@ class Settings(BaseModel):
 
         values: dict[str, Any] = {
             "perplexity_api_key": _secret(source.get("PERPLEXITY_API_KEY")),
+            "you_api_key": _secret(source.get("YDC_API_KEY")),
             "google_genai_api_key": _secret(source.get("GOOGLE_GENAI_API_KEY")),
             "openrouter_api_key": _secret(source.get("OPENROUTER_API_KEY")),
             "groq_api_key": _secret(source.get("GROQ_API_KEY")),
@@ -231,6 +269,31 @@ class Settings(BaseModel):
             ),
             "allow_local_credential_submission": _boolean(
                 source.get("ALLOW_LOCAL_CREDENTIAL_SUBMISSION"), default=False
+            ),
+            "you_search_enabled": _boolean(source.get("YOU_SEARCH_ENABLED"), default=True),
+            "you_contents_enabled": _boolean(source.get("YOU_CONTENTS_ENABLED"), default=True),
+            "you_research_enabled": _boolean(source.get("YOU_RESEARCH_ENABLED"), default=False),
+            "you_search_count": _integer(source.get("YOU_SEARCH_COUNT"), default=5),
+            "you_search_timeout_seconds": _float(
+                source.get("YOU_SEARCH_TIMEOUT_SECONDS"), default=20.0
+            ),
+            "you_contents_timeout_seconds": _float(
+                source.get("YOU_CONTENTS_TIMEOUT_SECONDS"), default=30.0
+            ),
+            "you_contents_max_age_seconds": _integer(
+                source.get("YOU_CONTENTS_MAX_AGE_SECONDS"), default=86_400
+            ),
+            "you_research_timeout_seconds": _float(
+                source.get("YOU_RESEARCH_TIMEOUT_SECONDS"), default=60.0
+            ),
+            "you_max_search_calls_per_enrichment": _integer(
+                source.get("YOU_MAX_SEARCH_CALLS_PER_ENRICHMENT"), default=2
+            ),
+            "you_max_contents_pages_per_enrichment": _integer(
+                source.get("YOU_MAX_CONTENTS_PAGES_PER_ENRICHMENT"), default=8
+            ),
+            "you_max_research_calls_per_enrichment": _integer(
+                source.get("YOU_MAX_RESEARCH_CALLS_PER_ENRICHMENT"), default=1
             ),
             "company_legal_name": _optional(source.get("COMPANY_LEGAL_NAME")),
             "company_website": _optional(source.get("COMPANY_WEBSITE")),

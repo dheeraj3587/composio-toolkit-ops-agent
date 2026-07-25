@@ -51,6 +51,7 @@ from ops.models import (
 from ops.network_endpoint_policy import validation_endpoint as network_validation_endpoint
 from ops.operational_research import (
     GeminiStructuredExtractor,
+    OfficialEvidenceFetcher,
     OperationalResearchEnricher,
     PerplexitySearchDiscovery,
     ResearchEnricher,
@@ -75,6 +76,16 @@ from ops.routing import RoutingDecision, decide_access
 from ops.secret_store import SecretStoreError, SQLiteSecretStore
 from ops.state import AccessRoute, OperationsState, RunStatus, validate_status_transition
 from ops.storage import OperationsStorage, OperationsUnitOfWork
+from ops.you_research import (
+    CompositeEvidenceDiscovery,
+    FallbackEvidenceContentFetcher,
+    GuardedHTTPEvidenceFetcher,
+    LegacyDiscoveryAdapter,
+    ResearchHostPolicy,
+    YouContentsFetcher,
+    YouResearchFallback,
+    YouSearchDiscovery,
+)
 
 LOGGER = logging.getLogger("composio_ops.run_service")
 
@@ -94,6 +105,12 @@ _CAPABILITY_SUPPRESSION_REASONS = {
     "composio_ready": "composio_ready",
     "connection_required": "composio_connection_required",
 }
+
+
+class _YouComWiringMarker:
+    """Display-only marker so the wiring audit can show "You.com is
+    configured" without fabricating a reference to internal pipeline
+    objects that only exist inside ``_build_research_enricher``'s closures."""
 
 
 def _capability_reason_code(report: ComposioCapabilityReport | None) -> str:
@@ -323,6 +340,12 @@ class RunService:
         # Resources owned and closed by this service when built at startup.
         self._http_client: httpx.AsyncClient | None = None
         self._validation_http_client: httpx.AsyncClient | None = None
+        # Shared You.com HTTP client (Contents SDK + the direct Research REST
+        # call). One scoped client is reused across an app's whole enrichment
+        # rather than one per call, per the "do not create a You client for
+        # every small internal operation" requirement. Only built when
+        # YDC_API_KEY is configured; stays None otherwise.
+        self._you_http_client: httpx.AsyncClient | None = None
         self._browser_worker: BrowserWorker | None = None
         self._gmail_worker: GmailWorker | None = None
         # In-memory marker of the last inbound reply id handled per run, so the
@@ -405,6 +428,14 @@ class RunService:
             "research_enricher",
             self._enricher,
             configured=settings.google_genai_api_key is not None,
+        )
+        # You.com is a sanitized wiring-audit ENTRY, never a live probe: a
+        # normal health/startup check must never spend a You.com credit. See
+        # `python -m ops.cli probe-you` for the explicit, opt-in live check.
+        self._record_wiring(
+            "you_com",
+            _YouComWiringMarker() if settings.you_api_key is not None else None,
+            configured=settings.you_api_key is not None,
         )
 
         # Read-only credential validator (HubSpot bearer, current endpoint).
@@ -700,15 +731,25 @@ class RunService:
         return polled
 
     def _build_research_enricher(self, settings: Settings) -> ResearchEnricher | None:
-        """Build the enricher only when Gemini is configured; own its HTTP client."""
+        """Build the enricher only when Gemini is configured; own its HTTP client(s).
+
+        Discovery order: You.com Search (primary, when ``you_search_configured``)
+        then Perplexity (fallback, when configured) via
+        ``CompositeEvidenceDiscovery``. Content-fetch order: You.com Contents
+        (primary, when ``you_contents_configured``) then the pre-existing
+        guarded HTTP fetcher (fallback, always available). You.com Research is
+        optional, disabled by default, and only ever supplies MORE candidate
+        pages for the SAME canonical Gemini extraction below.
+
+        Fully backward-compatible: when ``YDC_API_KEY`` is absent, this
+        builds the EXACT pre-existing Perplexity + guarded-HTTP wiring with
+        none of the new dependencies set, so ``OperationalResearchEnricher``
+        runs its original code path unchanged.
+        """
 
         if settings.google_genai_api_key is None:
             return None
-        discovery = (
-            PerplexitySearchDiscovery(settings.perplexity_api_key)
-            if settings.perplexity_api_key is not None
-            else None
-        )
+
         extractor = GeminiStructuredExtractor(
             settings.google_genai_api_key,
             model=settings.gemini_model_chain,
@@ -717,10 +758,96 @@ class RunService:
             timeout=httpx.Timeout(20.0, connect=10.0),
             follow_redirects=False,
         )
+
+        if settings.you_api_key is None:
+            discovery = (
+                PerplexitySearchDiscovery(settings.perplexity_api_key)
+                if settings.perplexity_api_key is not None
+                else None
+            )
+            return OperationalResearchEnricher(
+                discovery=discovery,
+                extractor=extractor,
+                http_client=self._http_client,
+            )
+
+        you_api_key = settings.you_api_key
+        discovery_providers: list[object] = []
+        if settings.you_search_configured:
+            discovery_providers.append(
+                YouSearchDiscovery(
+                    you_api_key,
+                    count=settings.you_search_count,
+                    timeout_seconds=settings.you_search_timeout_seconds,
+                    max_calls=settings.you_max_search_calls_per_enrichment,
+                )
+            )
+        if settings.perplexity_api_key is not None:
+            discovery_providers.append(
+                LegacyDiscoveryAdapter(PerplexitySearchDiscovery(settings.perplexity_api_key))
+            )
+        rich_discovery = (
+            CompositeEvidenceDiscovery(discovery_providers)  # type: ignore[arg-type]
+            if discovery_providers
+            else None
+        )
+
+        content_fetcher_factory = None
+        if settings.you_contents_configured:
+            self._you_http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                follow_redirects=False,
+            )
+            contents_timeout = settings.you_contents_timeout_seconds
+            contents_max_age = settings.you_contents_max_age_seconds
+            guarded_http_client = self._http_client
+
+            def _build_content_fetcher(host_policy: ResearchHostPolicy) -> object:
+                primary = YouContentsFetcher(
+                    you_api_key,
+                    policy=host_policy,
+                    max_age=contents_max_age,
+                    request_timeout=contents_timeout,
+                )
+                fallback_policy = host_policy.official_url_policy
+                if fallback_policy is None:
+                    return primary
+                fallback = GuardedHTTPEvidenceFetcher(
+                    OfficialEvidenceFetcher(guarded_http_client, fallback_policy)
+                )
+                return FallbackEvidenceContentFetcher(primary=primary, fallback=fallback)
+
+            content_fetcher_factory = _build_content_fetcher
+
+        research_fallback = None
+        if settings.you_research_configured:
+            if self._you_http_client is None:
+                self._you_http_client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(
+                        max(30.0, settings.you_research_timeout_seconds), connect=10.0
+                    ),
+                    follow_redirects=False,
+                )
+            research_fallback = YouResearchFallback(
+                you_api_key,
+                http_client=self._you_http_client,
+                timeout_seconds=settings.you_research_timeout_seconds,
+            )
+
         return OperationalResearchEnricher(
-            discovery=discovery,
+            discovery=None,
             extractor=extractor,
             http_client=self._http_client,
+            rich_discovery=rich_discovery,
+            # ops.operational_research declares these as small structural
+            # Protocols typed with `policy: object` (it cannot import the
+            # concrete ResearchHostPolicy without a circular import). The
+            # concrete you_research classes correctly narrow that parameter
+            # to ResearchHostPolicy, which mypy's Protocol contravariance
+            # check flags even though it is safe here: _enrich_rich always
+            # calls both with the exact ResearchHostPolicy it just built.
+            content_fetcher_factory=content_fetcher_factory,  # type: ignore[arg-type]
+            research_fallback=research_fallback,  # type: ignore[arg-type]
         )
 
     def _build_credential_validator(
@@ -873,7 +1000,7 @@ class RunService:
         self._workflow = None
         if workflow is not None:
             workflow.close()
-        for client_attr in ("_http_client", "_validation_http_client"):
+        for client_attr in ("_http_client", "_validation_http_client", "_you_http_client"):
             client = getattr(self, client_attr, None)
             if isinstance(client, httpx.AsyncClient):
                 try:
