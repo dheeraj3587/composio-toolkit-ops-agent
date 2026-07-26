@@ -237,6 +237,7 @@ class HitlRequest(StrictModel):
     """A bounded human-action request containing no credential material."""
 
     type: Literal[
+        "login_required",
         "captcha",
         "email_otp",
         "phone_otp",

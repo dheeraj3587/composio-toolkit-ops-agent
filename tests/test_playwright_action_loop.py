@@ -220,7 +220,8 @@ def test_initial_login_requires_credentials_then_resume_injects_them_in_same_ses
         "<input type='email' name='email'>"
         "<input type='password' name='password'>"
         "<button type='submit'>Sign in</button>"
-        "</form></body></html>"
+        "</form><iframe title='reCAPTCHA' "
+        "src='/recaptcha/api2/anchor?size=invisible'></iframe></body></html>"
     )
     credential_page = (
         "<html><body><h1>API token</h1>"

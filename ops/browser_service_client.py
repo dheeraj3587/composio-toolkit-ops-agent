@@ -18,6 +18,7 @@ references, which the service resolves internally.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,6 +30,7 @@ from pydantic import SecretStr
 from ops.browser_worker import BrowserObservation, BrowserSessionContext
 from ops.models import validate_vault_reference
 from ops.provider_errors import ConfigurationRequiredError, ProviderOperationError
+from ops.secret_store import parse_vault_reference
 
 LOGGER = logging.getLogger("composio_ops.browser_service_client")
 
@@ -292,6 +294,64 @@ class BrowserServiceClient:
             non_secret_notes=tuple(payload.get("non_secret_notes") or ()),
             reason_code=payload.get("reason_code"),
         )
+
+    async def auto_capture_credentials(
+        self,
+        handle: str,
+        app_slug: str,
+        secret_store: object | None = None,
+    ) -> dict[str, str] | None:
+        """Ask the service to capture into its vault; accept references only."""
+
+        del secret_store  # the service owns the shared vault boundary
+        known_slug = self._sessions.get(handle)
+        if known_slug and known_slug != app_slug:
+            raise ProviderOperationError(
+                capability="browser service credential capture",
+                reason_code="capture_app_mismatch",
+            )
+        try:
+            response = await self._request(
+                "POST",
+                f"/internal/browser/sessions/{handle}/capture-credentials",
+                json_body={},
+            )
+        except httpx.RequestError:
+            raise ProviderOperationError(
+                capability="browser service", reason_code="browser_service_unreachable"
+            ) from None
+        if response.status_code >= 400:
+            raise ProviderOperationError(
+                capability="browser service credential capture",
+                reason_code=self._reason(response),
+            )
+        try:
+            payload = response.json()
+            if not isinstance(payload, dict) or set(payload) != {"credential_refs"}:
+                raise ValueError("invalid response shape")
+            raw_refs = payload["credential_refs"]
+            if not isinstance(raw_refs, dict):
+                raise ValueError("invalid reference mapping")
+            refs: dict[str, str] = {}
+            for kind, reference in raw_refs.items():
+                if (
+                    not isinstance(kind, str)
+                    or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,99}", kind) is None
+                ):
+                    raise ValueError("invalid credential kind")
+                if not isinstance(reference, str):
+                    raise ValueError("invalid credential reference")
+                validated = validate_vault_reference(reference)
+                parts = parse_vault_reference(validated)
+                if parts.app_slug != app_slug or parts.kind != kind:
+                    raise ValueError("credential reference binding mismatch")
+                refs[kind] = validated
+        except (ValueError, TypeError, KeyError):
+            raise ProviderOperationError(
+                capability="browser service credential capture",
+                reason_code="invalid_capture_response",
+            ) from None
+        return refs or None
 
     async def session_status(self, session_id: str) -> tuple[bool, str]:
         """(exists, reason_code) straight from the service — never inferred."""

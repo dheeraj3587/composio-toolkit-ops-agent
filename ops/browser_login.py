@@ -129,6 +129,9 @@ _CHALLENGE_IFRAME_SELECTOR = (
     "iframe[src*='recaptcha' i], iframe[title*='recaptcha' i], "
     "iframe[src*='hcaptcha' i], iframe[title*='hcaptcha' i]"
 )
+_ACTIVE_CHALLENGE_IFRAME = re.compile(
+    r"(?i)(?:/bframe(?:[/?#]|$)|challenge|checkbox|i'?m not a robot|are you human)"
+)
 
 
 async def _count_visible_enabled(page: Any, selector: str, *, limit: int = 8) -> int:
@@ -511,7 +514,17 @@ async def visible_login_challenge(page: Any) -> bool:
         return False
     for index in range(count):
         try:
-            if await locator.nth(index).is_visible():
+            frame = locator.nth(index)
+            if not await frame.is_visible():
+                continue
+            title = (await frame.get_attribute("title", timeout=1_000)) or ""
+            source = (await frame.get_attribute("src", timeout=1_000)) or ""
+            metadata = f"{title} {source}"
+            visible_anchor = (
+                "/anchor" in source.casefold()
+                and re.search(r"(?i)(?:[?&])size=invisible(?:[&#]|$)", source) is None
+            )
+            if visible_anchor or _ACTIVE_CHALLENGE_IFRAME.search(metadata):
                 return True
         except Exception:
             continue

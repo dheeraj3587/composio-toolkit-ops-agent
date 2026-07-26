@@ -31,6 +31,7 @@ from fastapi.responses import JSONResponse
 from browser_service import __version__
 from browser_service.auth import AuthContext, assert_session_owner, token_dependency
 from browser_service.models import (
+    CaptureCredentialsResponse,
     CreateSessionRequest,
     HealthResponse,
     LiveViewGrant,
@@ -391,9 +392,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             # operator nothing, so a launch failure could not be diagnosed from the
             # service logs at all.
             reason = str(getattr(exc, "reason_code", "") or "unknown")
-            LOGGER.warning(
-                "browser launch failed: reason=%s error=%s", reason, type(exc).__name__
-            )
+            LOGGER.warning("browser launch failed: reason=%s error=%s", reason, type(exc).__name__)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="browser_launch_failed"
             ) from None
@@ -472,6 +471,55 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 )
         except SessionUnavailable as exc:
             raise _sanitized_error(exc) from None
+
+    @app.post(
+        "/internal/browser/sessions/{session_id}/capture-credentials",
+        response_model=CaptureCredentialsResponse,
+    )
+    async def capture_credentials(
+        session_id: str,
+        auth: AuthContext = _AUTH,
+    ) -> CaptureCredentialsResponse:
+        """Capture a reviewed credential into the shared vault, returning refs only."""
+
+        session = manager.get_if_present(session_id)
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
+        assert_session_owner(session_owner=session.owner, caller_owner=auth.owner)
+        try:
+            store = _credential_capture_store()
+        except ProviderOperationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=exc.reason_code,
+            ) from None
+        try:
+            with manager.lease(session_id) as leased:
+                captured = await asyncio.wait_for(
+                    _worker().auto_capture_credentials(
+                        leased.current_page_id,
+                        leased.app_slug,
+                        store,
+                    ),
+                    timeout=resolved.operation_timeout_seconds,
+                )
+                leased.touch()
+        except TimeoutError:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="credential_capture_timeout",
+            ) from None
+        except SessionUnavailable as exc:
+            raise _sanitized_error(exc) from None
+        except (TypeError, AttributeError, AssertionError, NameError):
+            raise
+        except Exception:
+            # Never include exception/page text: it could contain the credential.
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="credential_capture_failed",
+            ) from None
+        return CaptureCredentialsResponse(credential_refs=captured or {})
 
     @app.get("/internal/browser/sessions/{session_id}/screenshot")
     async def screenshot(session_id: str, auth: AuthContext = _AUTH) -> Response:
@@ -889,6 +937,24 @@ async def _drive(
         non_secret_notes=tuple(observation.non_secret_notes),
         reason_code=observation.reason_code,
         session=session.summary(),
+    )
+
+
+def _credential_capture_store() -> Any:
+    """Build the service-local view of the shared encrypted credential vault."""
+
+    from ops.config import Settings
+    from ops.secret_store import SQLiteSecretStore
+
+    app_settings = Settings.from_env(dotenv_path=None)
+    if app_settings.secret_vault_key is None:
+        raise ProviderOperationError(
+            capability="browser service vault",
+            reason_code="secret_vault_not_configured",
+        )
+    return SQLiteSecretStore(
+        app_settings.secret_vault_db_path,
+        app_settings.secret_vault_key.get_secret_value(),
     )
 
 

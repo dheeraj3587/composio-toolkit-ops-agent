@@ -26,12 +26,14 @@ from ops.browser_login import (
     inspect_login,
     magic_link_is_safe,
     normalize_resume_signal,
+    visible_login_challenge,
 )
 from ops.config import Settings
 from ops.playwright_worker import (
     ApprovedBrowserValueResolver,
     PageInspection,
     checkpoint_satisfied,
+    classify_structural_gate,
     predicate_satisfied,
 )
 from tests.browser_app.harness import require_chromium
@@ -161,6 +163,10 @@ def test_post_submit_visible_challenge_is_typed(
         async def is_visible(self) -> bool:
             return True
 
+        async def get_attribute(self, name: str, timeout: int = 0) -> str | None:
+            del timeout
+            return "reCAPTCHA challenge" if name == "title" else "https://captcha.test/bframe"
+
     class _Locator:
         async def count(self) -> int:
             return 1
@@ -182,6 +188,60 @@ def test_post_submit_visible_challenge_is_typed(
     )
     assert result.state == "unknown"
     assert result.reason_code == "captcha_required"
+
+
+def test_passive_recaptcha_anchor_is_not_a_login_challenge() -> None:
+    class _Item:
+        async def is_visible(self) -> bool:
+            return True
+
+        async def get_attribute(self, name: str, timeout: int = 0) -> str | None:
+            del timeout
+            if name == "title":
+                return "reCAPTCHA"
+            return "https://www.google.com/recaptcha/api2/anchor?size=invisible"
+
+    class _Locator:
+        async def count(self) -> int:
+            return 1
+
+        def nth(self, index: int) -> _Item:
+            assert index == 0
+            return _Item()
+
+    class _Page:
+        def locator(self, selector: str) -> _Locator:
+            assert "recaptcha" in selector
+            return _Locator()
+
+    assert asyncio.run(visible_login_challenge(_Page())) is False
+
+
+def test_visible_recaptcha_checkbox_anchor_is_a_login_challenge() -> None:
+    class _Item:
+        async def is_visible(self) -> bool:
+            return True
+
+        async def get_attribute(self, name: str, timeout: int = 0) -> str | None:
+            del timeout
+            if name == "title":
+                return "reCAPTCHA"
+            return "https://www.google.com/recaptcha/api2/anchor?size=normal"
+
+    class _Locator:
+        async def count(self) -> int:
+            return 1
+
+        def nth(self, index: int) -> _Item:
+            assert index == 0
+            return _Item()
+
+    class _Page:
+        def locator(self, selector: str) -> _Locator:
+            assert "recaptcha" in selector
+            return _Locator()
+
+    assert asyncio.run(visible_login_challenge(_Page())) is True
 
 
 def test_post_submit_unchanged_form_requires_provider_verification(
@@ -209,6 +269,23 @@ def test_post_submit_unchanged_form_requires_provider_verification(
         )
     )
     assert result.reason_code == "login_verification_required"
+
+
+def test_structural_gate_ignores_passive_frame_but_keeps_real_challenge() -> None:
+    def inspection(name: str) -> PageInspection:
+        return PageInspection(
+            url=f"https://{_HOST}/login",
+            title="Sign in",
+            visible_text="",
+            elements=(SnapshotElement(index=0, role="iframe", name=name),),
+            locators=(),
+            fingerprint="captcha-frame",
+        )
+
+    assert classify_structural_gate(inspection("reCAPTCHA")) is None
+    gate = classify_structural_gate(inspection("reCAPTCHA challenge"))
+    assert gate is not None
+    assert gate[0] == "captcha"
 
 
 # --- Login state machine -------------------------------------------------------

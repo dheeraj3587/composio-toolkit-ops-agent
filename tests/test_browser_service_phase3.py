@@ -98,6 +98,18 @@ class _FakeWorker:
         self.stopped: list[str] = []
         self.received_storage_state: dict[str, Any] | None = None
         self.storage_state = {"cookies": [{"name": "session", "value": "SUPERSECRETCOOKIEVALUE"}]}
+        self.capture_calls: list[tuple[str, str]] = []
+
+    async def auto_capture_credentials(
+        self, handle: str, app_slug: str, secret_store: Any
+    ) -> dict[str, str] | None:
+        self.capture_calls.append((handle, app_slug))
+        reference = secret_store.put(
+            app_slug=app_slug,
+            kind="api_token",
+            value="c" * 40,
+        )
+        return {"api_token": reference}
 
     async def start(
         self,
@@ -347,6 +359,47 @@ class TestSessionRpcLifecycle:
             gone = client.get(f"/internal/browser/sessions/{session_id}/status", headers=_headers())
             assert gone.status_code == 404
 
+    def test_capture_endpoint_vaults_locally_and_returns_only_reference(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cryptography.fernet import Fernet
+
+        from ops.config import Settings as OpsSettings
+        from ops.secret_store import SQLiteSecretStore
+
+        key = Fernet.generate_key().decode()
+        vault_path = tmp_path / "vault" / "credentials.db"
+        real_from_env = OpsSettings.from_env
+        monkeypatch.setattr(
+            OpsSettings,
+            "from_env",
+            staticmethod(
+                lambda *a, **k: real_from_env(dotenv_path=None).model_copy(
+                    update={
+                        "secret_vault_key": SecretStr(key),
+                        "secret_vault_db_path": vault_path,
+                    }
+                )
+            ),
+        )
+        client, worker = _client()
+        with client:
+            session_id = _create_session(client)["session_id"]
+            response = client.post(
+                f"/internal/browser/sessions/{session_id}/capture-credentials",
+                json={},
+                headers=_headers(),
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert set(body) == {"credential_refs"}
+        reference = body["credential_refs"]["api_token"]
+        assert reference.startswith("vault://pipedrive/api_token/")
+        assert "c" * 40 not in response.text
+        assert SQLiteSecretStore(vault_path, key).get(reference) == "c" * 40
+        assert worker.capture_calls == [("pw_fake_1", "pipedrive")]
+
     def test_navigate_never_types_a_raw_value_and_requires_a_configured_vault(self) -> None:
         """A raw credential value must never reach the worker.
 
@@ -582,9 +635,7 @@ class TestSessionManagerLifecycle:
                 inactivity_seconds=30,
                 closer=flaky_closer,
             )
-            session = manager.create(
-                owner=OWNER, app_slug="pipedrive", live_view_mode="screenshot"
-            )
+            session = manager.create(owner=OWNER, app_slug="pipedrive", live_view_mode="screenshot")
             session.last_active_at = datetime.now(UTC) - timedelta(hours=1)
 
             assert await manager.sweep() == ()
@@ -840,9 +891,7 @@ class TestInteractiveHitlGrants:
                 ).status_code
                 == 200
             )
-            token, _ = issue_live_view_token(
-                session_id=session_id, owner=OWNER, secret=TOKEN
-            )
+            token, _ = issue_live_view_token(session_id=session_id, owner=OWNER, secret=TOKEN)
 
             def _open_socket() -> None:
                 try:
@@ -2338,6 +2387,59 @@ class TestTransientSecretRoundTrip:
         assert body["secret_scope"] == "run-xyz"
         assert body["account_ref"] == "abc123hash"
         assert body["use_storage_state"] is True
+
+    def test_client_capture_accepts_only_valid_vault_references(self) -> None:
+        import httpx
+
+        from ops.browser_service_client import BrowserServiceClient
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path.endswith("/bs_1/capture-credentials")
+            return httpx.Response(
+                200,
+                json={"credential_refs": {"api_token": "vault://pipedrive/api_token/reference_1"}},
+            )
+
+        client = BrowserServiceClient(
+            base_url="http://browser-worker:8081",
+            token=TOKEN,
+            owner=OWNER,
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        refs = asyncio.run(client.auto_capture_credentials("bs_1", "pipedrive"))
+        assert refs == {"api_token": "vault://pipedrive/api_token/reference_1"}
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"credential_refs": {"api_token": "raw-secret-value"}},
+            {"credential_refs": {"API TOKEN": "vault://pipedrive/api_token/ref"}},
+            {"credential_refs": {"api_token": "vault://hubspot/api_token/ref"}},
+            {"credential_refs": {"api_token": "vault://pipedrive/access_token/ref"}},
+            {"credential_refs": {}, "raw_value": "forbidden"},
+        ],
+    )
+    def test_client_capture_rejects_malformed_or_raw_responses(
+        self, payload: dict[str, Any]
+    ) -> None:
+        import httpx
+
+        from ops.browser_service_client import BrowserServiceClient
+        from ops.provider_errors import ProviderOperationError
+
+        client = BrowserServiceClient(
+            base_url="http://browser-worker:8081",
+            token=TOKEN,
+            owner=OWNER,
+            client=httpx.AsyncClient(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, json=payload, request=request)
+                )
+            ),
+        )
+        with pytest.raises(ProviderOperationError) as excinfo:
+            asyncio.run(client.auto_capture_credentials("bs_1", "pipedrive"))
+        assert excinfo.value.reason_code == "invalid_capture_response"
 
 
 # --------------------------------------- P0-6: storage-state runtime binding

@@ -1199,19 +1199,29 @@ class PlaywrightBrowserWorker:
                 session.screenshot = None
                 session.screenshot_at = None
 
-            gate = detect_human_gate(inspection)
-            if gate is not None:
-                return gate
-
-            # A visible login form is a credential request, not evidence for a
-            # trace-authored CAPTCHA/provider-verification instruction. Classify
-            # the actual DOM before consulting the current checkpoint so an
-            # initial no-credential run asks for credentials explicitly. Resume
-            # secrets are handled above and never pass through this branch.
+            # A visible login form is a credential request, not a CAPTCHA merely
+            # because the page embeds a passive reCAPTCHA anchor/badge iframe.
+            # Inspect the actual form BEFORE generic structural gates on the
+            # initial no-secret pass. Real challenges still win when no login form
+            # is present, and post-submit challenges are classified by drive_login.
             if not sensitive_data and resume_signal is None:
                 login_gate = await self._login_gate_for_current_page(session)
                 if login_gate is not None:
                     return login_gate
+                # With no login form, inspect iframe metadata directly so a
+                # normal visible reCAPTCHA checkbox anchor is still a real gate.
+                # Snapshot names alone cannot distinguish it from an invisible
+                # provider badge.
+                if await visible_login_challenge(_active_page(session)):
+                    return self._human_required(
+                        session,
+                        "An interactive CAPTCHA must be completed by a human.",
+                        action_type="captcha",
+                    )
+
+            gate = detect_human_gate(inspection)
+            if gate is not None:
+                return gate
 
             # Only now, on a page proven non-sensitive, refresh the live view.
             await self.refresh_live_view(session)
@@ -2586,6 +2596,11 @@ _OTP_NAME = re.compile(
     r"(?i)one[-_ ]?time|verification code|security code|\botp\b|passcode|\bcode\b"
 )
 _CAPTCHA_NAME = re.compile(r"(?i)captcha|i'?m not a robot|are you human")
+# Provider pages commonly embed a visible reCAPTCHA anchor/badge iframe even
+# before a challenge exists. For iframe snapshots, require evidence that the
+# presented frame is the actual challenge/checkbox surface; ``reCAPTCHA`` alone
+# is intentionally insufficient.
+_ACTIVE_CAPTCHA_IFRAME = re.compile(r"(?i)challenge|checkbox|bframe|i'?m not a robot|are you human")
 _CONSENT_NAME = re.compile(
     r"(?i)^(?:i )?(?:agree|accept)\b|accept (?:the )?terms|accept and continue"
 )
@@ -2606,7 +2621,7 @@ _INTERACTIVE_ROLES = frozenset(
 
 
 def _is_actionable(element: SnapshotElement) -> bool:
-    return element.role.casefold() in _INTERACTIVE_ROLES
+    return element.role.casefold() in _INTERACTIVE_ROLES and element.actionable()
 
 
 def classify_structural_gate(
@@ -2619,9 +2634,12 @@ def classify_structural_gate(
         element_type = element.element_type.casefold()
         role = element.role.casefold()
 
-        # An interactive challenge: a captcha widget/iframe or its control. A passive
-        # badge is a non-actionable node and therefore ignored.
-        if _CAPTCHA_NAME.search(name) and (_is_actionable(element) or role == "iframe"):
+        # A provider badge/anchor iframe named only "reCAPTCHA" is passive and
+        # must not preempt a real login form. Actual challenge/checkbox frames and
+        # ordinary actionable CAPTCHA controls remain human gates.
+        captcha_control = role != "iframe" and _CAPTCHA_NAME.search(name)
+        captcha_frame = role == "iframe" and _ACTIVE_CAPTCHA_IFRAME.search(name)
+        if (captcha_control or captcha_frame) and _is_actionable(element):
             return "captcha", "An interactive CAPTCHA must be completed by a human."
 
         # A real OTP/code entry field (an input, not prose mentioning a code).

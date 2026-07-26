@@ -10,6 +10,7 @@ from __future__ import annotations
 import secrets
 from pathlib import Path
 
+import pytest
 from cryptography.fernet import Fernet
 
 from ops.browser_worker import BrowserObservation, BrowserSessionContext
@@ -30,9 +31,14 @@ HUBSPOT_ENDPOINT = "https://api.hubapi.com/account-info/v3/details"
 
 
 class _FakeBrowser:
+    provider_name = "browser_use"
+
     def __init__(self, outcome: str = "credential_page_ready") -> None:
         self.outcome = outcome
         self.starts = 0
+        self.capture_calls = 0
+        self.stopped: list[str] = []
+        self.last_capture_ref: str | None = None
 
     async def start(self, profile_id: str | None, **_kwargs: object) -> BrowserSessionContext:
         self.starts += 1
@@ -79,7 +85,25 @@ class _FakeBrowser:
         credential_creation_policy: str = "reuse_only",
         provider_session_id: object = None,
     ) -> BrowserObservation:
-        raise AssertionError("resume is out of scope")
+        del context, signal, research, sensitive_data, credential_creation_policy
+        del provider_session_id
+        return BrowserObservation(
+            status="credential_page_ready",
+            current_url="https://developers.hubspot.com/apps/new",
+            page_title="Create a developer app",
+        )
+
+    async def auto_capture_credentials(
+        self, handle: str, app_slug: str, secret_store: SQLiteSecretStore
+    ) -> dict[str, str]:
+        assert handle == "browser-sess-1"
+        self.capture_calls += 1
+        reference = secret_store.put(app_slug=app_slug, kind="access_token", value=RAW_SECRET)
+        self.last_capture_ref = reference
+        return {"access_token": reference}
+
+    async def stop(self, context: BrowserSessionContext) -> None:
+        self.stopped.append(context.session_id)
 
 
 class _StubPreflight:
@@ -158,6 +182,14 @@ class _FakeValidator:
         )
 
 
+class _ExplodingValidator:
+    async def validate(
+        self, *, app_slug: str, credential_refs: dict[str, str]
+    ) -> CredentialValidationResult:
+        del app_slug, credential_refs
+        raise RuntimeError("simulated validation failure")
+
+
 def _request(app_name: str) -> OperationsRequest:
     return OperationsRequest(
         app_name=app_name,
@@ -189,16 +221,18 @@ def _service(
     browser_outcome: str = "credential_page_ready",
     gmail: object = None,
 ) -> RunService:
+    browser = _FakeBrowser(browser_outcome)
     workflow = build_graph(
         checkpoint_path=tmp / "private" / "checkpoints.db",
         encryption_key=secrets.token_bytes(32),
         dependencies=WorkflowDependencies(
             research_loader=_reviewed_hubspot_research,
-            browser=_FakeBrowser(browser_outcome),  # type: ignore[arg-type]
+            browser=browser,  # type: ignore[arg-type]
+            browsers={"browser_use": browser, "playwright": browser},  # type: ignore[dict-item]
             gmail=gmail,  # type: ignore[arg-type]
         ),
     )
-    return RunService.from_paths(
+    service = RunService.from_paths(
         db_path=tmp / "private" / "ops.db",
         settings=Settings(),
         workflow=workflow,
@@ -206,6 +240,12 @@ def _service(
         credential_capturer=capturer,  # type: ignore[arg-type]
         credential_validator=validator,  # type: ignore[arg-type]
     )
+    service._browser_worker = browser  # noqa: SLF001 - focused adapter-boundary fixture
+    service._browser_workers = {  # type: ignore[dict-item]  # noqa: SLF001
+        "browser_use": browser,
+        "playwright": browser,
+    }
+    return service
 
 
 def _store(tmp: Path) -> SQLiteSecretStore:
@@ -374,6 +414,76 @@ def test_waiting_for_hitl_does_not_capture_credentials(tmp_path: Path) -> None:
     assert run["status"] == "waiting_for_hitl"
     assert capture.calls == 0
     assert validator.calls == 0
+
+
+def test_resume_from_hitl_captures_validates_and_completes(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    validator = _FakeValidator("valid")
+    service = _service(
+        tmp_path,
+        capturer=_FakeCapture(store),
+        validator=validator,
+        browser_outcome="hitl",
+    )
+    service._secret_store = store  # noqa: SLF001 - shared vault boundary under test
+    browser = service._browser_worker  # noqa: SLF001 - selected adapter under test
+    browser.provider_name = "playwright"
+
+    request = _request(SELF_SERVE_APP).model_copy(update={"browser_provider": "playwright"})
+    waiting = service.create_run(request, execution_mode="execute_when_configured")
+    resumed = service.resume_run(waiting["run_id"], signal="completed")
+    events = _events(service, waiting["run_id"])
+    output = service.get_output(waiting["run_id"])
+
+    browser = service._browser_worker  # noqa: SLF001 - assert selected adapter invocation
+    assert waiting["status"] == "waiting_for_hitl"
+    assert resumed["status"] == "completed"
+    assert browser.capture_calls == 1
+    assert browser.stopped == ["browser-sess-1"]
+    assert validator.calls == 1
+    assert output is not None
+    assert output["credential_refs"]["access_token"].startswith("vault://")
+    for expected in (
+        "credential_page_ready",
+        "credential_capture_started",
+        "credentials_stored",
+        "credentials_validated",
+        "integrator_bundle_generated",
+    ):
+        assert expected in events
+    assert RAW_SECRET not in repr(resumed) + repr(service.get_timeline(waiting["run_id"]))
+
+
+def test_resume_finalization_failure_is_durable_and_releases_playwright(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    service = _service(
+        tmp_path,
+        capturer=_FakeCapture(store),
+        validator=_ExplodingValidator(),
+        browser_outcome="hitl",
+    )
+    service._secret_store = store  # noqa: SLF001 - shared vault boundary under test
+    browser = service._browser_worker  # noqa: SLF001 - selected adapter teardown
+    browser.provider_name = "playwright"
+    request = _request(SELF_SERVE_APP).model_copy(update={"browser_provider": "playwright"})
+
+    waiting = service.create_run(request, execution_mode="execute_when_configured")
+    resumed = service.resume_run(waiting["run_id"], signal="completed")
+    stored = service.storage.get_run(waiting["run_id"])
+    events = _events(service, waiting["run_id"])
+    browser = service._browser_worker  # noqa: SLF001 - assert selected adapter teardown
+
+    assert resumed["status"] == "configuration_required"
+    assert stored is not None
+    assert stored["status"] == "configuration_required"
+    assert stored["route_reason_code"] == "credential_finalization_failed"
+    assert "credential_finalization_failed" in events
+    assert browser.stopped == ["browser-sess-1"]
+    assert browser.last_capture_ref is not None
+    with pytest.raises(SecretNotFoundError):
+        store.get(browser.last_capture_ref)
 
 
 def test_gated_flow_does_not_invoke_credential_capture(tmp_path: Path) -> None:

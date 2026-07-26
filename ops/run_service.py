@@ -3377,16 +3377,146 @@ class RunService:
             )
             current_url = state.get("current_url")
             still_blocked = bool(interrupts) or observation_status == "human_action_required"
-            next_status: RunStatus = "waiting_for_hitl" if still_blocked else "browser_running"
+            next_status: RunStatus
+            capture_events: list[tuple[str, dict[str, object]]] = []
+            capture_updates: dict[str, object] = {}
+            provider_browser = "running"
+            validation_status = "not_started"
+
             if signal == "cancelled":
                 next_status = "blocked"
+                provider_browser = "blocked"
+            elif still_blocked:
+                next_status = "waiting_for_hitl"
+            elif observation_status in {"credential_page_ready", "developer_console_ready"}:
+                next_status = "browser_running"
+                provider_browser = "credential_page_ready"
+                capture_events.append(
+                    (
+                        "credential_page_ready",
+                        {
+                            "current_url": current_url,
+                            "status": "browser_running",
+                            "external_actions": True,
+                        },
+                    )
+                )
+                research_payload = state.get("operational_research")
+                if not isinstance(research_payload, Mapping):
+                    research_payload = current.get("operational_research")
+                request_payload = state.get("request")
+                try:
+                    research_obj = OperationalResearch.model_validate(research_payload)
+                    request_obj = OperationsRequest.model_validate(request_payload)
+                except Exception:
+                    research_obj = None
+                    request_obj = None
+
+                selected_worker = self._browser_worker_for(
+                    cast(BrowserProvider, current.get("browser_provider", "browser_use"))
+                )
+                auto_capture = getattr(selected_worker, "auto_capture_credentials", None)
+                captured_refs: dict[str, str] | None = None
+                if (
+                    research_obj is not None
+                    and request_obj is not None
+                    and callable(auto_capture)
+                    and self._credential_validator is not None
+                    and self._secret_store is not None
+                ):
+                    capture_events.append(
+                        (
+                            "credential_capture_started",
+                            {
+                                "app_slug": research_obj.app_slug,
+                                "external_actions": True,
+                            },
+                        )
+                    )
+                    handle = str(
+                        state.get("browser_session_id") or current.get("browser_session_id") or ""
+                    )
+                    try:
+                        captured_refs = asyncio.run(
+                            auto_capture(handle, research_obj.app_slug, self._secret_store)
+                        )
+                    except Exception as exc:
+                        log_event(
+                            "browser.resume.autocapture_error",
+                            level=40,
+                            run_id=run_id,
+                            error=type(exc).__name__,
+                        )
+                        next_status = "configuration_required"
+                        validation_status = "configuration_required"
+                        capture_updates["route_reason_code"] = "credential_capture_failed"
+                        capture_events.append(
+                            (
+                                "credential_capture_failed",
+                                {
+                                    "reason_code": "credential_capture_failed",
+                                    "external_actions": True,
+                                },
+                            )
+                        )
+
+                if captured_refs and research_obj is not None and request_obj is not None:
+                    try:
+                        outcome = self._finalize_captured_credentials(
+                            research_obj, request_obj, captured_refs
+                        )
+                    except Exception as exc:
+                        log_event(
+                            "browser.resume.credential_finalization_error",
+                            level=40,
+                            run_id=run_id,
+                            error=type(exc).__name__,
+                        )
+                        # Finalization never persisted these refs. Remove the
+                        # just-captured entries best-effort so an unexpected
+                        # validator/bundle error cannot leave unreachable vault
+                        # rows behind.
+                        store = self._secret_store
+                        if store is not None:
+                            for reference in captured_refs.values():
+                                with contextlib.suppress(Exception):
+                                    store.delete(reference)
+                        next_status = "configuration_required"
+                        validation_status = "configuration_required"
+                        capture_updates["route_reason_code"] = "credential_finalization_failed"
+                        capture_events.append(
+                            (
+                                "credential_finalization_failed",
+                                {
+                                    "reason_code": "credential_finalization_failed",
+                                    "external_actions": True,
+                                },
+                            )
+                        )
+                    else:
+                        next_status = cast(RunStatus, outcome.status)
+                        validation_status = outcome.validation_status or "configuration_required"
+                        capture_updates["route_reason_code"] = outcome.reason_code
+                        if outcome.bundle is not None:
+                            capture_updates["integrator_bundle"] = outcome.bundle
+                        capture_events.extend(outcome.events)
+            else:
+                next_status = "browser_running"
 
             with self.storage.unit_of_work() as transaction:
                 record = transaction.get_run(run_id)
                 if record is None:  # pragma: no cover - re-checked under lock
                     raise KeyError("run was not found")
                 revision = int(record.get("state_revision", 0) or 0) + 1
-                validate_status_transition("waiting_for_hitl", next_status, "resume")
+                if next_status == "completed":
+                    # Capture completed all three domain phases during this one
+                    # atomic resume projection; validate every legal edge even
+                    # though only the terminal row is persisted.
+                    validate_status_transition("waiting_for_hitl", "browser_running", "resume")
+                    validate_status_transition("browser_running", "credentials_ready", "resume")
+                    validate_status_transition("credentials_ready", "completed", "resume")
+                else:
+                    validate_status_transition("waiting_for_hitl", next_status, "resume")
                 hitl_payload: dict[str, object] | None = None
                 if next_status == "waiting_for_hitl":
                     source = interrupts[0] if interrupts else state.get("hitl_request")
@@ -3398,6 +3528,13 @@ class RunService:
                     "last_projected_revision": revision,
                     "external_actions": True,
                     "hitl_request": hitl_payload,
+                    "provider_status": {
+                        "research": "baseline_ready",
+                        "browser": provider_browser,
+                        "email": "not_started",
+                        "validation": validation_status,
+                    },
+                    **capture_updates,
                 }
                 if isinstance(current_url, str) and current_url:
                     changes["browser_live_url"] = None  # never persist the signed URL
@@ -3431,16 +3568,13 @@ class RunService:
                             "external_actions": True,
                         },
                     )
-                elif next_status == "browser_running":
-                    transaction.append_audit_event(
-                        run_id=run_id,
-                        event_type="credential_page_ready",
-                        payload={
-                            "current_url": current_url,
-                            "status": "browser_running",
-                            "external_actions": True,
-                        },
-                    )
+                else:
+                    for event_type, payload in capture_events:
+                        transaction.append_audit_event(
+                            run_id=run_id,
+                            event_type=event_type,
+                            payload=payload,
+                        )
                 projected = _public_run(updated)
             if next_status in _TERMINAL_BROWSER_STATUSES:
                 # A cancelled (or otherwise terminal) resume ends the run, so the

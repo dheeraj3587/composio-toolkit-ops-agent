@@ -8,9 +8,12 @@ code-owned values the service itself resolves.
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from ops.models import validate_vault_reference
 
 SessionLifecycle = Literal["ACTIVE", "CLOSING", "CLOSED"]
 LiveViewMode = Literal["screenshot", "interactive_remote"]
@@ -116,6 +119,27 @@ class ObservationResponse(_Strict):
     session: SessionSummary | None = None
 
 
+class CaptureCredentialsResponse(_Strict):
+    """Reference-only result of deterministic service-local capture.
+
+    A credential value has no representable field in this contract. Validation
+    also prevents a malformed/raw value from escaping if a worker implementation
+    violates its boundary.
+    """
+
+    credential_refs: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("credential_refs")
+    @classmethod
+    def _references_only(cls, values: dict[str, str]) -> dict[str, str]:
+        references: dict[str, str] = {}
+        for name, value in values.items():
+            if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,99}", name) is None:
+                raise ValueError("invalid credential kind")
+            references[name] = validate_vault_reference(value)
+        return references
+
+
 class LiveViewGrant(_Strict):
     """A short-lived, session-bound interactive-HITL grant.
 
@@ -152,6 +176,7 @@ class ErrorResponse(_Strict):
 
 
 __all__ = [
+    "CaptureCredentialsResponse",
     "CreateSessionRequest",
     "ErrorResponse",
     "HealthResponse",
