@@ -29,7 +29,7 @@ from pydantic import SecretStr
 
 from ops.browser_api_trace_catalog import get_browser_api_trace
 from ops.browser_link_log import log_event, url_host
-from ops.browser_worker import BrowserWorker
+from ops.browser_worker import BrowserSessionContext, BrowserWorker
 from ops.composio_capability import ComposioCapabilityPreflight, ComposioCapabilityReport
 from ops.config import Settings
 from ops.credential_validator import (
@@ -674,11 +674,15 @@ class RunService:
     ) -> None:
         if not run_id:
             return
+        release_provider: BrowserProvider | None = None
         try:
             with self.storage.unit_of_work() as transaction:
                 current = transaction.get_run(run_id)
                 if current is None or current.get("status") not in stranded_statuses:
                     return
+                release_provider = cast(
+                    BrowserProvider, current.get("browser_provider", "browser_use")
+                )
                 previous_status = cast(RunStatus, current["status"])
                 revision = int(current.get("state_revision", 0) or 0) + 1
                 validate_status_transition(previous_status, "configuration_required", "reconcile")
@@ -697,6 +701,12 @@ class RunService:
                         "reason": reason,
                         "external_actions": False,
                     },
+                )
+            if release_provider is not None:
+                self._release_browser_session(
+                    self._session_context_for(run_id),
+                    release_provider,
+                    reason=f"reconcile_{reason}",
                 )
         except Exception:  # pragma: no cover - per-run best effort
             LOGGER.warning("could not reconcile a stranded run on startup")
@@ -1610,6 +1620,14 @@ class RunService:
                         and research.credential_management_url
                         and get_browser_api_trace(research.app_slug) is not None
                     )
+                    # The pre-created session is attempted first, but a provider
+                    # failure must NOT abort run creation. It previously raised
+                    # straight out of create_run, which returned an unhandled 500
+                    # and persisted NOTHING: the operator saw "the operations API is
+                    # unavailable" with no run in the ledger and no way to see why.
+                    # A failed start now falls through to the durable workflow, which
+                    # records a truthful failure state for a run that really exists.
+                    context = None
                     if (
                         self._async_browser_enabled
                         and is_self_serve
@@ -1644,15 +1662,21 @@ class RunService:
                                     live_view_mode="screenshot",
                                 )
                             )
+                        except (TypeError, AttributeError, AssertionError, NameError):
+                            raise  # a programming error must surface, never degrade
                         except Exception as exc:
+                            # Sanitized reason only; the durable workflow below now
+                            # records the outcome against a persisted run.
                             log_event(
                                 "run.dispatch.session_error",
                                 level=40,
                                 run_id=run_id,
                                 thread_id=thread_id,
                                 error=type(exc).__name__,
+                                reason_code=str(getattr(exc, "reason_code", "") or "unknown"),
                             )
-                            raise
+                            context = None
+                    if context is not None:
                         pending_async_navigate = (context, start_sensitive_data)
                         workflow_state: OperationsState = {
                             "status": "browser_running",
@@ -1669,6 +1693,8 @@ class RunService:
                             live_view_available=context.live_view_available,
                         )
                     else:
+                        # Reached either because Option A does not apply to this run
+                        # or because the pre-created session failed above.
                         log_event(
                             "run.dispatch.begin",
                             run_id=run_id,
@@ -2037,6 +2063,11 @@ class RunService:
                 error=type(exc).__name__,
             )
             self._mark_async_browser_failed(run_id)
+            # The run is terminal, so its pre-created session must not keep the
+            # single Playwright slot until the idle sweep.
+            self._release_browser_session(
+                context, request.browser_provider, reason="async_workflow_error"
+            )
             return
         finally:
             if sensitive_data is not None:
@@ -2044,6 +2075,9 @@ class RunService:
         try:
             self._apply_async_browser_result(run_id, thread_id, request, workflow_state, context)
         except Exception as exc:  # pragma: no cover - defensive
+            self._release_browser_session(
+                context, request.browser_provider, reason="async_apply_error"
+            )
             log_event(
                 "browser.async.apply_error",
                 level=40,
@@ -2081,12 +2115,22 @@ class RunService:
         with lock:
             record = self.storage.get_run(run_id)
             if record is None:
+                self._release_browser_session(
+                    context, request.browser_provider, reason="async_run_missing"
+                )
                 return
             previous = str(record.get("status") or "browser_running")
             if previous != "browser_running":
                 # A resume or another writer already advanced the run; do not
-                # clobber its state.
+                # clobber its state. If that writer made the run terminal, make
+                # teardown idempotently certain here as well.
                 log_event("browser.async.apply_skip", run_id=run_id, prev_status=previous)
+                if previous in _TERMINAL_BROWSER_STATUSES:
+                    self._release_browser_session(
+                        context,
+                        request.browser_provider,
+                        reason=f"async_apply_skip_{previous}",
+                    )
                 return
 
             events: list[tuple[str, dict[str, object]]] = []
@@ -2208,6 +2252,9 @@ class RunService:
             with self.storage.unit_of_work() as transaction:
                 rec = transaction.get_run(run_id)
                 if rec is None:  # pragma: no cover
+                    self._release_browser_session(
+                        context, request.browser_provider, reason="async_transaction_run_missing"
+                    )
                     return
                 revision = int(rec.get("state_revision", 0) or 0) + 1
                 if previous != next_status:
@@ -2256,17 +2303,65 @@ class RunService:
         inspection), so this branch must never stop them.
         """
 
+        if next_status not in _TERMINAL_BROWSER_STATUSES:
+            return
+        self._release_browser_session(
+            context,
+            provider,
+            reason=f"async_terminal_{next_status}",
+        )
+
+    def _release_browser_session(
+        self,
+        context: Any,
+        provider: BrowserProvider,
+        *,
+        reason: str,
+    ) -> None:
+        """Release a self-hosted browser session for a run that is finished.
+
+        Idempotent and never fatal: the browser service's own close is idempotent,
+        so a duplicate call is a no-op. Every TERMINAL path must come through here,
+        because a Playwright deployment runs a single-session display: a slot left
+        held by a finished run makes the NEXT run fail with capacity_exhausted
+        until the idle sweep eventually notices.
+        """
+
         worker = self._browser_worker_for(provider)
         if context is None or worker is None:
             return
-        if next_status not in _TERMINAL_BROWSER_STATUSES:
-            return
         if str(getattr(worker, "provider_name", "browser_use")) != "playwright":
+            # Browser Use owns its own retention/reconciliation semantics.
             return
         try:
             asyncio.run(worker.stop(context))
-        except Exception:  # pragma: no cover - cleanup must never break the run
-            log_event("browser.async.terminal_stop_error", level=30, status=next_status)
+        except Exception:
+            log_event("browser.session.release_error", level=30, reason=reason)
+        else:
+            log_event("browser.session.released", reason=reason)
+
+    def _session_context_for(self, run_id: str) -> Any:
+        """A minimal session handle for a persisted run, or None.
+
+        Teardown only needs the session id, so this avoids reconstructing worker
+        state that no longer exists after a restart.
+        """
+
+        record = self.storage.get_run(run_id)
+        if record is None:
+            return None
+        session_id = record.get("browser_session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        return BrowserSessionContext(
+            profile_id=session_id,
+            session_id=session_id,
+            live_view_available=False,
+            allowed_domains=(),
+            created_at="",
+            inactivity_expires_at="",
+            maximum_expires_at="",
+        )
 
     def _mark_async_browser_failed(self, run_id: str) -> None:
         """Best-effort transition of a stuck browser_running run to failed."""
@@ -2750,7 +2845,15 @@ class RunService:
 
         with self.storage.unit_of_work() as transaction:
             result = self._apply_projection(transaction, run_id, state, revision, command)
-            return _public_run(result)
+            projected = _public_run(result)
+        projected_status = str(result.get("status") or "")
+        if projected_status in _TERMINAL_BROWSER_STATUSES:
+            self._release_browser_session(
+                self._session_context_for(run_id),
+                cast(BrowserProvider, result.get("browser_provider", "browser_use")),
+                reason=f"project_{projected_status}",
+            )
+        return projected
 
     def _apply_projection(
         self,
@@ -2841,9 +2944,19 @@ class RunService:
                     last_projected_revision=new_revision,
                     **changes,
                 )
-                return _public_run(updated)
+                projected = _public_run(updated)
+                release_provider = cast(
+                    BrowserProvider, updated.get("browser_provider", "browser_use")
+                )
         finally:
             lock.release()
+        if next_status in _TERMINAL_BROWSER_STATUSES:
+            self._release_browser_session(
+                self._session_context_for(run_id),
+                release_provider,
+                reason=f"guarded_status_{next_status}",
+            )
+        return projected
 
     def get_browser_screenshot(self, run_id: str) -> tuple[bytes, str] | None:
         """Return the newest masked screenshot for a run's browser session.
@@ -3328,7 +3441,16 @@ class RunService:
                             "external_actions": True,
                         },
                     )
-                return _public_run(updated)
+                projected = _public_run(updated)
+            if next_status in _TERMINAL_BROWSER_STATUSES:
+                # A cancelled (or otherwise terminal) resume ends the run, so the
+                # session is released here instead of lingering as a held slot.
+                self._release_browser_session(
+                    self._session_context_for(run_id),
+                    cast(BrowserProvider, current.get("browser_provider", "browser_use")),
+                    reason=f"resume_{next_status}",
+                )
+            return projected
         finally:
             lock.release()
 
@@ -3463,9 +3585,18 @@ class RunService:
                         "external_actions": True,
                     },
                 )
-                return _public_run(updated)
+                projected = _public_run(updated)
+                release_provider = cast(
+                    BrowserProvider, current.get("browser_provider", "browser_use")
+                )
         finally:
             lock.release()
+        self._release_browser_session(
+            self._session_context_for(run_id),
+            release_provider,
+            reason=f"credentials_{final_status}",
+        )
+        return projected
 
     def snapshot_provenance(self) -> P1SnapshotProvenance:
         return load_verified_snapshot(self.p1_adapter.snapshot_root).provenance

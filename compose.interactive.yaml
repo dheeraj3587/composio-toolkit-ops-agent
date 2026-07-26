@@ -1,0 +1,21 @@
+services:
+  api:
+    environment:
+      ALLOW_LOCAL_CREDENTIAL_SUBMISSION: "true"
+      BROWSER_INTERACTIVE_HITL_ENABLED: "true"
+
+  browser-worker:
+    environment:
+      BROWSER_INTERACTIVE_HITL_ENABLED: "true"
+      PLAYWRIGHT_MAX_SESSIONS: "1"
+      BROWSER_DISPLAY_NUM: "99"
+      BROWSER_SCREEN_GEOMETRY: "1440x900x24"
+      BROWSER_VNC_PORT: "5900"
+      TZ: Asia/Singapore
+
+    tmpfs:
+      - /tmp/.X11-unix:rw,nosuid,nodev,size=16m,mode=1777
+  caddy:
+    environment:
+      # The WebSocket owner must match the API/browser-worker session owner.
+      BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-assignment-owner}

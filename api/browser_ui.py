@@ -39,7 +39,10 @@ SESSION_LOST_REASONS = frozenset(
 # HITL action types an owner can actually clear by supplying sign-in credentials.
 # A CAPTCHA, OTP, passkey, billing or consent gate is NOT one of them, so the
 # login form must never be offered for those.
-LOGIN_HITL_ACTIONS = frozenset({"provider_verification", "account_selection", "login_required"})
+# Only a missing-login gate requires another email/password submission.
+# Provider verification and account selection are completed directly
+# through the interactive browser.
+LOGIN_HITL_ACTIONS = frozenset({"login_required"})
 
 # Terminal run statuses: no browser mutation is legal from any of them.
 TERMINAL_RUN_STATUSES = frozenset({"completed", "blocked", "failed"})

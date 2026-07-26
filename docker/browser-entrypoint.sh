@@ -28,6 +28,22 @@ is_enabled() {
     esac
 }
 
+# Chromium needs a WRITABLE HOME even when it persists no profile: a HEADFUL
+# startup touches $HOME for GTK/dconf, fontconfig and NSS state. The image WORKDIR
+# (/app) sits on the read-only root filesystem, so a headful launch died instantly
+# with SIGTRAP, surfaced by Playwright as "Target page, context or browser has been
+# closed", while HEADLESS - which touches none of that - kept working. That is why
+# the readiness probe stayed green while every real session failed to start.
+# Point HOME and the XDG directories at the writable tmpfs instead.
+BROWSER_HOME="${BROWSER_HOME:-/tmp/browser-home}"
+HOME="${BROWSER_HOME}"
+XDG_CACHE_HOME="${BROWSER_HOME}/.cache"
+XDG_CONFIG_HOME="${BROWSER_HOME}/.config"
+XDG_RUNTIME_DIR="${BROWSER_HOME}/run"
+mkdir -p "${XDG_CACHE_HOME}" "${XDG_CONFIG_HOME}" "${XDG_RUNTIME_DIR}"
+chmod 700 "${XDG_RUNTIME_DIR}"
+export HOME XDG_CACHE_HOME XDG_CONFIG_HOME XDG_RUNTIME_DIR
+
 if is_enabled "${BROWSER_INTERACTIVE_HITL_ENABLED:-false}"; then
     echo "browser-service: interactive HITL enabled, starting display stack" >&2
 

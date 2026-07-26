@@ -5,6 +5,7 @@ import { revalidatePath } from "next/cache"
 import {
   ApiError,
   getLiveView,
+  getRun,
   performPhaseAction,
   PhaseConflictError,
   resumeWithBrowserLogin,
@@ -21,6 +22,7 @@ import type {
 export interface PhaseActionState {
   message: string | null
   tone: "neutral" | "error"
+  interactiveStateVersion?: string | null
 }
 
 export async function runPhaseAction(
@@ -44,10 +46,20 @@ export async function runPhaseAction(
 
   try {
     const receipt = await performPhaseAction(runId, action, capability)
+    const refreshed = action === "resume" && receipt.status === "accepted"
+      ? await getRun(runId)
+      : null
+    const interactiveStateVersion =
+      refreshed?.browser?.provider === "playwright" &&
+      refreshed.browser.lifecycle === "waiting_for_hitl" &&
+      refreshed.browser.interaction_available
+        ? refreshed.run.updated_at
+        : null
     revalidatePath(`/runs/${encodeURIComponent(runId)}`)
     return {
       message: receipt.detail ?? (receipt.status === "no_change" ? "Backend state did not change." : "Backend accepted the action."),
       tone: receipt.status === "configuration_required" ? "error" : "neutral",
+      interactiveStateVersion,
     }
   } catch (error) {
     if (error instanceof PhaseConflictError) {

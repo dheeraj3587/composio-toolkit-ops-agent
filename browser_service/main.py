@@ -326,6 +326,11 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             )
         return app.state.worker
 
+    # The idle sweep must be able to see a human attached to the interactive
+    # relay; without this a waiting_for_hitl session is "idle" by definition and
+    # could be reaped while someone is using it.
+    manager.set_attachment_probe(lambda session_id: bool(live_attachments.get(session_id)))
+
     # Attach the real worker-backed closer now that the factory exists.
     manager.set_closer(
         make_session_closer(
@@ -381,7 +386,14 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 session.storage_binding = _storage_binding(payload, auth.owner)
         except Exception as exc:  # sanitized: never surface provider text
             await manager.close(session.session_id, reason_code="browser_launch_failed")
-            LOGGER.warning("browser launch failed: %s", type(exc).__name__)
+            # Log the provider's OWN sanitized reason code, not just the exception
+            # class. "browser launch failed: ProviderOperationError" told an
+            # operator nothing, so a launch failure could not be diagnosed from the
+            # service logs at all.
+            reason = str(getattr(exc, "reason_code", "") or "unknown")
+            LOGGER.warning(
+                "browser launch failed: reason=%s error=%s", reason, type(exc).__name__
+            )
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="browser_launch_failed"
             ) from None

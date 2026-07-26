@@ -60,16 +60,25 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
       ? ["running", "waiting_for_hitl", "credential_page_ready"].includes(browser.lifecycle)
       : ["waiting_for_hitl", "browser_running"].includes(detail.run.status))
 
-  // Do not show the generic resume beside a more specific credential action.
-  const canResume = browser
-    ? browser.can_resume && !browser.can_submit_login && !browser.can_submit_otp
-    : detail.run.status === "waiting_for_hitl" && detail.hitl_request?.resumable === true
+  // Interactive Playwright HITL has priority over generic controls.
   const interactivePlaywrightResume = Boolean(
-    canResume &&
-    browser?.provider === "playwright" &&
+    browser?.can_resume &&
+    browser.provider === "playwright" &&
     browser.lifecycle === "waiting_for_hitl" &&
     browser.interaction_available,
   )
+
+  // Do not show generic Resume beside interactive Playwright HITL
+  // or another specific credential action.
+  const canResume = browser
+    ? Boolean(
+        browser.can_resume &&
+          !interactivePlaywrightResume &&
+          !browser.can_submit_login &&
+          !browser.can_submit_otp,
+      )
+    : detail.run.status === "waiting_for_hitl" &&
+      detail.hitl_request?.resumable === true
 
   const canPoll = !isPlanOnly && ["outreach_sent", "waiting_for_reply"].includes(detail.run.status)
   const missingFields = Array.from(new Set([

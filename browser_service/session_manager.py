@@ -122,6 +122,7 @@ class SessionManager:
         maximum_age_seconds: int,
         drain_seconds: float,
         closer: Callable[[ManagedSession], Awaitable[None]] | None = None,
+        attachment_probe: Callable[[str], bool] | None = None,
     ) -> None:
         self._sessions: dict[str, ManagedSession] = {}
         self._lock = threading.RLock()
@@ -133,7 +134,30 @@ class SessionManager:
         self._capacity = threading.BoundedSemaphore(max_sessions)
         self._in_use = 0
         self._closer = closer
+        # Answers "is a human attached to this session's interactive relay right
+        # now?". Injected so the manager needs no knowledge of the WebSocket layer.
+        self._attachment_probe = attachment_probe
         self.janitor_running = False
+
+    def set_attachment_probe(self, probe: Callable[[str], bool]) -> None:
+        """Install the live-attachment probe used by the idle sweep."""
+
+        self._attachment_probe = probe
+
+    def is_attached(self, session_id: str) -> bool:
+        """Whether an authorized interactive client currently holds this session.
+
+        A probe failure is treated as ATTACHED: wrongly reaping a session a human
+        is driving is far worse than briefly holding one slot until max age.
+        """
+
+        probe = self._attachment_probe
+        if probe is None:
+            return False
+        try:
+            return bool(probe(session_id))
+        except Exception:
+            return True
 
     def set_closer(self, closer: Callable[[ManagedSession], Awaitable[None]]) -> None:
         """Install the closer after construction.
@@ -308,8 +332,18 @@ class SessionManager:
                 if session.lifecycle != "ACTIVE":
                     continue
                 if session.is_age_expired(moment):
+                    # The maximum-age ceiling is absolute: it bounds even a session
+                    # a human is still attached to, so a slot can never be held for
+                    # ever.
                     expired.append((session.session_id, "session_max_age_exceeded"))
                 elif session.is_idle_expired(moment, self._inactivity):
+                    # "Idle" means no autonomous operation ran recently, which is
+                    # precisely the state of a waiting_for_hitl session while a
+                    # person works in the interactive view. Reaping that would close
+                    # the browser under the human it is waiting for, so a pending
+                    # HITL gate with an attached client is not idle.
+                    if session.hitl_pending and self.is_attached(session.session_id):
+                        continue
                     expired.append((session.session_id, "session_idle_expired"))
         return tuple(expired)
 

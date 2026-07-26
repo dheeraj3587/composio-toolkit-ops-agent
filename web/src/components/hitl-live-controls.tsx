@@ -58,6 +58,7 @@ function SubmitButton({ label, pendingLabel }: { label: string; pendingLabel: st
 export function HitlLiveControls({
   runId,
   browser,
+  browserStateVersion,
   canResumeInteractive = false,
   fieldName = "api_token",
   fieldLabel = "API token",
@@ -133,10 +134,20 @@ export function HitlLiveControls({
     }, 3_000)
 
     return () => window.clearInterval(timer)
-  }, [isInteractiveHitl, isPlaywright, requestLiveView, runId])
+  }, [
+    browserStateVersion,
+    isInteractiveHitl,
+    isPlaywright,
+    requestLiveView,
+    resumeState.interactiveStateVersion,
+    runId,
+  ])
 
   function disconnectBeforeResume() {
     remoteViewRef.current?.disconnect()
+    // The next backend state version represents a new HITL generation on the
+    // same run and therefore needs a fresh, short-lived WebSocket grant.
+    interactiveRunWithGrant.current = null
     liveRequestSequence.current += 1
     liveRequestInFlight.current = null
     setLiveState({
