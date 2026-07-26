@@ -148,6 +148,8 @@ def test_create_and_detail_expose_verified_phase_two_contract(harness: ApiHarnes
         "status",
         "access_route",
         "execution_mode",
+        "browser_provider",
+        "credential_creation_policy",
         "external_actions",
         "created_at",
         "updated_at",
@@ -273,7 +275,8 @@ def test_timeline_endpoint_returns_summaries_not_raw_audit_payloads(
     assert payload["run_id"] == run_id
     assert payload["items"]
     assert all(
-        set(item) == {"event_type", "summary", "status", "created_at"} for item in payload["items"]
+        set(item) == {"event_id", "event_type", "summary", "status", "created_at"}
+        for item in payload["items"]
     )
     rendered = response.text
     assert "provider_payload" not in rendered

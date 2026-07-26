@@ -1,8 +1,9 @@
 # The Playwright autonomous browser harness
 
-> **Browser Use remains the production default.** `browser_provider` defaults to
-> `browser_use`, `compose.prod.yaml` is untouched, and the browser service exists
-> only in the sandbox stack. **Playwright is opt-in and is not deployed.**
+> **Per-run provider selection.** Older API and CLI calls still default to
+> `browser_use`. The website prefers Playwright when its isolated production
+> service is ready. Both adapters may be wired concurrently; a run never changes
+> provider or falls back after creation.
 >
 > **The LLM can only select policy-generated candidate IDs.** No model can author a
 > selector, a URL, typed text, JavaScript, shell, a credential value, an OTP or a
@@ -199,27 +200,25 @@ post-auth.
 
 ## 7. HITL
 
-**Screenshot HITL (the only usable mode today)**:
+**Screenshot HITL**:
 `GET /internal/browser/sessions/{id}/screenshot`, owner-gated. When no frame is
 available it returns **409 `screenshot_unavailable`** rather than serving a stale
 frame from a previous page. Availability is truthful: `screenshot_available` is
 False until a real, non-sensitive frame has been captured.
 
-**Interactive remote — DEFERRED and DISABLED.** An operator-usable interactive
-surface would require a same-origin noVNC HTML client, an authenticated API
-WebSocket proxy (a browser `WebSocket()` cannot send a custom owner header), a URL
-that is not the private Docker hostname, and per-session display isolation. None of
-that is implemented end to end, so the feature is **not** available:
-`BrowserServiceSettings` **rejects `interactive_hitl_enabled=true`** (a flag that
-looks functional but yields a dead URL is worse than an honestly disabled one).
-`SessionSummary` reports `interactive_supported=False` and
-`interactive_available=False`. Screenshot HITL is unaffected.
+**Interactive remote — configuration-gated.** The assignment deployment enables a
+single-session, same-origin noVNC client only while a Playwright run is paused for
+human action. FastAPI requests a private, short-lived grant from the browser service;
+the Next.js server validates that exact internal URL and returns only the relative
+same-origin path to the client. Caddy terminates Basic Auth, strips its Authorization
+header, injects the fixed browser owner, and proxies that one WebSocket route. The
+grant remains bound to the owner and session, while x11vnc and browser RPC ports stay
+private. Resume disconnects the client before continuing automation, and an expired
+grant requires an operator-initiated reconnect.
 
-The signed, session-and-owner-bound, short-lived grant token
-(`ops.browser_live_view`) and the loopback-only relay (`browser_service/novnc.py`)
-remain in the tree behind the flag and are unit-tested, so the eventual
-implementation has reviewed primitives to build on — but interactive HITL must be
-treated as **not yet implemented**.
+The container has one X display, so interactive configuration is valid only with
+`PLAYWRIGHT_MAX_SESSIONS=1`. Other deployments may leave
+`BROWSER_INTERACTIVE_HITL_ENABLED=false` and retain screenshot-only HITL.
 
 ---
 
@@ -452,8 +451,8 @@ Stage 5 is *defined* so the plan is reviewable, but `production_canary_activated
 returns `False` and a test asserts it; activating it is a separate, explicit
 decision.
 
-Interactive HITL is intentionally absent from this table because it is deferred
-and config-rejected (see §7), not a rollout stage.
+Interactive HITL is a transport for an existing human-action pause rather than a
+separate autonomous rollout stage, so it is intentionally absent from this table.
 
 **Shadow mode (stage 1)** is safe structurally, not procedurally: `ShadowPlanner`
 has no page, no browser and no execution path. It is a pure function from a
@@ -502,11 +501,10 @@ Stated plainly, because the value of this document depends on it.
    uses RFC 2606 `.example` hostnames over real TLS mapped to loopback. That is
    deliberate and it proves the guards work; it does not prove any particular
    vendor's UI is navigable.
-5. **Interactive HITL is deferred and disabled** (see §7). The signed-grant and
-   relay primitives are unit-tested, but there is no operator-usable end-to-end
-   path, so `BrowserServiceSettings` rejects `interactive_hitl_enabled=true`
-   outright rather than exposing a flag that yields an unusable URL. Screenshot
-   HITL is unaffected.
+5. **Interactive HITL remains deployment-gated** (see §7). The assignment stack
+   enables it with one browser session and a private display; the base production
+   stack does not expose it unless that override and its required secrets are
+   configured. Live vendor verification is recorded separately from local tests.
 6. **Shadow mode is not wired into the live Browser Use path.** The planner and
    comparison exist and are tested; emitting a shadow plan during a real Browser Use
    run is a follow-up.
@@ -523,7 +521,8 @@ Stated plainly, because the value of this document depends on it.
 ## 19. Deferred work
 
 - Verify trace predicates live for the remaining 24 apps.
-- Execute stage 2 (read-only canary) against an owned test account.
+- Complete the controlled assignment smoke test against the owned Pipedrive account
+  and record whether it reaches the reviewed target or a truthful security handoff.
 - Wire shadow planning into live Browser Use runs and collect divergence data.
 - Ship a metrics sink and dashboards; add alerting on HITL and completion rates.
 - Pin CI actions to immutable SHAs and make `browser-image` a required check.

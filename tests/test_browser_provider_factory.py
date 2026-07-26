@@ -9,6 +9,7 @@ branch needs only the live opt-in and is selected by the factory.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from pydantic import SecretStr
 
@@ -89,3 +90,48 @@ def test_factory_default_builds_a_browser_use_worker(tmp_path: Path) -> None:
     # Playwright harness; and it satisfies the provider surface.
     assert type(worker).__name__ in {"BrowserWorker", "AssignmentBrowserWorker"}
     assert hasattr(worker, "navigate_onboarding") and hasattr(worker, "start")
+
+
+def test_registry_wires_both_configured_providers_concurrently(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    settings = Settings(
+        allow_live_browser=True,
+        browser_use_api_key=SecretStr("browser-use-test-key"),
+        browser_service_url="http://browser-worker:8081",
+        browser_service_token=SecretStr("service-test-token"),
+    )
+    service = _svc(tmp_path, settings)
+
+    class Worker:
+        def __init__(self, provider_name: str) -> None:
+            self.provider_name = provider_name
+
+    built: list[str] = []
+
+    def build(_settings: Settings, *, provider: str | None = None) -> Any:
+        assert provider is not None
+        built.append(provider)
+        return Worker(provider)
+
+    monkeypatch.setattr(service, "_build_browser_worker", build)
+    dependencies = service._build_workflow_dependencies(settings)  # noqa: SLF001
+
+    assert set(built) == {"browser_use", "playwright"}
+    assert set(dependencies.browsers) == {"browser_use", "playwright"}
+    assert dependencies.browsers["browser_use"].provider_name == "browser_use"
+    assert dependencies.browsers["playwright"].provider_name == "playwright"
+
+
+def test_run_provider_lookup_never_cross_routes_workers(tmp_path: Path) -> None:
+    service = _svc(tmp_path, Settings())
+    browser_use = object()
+    playwright = object()
+    service._browser_workers = {  # type: ignore[dict-item]
+        "browser_use": browser_use,
+        "playwright": playwright,
+    }
+
+    assert service._browser_worker_for({"browser_provider": "browser_use"}) is browser_use
+    assert service._browser_worker_for({"browser_provider": "playwright"}) is playwright

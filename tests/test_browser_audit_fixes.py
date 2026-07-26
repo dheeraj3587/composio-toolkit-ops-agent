@@ -325,7 +325,7 @@ def test_graph_resolves_browser_provider_name() -> None:
     source = (_REPO / "ops" / "graph.py").read_text(encoding="utf-8")
     # No hardcoded browser_use literal remains at the ledger call sites.
     assert 'provider="browser_use"' not in source
-    assert "provider=self._browser_provider_name()" in source
+    assert "provider=self._browser_provider_name(state)" in source
     assert hasattr(DurableOperationsWorkflow, "_browser_provider_name")
 
 

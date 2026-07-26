@@ -8,7 +8,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from ops.state import AccessRoute
+from ops.state import AccessRoute, BrowserProvider, CredentialCreationPolicy
 
 VAULT_REFERENCE_PATTERN = re.compile(r"^vault://[a-z0-9-]+/[a-z0-9_-]+/[A-Za-z0-9_-]+$")
 VaultReference = Annotated[str, Field(min_length=12, max_length=512)]
@@ -110,6 +110,12 @@ class OperationsRequest(StrictModel):
     app_name: str = Field(min_length=1, max_length=200)
     company: CompanyProfile
     requested_scope_policy: Literal["minimum", "recommended", "maximum"] = "maximum"
+    # Immutable execution-engine choice. Older callers and checkpoints default to
+    # Browser Use; the website sends its explicit operator selection.
+    browser_provider: BrowserProvider = "browser_use"
+    # Immutable authorization boundary for developer-app/key creation. Legacy
+    # API/CLI callers remain read-only unless they opt in explicitly.
+    credential_creation_policy: CredentialCreationPolicy = "reuse_only"
     dry_run: bool = True
     # Explicit local intent only. It is never inferred from research, a browser
     # page, or an LLM, and is forwarded only to the browser target selector.

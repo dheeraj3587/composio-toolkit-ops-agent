@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   getTimeline: vi.fn(),
 }))
 
+vi.mock("server-only", () => ({}))
 vi.mock("next/server", () => ({ connection: vi.fn(async () => undefined) }))
 vi.mock("next/navigation", () => ({
   notFound: vi.fn(),

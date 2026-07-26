@@ -12,7 +12,8 @@ from pathlib import Path
 
 from ops.config import Settings
 from ops.graph import DurableOperationsWorkflow, WorkflowDependencies, build_graph
-from ops.models import CompanyProfile, OperationsRequest
+from ops.models import CompanyProfile, OperationalResearch, OperationsRequest
+from ops.p1_adapter import P1LookupFound, P1OperationalAdapter, to_operational_research
 from ops.run_service import RunService
 
 
@@ -37,6 +38,12 @@ def _adapterless(checkpoint: Path) -> DurableOperationsWorkflow:
     )
 
 
+def _research(app_name: str) -> OperationalResearch:
+    found = P1OperationalAdapter().lookup(app_name)
+    assert isinstance(found, P1LookupFound)
+    return to_operational_research(found.record)
+
+
 def test_durable_start_checkpoint_close_reopen_reads_same_thread_state(tmp_path: Path) -> None:
     checkpoint = tmp_path / "private" / "checkpoints.db"
     key = secrets.token_bytes(32)
@@ -52,7 +59,7 @@ def test_durable_start_checkpoint_close_reopen_reads_same_thread_state(tmp_path:
     finally:
         workflow.close()
 
-    assert started["status"] == "route_selected"
+    assert started["status"] == "configuration_required"
     assert started["access_route"] == "self_serve"
     assert checkpoint.is_file()
 
@@ -66,7 +73,7 @@ def test_durable_start_checkpoint_close_reopen_reads_same_thread_state(tmp_path:
     finally:
         reopened.close()
 
-    assert state["status"] == "route_selected"
+    assert state["status"] == "configuration_required"
     assert state["access_route"] == "self_serve"
 
 
@@ -81,7 +88,62 @@ def test_checkpoint_state_values_are_not_stored_in_plaintext(tmp_path: Path) -> 
     raw = checkpoint.read_bytes()
     # State values live inside the AES-encrypted checkpoint blobs, never plaintext.
     assert b"self_serve" not in raw
-    assert b"route_selected" not in raw
+    assert b"configuration_required" not in raw
+
+
+def test_validated_research_is_handed_to_the_durable_workflow(tmp_path: Path) -> None:
+    workflow = _adapterless(tmp_path / "private" / "checkpoints.db")
+    reviewed = _research("HubSpot").model_copy(
+        update={
+            "login_url": "https://app.hubspot.com/login",
+            "credential_management_url": "https://developers.hubspot.com/apps",
+        }
+    )
+    try:
+        state = workflow.start(
+            _request(dry_run=False),
+            thread_id="local_" + "e" * 32,
+            research=reviewed,
+        )
+    finally:
+        workflow.close()
+
+    assert state["status"] == "configuration_required"
+    assert state["errors"][-1]["reason_code"] == "browser_adapter_missing"
+
+
+def test_untraced_app_with_urls_stays_research_only(tmp_path: Path) -> None:
+    workflow = _adapterless(tmp_path / "private" / "checkpoints.db")
+    untraced = _research("Discord").model_copy(
+        update={
+            "login_url": "https://discord.com/login",
+            "credential_management_url": "https://discord.com/developers/applications",
+        }
+    )
+    try:
+        state = workflow.start(
+            _request("Discord", dry_run=False),
+            thread_id="local_" + "f" * 32,
+            research=untraced,
+        )
+    finally:
+        workflow.close()
+
+    assert state["status"] == "configuration_required"
+    assert state["route_reason_code"] == "browser_trace_not_reviewed"
+
+
+def test_hybrid_browser_success_continues_to_controlled_outreach() -> None:
+    workflow = object.__new__(DurableOperationsWorkflow)
+    assert (
+        workflow._after_browser(  # type: ignore[arg-type]  # noqa: SLF001
+            {
+                "access_route": "hybrid",
+                "browser_observation": {"status": "credential_page_ready"},
+            }
+        )
+        == "outreach_send"
+    )
 
 
 def test_execute_when_configured_runs_the_graph_when_workflow_configured(tmp_path: Path) -> None:
@@ -94,7 +156,7 @@ def test_execute_when_configured_runs_the_graph_when_workflow_configured(tmp_pat
 
     # Routed through the durable engine, projected to the ledger, no provider action.
     assert run["execution_mode"] == "execute_when_configured"
-    assert run["status"] == "route_selected"
+    assert run["status"] == "configuration_required"
     assert run["external_actions"] is False
     stored = service.storage.get_run(run["run_id"])
     assert stored is not None

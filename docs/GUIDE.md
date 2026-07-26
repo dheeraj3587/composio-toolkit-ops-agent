@@ -83,13 +83,12 @@ never the source of truth.
 ### 2.2 Human‑in‑the‑loop with autonomous login injection
 
 When the browser agent hits a sign‑in wall, the run pauses at `waiting_for_hitl`. The owner then
-submits the app login (`email` + `password`) on the resume call. Those values are injected into
-Browser Use as **secure `sensitive_data` placeholders** — the agent types the bare placeholder keys
-(`x_login_email`, `x_login_password`, and, when an emailed code is fetched, `x_login_otp`) which the
-provider substitutes with the real values at the DOM layer. **The model never sees the values**, and
-they are held in memory for a single resume call only — never written to run state, the encrypted
-checkpoint, audit events, or logs. Gates that genuinely require a person (CAPTCHA, MFA/OTP, passkeys,
-device approval, billing, legal consent) still pause for HITL.
+submits the app login (`email` + `password`) on the resume call. Browser Use receives secure
+`sensitive_data` placeholders; Playwright resolves one-time run-scoped vault references inside the
+isolated browser service and performs code-owned form fills. **The model never sees the values**,
+and they are held only for the bounded operation — never written to run state, the encrypted
+checkpoint, audit events, or logs. Gates that genuinely require a person (CAPTCHA, MFA/OTP,
+passkeys, device approval, billing, legal consent) still pause for HITL.
 
 ### 2.3 Deterministic routing
 
@@ -284,7 +283,7 @@ loopback / owner‑token caller (see [Security model](#10-security-model)).
 
 | Method & path | Purpose |
 | ------------- | ------- |
-| `POST /api/runs` | Create a run (`execution_mode`: `plan_only` \| `execute_when_configured`). |
+| `POST /api/runs` | Create a run (`execution_mode`, immutable `browser_provider`, and immutable `credential_creation_policy`; legacy policy default is `reuse_only`). |
 | `GET /api/runs` · `GET /api/runs/{id}` | List / fetch a run's sanitized projection. |
 | `GET /api/runs/{id}/timeline` | Human‑readable, sanitized event timeline. |
 | `POST /api/runs/{id}/resume` | Continue a `waiting_for_hitl` run; optionally inject `browser_login`. |
@@ -406,18 +405,23 @@ What this starts, and what it deliberately does not do:
   `python -m playwright install --with-deps chromium`); the API image has no browser binary, so a
   Chromium crash cannot take down the control plane and an API restart does not kill a live session.
 - **No browser port is published.** The RPC surface (8081) and VNC (5900) are reachable only on the
-  private `opsnet` network; only Caddy publishes ports. Interactive noVNC stays **disabled**.
-- `BROWSER_PROVIDER=playwright`, so the API speaks authenticated RPC to the service and never
-  launches Chromium itself. `PLAYWRIGHT_MAX_SESSIONS` defaults to **1** (one real Chromium process
-  per session).
+  private `opsnet` network; only Caddy publishes ports. During a Playwright HITL pause, Caddy exposes
+  one exact, Basic-Auth-protected same-origin noVNC WebSocket route. Its short-lived grant is bound to
+  the run owner and browser session; neither the private service hostname nor a raw VNC port reaches
+  the client.
+- `BROWSER_PROVIDER=playwright`, so omitted legacy requests default to Playwright in this deployment;
+  each run still uses its immutable provider choice. The API speaks authenticated RPC to the service
+  and never launches Chromium itself. Interactive mode hard-caps `PLAYWRIGHT_MAX_SESSIONS` at **1**
+  because the container owns one display.
 - The API and the browser service share one private credential‑vault volume and the **same**
   `SECRET_VAULT_KEY` and `BROWSER_SERVICE_TOKEN`. Only one‑time, run‑scoped `vault://` references
   cross the RPC boundary — never a raw credential value.
 - You.com **Search and Contents are enabled**; the expensive **Research fallback stays disabled**
   (`YOU_RESEARCH_ENABLED=false`). You.com is retrieval only: it never drives a browser and never
   receives a credential.
-- Browser Use remains available as a compatibility provider — set `BROWSER_PROVIDER=browser_use`
-  with `BROWSER_USE_API_KEY` to select it instead.
+- Browser Use remains available concurrently when `BROWSER_USE_API_KEY` is set.
+  `BROWSER_PROVIDER=browser_use` controls only the compatibility default for API
+  and CLI clients that omit the immutable per-run field.
 - **Not certified for production.** This stack exists so the assignment flow can be demonstrated end
   to end; it has not been through the hardening review that `compose.prod.yaml` documents.
 
@@ -441,8 +445,10 @@ relevant provider configuration.
 
 ## 13. Operational notes and limitations
 
-- **Provider configuration gates features.** Browser onboarding needs `ALLOW_LIVE_BROWSER=true` + a
-  Browser Use key; gated outreach needs Composio + a connected Gmail account + a recipient override.
+- **Provider configuration gates features.** Browser onboarding needs
+  `ALLOW_LIVE_BROWSER=true` plus the selected provider's configuration (Browser
+  Use key or isolated Playwright service); gated outreach needs Composio + a
+  connected Gmail account + a recipient override.
   Absent configuration is reported truthfully as `configuration_required`, never silently skipped.
 - **Owner‑only endpoints are not internet‑facing.** Credential submission, reveal, live view, and
   autonomous‑login resume are owner operations performed from a trusted loopback/owner context (host

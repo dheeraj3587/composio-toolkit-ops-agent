@@ -37,6 +37,9 @@ OWNER_HEADER = "X-Browser-Session-Owner"
 
 ReconcileOutcome = Literal["resumable", "session_lost", "unreachable"]
 
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024
+
 # Health states mirrored from the service (no Browser Use wording here).
 ProviderHealthState = Literal[
     "disabled",
@@ -87,6 +90,7 @@ class BrowserServiceClient:
         owner: str,
         timeout_seconds: float = 150.0,
         client: httpx.AsyncClient | None = None,
+        sync_client: httpx.Client | None = None,
     ) -> None:
         if not base_url:
             raise ConfigurationRequiredError(
@@ -97,6 +101,7 @@ class BrowserServiceClient:
         self._owner = owner
         self._timeout = timeout_seconds
         self._client = client
+        self._sync_client = sync_client
         # Sanitized per-session bookkeeping (never a URL with a query string).
         self._sessions: dict[str, str] = {}
 
@@ -205,6 +210,7 @@ class BrowserServiceClient:
         *,
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
+        credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
         return await self._drive(
             context,
@@ -213,6 +219,7 @@ class BrowserServiceClient:
             credential_refs=sensitive_data,
             signal=None,
             account_creation_requested=account_creation_requested,
+            credential_creation_policy=credential_creation_policy,
         )
 
     async def resume_after_hitl(
@@ -222,11 +229,17 @@ class BrowserServiceClient:
         research: Any = None,
         *,
         sensitive_data: Mapping[str, str] | None = None,
+        credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
         del provider_session_id  # the service session id IS the provider id here
         return await self._drive(
-            context, research, path="resume", credential_refs=sensitive_data, signal=signal
+            context,
+            research,
+            path="resume",
+            credential_refs=sensitive_data,
+            signal=signal,
+            credential_creation_policy=credential_creation_policy,
         )
 
     async def _drive(
@@ -238,11 +251,13 @@ class BrowserServiceClient:
         credential_refs: Mapping[str, str] | None,
         signal: str | None,
         account_creation_requested: bool = False,
+        credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
         refs = _vault_references_only(credential_refs)
         body: dict[str, object] = {"credential_refs": refs}
         if account_creation_requested:
             body["account_creation_requested"] = True
+        body["credential_creation_policy"] = credential_creation_policy
         if research is not None:
             body["research"] = (
                 research.model_dump(mode="json") if hasattr(research, "model_dump") else research
@@ -323,6 +338,39 @@ class BrowserServiceClient:
         data = response.content
         return data if isinstance(data, bytes) and data else None
 
+    def latest_screenshot(self, session_id: str) -> tuple[bytes, str] | None:
+        """Fetch one current masked frame through the isolated-service RPC.
+
+        ``RunService`` exposes a synchronous projection surface, so the production
+        RPC adapter needs a synchronous counterpart to :meth:`screenshot`. The
+        previous adapter omitted this method entirely; consequently every
+        Playwright live-view request reported unavailable even while Chromium was
+        active. The service remains the authority for capture safety and returns
+        409 whenever a frame cannot be exposed.
+        """
+
+        url = f"{self._base_url}/internal/browser/sessions/{session_id}/screenshot"
+        client = self._sync_client
+        owns_client = client is None
+        if client is None:
+            client = httpx.Client(
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                follow_redirects=False,
+            )
+        try:
+            response = client.get(url, headers=self._headers(), timeout=30.0)
+        except httpx.RequestError:
+            return None
+        finally:
+            if owns_client:
+                client.close()
+        if response.status_code != 200:
+            return None
+        data = response.content
+        if not data.startswith(_PNG_SIGNATURE) or len(data) > _MAX_SCREENSHOT_BYTES:
+            return None
+        return data, datetime.now(UTC).isoformat()
+
     async def request_live_view(self, session_id: str) -> tuple[str, str | None, str]:
         """Request an interactive grant: (mode, url_or_None, expires_at).
 
@@ -345,13 +393,61 @@ class BrowserServiceClient:
             str(payload.get("expires_at") or ""),
         )
 
+    def request_live_view_sync(self, session_id: str) -> tuple[str, str, str] | None:
+        """Mint one fresh interactive grant for immediate server-side projection.
+
+        The returned URL is intentionally not cached on this client. Its only
+        consumer converts it to a same-origin path in the Next.js server action.
+        """
+
+        url = f"{self._base_url}/internal/browser/sessions/{session_id}/live-view"
+        client = self._sync_client
+        owns_client = client is None
+        if client is None:
+            client = httpx.Client(
+                timeout=httpx.Timeout(20.0, connect=10.0),
+                follow_redirects=False,
+            )
+        try:
+            response = client.post(url, headers=self._headers(), timeout=20.0)
+        except httpx.RequestError:
+            return None
+        finally:
+            if owns_client:
+                client.close()
+        if response.status_code >= 400:
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        mode = payload.get("mode")
+        grant_url = payload.get("url")
+        expires_at = payload.get("expires_at")
+        if mode != "interactive_remote" or not isinstance(grant_url, str):
+            return None
+        return mode, grant_url, str(expires_at or "")
+
     async def stop(self, context: BrowserSessionContext) -> None:
         try:
-            await self._request(
+            response = await self._request(
                 "DELETE", f"/internal/browser/sessions/{context.session_id}", timeout=60.0
             )
         except httpx.RequestError:
             LOGGER.warning("browser service unreachable while stopping a session")
+            return
+        if response.status_code >= 400:
+            LOGGER.warning("browser service refused session teardown")
+            return
+        try:
+            reason_code = str(response.json().get("reason_code") or "")
+        except (AttributeError, ValueError):
+            LOGGER.warning("browser service returned an invalid teardown response")
+            return
+        if reason_code.endswith(":teardown_failed"):
+            # Keep local bookkeeping so reconciliation/another stop can retry.
+            LOGGER.warning("browser service session teardown remains pending")
+            return
         self._sessions.pop(context.session_id, None)
 
     async def close(self) -> None:

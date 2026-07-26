@@ -2,7 +2,7 @@
 #
 # This file exists so the self-hosted browser harness can be exercised against a
 # real Chromium build in isolation. It is deliberately NOT part of the production
-# stack: compose.prod.yaml is untouched, no production volume is mounted, no port
+# stack: no production volume is mounted and no port
 # is published, and live browsing is OFF by default.
 #
 #   docker compose -f compose.playwright.sandbox.yaml --env-file .env.playwright.sandbox build

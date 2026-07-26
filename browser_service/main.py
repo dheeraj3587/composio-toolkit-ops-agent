@@ -19,8 +19,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -45,6 +46,70 @@ from browser_service.settings import BrowserServiceSettings
 from ops.provider_errors import ProviderOperationError
 
 LOGGER = logging.getLogger("browser_service")
+
+_LIVE_VIEW_QUERY = re.compile(
+    r"(?P<path>/internal/browser/live-view/novnc)\?[^\s\"']*",
+    flags=re.IGNORECASE,
+)
+_TOKEN_QUERY_VALUE = re.compile(r"(?i)(token=)[^&\s\"']+")
+_SAFE_LOG_IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]{1,180}$")
+
+
+def _safe_log_identifier(value: str) -> str:
+    """Return only a bounded identifier that cannot smuggle a token into logs."""
+
+    return value if _SAFE_LOG_IDENTIFIER.fullmatch(value) is not None else "-"
+
+
+def _redact_uvicorn_log_value(value: Any) -> Any:
+    """Remove bearer query material while preserving logging interpolation."""
+
+    if isinstance(value, str):
+        without_live_query = _LIVE_VIEW_QUERY.sub(r"\g<path>", value)
+        return _TOKEN_QUERY_VALUE.sub(r"\1[REDACTED]", without_live_query)
+    if isinstance(value, tuple):
+        return tuple(_redact_uvicorn_log_value(item) for item in value)
+    if isinstance(value, list):
+        return [_redact_uvicorn_log_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_uvicorn_log_value(item) for key, item in value.items()}
+    return value
+
+
+class UvicornWebSocketLogFilter(logging.Filter):
+    """Strip noVNC grant queries from Uvicorn handshake/denial records.
+
+    Uvicorn's websocket protocol logger uses ``uvicorn.error`` rather than the
+    HTTP access logger, so ``--no-access-log`` alone cannot protect a query-string
+    bearer token. This filter handles both the format string and its arguments.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = _redact_uvicorn_log_value(record.msg)
+        record.args = _redact_uvicorn_log_value(record.args)
+        return True
+
+
+def install_uvicorn_websocket_log_filter() -> UvicornWebSocketLogFilter:
+    """Attach the filter after Uvicorn configured logging, idempotently."""
+
+    logger = logging.getLogger("uvicorn.error")
+    existing = next(
+        (item for item in logger.filters if isinstance(item, UvicornWebSocketLogFilter)),
+        None,
+    )
+    redacting_filter = existing or UvicornWebSocketLogFilter()
+    if existing is None:
+        logger.addFilter(redacting_filter)
+    for handler in logger.handlers:
+        if not any(isinstance(item, UvicornWebSocketLogFilter) for item in handler.filters):
+            handler.addFilter(redacting_filter)
+    return redacting_filter
+
+
+# Uvicorn configures its loggers before importing ``browser_service.main:app``.
+# Installing at module import therefore protects websocket accept/deny records.
+_UVICORN_WEBSOCKET_LOG_FILTER = install_uvicorn_websocket_log_filter()
 
 _JANITOR_INTERVAL_SECONDS = 60.0
 
@@ -142,8 +207,12 @@ def _load_storage_state(
         return None
 
 
-def make_session_closer(worker_factory: Any) -> Any:
-    """Build the manager's closer, which stops the REAL worker session.
+def make_session_closer(
+    worker_factory: Callable[[], Any],
+    *,
+    attachment_drainer: Callable[[str], Awaitable[bool]] | None = None,
+) -> Callable[[ManagedSession], Awaitable[None]]:
+    """Build the manager's unified live-view and browser-session closer.
 
     Previously the closer walked ``session.context``/``browser``/``playwright``,
     none of which were ever populated — so the janitor and service shutdown closed
@@ -152,14 +221,18 @@ def make_session_closer(worker_factory: Any) -> Any:
     """
 
     async def _close(session: ManagedSession) -> None:
+        # Revoke grants first, then stop every relay before Chromium is closed or
+        # the single-display capacity can be reused by another run.
+        session.hitl_pending = False
+        if attachment_drainer is not None and not await attachment_drainer(session.session_id):
+            raise RuntimeError("live_attachment_drain_failed")
         context = session.worker_context
         if context is None:
             return
         worker = worker_factory()
         if worker is None:
-            return
-        with contextlib.suppress(Exception):
-            await worker.stop(context)
+            raise RuntimeError("browser_worker_missing_during_close")
+        await worker.stop(context)
         session.worker_context = None
 
     return _close
@@ -208,6 +281,33 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
     # /internal/health to answer "chromium not installed".
     app.state.worker = None
     app.state.readiness = _ReadinessCache()
+    # Open interactive attachments are process-local and deliberately never
+    # persisted. Resume drains this registry before autonomous browser work starts.
+    live_attachments: dict[str, dict[asyncio.Task[Any], WebSocket]] = {}
+    app.state.live_attachments = live_attachments
+
+    async def _drain_live_attachments(
+        session_id: str, *, close_reason: str = "hitl_resumed"
+    ) -> bool:
+        attached = list(live_attachments.get(session_id, {}).items())
+        if not attached:
+            return True
+        for _task, socket in attached:
+            with contextlib.suppress(Exception):
+                await socket.close(code=1001, reason=close_reason)
+        tasks = [task for task, _socket in attached if not task.done()]
+        if tasks:
+            _done, pending = await asyncio.wait(
+                tasks,
+                timeout=min(resolved.drain_seconds, 5.0),
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                with contextlib.suppress(Exception):
+                    await asyncio.gather(*pending, return_exceptions=True)
+        await asyncio.sleep(0)
+        return not live_attachments.get(session_id)
 
     def _worker() -> Any:
         if app.state.worker is None:
@@ -227,7 +327,14 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         return app.state.worker
 
     # Attach the real worker-backed closer now that the factory exists.
-    manager.set_closer(make_session_closer(lambda: app.state.worker))
+    manager.set_closer(
+        make_session_closer(
+            lambda: app.state.worker,
+            attachment_drainer=lambda session_id: _drain_live_attachments(
+                session_id, close_reason="session_closed"
+            ),
+        )
+    )
 
     # ---------------------------------------------------------------- sessions
     @app.post(
@@ -267,6 +374,9 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             # A screenshot is NOT available until one is actually captured — a
             # launched browser is not the same as a current, non-sensitive frame.
             session.screenshot_available = False
+            # Interactive readiness is an explicit deployment capability. It is
+            # never inferred from a screenshot or a run state.
+            session.interactive_ready = resolved.interactive_hitl_enabled
             if payload.use_storage_state:
                 session.storage_binding = _storage_binding(payload, auth.owner)
         except Exception as exc:  # sanitized: never surface provider text
@@ -309,6 +419,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                     resolved,
                     resume_signal=None,
                     account_creation_requested=payload.account_creation_requested,
+                    credential_creation_policy=payload.credential_creation_policy,
                 )
         except SessionUnavailable as exc:
             raise _sanitized_error(exc) from None
@@ -323,6 +434,19 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         if session is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
         assert_session_owner(session_owner=session.owner, caller_owner=auth.owner)
+        if not session.hitl_pending:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="hitl_not_pending")
+        # Revoke stale grants before closing attachments. A socket racing this
+        # transition will fail its handshake because HITL is no longer pending.
+        session.hitl_pending = False
+        if not await _drain_live_attachments(session_id):
+            # The operator must be able to retry Resume after the stale socket
+            # finally closes. Leaving this false would strand the run forever.
+            session.hitl_pending = True
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="live_attachment_drain_failed",
+            )
         try:
             with manager.lease(session_id) as leased:
                 return await _drive(
@@ -332,6 +456,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                     payload.credential_refs,
                     resolved,
                     resume_signal=payload.signal,
+                    credential_creation_policy=payload.credential_creation_policy,
                 )
         except SessionUnavailable as exc:
             raise _sanitized_error(exc) from None
@@ -368,6 +493,8 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         assert_session_owner(session_owner=session.owner, caller_owner=auth.owner)
         if not resolved.interactive_hitl_enabled:
             return LiveViewGrant(mode="screenshot", url=None, session_id=session_id)
+        if not session.hitl_pending:
+            return LiveViewGrant(mode="screenshot", url=None, session_id=session_id)
         from ops.browser_live_view import (
             LiveViewAudit,
             build_interactive_url,
@@ -398,8 +525,8 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         # Audited WITHOUT the token or the URL, and the URL is never persisted.
         LOGGER.info(
             "live view grant issued session=%s owner=%s event=%s reason=%s",
-            audit.session_id,
-            audit.owner,
+            _safe_log_identifier(audit.session_id),
+            _safe_log_identifier(audit.owner),
             audit.event,
             audit.reason_code,
         )
@@ -424,6 +551,9 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         token = websocket.query_params.get("token", "")
         owner = websocket.headers.get("x-browser-session-owner", "")
         session = manager.get_if_present(session_id)
+        # Log only canonical state, never attacker-controlled query/header text.
+        log_session_id = _safe_log_identifier(session.session_id) if session else "-"
+        log_owner = _safe_log_identifier(session.owner) if session else "-"
         secret = resolved.service_token.get_secret_value() if resolved.service_token else ""
         try:
             authorize_live_view(
@@ -434,35 +564,47 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 session_owner=session.owner if session else None,
                 session_lifecycle=session.lifecycle if session else None,
                 interactive_enabled=resolved.interactive_hitl_enabled,
+                hitl_pending=session.hitl_pending if session else False,
             )
         except LiveViewDenied as exc:
             # Refuse BEFORE accepting: an unauthorized client never gets a socket.
-            LOGGER.warning(
-                "live view denied session=%s reason=%s", session_id or "-", exc.reason_code
-            )
+            LOGGER.warning("live view denied session=%s reason=%s", log_session_id, exc.reason_code)
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=exc.reason_code)
             return
 
-        await websocket.accept(subprotocol="binary")
-        LOGGER.info("live view opened session=%s owner=%s", session_id, owner)
+        # Reserve the attachment BEFORE the first post-authorization await. Resume
+        # can now always see and drain an authorized handshake, even if WebSocket
+        # acceptance is slow. This closes the authorize -> accept -> register race
+        # that could otherwise overlap a newly resumed autonomous browser drive.
+        attachment_task = asyncio.current_task()
+        if attachment_task is None:  # pragma: no cover - ASGI always owns a task
+            raise RuntimeError("websocket_task_missing")
+        live_attachments.setdefault(session_id, {})[attachment_task] = websocket
 
-        async def _receive() -> bytes | None:
-            from starlette.websockets import WebSocketDisconnect
-
-            try:
-                message = await websocket.receive()
-            except (WebSocketDisconnect, RuntimeError):
-                return None
-            if message.get("type") == "websocket.disconnect":
-                return None
-            data = message.get("bytes")
-            if isinstance(data, bytes):
-                return data
-            text = message.get("text")
-            return text.encode() if isinstance(text, str) else b""
-
-        reason = "live_view_closed"
+        reason = "live_view_accept_failed"
         try:
+            # RFB payloads remain binary frames, but noVNC does not need to request
+            # a WebSocket subprotocol named "binary". Accepting one it did not offer
+            # makes standards-compliant browser clients refuse the connection.
+            await websocket.accept()
+            reason = "live_view_closed"
+            LOGGER.info("live view opened session=%s owner=%s", log_session_id, log_owner)
+
+            async def _receive() -> bytes | None:
+                from starlette.websockets import WebSocketDisconnect
+
+                try:
+                    message = await websocket.receive()
+                except (WebSocketDisconnect, RuntimeError):
+                    return None
+                if message.get("type") == "websocket.disconnect":
+                    return None
+                data = message.get("bytes")
+                if isinstance(data, bytes):
+                    return data
+                text = message.get("text")
+                return text.encode() if isinstance(text, str) else b""
+
             from browser_service.novnc import relay_websocket_to_vnc
 
             reason = await relay_websocket_to_vnc(
@@ -475,10 +617,20 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             with contextlib.suppress(Exception):
                 await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason=exc.reason_code)
         finally:
+            session_attachments = live_attachments.get(session_id)
+            if session_attachments is not None:
+                session_attachments.pop(attachment_task, None)
+                if not session_attachments:
+                    live_attachments.pop(session_id, None)
             with contextlib.suppress(Exception):
                 await websocket.close()
             # Close is audited too, so an interactive attachment is never silent.
-            LOGGER.info("live view closed session=%s owner=%s reason=%s", session_id, owner, reason)
+            LOGGER.info(
+                "live view closed session=%s owner=%s reason=%s",
+                log_session_id,
+                log_owner,
+                reason,
+            )
 
     @app.delete("/internal/browser/sessions/{session_id}")
     async def delete_session(session_id: str, auth: AuthContext = _AUTH) -> JSONResponse:
@@ -618,6 +770,7 @@ async def _drive(
     *,
     resume_signal: str | None,
     account_creation_requested: bool = False,
+    credential_creation_policy: str = "reuse_only",
 ) -> ObservationResponse:
     """Run one navigate/resume operation and project a sanitized observation.
 
@@ -659,7 +812,10 @@ async def _drive(
         ) from None
     try:
         if resume_signal is None:
-            navigate_kwargs: dict[str, object] = {"sensitive_data": sensitive}
+            navigate_kwargs: dict[str, object] = {
+                "sensitive_data": sensitive,
+                "credential_creation_policy": credential_creation_policy,
+            }
             if account_creation_requested:
                 navigate_kwargs["account_creation_requested"] = True
             observation = await asyncio.wait_for(
@@ -669,7 +825,11 @@ async def _drive(
         else:
             observation = await asyncio.wait_for(
                 worker.resume_after_hitl(
-                    context, resume_signal, research, sensitive_data=sensitive
+                    context,
+                    resume_signal,
+                    research,
+                    sensitive_data=sensitive,
+                    credential_creation_policy=credential_creation_policy,
                 ),
                 timeout=settings.operation_timeout_seconds,
             )
@@ -697,7 +857,7 @@ async def _drive(
     # so it is encrypted at rest and never logged.
     if session.storage_binding is not None:
         store = _state_store(settings)
-        if observation.status in {"credential_page_ready", "succeeded"}:
+        if observation.status == "credential_page_ready":
             await _save_storage_state(worker, session, store)
         elif observation.reason_code in _AUTH_STATE_INVALIDATION_REASONS:
             # Invalidate saved authentication state ONLY for explicit auth reasons.

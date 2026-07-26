@@ -10,10 +10,12 @@ import { ArrowRight, Check, LockKeyhole, ShieldCheck } from "lucide-react"
 import { createRunAction, type CreateRunFormState } from "@/app/runs/new/actions"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
+import { BrowserEngineField, browserProviderIsSelectable } from "@/components/browser-engine-field"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
+import type { BrowserProvider, ProviderStatus } from "@/lib/types"
 
 const vaultReference = /^vault:\/\/[a-z0-9-]+\/[a-z0-9_-]+\/[A-Za-z0-9_-]+$/
 const safeUrl = z.url({ protocol: /^https?$/ })
@@ -22,6 +24,10 @@ const runFormSchema = z.object({
   app_name: z.string().trim().min(2, "Enter an application name.").max(120),
   requested_scope_policy: z.enum(["minimum", "recommended", "maximum"]),
   execution_mode: z.enum(["plan_only", "execute_when_configured"]),
+  browser_provider: z.enum(["playwright", "browser_use"], {
+    error: "Choose an available browser engine.",
+  }),
+  credential_creation_policy: z.enum(["reuse_only", "create_if_missing"]),
   callback_urls: z.string().max(2_000).refine((value) => {
     const urls = value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean)
     return urls.length <= 10 && urls.every((url) => safeUrl.safeParse(url).success)
@@ -45,7 +51,18 @@ const initialCreateRunState: CreateRunFormState = {
   requestFingerprint: null,
 }
 
-export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string }) {
+export function NewRunForm({
+  defaultAppName = "",
+  providerStates,
+}: {
+  defaultAppName?: string
+  providerStates: ProviderStatus[]
+}) {
+  const defaultProvider: BrowserProvider | undefined = browserProviderIsSelectable(providerStates, "playwright")
+    ? "playwright"
+    : browserProviderIsSelectable(providerStates, "browser_use")
+      ? "browser_use"
+      : undefined
   const [state, formAction] = useActionState(createRunAction, initialCreateRunState)
   const [pending, startTransition] = useTransition()
   const {
@@ -61,6 +78,8 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
       app_name: defaultAppName,
       requested_scope_policy: "maximum",
       execution_mode: "execute_when_configured",
+      browser_provider: defaultProvider,
+      credential_creation_policy: "create_if_missing",
       callback_urls: "",
       outreach_recipient_override: "",
       legal_name: "",
@@ -84,6 +103,8 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
     data.set("app_name", values.app_name)
     data.set("requested_scope_policy", values.requested_scope_policy)
     data.set("execution_mode", values.execution_mode)
+    data.set("browser_provider", values.browser_provider)
+    data.set("credential_creation_policy", values.credential_creation_policy)
     data.set("callback_urls", values.callback_urls)
     data.set("outreach_recipient_override", values.outreach_recipient_override)
     data.set("legal_name", values.legal_name)
@@ -138,6 +159,27 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
             />
           </Field>
           <Field
+            label="Credential creation"
+            htmlFor="credential_creation_policy"
+            hint="The agent always searches for the exact integration name first. Human-only, billing, legal, verification, and ambiguous steps still pause."
+          >
+            <Controller
+              name="credential_creation_policy"
+              control={control}
+              render={({ field }) => (
+                <Select name={field.name} value={field.value} onValueChange={field.onChange}>
+                  <SelectTrigger id="credential_creation_policy" className="w-full rounded-md bg-white">
+                    <SelectValue placeholder="Choose creation behavior" />
+                  </SelectTrigger>
+                  <SelectContent className="rounded-md">
+                    <SelectItem value="create_if_missing">Create if missing — reviewed routes only</SelectItem>
+                    <SelectItem value="reuse_only">Reuse only — never create</SelectItem>
+                  </SelectContent>
+                </Select>
+              )}
+            />
+          </Field>
+          <Field
             label="Execution mode"
             htmlFor="execution_mode"
             hint={executionMode === "plan_only"
@@ -160,6 +202,12 @@ export function NewRunForm({ defaultAppName = "" }: { defaultAppName?: string })
               )}
             />
           </Field>
+          <BrowserEngineField
+            control={control}
+            providerStates={providerStates}
+            error={errors.browser_provider}
+            serverInvalid={serverInvalid.has("browser_provider")}
+          />
           <Field label="OAuth callback URLs" htmlFor="callback_urls" error={fieldError(errors.callback_urls?.message, serverInvalid.has("callback_urls"))} hint="Optional. One HTTP(S) URL per line; token-bearing URLs are rejected by the backend.">
             <Textarea id="callback_urls" rows={4} placeholder="https://integrator.example.com/oauth/callback" aria-invalid={invalid("callback_urls")} {...register("callback_urls")} />
           </Field>

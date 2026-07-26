@@ -53,6 +53,7 @@ const runStatus = z.enum([
 // The wired browser backend and the view it can offer. Declared here because both
 // the run-detail projection (BrowserUiState) and the live-view response use them.
 export const browserProviderSchema = z.enum(["browser_use", "playwright"])
+export const credentialCreationPolicySchema = z.enum(["reuse_only", "create_if_missing"])
 export const liveViewModeSchema = z.enum([
   "hosted_url",
   "screenshot",
@@ -136,6 +137,8 @@ export const runSummarySchema = z.strictObject({
   created_at: isoTimestamp,
   updated_at: isoTimestamp,
   execution_mode: z.enum(["plan_only", "execute_when_configured"]),
+  browser_provider: z.enum(["browser_use", "playwright"]),
+  credential_creation_policy: credentialCreationPolicySchema.default("reuse_only"),
   external_actions: z.boolean(),
 })
 
@@ -249,6 +252,7 @@ export const timelineResponseSchema = z.strictObject({
   items: z
     .array(
       z.strictObject({
+        event_id: z.number().int().positive(),
         event_type: safeToken,
         summary: boundedText(500),
         status: z.enum(["recorded", "completed", "blocked", "failed"]),
@@ -351,6 +355,48 @@ const relativeViewerPath = (endpoint: "screenshot" | "interactive") =>
     .max(300)
     .regex(new RegExp(`^/api/runs/[A-Za-z0-9_-]{1,180}/live-view/${endpoint}$`))
 
+// The API-to-Next hop may carry one private, short-lived noVNC grant. This
+// schema lives in a server-only module and accepts only the reviewed browser
+// service endpoint with exactly one bounded session and token parameter. The
+// value is converted to a same-origin path before any client state is created.
+const privateInteractiveGrant = z.string().min(1).max(4_096).superRefine((value, context) => {
+  let parsed: URL
+
+  try {
+    parsed = new URL(value)
+  } catch {
+    context.addIssue({ code: "custom", message: "The interactive grant URL is invalid." })
+    return
+  }
+
+  const queryKeys = [...parsed.searchParams.keys()]
+  const session = parsed.searchParams.get("session")
+  const token = parsed.searchParams.get("token")
+  const validEndpoint =
+    parsed.protocol === "http:" &&
+    parsed.hostname === "browser-worker" &&
+    parsed.port === "8081" &&
+    parsed.pathname === "/internal/browser/live-view/novnc" &&
+    parsed.username === "" &&
+    parsed.password === "" &&
+    parsed.hash === ""
+  const validQuery =
+    queryKeys.length === 2 &&
+    new Set(queryKeys).size === 2 &&
+    queryKeys.includes("session") &&
+    queryKeys.includes("token") &&
+    session !== null &&
+    /^[A-Za-z0-9_-]{1,180}$/.test(session) &&
+    token !== null &&
+    token.length > 0 &&
+    token.length <= 2_048 &&
+    !/[\u0000-\u001f\u007f]/.test(token)
+
+  if (!validEndpoint || !validQuery) {
+    context.addIssue({ code: "custom", message: "The interactive grant URL is not allowed." })
+  }
+})
+
 // Provider- and mode-aware live view (api/models.py::LiveViewResponse). The
 // mode-specific requirements are mirrored here so a drifting backend response is
 // rejected as invalid rather than rendered as a broken viewer.
@@ -362,7 +408,7 @@ export const liveViewResponseSchema = z
     mode: liveViewModeSchema,
     live_url: liveViewUrl.nullish().default(null),
     screenshot_url: relativeViewerPath("screenshot").nullish().default(null),
-    interactive_url: relativeViewerPath("interactive").nullish().default(null),
+    interactive_url: privateInteractiveGrant.nullish().default(null),
     captured_at: isoTimestamp.nullish().default(null),
     interaction_available: z.boolean(),
     reason_code: z
@@ -421,15 +467,24 @@ export const liveViewResponseSchema = z
         message: "A screenshot live view is not interactive.",
       })
     }
-    // A viewer path must address THIS run on this origin.
-    for (const path of [value.screenshot_url, value.interactive_url]) {
-      if (path && !path.startsWith(`/api/runs/${value.run_id}/`)) {
-        context.addIssue({
-          code: "custom",
-          path: ["run_id"],
-          message: "A viewer path must address this run on the same origin.",
-        })
-      }
+    if (value.mode === "interactive_remote" && !value.interaction_available) {
+      context.addIssue({
+        code: "custom",
+        path: ["interaction_available"],
+        message: "An interactive remote view must allow interaction.",
+      })
+    }
+    // Screenshot routes remain bound to THIS run. Interactive grants are bound
+    // by their signed browser-service session token and revalidated server-side.
+    if (
+      value.screenshot_url &&
+      !value.screenshot_url.startsWith(`/api/runs/${value.run_id}/`)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["run_id"],
+        message: "A viewer path must address this run on the same origin.",
+      })
     }
   })
 

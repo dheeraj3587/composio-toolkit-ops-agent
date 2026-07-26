@@ -1,13 +1,12 @@
 # Playwright sandbox (evaluation only)
 
-The self‑hosted Playwright harness is an **alternative** browser backend to the paid
-Browser Use cloud. It is **not** production‑enabled.
+The self-hosted Playwright harness is an alternative browser backend to Browser
+Use cloud. Production now wires both engines; every run freezes one explicit
+provider and never falls back to the other.
 
-> **Deployment status.** Browser Use remains the primary production harness.
-> Production keeps `BROWSER_PROVIDER` unset (defaulting to `browser_use`), and
-> `compose.prod.yaml`, the deploy scripts, the Caddyfile, and `.env.production` are
-> untouched. Do **not** switch production to Playwright: the separate browser‑service
-> RPC, API‑independent restart survival, and real deployment remain future phases.
+> **Deployment status.** `compose.prod.yaml` runs Chromium in the isolated
+> `browser-worker` service. `BROWSER_PROVIDER` remains only the omitted-field
+> compatibility default; the website sends the operator's per-run selection.
 
 ## Why a separate image
 
@@ -125,13 +124,14 @@ Chromium crash or memory spike from threatening the control plane.
   so the janitor can never close a session mid-action and a slot cannot be
   double-released.
 - **Interactive HITL.** A screenshot cannot solve a CAPTCHA, an account chooser or an
-  MFA prompt, so real remote control is available — gated by an HMAC-signed token bound
-  to one session id, one owner, and a few minutes' expiry. It is **off by default**
-  (`BROWSER_INTERACTIVE_HITL_ENABLED=false`); when off, Xvfb/x11vnc are never even
-  started. x11vnc binds to container loopback (`-localhost`) and the container
-  publishes **no port**, so the only path in is the authenticated WebSocket relay.
-  Opens, closes and denials are audited by reason code; the grant URL is returned once
-  and never durably persisted.
+  MFA prompt, so the assignment overlay enables real remote control for exactly one
+  session. The grant is HMAC-signed and bound to one session id, one owner, and a
+  five-minute expiry. Xvfb runs display `:99` at `1440x900x24`; x11vnc binds to
+  container loopback (`-localhost`) and the container publishes **no browser port**.
+  Caddy is the only ingress: after Basic Auth it relays the exact same-origin path
+  `/internal/browser/live-view/novnc`, strips the Basic Auth header, and injects the
+  fixed assignment owner. Opens, closes and denials are audited by reason code; the
+  grant URL is returned once and never durably persisted.
 - **Why not websockify?** Verified against its source, not assumed:
   `auth_plugins.BasePlugin.authenticate(headers, target_host, target_port)` receives
   only headers, so a URL grant token cannot be validated there; `token_plugins` is a
@@ -161,7 +161,7 @@ Chromium crash or memory spike from threatening the control plane.
 - **API health does not launch Chromium** (the API image has none). Playwright reports
   `configured_not_verified`; the browser service's own health endpoint is the readiness
   proof.
-- **The Docker gates for Phase 3 were not executed.** `docker compose config` and
+- **The Docker gates require a Docker-capable host.** `docker compose config` and
   `docker compose build` could not run in the authoring environment (no `docker` binary,
   no `/var/run/docker.sock`). `Dockerfile.browser`, the entrypoint and the
   `browser-worker` service are validated **structurally** by
@@ -170,9 +170,61 @@ Chromium crash or memory spike from threatening the control plane.
   display stack is installed, VNC binds to loopback, and every dangerous switch
   defaults to off). Those tests check the declared configuration, **not a running
   container** — a real `docker compose build` is still required before deployment.
-- **Production is not switched.** `browser_provider` still defaults to `browser_use`,
-  `compose.prod.yaml` is untouched, and `browser-worker` exists only in the sandbox
-  stack.
+- **Production supports both providers.** Older omitted-field clients still default
+  to `browser_use`; the UI selects per run, and Playwright always executes through
+  `browser-worker` rather than inside the API.
+
+## Assignment live control on the Singapore VPS
+
+Use the production definition together with the assignment override. The base
+definition keeps interactive control off; the override turns it on with the only
+supported safe capacity, one browser session on one private X display.
+
+```bash
+cp .env.assignment.example .env.assignment
+
+docker compose \
+  -f compose.prod.yaml \
+  -f compose.assignment.yaml \
+  --env-file .env.assignment \
+  config > /tmp/interactive-assignment.yaml
+
+docker compose \
+  -f compose.prod.yaml \
+  -f compose.assignment.yaml \
+  --env-file .env.assignment \
+  up -d --build
+```
+
+Set `DOMAIN` to the HTTPS hostname whose DNS resolves to the VPS. Do not submit
+vendor credentials through the `DOMAIN=:80` fallback. The VPS and Playwright context
+use `Asia/Singapore`; the browser locale is `en-SG`. This describes the real machine
+location and is not a fingerprint or geolocation override.
+
+Only Caddy publishes ports 80/443. Do not add host mappings for FastAPI 8000,
+browser RPC 8081, VNC 5900, or a separate noVNC/websockify port 6080. The browser
+connects to the same-origin HTTPS site, so the interactive connection is
+`wss://<DOMAIN>/internal/browser/live-view/novnc?...`; a private Docker hostname must
+never appear in browser-visible state.
+
+Before a live run, confirm the merged definition keeps the boundary intact:
+
+```bash
+grep -nE \
+  'BROWSER_INTERACTIVE_HITL_ENABLED|PLAYWRIGHT_MAX_SESSIONS|BROWSER_SCREEN_GEOMETRY|TZ:' \
+  /tmp/interactive-assignment.yaml
+
+docker compose \
+  -f compose.prod.yaml \
+  -f compose.assignment.yaml \
+  --env-file .env.assignment \
+  ps
+```
+
+Expected browser-worker startup includes
+`browser-service: interactive HITL enabled, starting display stack`. A CAPTCHA,
+MFA, new-location check, or account chooser remains a human handoff: this deployment
+does not bypass or solve provider security controls.
 
 ## Live sandbox runs
 

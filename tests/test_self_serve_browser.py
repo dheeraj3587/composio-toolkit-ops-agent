@@ -14,7 +14,8 @@ from ops.composio_capability import CapabilityState, ComposioCapabilityReport
 from ops.config import Settings
 from ops.effect_ledger import SQLiteEffectStore
 from ops.graph import WorkflowDependencies, build_graph
-from ops.models import CompanyProfile, OperationsRequest
+from ops.models import CompanyProfile, OperationalResearch, OperationsRequest
+from ops.p1_adapter import P1LookupFound, P1OperationalAdapter, to_operational_research
 from ops.provider_errors import ProviderOperationError
 from ops.run_service import RunService
 
@@ -46,9 +47,14 @@ class _FakeBrowser:
         )
 
     async def navigate_onboarding(
-        self, context: object, research: object, *, sensitive_data: object = None
+        self,
+        context: object,
+        research: object,
+        *,
+        sensitive_data: object = None,
+        credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
-        del context, research, sensitive_data
+        del context, research, sensitive_data, credential_creation_policy
         if self.outcome == "credential_page_ready":
             return BrowserObservation(
                 status="credential_page_ready",
@@ -72,6 +78,7 @@ class _FakeBrowser:
         research: object = None,
         *,
         sensitive_data: object = None,
+        credential_creation_policy: str = "reuse_only",
         provider_session_id: object = None,
     ) -> BrowserObservation:
         raise AssertionError("HITL resume is out of M5 scope")
@@ -138,6 +145,7 @@ def _service(
         checkpoint_path=tmp / "private" / "checkpoints.db",
         encryption_key=secrets.token_bytes(32),
         dependencies=WorkflowDependencies(
+            research_loader=_reviewed_hubspot_research,
             browser=browser,  # type: ignore[arg-type]
             gmail=gmail,  # type: ignore[arg-type]
             effect_store=effect_store,
@@ -148,6 +156,17 @@ def _service(
         settings=Settings(),
         workflow=workflow,
         capability_preflight=preflight,  # type: ignore[arg-type]
+    )
+
+
+def _reviewed_hubspot_research(app_name: str) -> OperationalResearch:
+    found = P1OperationalAdapter().lookup(app_name)
+    assert isinstance(found, P1LookupFound)
+    return to_operational_research(found.record).model_copy(
+        update={
+            "login_url": "https://app.hubspot.com/login",
+            "credential_management_url": "https://developers.hubspot.com/apps",
+        }
     )
 
 

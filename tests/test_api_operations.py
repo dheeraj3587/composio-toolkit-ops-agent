@@ -197,6 +197,40 @@ def test_execution_mode_defaults_to_plan_only() -> None:
     assert request.execution_mode == "plan_only"
 
 
+def test_browser_provider_defaults_to_browser_use_for_legacy_clients() -> None:
+    request = CreateRunRequest.model_validate(_request_payload())
+    assert request.browser_provider == "browser_use"
+
+
+def test_credential_creation_policy_defaults_to_reuse_only_for_legacy_clients() -> None:
+    request = CreateRunRequest.model_validate(_request_payload())
+    assert request.credential_creation_policy == "reuse_only"
+
+
+@pytest.mark.parametrize("policy", ["reuse_only", "create_if_missing"])
+def test_credential_creation_policy_accepts_canonical_values(policy: str) -> None:
+    request = CreateRunRequest.model_validate(_request_payload(credential_creation_policy=policy))
+    assert request.credential_creation_policy == policy
+
+
+def test_credential_creation_policy_rejects_unknown_values() -> None:
+    with pytest.raises(ValidationError):
+        CreateRunRequest.model_validate(
+            _request_payload(credential_creation_policy="always_create")
+        )
+
+
+@pytest.mark.parametrize("provider", ["browser_use", "playwright"])
+def test_browser_provider_accepts_both_canonical_values(provider: str) -> None:
+    request = CreateRunRequest.model_validate(_request_payload(browser_provider=provider))
+    assert request.browser_provider == provider
+
+
+def test_browser_provider_rejects_unknown_values() -> None:
+    with pytest.raises(ValidationError):
+        CreateRunRequest.model_validate(_request_payload(browser_provider="automatic"))
+
+
 def test_dry_run_true_normalizes_to_plan_only() -> None:
     request = CreateRunRequest.model_validate(_request_payload(dry_run=True))
     assert request.execution_mode == "plan_only"
@@ -289,7 +323,9 @@ def test_execute_when_configured_via_api_runs_graph_when_key_present(tmp_path: P
     run = response.json()["run"]
     # The FastAPI lifespan built the durable workflow and execute_when_configured ran it.
     assert run["execution_mode"] == "execute_when_configured"
-    assert run["status"] == "route_selected"
+    # The durable graph ran, then failed closed because the static P1 baseline has
+    # no evidence-backed login/credential URLs for browser execution.
+    assert run["status"] == "configuration_required"
     assert run["status"] != "accepted"
     assert run["external_actions"] is False
 

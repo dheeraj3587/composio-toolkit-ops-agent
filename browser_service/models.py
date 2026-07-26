@@ -88,6 +88,7 @@ class NavigateRequest(_Strict):
     # Explicit local intent. The service never infers account existence from a
     # page, research content, or a model response.
     account_creation_requested: bool = False
+    credential_creation_policy: Literal["reuse_only", "create_if_missing"] = "reuse_only"
 
 
 class ResumeRequest(_Strict):
@@ -96,6 +97,7 @@ class ResumeRequest(_Strict):
     signal: str = Field(min_length=1, max_length=64)
     research: dict[str, object] | None = None
     credential_refs: dict[str, str] = Field(default_factory=dict)
+    credential_creation_policy: Literal["reuse_only", "create_if_missing"] = "reuse_only"
 
 
 class ObservationResponse(_Strict):

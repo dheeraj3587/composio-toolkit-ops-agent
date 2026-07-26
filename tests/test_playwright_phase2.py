@@ -26,7 +26,12 @@ from ops.browser_candidates import (
     select_candidate,
 )
 from ops.browser_decider import SnapshotElement, build_snapshot, validate_choice
-from ops.browser_egress import EgressStage, EgressStageTracker, build_egress_policy
+from ops.browser_egress import (
+    EgressStage,
+    EgressStageTracker,
+    build_egress_policy,
+    reviewed_egress_extensions,
+)
 from ops.browser_pages import (
     BrowserPageRegistry,
     DialogPolicy,
@@ -447,8 +452,11 @@ def test_download_blocked_by_default() -> None:
         records: list[DownloadRecord] = []
         install_download_guard(page, DownloadPolicy(), records)
         try:
-            await page.click("[data-testid=dl]")
+            async with page.expect_download(timeout=5_000):
+                await page.click("[data-testid=dl]")
         except Exception:
+            # The production handler may cancel before Playwright resolves the
+            # waiter; the listener still records that denied attempt.
             pass
         await page.wait_for_timeout(600)
         return [(r.allowed, r.reason_code) for r in records]
@@ -520,6 +528,48 @@ def test_egress_stage_never_loosens() -> None:
     tracker = EgressStageTracker()
     tracker.advance_to(EgressStage.CREDENTIAL_SURFACE)
     assert tracker.advance_to(EgressStage.PRE_AUTH) is EgressStage.CREDENTIAL_SURFACE
+
+
+def test_pipedrive_vendor_cdn_is_asset_only_and_dropped_on_credential_surface() -> None:
+    extras = reviewed_egress_extensions("pipedrive")
+    policy = build_egress_policy(
+        ("app.pipedrive.com", "*.pipedrive.com"),
+        identity_provider_hosts=extras.identity_provider_hosts,
+        active_script_hosts=extras.active_script_hosts,
+        passive_asset_hosts=extras.passive_asset_hosts,
+    )
+    cdn = "https://cdn.syd-1.pipedriveassets.com/auth/login.js"
+
+    assert policy.permits(url=cdn, kind="script", stage=EgressStage.PRE_AUTH) is True
+    assert policy.permits(url=cdn, kind="stylesheet", stage=EgressStage.AUTHENTICATING) is True
+    assert policy.permits(url=cdn, kind="document", stage=EgressStage.AUTHENTICATING) is False
+    assert policy.permits(url=cdn, kind="script", stage=EgressStage.CREDENTIAL_SURFACE) is False
+    captcha = "https://www.recaptcha.net/recaptcha/api2/anchor"
+    assert policy.permits(url=captcha, kind="document", stage=EgressStage.PRE_AUTH) is False
+    assert policy.permits(url=captcha, kind="script", stage=EgressStage.PRE_AUTH) is True
+    assert policy.permits(url=captcha, kind="document", stage=EgressStage.AUTHENTICATING) is True
+    assert policy.permits(url=captcha, kind="document", stage=EgressStage.AUTHENTICATED) is False
+    static = "https://www.gstatic.com/recaptcha/releases/runtime.js"
+    assert policy.permits(url=static, kind="script", stage=EgressStage.AUTHENTICATING) is True
+    assert policy.permits(url=static, kind="other", stage=EgressStage.AUTHENTICATING) is True
+    assert policy.permits(url=static, kind="image", stage=EgressStage.AUTHENTICATING) is True
+    assert policy.permits(url=static, kind="document", stage=EgressStage.AUTHENTICATING) is False
+    assert (
+        policy.permits(
+            url="https://cdn.cookielaw.org/runtime.bin",
+            kind="other",
+            stage=EgressStage.AUTHENTICATING,
+        )
+        is False
+    )
+    assert (
+        policy.permits(
+            url="https://www.googletagmanager.com/gtm.js",
+            kind="script",
+            stage=EgressStage.AUTHENTICATING,
+        )
+        is False
+    )
 
 
 # ===========================================================================

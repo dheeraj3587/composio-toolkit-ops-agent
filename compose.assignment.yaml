@@ -3,7 +3,7 @@
 # This file is an override layer, applied on top of the base stack per Docker's
 # multiple-compose-file merge rules (https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/):
 # mappings such as `environment` are merged key-by-key and sequences such as
-# `volumes` are appended, so compose.prod.yaml itself stays untouched.
+# `volumes` are appended.
 #
 #   cp .env.assignment.example .env.assignment
 #   docker compose -f compose.prod.yaml -f compose.assignment.yaml \
@@ -19,8 +19,9 @@
 # Deployment properties that are deliberate:
 #   * no `ports:` on browser-worker — RPC (8081) and VNC (5900) stay on the private
 #     network; only caddy publishes anything;
-#   * interactive noVNC remains disabled;
-#   * one Playwright session by default (a real Chromium process per session);
+#   * interactive noVNC is exposed only through Caddy's exact, Basic-Auth-protected
+#     same-origin WebSocket path;
+#   * exactly one Playwright session owns the container's single X display;
 #   * raw credentials never cross the RPC boundary — only `vault://` references do.
 
 services:
@@ -32,6 +33,7 @@ services:
       BROWSER_SERVICE_URL: http://browser-worker:8081
       BROWSER_SERVICE_TOKEN: ${BROWSER_SERVICE_TOKEN:?BROWSER_SERVICE_TOKEN is required}
       BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-assignment-owner}
+      BROWSER_INTERACTIVE_HITL_ENABLED: "true"
       # The SHARED encrypted vault. The control plane writes one-time, run-scoped
       # browser-login references here; the browser service consumes them once.
       # NOTE: this overrides the base stack's /data/secret_vault.db, so the
@@ -82,11 +84,28 @@ services:
       BROWSER_SESSION_INACTIVITY_SECONDS: ${BROWSER_SESSION_INACTIVITY_SECONDS:-900}
       BROWSER_SESSION_MAX_AGE_SECONDS: ${BROWSER_SESSION_MAX_AGE_SECONDS:-3600}
 
-      PLAYWRIGHT_MAX_SESSIONS: ${PLAYWRIGHT_MAX_SESSIONS:-1}
+      # Interactive mode owns one X display, so this limit is intentionally not
+      # configurable in the assignment overlay.
+      PLAYWRIGHT_MAX_SESSIONS: "1"
       PLAYWRIGHT_DISABLE_SANDBOX: ${PLAYWRIGHT_DISABLE_SANDBOX:-true}
 
-      # Interactive remote control stays OFF for the assignment.
-      BROWSER_INTERACTIVE_HITL_ENABLED: "false"
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      CEREBRAS_MODEL: ${CEREBRAS_MODEL:-gpt-oss-120b}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-nvidia/nemotron-3-ultra-550b-a55b:free}
+      GOOGLE_GENAI_API_KEY: ${GOOGLE_GENAI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
+
+      # Headed Chromium + loopback-only x11vnc. Caddy exposes only the signed,
+      # owner-bound relay path; neither VNC nor browser RPC is published.
+      BROWSER_INTERACTIVE_HITL_ENABLED: "true"
+      BROWSER_DISPLAY_NUM: "99"
+      BROWSER_SCREEN_GEOMETRY: "1440x900x24"
+      BROWSER_VNC_PORT: "5900"
+      BROWSER_LIVE_VIEW_TOKEN_SECONDS: "300"
+
+      TZ: Asia/Singapore
+      LANG: C.UTF-8
 
       # Storage state is encrypted at rest; with no key it is simply not persisted.
       BROWSER_STORAGE_STATE_KEY: ${BROWSER_STORAGE_STATE_KEY:-}
@@ -121,6 +140,12 @@ services:
       timeout: 40s
       start_period: 30s
       retries: 3
+
+  caddy:
+    environment:
+      # Caddy injects this fixed owner only on the exact live-view WebSocket
+      # route. It must match the API and browser-worker owner above.
+      BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-assignment-owner}
 
 volumes:
   browser_profiles:

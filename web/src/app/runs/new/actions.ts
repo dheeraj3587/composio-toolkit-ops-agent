@@ -69,6 +69,16 @@ export async function createRunAction(
   const executionMode = ["plan_only", "execute_when_configured"].includes(requestedExecutionMode)
     ? (requestedExecutionMode as OperationsRequestInput["execution_mode"])
     : "plan_only"
+  const requestedBrowserProvider = value(formData, "browser_provider", 40)
+  const browserProvider = ["browser_use", "playwright"].includes(requestedBrowserProvider)
+    ? (requestedBrowserProvider as OperationsRequestInput["browser_provider"])
+    : null
+  const requestedCreationPolicy = value(formData, "credential_creation_policy", 40)
+  const creationPolicy = ["reuse_only", "create_if_missing"].includes(
+    requestedCreationPolicy,
+  )
+    ? (requestedCreationPolicy as OperationsRequestInput["credential_creation_policy"])
+    : null
 
   const invalid: string[] = []
   if (appName.length < 2) invalid.push("app_name")
@@ -87,6 +97,8 @@ export async function createRunAction(
   // A password this long is almost certainly an error/abuse; reject rather than
   // truncate (which would submit a wrong secret).
   if (appLoginPassword.length > 512) invalid.push("app_login_password")
+  if (browserProvider === null) invalid.push("browser_provider")
+  if (creationPolicy === null) invalid.push("credential_creation_policy")
 
   if (invalid.length > 0) {
     return {
@@ -109,6 +121,8 @@ export async function createRunAction(
     },
     requested_scope_policy: policy,
     execution_mode: executionMode,
+    browser_provider: browserProvider ?? "browser_use",
+    credential_creation_policy: creationPolicy ?? "reuse_only",
     outreach_recipient_override: outreachOverride || null,
     browser_login:
       appLoginEmail && appLoginPassword

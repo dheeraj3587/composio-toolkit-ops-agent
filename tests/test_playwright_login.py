@@ -22,6 +22,7 @@ from ops.browser_decider import SnapshotElement, build_snapshot
 from ops.browser_login import (
     drive_login,
     inject_otp,
+    inspect_after_login_submit,
     inspect_login,
     magic_link_is_safe,
     normalize_resume_signal,
@@ -37,6 +38,21 @@ from tests.browser_app.harness import require_chromium
 
 _HOST = "app.pipedrive.com"
 _PATTERNS = (_HOST, "*.pipedrive.com")
+
+
+def _login_inspection(state: str, reason: str) -> Any:
+    from ops.browser_login import LoginInspection
+
+    return LoginInspection(
+        state=state,
+        email_field=None,
+        password_field=None,
+        otp_fields=(),
+        submit_control=None,
+        current_url=f"https://{_HOST}/login",
+        reason_code=reason,
+    )
+
 
 # --- Local deterministic test application (routed HTML per path) ----------------
 _APP: dict[str, str] = {
@@ -130,6 +146,69 @@ def _run(path: str, coro_factory: Any) -> Any:
                 await browser.close()
 
     return asyncio.run(_main())
+
+
+def test_post_submit_visible_challenge_is_typed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ops.browser_login as login_module
+
+    async def unchanged(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        return _login_inspection("credentials_ready", "credentials_ready")
+
+    class _Item:
+        async def is_visible(self) -> bool:
+            return True
+
+    class _Locator:
+        async def count(self) -> int:
+            return 1
+
+        def nth(self, index: int) -> _Item:
+            assert index == 0
+            return _Item()
+
+    class _Page:
+        def locator(self, selector: str) -> _Locator:
+            assert "recaptcha" in selector
+            return _Locator()
+
+    monkeypatch.setattr(login_module, "wait_for_login_state_change", unchanged)
+    result = asyncio.run(
+        inspect_after_login_submit(
+            _Page(), previous="credentials_ready", patterns=_PATTERNS, timeout_seconds=0.5
+        )
+    )
+    assert result.state == "unknown"
+    assert result.reason_code == "captcha_required"
+
+
+def test_post_submit_unchanged_form_requires_provider_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ops.browser_login as login_module
+
+    async def unchanged(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        return _login_inspection("credentials_ready", "credentials_ready")
+
+    class _Locator:
+        async def count(self) -> int:
+            return 0
+
+    class _Page:
+        def locator(self, selector: str) -> _Locator:
+            assert "recaptcha" in selector
+            return _Locator()
+
+    monkeypatch.setattr(login_module, "wait_for_login_state_change", unchanged)
+    result = asyncio.run(
+        inspect_after_login_submit(
+            _Page(), previous="credentials_ready", patterns=_PATTERNS, timeout_seconds=0.5
+        )
+    )
+    assert result.reason_code == "login_verification_required"
 
 
 # --- Login state machine -------------------------------------------------------
@@ -436,6 +515,80 @@ class TestLoginResultPropagation:
         assert obs is not None
         assert obs.status == "failed"
         assert obs.reason_code == "login_incomplete"
+
+    def test_visible_captcha_becomes_a_bounded_interactive_handoff(self) -> None:
+        worker = self._worker()
+        session = self._session()
+        result = _login_inspection("unknown", "captcha_required")
+
+        first = worker._observation_from_login_result(session, result, had_credentials=True)
+        second = worker._observation_from_login_result(session, result, had_credentials=True)
+        exhausted = worker._observation_from_login_result(session, result, had_credentials=True)
+
+        assert first is not None and first.status == "human_action_required"
+        assert first.human_action_type == "captcha"
+        assert second is not None and second.status == "human_action_required"
+        assert exhausted is not None and exhausted.status == "failed"
+        assert exhausted.reason_code == "login_incomplete"
+
+    def test_provider_verification_is_not_mislabeled_as_bad_credentials(self) -> None:
+        obs = self._disposition("unknown", "login_verification_required")
+        assert obs is not None
+        assert obs.status == "human_action_required"
+        assert obs.reason_code == "login_verification_required"
+        assert obs.human_action_type == "provider_verification"
+
+    def test_all_login_handoffs_share_the_two_pause_budget(self) -> None:
+        worker = self._worker()
+        session = self._session()
+        otp = _login_inspection("otp_required", "otp_required")
+        account = _login_inspection("account_selection_required", "account_selection_required")
+
+        first = worker._observation_from_login_result(session, otp, had_credentials=False)
+        second = worker._observation_from_login_result(session, account, had_credentials=False)
+        exhausted = worker._observation_from_login_result(session, otp, had_credentials=False)
+
+        assert first is not None and first.status == "human_action_required"
+        assert second is not None and second.status == "human_action_required"
+        assert exhausted is not None and exhausted.reason_code == "login_incomplete"
+
+    def test_resume_checks_a_form_hiding_captcha_before_target_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import ops.playwright_worker as worker_module
+        from ops.browser_api_trace_catalog import get_browser_api_trace
+
+        worker = self._worker()
+        session = self._session()
+        session.app_slug = "pipedrive"
+        trace = get_browser_api_trace("pipedrive")
+        assert trace is not None
+
+        async def no_success(*args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            return None
+
+        async def no_surface(*args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            return _login_inspection("unknown", "no_recognized_login_surface")
+
+        async def challenge(*args: Any, **kwargs: Any) -> bool:
+            del args, kwargs
+            return True
+
+        async def must_not_retry(*args: Any, **kwargs: Any) -> bool:
+            del args, kwargs
+            raise AssertionError("visible CAPTCHA must be handled before navigation")
+
+        monkeypatch.setattr(worker, "verify_credential_page", no_success)
+        monkeypatch.setattr(worker, "_retry_reviewed_target_after_login", must_not_retry)
+        monkeypatch.setattr(worker_module, "inspect_login", no_surface)
+        monkeypatch.setattr(worker_module, "visible_login_challenge", challenge)
+
+        result = asyncio.run(worker._resume_login_after_hitl(session, trace))
+        assert result is not None
+        assert result.status == "human_action_required"
+        assert result.reason_code == "captcha_required"
 
     def test_no_recognized_surface_continues_the_loop(self) -> None:
         # None means "let the trace predicate decide", not "authenticated".

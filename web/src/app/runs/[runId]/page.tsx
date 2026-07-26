@@ -15,7 +15,6 @@ import {
   PhaseGrid,
   ResearchPanel,
   SecurityPanel,
-  phaseMap,
 } from "@/components/run-detail-panels"
 import { StatusBadge } from "@/components/status-badge"
 import { Timeline } from "@/components/timeline"
@@ -24,6 +23,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ApiError, getRun, getRunOutput, getTimeline } from "@/lib/api"
 import { formatTimestamp, humanize } from "@/lib/format"
+import { phaseMap } from "@/lib/phases"
 import type { PhaseCollection, PhaseState, RetryCapability } from "@/lib/types"
 
 export const metadata: Metadata = { title: "Run detail" }
@@ -64,6 +64,12 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
   const canResume = browser
     ? browser.can_resume && !browser.can_submit_login && !browser.can_submit_otp
     : detail.run.status === "waiting_for_hitl" && detail.hitl_request?.resumable === true
+  const interactivePlaywrightResume = Boolean(
+    canResume &&
+    browser?.provider === "playwright" &&
+    browser.lifecycle === "waiting_for_hitl" &&
+    browser.interaction_available,
+  )
 
   const canPoll = !isPlanOnly && ["outreach_sent", "waiting_for_reply"].includes(detail.run.status)
   const missingFields = Array.from(new Set([
@@ -82,9 +88,11 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
           <h1 className="mt-3 text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">{detail.run.app_name}</h1>
           <p className="mt-3 break-all font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">{detail.run.run_id}</p>
         </div>
-        <div className="grid overflow-hidden rounded-md border border-border bg-border sm:grid-cols-2 xl:min-w-[720px] xl:grid-cols-4">
+        <div className="grid overflow-hidden rounded-md border border-border bg-border sm:grid-cols-2 xl:min-w-[920px] xl:grid-cols-6">
           <Meta icon={Fingerprint} label="Access route" value={humanize(detail.run.access_route)} />
           <Meta icon={Settings2} label="Execution mode" value={humanize(detail.run.execution_mode)} />
+          <Meta icon={Globe2} label="Browser engine" value={humanize(detail.run.browser_provider)} />
+          <Meta icon={Settings2} label="Credential policy" value={humanize(detail.run.credential_creation_policy)} />
           <Meta icon={Clock3} label="Updated · UTC" value={formatTimestamp(detail.run.updated_at)} />
           <Meta icon={CircleOff} label="External actions" value={detail.run.external_actions ? "Enabled" : "Off"} />
         </div>
@@ -132,6 +140,8 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
                 <HitlLiveControls
                   runId={runId}
                   browser={browser}
+                  browserStateVersion={detail.run.updated_at}
+                  canResumeInteractive={interactivePlaywrightResume}
                   fieldName={detail.research?.credential_fields?.[0] ?? "api_token"}
                   fieldLabel={humanize(detail.research?.credential_fields?.[0] ?? "API token")}
                 />
@@ -142,7 +152,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
               )}
             </CapabilityPanel>
           </div>
-          <HitlPanel request={isPlanOnly ? null : detail.hitl_request} action={canResume ? <PhaseActionForm runId={runId} action="resume" label="Resume after human action" /> : undefined} />
+          <HitlPanel request={isPlanOnly ? null : detail.hitl_request} action={canResume && !interactivePlaywrightResume ? <PhaseActionForm runId={runId} action="resume" label="Resume after human action" /> : undefined} />
           <CapabilityPanel title="Provider email" icon={Mail} phase={emailPhase}>
             {canPoll ? <PhaseActionForm runId={runId} action="poll-email" label="Poll controlled inbox" /> : isRetryable(emailPhase) ? <PhaseActionForm runId={runId} action="retry" capability="email" label="Retry email phase" /> : <ControlUnavailable />}
           </CapabilityPanel>

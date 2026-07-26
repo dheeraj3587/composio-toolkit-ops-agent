@@ -20,7 +20,7 @@ endpoints use:
 
 1. the grant token must verify (HMAC signature, bound session id, bound owner,
    unexpired) — see ``ops.browser_live_view.verify_live_view_token``,
-2. the session must exist, be ``ACTIVE``, and be owned by the caller,
+2. the session must exist, be ``ACTIVE``, be awaiting HITL, and be owned by the caller,
 3. only then is a TCP connection opened to x11vnc on **loopback inside this
    container**, which is the only place the VNC port is reachable.
 
@@ -77,6 +77,7 @@ def authorize_live_view(
     session_owner: str | None,
     session_lifecycle: str | None,
     interactive_enabled: bool,
+    hitl_pending: bool = False,
 ) -> str:
     """Authorize one interactive attachment, or raise ``LiveViewDenied``.
 
@@ -108,6 +109,8 @@ def authorize_live_view(
         raise LiveViewDenied("session_not_found")
     if session_lifecycle != "ACTIVE":
         raise LiveViewDenied("session_closing")
+    if not hitl_pending:
+        raise LiveViewDenied("hitl_not_pending")
     return "live_view_authorized"
 
 

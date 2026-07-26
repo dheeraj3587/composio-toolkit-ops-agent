@@ -134,9 +134,11 @@ class Settings(BaseModel):
     browser_use_model: str = "claude-opus-4.7"
     # Per-session cost cap set high so a run never stops mid-task on the cap.
     browser_use_max_cost_usd: float = Field(default=50.0, gt=0)
-    # Which browser automation backend a run uses. Default is the paid Browser Use
-    # cloud (prod-proven); "playwright" selects the self-hosted harness. This is the
-    # single switch behind the gradual migration — the default keeps prod unchanged.
+    # Cloud tasks must not hold a run and paid session open forever if the SDK
+    # stalls. The worker stops the session when this wall-clock bound expires.
+    browser_use_task_timeout_seconds: int = Field(default=180, ge=30, le=600)
+    # Compatibility default for API/CLI callers that omit the immutable per-run
+    # selection. It does not prevent the other configured adapter from being wired.
     browser_provider: Literal["browser_use", "playwright"] = "browser_use"
     # Self-hosted Playwright limits. Each session is a real Chromium process, so the
     # cap is sized for a small VPS. --no-sandbox is opt-in (see _launch_args).
@@ -149,6 +151,9 @@ class Settings(BaseModel):
     browser_service_url: str | None = None
     browser_service_token: SecretStr | None = Field(default=None, repr=False)
     browser_service_owner: str = "ops-assignment-user"
+    # Explicit capability switch for the one-session headed/noVNC assignment path.
+    # The browser service independently enforces max_sessions=1 when this is true.
+    browser_interactive_hitl_enabled: bool = False
     # Running Chromium INSIDE the API process is for isolated tests and local
     # debugging only, so it must be requested explicitly rather than being a silent
     # fallback whenever the service happens to be unconfigured.
@@ -271,7 +276,11 @@ class Settings(BaseModel):
 
         values: dict[str, Any] = {
             "perplexity_api_key": _secret(source.get("PERPLEXITY_API_KEY")),
-            "you_api_key": _secret(source.get("YDC_API_KEY")),
+            # YDC_API_KEY is canonical. Accept the two historical spellings used
+            # by existing deployments without ever copying or logging the value.
+            "you_api_key": _secret(
+                source.get("YDC_API_KEY") or source.get("YOU_API_KEY") or source.get("You_API_KEY")
+            ),
             "google_genai_api_key": _secret(source.get("GOOGLE_GENAI_API_KEY")),
             "openrouter_api_key": _secret(source.get("OPENROUTER_API_KEY")),
             "groq_api_key": _secret(source.get("GROQ_API_KEY")),
@@ -297,6 +306,9 @@ class Settings(BaseModel):
             "browser_use_max_cost_usd": _float(
                 source.get("BROWSER_USE_MAX_COST_USD"), default=50.0
             ),
+            "browser_use_task_timeout_seconds": _integer(
+                source.get("BROWSER_USE_TASK_TIMEOUT_SECONDS"), default=180
+            ),
             "browser_provider": _choice(
                 source.get("BROWSER_PROVIDER"),
                 ("browser_use", "playwright"),
@@ -310,6 +322,9 @@ class Settings(BaseModel):
             "browser_service_token": _secret(source.get("BROWSER_SERVICE_TOKEN")),
             "browser_service_owner": (
                 _optional(source.get("BROWSER_SERVICE_OWNER")) or "ops-assignment-user"
+            ),
+            "browser_interactive_hitl_enabled": _boolean(
+                source.get("BROWSER_INTERACTIVE_HITL_ENABLED"), default=False
             ),
             "playwright_in_process_sandbox": _boolean(
                 source.get("PLAYWRIGHT_IN_PROCESS_SANDBOX"), default=False

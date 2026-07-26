@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -125,6 +125,10 @@ _MAGIC_LINK = re.compile(
     r"|sign[- ]in link|verification link (?:has been )?sent"
 )
 _AUTH_PATH = re.compile(r"(?i)/(login|signin|sign-in|auth|sso|session|account/login)")
+_CHALLENGE_IFRAME_SELECTOR = (
+    "iframe[src*='recaptcha' i], iframe[title*='recaptcha' i], "
+    "iframe[src*='hcaptcha' i], iframe[title*='hcaptcha' i]"
+)
 
 
 async def _count_visible_enabled(page: Any, selector: str, *, limit: int = 8) -> int:
@@ -493,6 +497,56 @@ async def wait_for_login_state_change(
     return await inspect_login(page, patterns)
 
 
+async def visible_login_challenge(page: Any) -> bool:
+    """Whether an actual CAPTCHA challenge frame is visible right now.
+
+    Passive badges and hidden response controls are deliberately ignored; a
+    challenge is a human gate only when its iframe is visibly presented.
+    """
+
+    try:
+        locator = page.locator(_CHALLENGE_IFRAME_SELECTOR)
+        count = min(int(await locator.count()), 8)
+    except Exception:
+        return False
+    for index in range(count):
+        try:
+            if await locator.nth(index).is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def inspect_after_login_submit(
+    page: Any,
+    *,
+    previous: LoginState,
+    patterns: Sequence[str],
+    timeout_seconds: float = 20.0,
+) -> LoginInspection:
+    """Wait for a submitted login to change, then classify any visible gate."""
+
+    result = await wait_for_login_state_change(
+        page,
+        previous=previous,
+        patterns=patterns,
+        timeout_seconds=timeout_seconds,
+    )
+    # Preserve every explicit result (wrong password, OTP, account selection,
+    # magic link, or an email-first password step). A no-surface result can still
+    # be a visible challenge whose form was hidden by the provider overlay.
+    if result.state != previous and result.reason_code != "no_recognized_login_surface":
+        return result
+    if await visible_login_challenge(page):
+        return replace(result, state="unknown", reason_code="captcha_required")
+    if result.state != previous:
+        return result
+    # No explicit bad-credential evidence appeared. On a new device this may be a
+    # risk decision or delayed provider verification, so escalate rather than lie.
+    return replace(result, state="unknown", reason_code="login_verification_required")
+
+
 async def drive_login(
     page: Any, sensitive_data: Mapping[str, str], patterns: Sequence[str]
 ) -> LoginInspection:
@@ -543,22 +597,34 @@ async def drive_login(
             await _fill_first(surface, _EMAIL_SELECTOR, email)
         if password:
             await _fill_first(surface, _PASSWORD_SELECTOR, password)
-        await _click_submit(surface)
-        return await inspect_login(page, patterns)
+        submitted = await _click_submit(surface)
+        if not submitted:
+            return inspection
+        return await inspect_after_login_submit(
+            page, previous="credentials_ready", patterns=patterns
+        )
 
     # Email-first: submit the email, then handle the resulting password page.
     if inspection.state == "email_required":
         if email:
             await _fill_first(surface, _EMAIL_SELECTOR, email)
-            await _click_email_continue(surface)
-            after = await inspect_login(page, patterns)
+            submitted = await _click_email_continue(surface)
+            if not submitted:
+                return inspection
+            after = await inspect_after_login_submit(
+                page, previous="email_required", patterns=patterns
+            )
             next_surface = resolve_reviewed_frame(page, after.frame_path, patterns)
             if after.state == "password_required" and password and next_surface is not None:
                 if not await _origin_safe_and_unique(page, patterns, next_surface):
                     return after
                 await _fill_first(next_surface, _PASSWORD_SELECTOR, password)
-                await _click_submit(next_surface)
-                return await inspect_login(page, patterns)
+                submitted = await _click_submit(next_surface)
+                if not submitted:
+                    return after
+                return await inspect_after_login_submit(
+                    page, previous="password_required", patterns=patterns
+                )
             return after
         return inspection
 
@@ -566,8 +632,12 @@ async def drive_login(
     if inspection.state == "password_required":
         if password and await _origin_safe_and_unique(page, patterns, surface):
             await _fill_first(surface, _PASSWORD_SELECTOR, password)
-            await _click_submit(surface)
-            return await inspect_login(page, patterns)
+            submitted = await _click_submit(surface)
+            if not submitted:
+                return inspection
+            return await inspect_after_login_submit(
+                page, previous="password_required", patterns=patterns
+            )
         return inspection
 
     return inspection
@@ -745,10 +815,12 @@ __all__ = [
     "apply_resume_secrets",
     "drive_login",
     "inject_otp",
+    "inspect_after_login_submit",
     "inspect_login",
     "magic_link_is_safe",
     "normalize_resume_signal",
     "resolve_reviewed_frame",
     "reviewed_login_surfaces",
+    "visible_login_challenge",
     "wait_for_login_state_change",
 ]

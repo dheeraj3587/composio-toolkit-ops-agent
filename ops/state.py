@@ -16,6 +16,8 @@ AccessRoute = Literal[
     "blocked",
     "unknown",
 ]
+BrowserProvider = Literal["browser_use", "playwright"]
+CredentialCreationPolicy = Literal["reuse_only", "create_if_missing"]
 
 RunStatus = Literal[
     "created",
@@ -52,7 +54,15 @@ _LEGAL_STATUS_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
         {"browser_running", "outreach_sent", "configuration_required", "blocked", "failed"}
     ),
     "browser_running": frozenset(
-        {"waiting_for_hitl", "credentials_ready", "configuration_required", "blocked", "failed"}
+        {
+            "waiting_for_hitl",
+            "outreach_sent",
+            "waiting_for_reply",
+            "credentials_ready",
+            "configuration_required",
+            "blocked",
+            "failed",
+        }
     ),
     # ``configuration_required`` is reachable from ``waiting_for_hitl`` because a
     # self-hosted (in-process) browser session does not survive an api restart: such
@@ -132,6 +142,8 @@ class OperationsState(TypedDict, total=False):
     route_reason: str
     route_reason_code: str
     status: RunStatus
+    browser_provider: BrowserProvider
+    credential_creation_policy: CredentialCreationPolicy
     state_revision: int
     last_projected_revision: int
 

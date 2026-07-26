@@ -15,10 +15,21 @@
 #        credentials or provider work; there is no transport encryption.
 #
 # ACME_EMAIL is optional and only used for certificate expiry notices.
-
 {
 	admin off
 	email {$ACME_EMAIL:admin@example.com}
+
+	# Reverse-proxy failures are runtime logs (not access logs) and can include the
+	# request URI. Redact both signed grant parameters before encoding any Caddy
+	# log so an unavailable browser-worker cannot leak the WebSocket capability.
+	log default {
+		format filter {
+			request>uri query {
+				replace session REDACTED
+				replace token REDACTED
+			}
+		}
+	}
 }
 
 # Internal container-health listener. It is bound only inside the Caddy
@@ -39,9 +50,18 @@ http://127.0.0.1:8080 {
 	# Remove server fingerprinting.
 	header -Server
 
+	# The signed live-view grant is necessarily a WebSocket query parameter.
+	# Keep this path out of access logs even if site logging is enabled later.
+	@playwright_live_view {
+		path /internal/browser/live-view/novnc
+	}
+	log_skip @playwright_live_view
+
 	# Ordered routing (a `route` block preserves written order; first match wins):
 	#   1. /healthz is an unauthenticated load-balancer probe.
-	#   2. Every other browser route is protected by Basic Auth and sent only to
+	#   2. The one reviewed Playwright live-view WebSocket path is protected by
+	#      Basic Auth and relayed directly to the private browser service.
+	#   3. Every other browser route is protected by Basic Auth and sent only to
 	#      Next.js. FastAPI is intentionally not exposed through Caddy.
 	#
 	# Caddy's reverse_proxy automatically sets X-Forwarded-For, X-Forwarded-Proto
@@ -49,6 +69,23 @@ http://127.0.0.1:8080 {
 	route {
 		handle /healthz {
 			respond "ok" 200
+		}
+
+		handle @playwright_live_view {
+			basic_auth {
+				{$OPS_BASIC_AUTH_USER} {$OPS_BASIC_AUTH_HASH}
+			}
+
+			reverse_proxy browser-worker:8081 {
+				# Basic Auth terminates at Caddy. The browser service receives only
+				# its fixed operator identity plus the signed, session-bound grant
+				# carried by the WebSocket query string.
+				header_up -Authorization
+				header_up X-Browser-Session-Owner {$BROWSER_SERVICE_OWNER:production-owner}
+
+				# Do not forcibly churn a live human handoff during Caddy reloads.
+				stream_close_delay 5m
+			}
 		}
 
 		handle {

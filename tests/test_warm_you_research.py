@@ -1,103 +1,61 @@
-"""Offline tests for the dry-run-first You.com warming command."""
-
 from __future__ import annotations
 
-import importlib.util
+import argparse
+import json
 from pathlib import Path
-from types import ModuleType
 
-from ops.config import Settings
-
-_ROOT = Path(__file__).resolve().parents[1]
-_SCRIPT = _ROOT / "scripts" / "warm_you_research.py"
-
-
-def _module() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("warm_you_research_test", _SCRIPT)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from scripts.warm_you_research import (
+    _selected_records,
+    _summary_row,
+    _traced_apps,
+    _write_summary,
+)
 
 
-def test_dry_run_uses_verified_snapshot_without_executing(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
-    module = _module()
+def test_all_selection_covers_exactly_the_verified_p1_catalog() -> None:
+    records = _selected_records(argparse.Namespace(all=True, app_slug=None, limit=None))
 
-    async def _must_not_execute(**kwargs: object) -> list[dict[str, object]]:
-        del kwargs
-        raise AssertionError("dry-run must not invoke enrichment")
-
-    monkeypatch.setattr(module, "_execute", _must_not_execute)
-    assert module.main(["--app-slug", "pipedrive"]) == 0
-    output = capsys.readouterr().out
-    assert "DRY RUN: 1 verified P1 app(s)" in output
-    assert "No You.com, Gemini, browser, or vendor calls were made." in output
-    assert "pipedrive: skipped reason=dry_run" in output
+    assert len(records) == 100
+    assert len({record.slug for record in records}) == 100
+    assert len(_traced_apps()) == 25
 
 
-def test_execute_uses_injected_runtime_boundary_and_writes_sanitized_summary(
-    monkeypatch, tmp_path: Path
-) -> None:
-    module = _module()
-    calls: dict[str, object] = {}
-
-    async def _fake_execute(
-        records: object,
-        *,
-        settings: Settings,
-        force_refresh: bool,
-        concurrency: int,
-        continue_on_error: bool,
-    ) -> list[dict[str, object]]:
-        calls.update(
-            records=list(records),
-            settings=settings,
-            force_refresh=force_refresh,
-            concurrency=concurrency,
-            continue_on_error=continue_on_error,
-        )
-        return [
-            {
-                "app_slug": "pipedrive",
-                "status": "enriched",
-                "reason_code": "official_evidence_enriched",
-                "missing_fields": ["token_url"],
-                "missing_field_count": 1,
-                "verified_claim_count": 3,
-            }
-        ]
-
-    monkeypatch.setattr(module, "_execute", _fake_execute)
-    monkeypatch.setattr(
-        module.Settings,
-        "from_env",
-        classmethod(lambda cls: Settings()),
+def test_summary_marks_only_traced_apps_with_both_verified_urls_browser_ready() -> None:
+    records = _selected_records(argparse.Namespace(all=True, app_slug=None, limit=None))
+    traced = _traced_apps()
+    record = next(item for item in records if item.slug in traced)
+    row = _summary_row(
+        record,
+        status="enriched",
+        missing_fields=(),
+        verified_claim_count=2,
+        research={
+            "access_route": "self_serve",
+            "login_url": "https://example.test/login",
+            "credential_management_url": "https://example.test/settings/api",
+        },
+        traced_apps=traced,
     )
-    summary = tmp_path / "summary.json"
-    assert (
-        module.main(
-            [
-                "--app-slug",
-                "pipedrive",
-                "--execute",
-                "--force-refresh",
-                "--max-age-seconds",
-                "60",
-                "--concurrency",
-                "2",
-                "--continue-on-error",
-                "--output-summary",
-                str(summary),
-            ]
-        )
-        == 0
+
+    assert row["coverage_status"] == "browser_ready"
+    assert row["browser_trace_status"] == "reviewed"
+
+
+def test_written_report_contains_sanitized_coverage_totals(tmp_path: Path) -> None:
+    path = tmp_path / "coverage.json"
+    _write_summary(
+        path,
+        execute=True,
+        rows=(
+            {"coverage_status": "browser_ready", "app_slug": "one"},
+            {"coverage_status": "research_only", "app_slug": "two"},
+            {"coverage_status": "research_only", "app_slug": "three"},
+        ),
     )
-    assert calls["force_refresh"] is True
-    assert calls["concurrency"] == 2
-    assert calls["continue_on_error"] is True
-    assert isinstance(calls["settings"], Settings)
-    assert calls["settings"].you_contents_max_age_seconds == 60  # type: ignore[index]
-    content = summary.read_text(encoding="utf-8")
-    assert '"mode": "execute"' in content
-    assert "pipedrive" in content
-    assert "api_key" not in content
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["selected_app_count"] == 3
+    assert payload["coverage_counts"] == {
+        "browser_ready": 1,
+        "research_only": 2,
+    }

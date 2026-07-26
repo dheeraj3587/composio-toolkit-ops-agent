@@ -29,6 +29,9 @@ _PLAYWRIGHT = Settings(
     browser_service_token=SecretStr("service-token"),
     allow_local_credential_submission=True,
 )
+_PLAYWRIGHT_INTERACTIVE = _PLAYWRIGHT.model_copy(
+    update={"browser_interactive_hitl_enabled": True}
+)
 _BROWSER_USE = Settings(
     allow_live_browser=True,
     browser_use_api_key=SecretStr("bu-key"),
@@ -261,17 +264,37 @@ def test_screenshot_availability_requires_an_actual_frame() -> None:
     assert without_frame.live_view_available is False
 
 
-def test_interactive_remote_is_never_advertised_yet() -> None:
-    for settings in (_PLAYWRIGHT, _BROWSER_USE):
-        state = project_browser_ui(
-            settings=settings,
-            run_status="waiting_for_hitl",
-            event_types={"browser_hitl_required"},
-            browser_session_id="s_1",
-            screenshot_present=True,
-            hitl=_hitl("captcha"),
-        )
-        assert state.live_view_mode != "interactive_remote"
+def test_interactive_playwright_is_advertised_only_during_hitl() -> None:
+    waiting = project_browser_ui(
+        settings=_PLAYWRIGHT_INTERACTIVE,
+        run_status="waiting_for_hitl",
+        event_types={"browser_hitl_required"},
+        browser_session_id="pw_1",
+        screenshot_present=False,
+        hitl=_hitl("captcha"),
+    )
+    running = project_browser_ui(
+        settings=_PLAYWRIGHT_INTERACTIVE,
+        run_status="browser_running",
+        event_types={"browser_session_started"},
+        browser_session_id="pw_1",
+        screenshot_present=True,
+    )
+    disabled = project_browser_ui(
+        settings=_PLAYWRIGHT,
+        run_status="waiting_for_hitl",
+        event_types={"browser_hitl_required"},
+        browser_session_id="pw_1",
+        screenshot_present=True,
+        hitl=_hitl("captcha"),
+    )
+
+    assert waiting.live_view_mode == "interactive_remote"
+    assert waiting.interaction_available is True
+    assert running.live_view_mode == "screenshot"
+    assert running.interaction_available is False
+    assert disabled.live_view_mode == "screenshot"
+    assert disabled.interaction_available is False
 
 
 # --- production path: api.main installs the projection layers ----------------
@@ -327,11 +350,10 @@ def test_production_api_main_projection_is_provider_aware(tmp_path: Path) -> Non
     assert browser["can_submit_credential"] is False
     assert browser["credential_page_verified"] is False
 
-    # The provider state list reports the same provider identity, never
-    # browser_use, and Playwright is NOT reported unconfigured despite there being
-    # no BROWSER_USE_API_KEY in this environment.
+    # Readiness is reported independently for both providers. Playwright is
+    # configured without requiring a Browser Use key.
     states = {state["provider"]: state for state in detail_payload["provider_states"]}
-    assert "browser_use" not in states
+    assert states["browser_use"]["status"] == "not_configured"
     assert states["playwright"]["status"] == "configured_not_verified"
 
     # The production phase projection describes the selected provider too.

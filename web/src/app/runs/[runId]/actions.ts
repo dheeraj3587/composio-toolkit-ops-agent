@@ -10,6 +10,7 @@ import {
   resumeWithBrowserLogin,
   submitCredentials,
 } from "@/lib/api"
+import { sameOriginInteractivePath } from "@/lib/live-view-grant"
 import type {
   BrowserProvider,
   LiveViewMode,
@@ -73,6 +74,7 @@ export interface LiveViewState {
   mode: LiveViewMode
   liveUrl: string | null
   screenshotUrl: string | null
+  interactivePath: string | null
   capturedAt: string | null
   interactionAvailable: boolean
   message: string | null
@@ -85,6 +87,7 @@ function unavailableLiveView(message: string): LiveViewState {
     mode: "unavailable",
     liveUrl: null,
     screenshotUrl: null,
+    interactivePath: null,
     capturedAt: null,
     interactionAvailable: false,
     message,
@@ -117,6 +120,7 @@ export async function openLiveView(
         mode: result.mode,
         liveUrl: result.live_url,
         screenshotUrl: null,
+        interactivePath: null,
         capturedAt: result.captured_at ?? null,
         interactionAvailable: result.interaction_available,
         message: "Interactive hosted browser session ready.",
@@ -132,6 +136,7 @@ export async function openLiveView(
         liveUrl: null,
         screenshotUrl:
           `/api/control/runs/${encodeURIComponent(runId)}/live-view/screenshot?v=${version}`,
+        interactivePath: null,
         capturedAt: result.captured_at ?? null,
         interactionAvailable: false,
         message: "Latest Playwright browser frame loaded. This view is read-only.",
@@ -139,9 +144,24 @@ export async function openLiveView(
       }
     }
 
-    // interactive_remote is deliberately not rendered until the repository exposes
-    // a complete same-origin noVNC client and WebSocket proxy. A private service URL
-    // must never be returned to browser JavaScript.
+    if (
+      result.mode === "interactive_remote" &&
+      result.interactive_url &&
+      result.interaction_available
+    ) {
+      return {
+        provider: result.provider,
+        mode: "interactive_remote",
+        liveUrl: null,
+        screenshotUrl: null,
+        interactivePath: sameOriginInteractivePath(result.interactive_url),
+        capturedAt: result.captured_at ?? null,
+        interactionAvailable: true,
+        message: "Interactive Playwright session ready.",
+        tone: "neutral",
+      }
+    }
+
     return {
       ...unavailableLiveView("The selected interactive browser view is not available in this control plane."),
       provider: result.provider,

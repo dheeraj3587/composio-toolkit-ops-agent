@@ -27,6 +27,7 @@ from uuid import uuid4
 import httpx
 from pydantic import SecretStr
 
+from ops.browser_api_trace_catalog import get_browser_api_trace
 from ops.browser_link_log import log_event, url_host
 from ops.browser_worker import BrowserWorker
 from ops.composio_capability import ComposioCapabilityPreflight, ComposioCapabilityReport
@@ -82,7 +83,13 @@ from ops.redaction import redact_data, redact_text
 from ops.research_cache import SqliteResearchCache
 from ops.routing import RoutingDecision, decide_access
 from ops.secret_store import SecretStoreError, SQLiteSecretStore
-from ops.state import AccessRoute, OperationsState, RunStatus, validate_status_transition
+from ops.state import (
+    AccessRoute,
+    BrowserProvider,
+    OperationsState,
+    RunStatus,
+    validate_status_transition,
+)
 from ops.storage import OperationsStorage, OperationsUnitOfWork
 from ops.you_research import (
     CompositeEvidenceDiscovery,
@@ -144,6 +151,8 @@ _PUBLIC_RUN_FIELDS = (
     "access_route",
     "created_at",
     "updated_at",
+    "browser_provider",
+    "credential_creation_policy",
 )
 
 
@@ -236,6 +245,42 @@ def _validate_created_projection(final_status: str) -> None:
 def _request_fingerprint(request: OperationsRequest, execution_mode: str) -> str:
     canonical = json.dumps(
         {"execution_mode": execution_mode, "request": request.model_dump(mode="json")},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _legacy_request_fingerprints(request: OperationsRequest, execution_mode: str) -> set[str]:
+    """Accepted historical fingerprint shapes for compatibility replays."""
+
+    if request.credential_creation_policy != "reuse_only":
+        return set()
+    fingerprints: set[str] = set()
+    excluded_sets = [{"credential_creation_policy"}]
+    if request.browser_provider == "browser_use":
+        excluded_sets.append({"browser_provider", "credential_creation_policy"})
+    for excluded in excluded_sets:
+        legacy_request = request.model_dump(mode="json", exclude=excluded)
+        canonical = json.dumps(
+            {"execution_mode": execution_mode, "request": legacy_request},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        fingerprints.add(hashlib.sha256(canonical).hexdigest())
+    return fingerprints
+
+
+def _legacy_request_fingerprint(request: OperationsRequest, execution_mode: str) -> str:
+    """Return the oldest Browser Use fingerprint shape kept for test/client compatibility."""
+
+    legacy_request = request.model_dump(
+        mode="json", exclude={"browser_provider", "credential_creation_policy"}
+    )
+    canonical = json.dumps(
+        {"execution_mode": execution_mode, "request": legacy_request},
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -357,6 +402,9 @@ class RunService:
         # stored on the service (that would be unsafe across the per-enrichment
         # ``asyncio.run`` event loops). Only built when YDC_API_KEY is present.
         self._research_cache: SqliteResearchCache | None = None
+        self._browser_workers: dict[BrowserProvider, BrowserWorker] = {}
+        # Compatibility alias for older tests and assignment patches. Runtime
+        # operations always resolve from _browser_workers using the persisted run.
         self._browser_worker: BrowserWorker | None = None
         self._gmail_worker: GmailWorker | None = None
         # In-memory marker of the last inbound reply id handled per run, so the
@@ -542,15 +590,6 @@ class RunService:
         # alone is not evidence, so each waiting_for_hitl run is CHECKED against the
         # service (see _browser_session_is_live); only a session the service still
         # reports ACTIVE is left resumable.
-        reattach = bool(getattr(self._browser_worker, "supports_restart_reattach", True))
-        stranded_statuses = (
-            ("browser_running",) if reattach else ("browser_running", "waiting_for_hitl")
-        )
-        reason = (
-            "api_restart_stranded_browser_run" if reattach else "playwright_session_lost_on_restart"
-        )
-        # Only the RPC-backed provider can be asked whether a session survived.
-        verifies_sessions = callable(getattr(self._browser_worker, "reconcile_session", None))
         try:
             offset = 0
             while True:
@@ -560,6 +599,19 @@ class RunService:
                 for record in batch:
                     status = record.get("status")
                     run_id = str(record.get("run_id") or "")
+                    worker = self._browser_worker_for(record)
+                    reattach = bool(getattr(worker, "supports_restart_reattach", True))
+                    stranded_statuses = (
+                        ("browser_running",)
+                        if reattach
+                        else ("browser_running", "waiting_for_hitl")
+                    )
+                    reason = (
+                        "api_restart_stranded_browser_run"
+                        if reattach
+                        else "playwright_session_lost_on_restart"
+                    )
+                    verifies_sessions = callable(getattr(worker, "reconcile_session", None))
                     if status in stranded_statuses:
                         self._reconcile_one_stranded(
                             run_id,
@@ -595,7 +647,7 @@ class RunService:
         was briefly unreachable would destroy a session that is actually alive.
         """
 
-        worker = self._browser_worker
+        worker = self._browser_worker_for(record)
         reconcile = getattr(worker, "reconcile_session", None)
         if not callable(reconcile):
             return None
@@ -965,12 +1017,12 @@ class RunService:
         return PolicyBoundCredentialValidator(validator=validator, endpoints=endpoints)
 
     def _build_workflow_dependencies(self, settings: Settings) -> WorkflowDependencies:
-        """Inject controlled Gmail and Browser Use adapters only when configured.
+        """Inject controlled Gmail and every configured browser adapter.
 
         Gmail outreach requires Composio configuration AND a configured
         OUTREACH_RECIPIENT_OVERRIDE so every send is delivered to the controlled
-        recipient, never the discovered vendor address. The Browser Use adapter is
-        injected only when live browsing is explicitly enabled with a key.
+        recipient, never the discovered vendor address. Browser adapters are
+        evaluated independently and registered under their canonical identities.
         """
 
         # Build the effect ledger up front so the Gmail worker can share it for
@@ -998,22 +1050,43 @@ class RunService:
             self._gmail_worker = gmail
         self._record_wiring("gmail", gmail, configured=gmail is not None)
 
-        browser: BrowserWorker | None = None
-        if self._browser_provider_enabled(settings):
-            browser = self._build_browser_worker(settings)
-            self._browser_worker = browser
+        browsers: dict[BrowserProvider, BrowserWorker] = {}
+        for provider_name in ("browser_use", "playwright"):
+            if not self._browser_provider_enabled(settings, provider_name):
+                self._record_wiring(
+                    f"browser:{provider_name}",
+                    None,
+                    configured=False,
+                )
+                continue
+            provider_settings = settings.model_copy(update={"browser_provider": provider_name})
+            worker = self._build_browser_worker(provider_settings, provider=provider_name)
+            browsers[provider_name] = worker
+            self._record_wiring(
+                f"browser:{provider_name}",
+                worker,
+                configured=True,
+            )
+        self._browser_workers = browsers
+        browser = browsers.get(settings.browser_provider)
+        self._browser_worker = browser
         self._record_wiring("browser", browser, configured=browser is not None)
 
         self._record_wiring("effect_store", self._effect_store, configured=True)
 
         return WorkflowDependencies(
             browser=browser,
+            browsers=browsers,
             gmail=gmail,
             effect_store=self._effect_store,
             outreach_recipient=settings.outreach_recipient_override,
         )
 
-    def _browser_provider_enabled(self, settings: Settings) -> bool:
+    def _browser_provider_enabled(
+        self,
+        settings: Settings,
+        provider: BrowserProvider | None = None,
+    ) -> bool:
         """Whether a browser worker should be wired for the selected provider.
 
         ``browser_use`` keeps the exact prod condition (live opt-in + an API key).
@@ -1026,10 +1099,38 @@ class RunService:
 
         # One shared, provider-aware helper (also used by health + retry eligibility)
         # so a Playwright deployment is never judged by a Browser Use key.
-        return browser_configuration_state(settings)
+        return browser_configuration_state(settings, provider)
+
+    def _browser_worker_for(
+        self,
+        source: Mapping[str, object] | BrowserProvider,
+    ) -> BrowserWorker | None:
+        provider = (
+            source
+            if isinstance(source, str)
+            else cast(BrowserProvider, source.get("browser_provider", "browser_use"))
+        )
+        workers = cast(
+            dict[BrowserProvider, BrowserWorker],
+            getattr(self, "_browser_workers", {}),
+        )
+        worker = workers.get(provider)
+        if worker is not None:
+            return worker
+        # Compatibility for narrow tests and older embedders that injected the
+        # former single-worker attribute directly. Never cross-route a worker
+        # whose provider identity is known to differ from the run.
+        legacy_worker = cast(BrowserWorker | None, getattr(self, "_browser_worker", None))
+        legacy_provider = getattr(legacy_worker, "provider_name", provider)
+        return legacy_worker if legacy_provider == provider else None
 
     def _browser_login_payload(
-        self, *, app_slug: str, scope_id: str, values: Mapping[str, SecretStr]
+        self,
+        *,
+        provider: BrowserProvider,
+        app_slug: str,
+        scope_id: str,
+        values: Mapping[str, SecretStr],
     ) -> dict[str, str]:
         """Build the credential payload for the ACTIVE browser provider.
 
@@ -1040,7 +1141,7 @@ class RunService:
         """
 
         raw = {name: secret.get_secret_value() for name, secret in values.items()}
-        worker = self._browser_worker
+        worker = self._browser_worker_for(provider)
         if getattr(worker, "provider_name", "") != "playwright":
             return raw
         if not callable(getattr(worker, "reconcile_session", None)):
@@ -1102,7 +1203,12 @@ class RunService:
             ) from None
         return references
 
-    def _build_browser_worker(self, settings: Settings) -> BrowserWorker:
+    def _build_browser_worker(
+        self,
+        settings: Settings,
+        *,
+        provider: BrowserProvider | None = None,
+    ) -> BrowserWorker:
         """Select the browser backend.
 
         Default resolves the (possibly assignment-patched) ``BrowserWorker`` in this
@@ -1117,8 +1223,8 @@ class RunService:
         debugging, not a silent fallback when the service is unconfigured.
         """
 
-        provider = getattr(settings, "browser_provider", "browser_use")
-        if provider == "playwright":
+        selected = provider or settings.browser_provider
+        if selected == "playwright":
             if getattr(settings, "playwright_in_process_sandbox", False):
                 try:
                     from ops.playwright_worker import PlaywrightBrowserWorker
@@ -1201,12 +1307,13 @@ class RunService:
             except Exception:  # pragma: no cover - best-effort cleanup
                 pass
             self._research_cache = None
-        if self._browser_worker is not None:
+        for worker in dict.fromkeys(self._browser_workers.values()):
             try:
-                asyncio.run(self._browser_worker.close())
+                asyncio.run(worker.close())
             except Exception:  # pragma: no cover - best-effort cleanup
                 pass
-            self._browser_worker = None
+        self._browser_workers = {}
+        self._browser_worker = None
 
     def create_run(
         self,
@@ -1287,7 +1394,10 @@ class RunService:
                 existing = transaction.get_idempotent_run(validated_idempotency_key)
                 if existing is not None:
                     record, stored_fingerprint = existing
-                    if stored_fingerprint != request_fingerprint:
+                    legacy_match = stored_fingerprint in _legacy_request_fingerprints(
+                        request, execution_mode
+                    )
+                    if stored_fingerprint != request_fingerprint and not legacy_match:
                         raise IdempotencyConflictError(
                             "idempotency key was already used for another request"
                         )
@@ -1335,6 +1445,8 @@ class RunService:
                 },
                 scope_policy=request.requested_scope_policy,
                 execution_mode=persisted_execution_mode,
+                browser_provider=request.browser_provider,
+                credential_creation_policy=request.credential_creation_policy,
                 external_actions=False,
                 idempotency_key=validated_idempotency_key,
                 request_fingerprint=request_fingerprint,
@@ -1346,6 +1458,8 @@ class RunService:
                     "status": "created",
                     "scope_policy": request.requested_scope_policy,
                     "execution_mode": persisted_execution_mode,
+                    "browser_provider": request.browser_provider,
+                    "credential_creation_policy": request.credential_creation_policy,
                     "external_actions": False,
                 },
             )
@@ -1480,6 +1594,7 @@ class RunService:
                     start_sensitive_data: dict[str, str] | None = None
                     if browser_login and run_provider_action:
                         start_sensitive_data = self._browser_login_payload(
+                            provider=request.browser_provider,
                             # The verified slug and the newly created run id are
                             # already in scope here; the run row is not readable
                             # yet from inside its own creating transaction.
@@ -1489,11 +1604,18 @@ class RunService:
                             scope_id=run_id,
                             values=browser_login,
                         )
+                    selected_worker = self._browser_worker_for(request.browser_provider)
+                    browser_research_ready = bool(
+                        research.login_url
+                        and research.credential_management_url
+                        and get_browser_api_trace(research.app_slug) is not None
+                    )
                     if (
                         self._async_browser_enabled
                         and is_self_serve
                         and run_provider_action
-                        and self._browser_worker is not None
+                        and selected_worker is not None
+                        and browser_research_ready
                     ):
                         # OPTION A: pre-create the live provider session so the
                         # embedded live view is available immediately, commit the
@@ -1505,7 +1627,7 @@ class RunService:
                         # supplies is passed here: without app_slug the service
                         # cannot resolve its host policy, and without secret_scope
                         # it cannot consume this run's one-time login references.
-                        worker = self._browser_worker
+                        worker = selected_worker
                         is_playwright = getattr(worker, "provider_name", "") == "playwright"
                         account_ref: str | None = None
                         if is_playwright:
@@ -1561,6 +1683,7 @@ class RunService:
                                 request.model_copy(update={"dry_run": not run_provider_action}),
                                 thread_id=thread_id,
                                 sensitive_data=start_sensitive_data,
+                                research=research if browser_research_ready else None,
                             )
                         except Exception as exc:
                             log_event(
@@ -1838,7 +1961,14 @@ class RunService:
         # creation write and the run row is already queryable + streamable.
         if pending_async_navigate is not None:
             context, async_sensitive = pending_async_navigate
-            self._spawn_async_browser(run_id, thread_id, request, context, async_sensitive)
+            self._spawn_async_browser(
+                run_id,
+                thread_id,
+                request,
+                research,
+                context,
+                async_sensitive,
+            )
         return _public_run(created)
 
     def _spawn_async_browser(
@@ -1846,6 +1976,7 @@ class RunService:
         run_id: str,
         thread_id: str,
         request: OperationsRequest,
+        research: OperationalResearch,
         context: Any,
         sensitive_data: dict[str, str] | None,
     ) -> None:
@@ -1853,7 +1984,7 @@ class RunService:
 
         thread = threading.Thread(
             target=self._run_async_browser,
-            args=(run_id, thread_id, request, context, sensitive_data),
+            args=(run_id, thread_id, request, research, context, sensitive_data),
             name=f"browser-{run_id[:16]}",
             daemon=True,
         )
@@ -1866,6 +1997,7 @@ class RunService:
         run_id: str,
         thread_id: str,
         request: OperationsRequest,
+        research: OperationalResearch,
         context: Any,
         sensitive_data: dict[str, str] | None,
     ) -> None:
@@ -1893,6 +2025,7 @@ class RunService:
                 request.model_copy(update={"dry_run": False}),
                 thread_id=thread_id,
                 sensitive_data=sensitive_data,
+                research=research,
                 seed=seed,
             )
         except Exception as exc:
@@ -2012,7 +2145,8 @@ class RunService:
                 # browser from the session profile and read the API token over
                 # CDP (no human copy, no LLM read). Falls back to owner paste.
                 captured_refs: dict[str, str] | None = None
-                auto_capture = getattr(self._browser_worker, "auto_capture_credentials", None)
+                selected_worker = self._browser_worker_for(request.browser_provider)
+                auto_capture = getattr(selected_worker, "auto_capture_credentials", None)
                 if (
                     research_obj is not None
                     and callable(auto_capture)
@@ -2097,10 +2231,19 @@ class RunService:
                     transaction.append_audit_event(
                         run_id=run_id, event_type=event_type, payload=payload
                     )
-        self._stop_terminal_playwright_session(context, next_status)
+        self._stop_terminal_playwright_session(
+            context,
+            next_status,
+            request.browser_provider,
+        )
         log_event("browser.async.applied", run_id=run_id, status=next_status)
 
-    def _stop_terminal_playwright_session(self, context: Any, next_status: RunStatus) -> None:
+    def _stop_terminal_playwright_session(
+        self,
+        context: Any,
+        next_status: RunStatus,
+        provider: BrowserProvider,
+    ) -> None:
         """Close a self-hosted browser session once the run reaches a terminal state.
 
         A Playwright session is a real local Chromium process, so leaving it running
@@ -2113,7 +2256,7 @@ class RunService:
         inspection), so this branch must never stop them.
         """
 
-        worker = self._browser_worker
+        worker = self._browser_worker_for(provider)
         if context is None or worker is None:
             return
         if next_status not in _TERMINAL_BROWSER_STATUSES:
@@ -2716,7 +2859,7 @@ class RunService:
         session_id = record.get("browser_session_id")
         if not isinstance(session_id, str) or not session_id:
             return None
-        worker = self._browser_worker
+        worker = self._browser_worker_for(record)
         if worker is None:
             return None
         getter = getattr(worker, "latest_screenshot", None)
@@ -2732,6 +2875,38 @@ class RunService:
             return (result[0], result[1])
         return None
 
+    def get_browser_interactive_grant(self, run_id: str) -> tuple[str, str, str] | None:
+        """Mint an ephemeral Playwright grant only for an active human handoff.
+
+        The signed URL is returned once to the API projection and is never written
+        to storage, checkpoints, audit events, worker caches, or logs.
+        """
+
+        record = self.storage.get_run(run_id)
+        if (
+            record is None
+            or record.get("browser_provider") != "playwright"
+            or record.get("status") != "waiting_for_hitl"
+        ):
+            return None
+        session_id = record.get("browser_session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        worker = self._browser_worker_for(record)
+        requester = getattr(worker, "request_live_view_sync", None)
+        if not callable(requester):
+            return None
+        result = requester(session_id)
+        if (
+            isinstance(result, tuple)
+            and len(result) == 3
+            and result[0] == "interactive_remote"
+            and isinstance(result[1], str)
+            and isinstance(result[2], str)
+        ):
+            return cast("tuple[str, str, str]", result)
+        return None
+
     def get_browser_live_url(self, run_id: str) -> str | None:
         """Return the ephemeral signed live-view URL for a run, if one is active.
 
@@ -2740,13 +2915,13 @@ class RunService:
         exists only while the worker holds the session, for owner interaction.
         """
 
-        worker = self._browser_worker
-        if worker is None:
-            log_event("liveview.resolve.no_worker", level=30, run_id=run_id)
-            return None
         record = self.storage.get_run(run_id)
         if record is None:
             log_event("liveview.resolve.no_run", level=30, run_id=run_id)
+            return None
+        worker = self._browser_worker_for(record)
+        if worker is None:
+            log_event("liveview.resolve.no_worker", level=30, run_id=run_id)
             return None
         session_id = record.get("browser_session_id")
         if not isinstance(session_id, str) or not session_id:
@@ -3044,7 +3219,7 @@ class RunService:
 
         When ``browser_login`` is supplied (owner-only, loopback), its raw values
         are resolved in-memory ONLY for the single ``workflow.resume`` call and
-        injected into Browser Use as secure ``sensitive_data`` placeholders so the
+        injected through the selected provider's one-time secret boundary so the
         agent logs in autonomously. The raw values are never written to run state,
         checkpoints, audit events, or logs, and are dropped as soon as resume
         returns; only the non-secret field names are recorded.
@@ -3065,9 +3240,15 @@ class RunService:
             injected_login_fields: list[str] = sorted(browser_login) if browser_login else []
             sensitive_data: dict[str, str] | None = None
             if browser_login:
-                sensitive_data = {
-                    name: secret.get_secret_value() for name, secret in browser_login.items()
-                }
+                sensitive_data = self._browser_login_payload(
+                    provider=cast(
+                        BrowserProvider,
+                        current.get("browser_provider", "browser_use"),
+                    ),
+                    app_slug=str(current.get("app_slug") or "unknown"),
+                    scope_id=run_id,
+                    values=browser_login,
+                )
             try:
                 state = self._workflow.resume(thread_id, signal, sensitive_data=sensitive_data)
             finally:

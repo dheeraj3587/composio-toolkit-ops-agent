@@ -59,7 +59,7 @@ class _FakeCoreService:
             {"dependency": "secret_store", "runtime_wired": True},
             {"dependency": "research_enricher", "runtime_wired": True},
             {"dependency": "composio_preflight", "runtime_wired": True},
-            {"dependency": "browser", "runtime_wired": True},
+            {"dependency": "browser:browser_use", "runtime_wired": True},
         ]
 
 
@@ -157,4 +157,5 @@ def test_assignment_provider_projection_marks_initialized_adapters_ready() -> No
         "gemini": "ready",
         "composio": "ready",
         "browser_use": "ready",
+        "playwright": "not_configured",
     }

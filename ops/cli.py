@@ -479,6 +479,18 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("minimum", "recommended", "maximum"),
         default="maximum",
     )
+    run_parser.add_argument(
+        "--browser-provider",
+        choices=("browser_use", "playwright"),
+        default="browser_use",
+        help="Freeze the browser engine for this run (default: browser_use).",
+    )
+    run_parser.add_argument(
+        "--credential-creation-policy",
+        choices=("reuse_only", "create_if_missing"),
+        default="reuse_only",
+        help="Reuse an existing developer credential or explicitly allow create-if-missing.",
+    )
 
     for command, help_text in (
         ("status", "Show the sanitized local run status."),
@@ -552,6 +564,8 @@ def main(argv: list[str] | None = None) -> int:
                 app_name=args.app_name,
                 company=_default_company(args),
                 requested_scope_policy=args.scope_policy,
+                browser_provider=args.browser_provider,
+                credential_creation_policy=args.credential_creation_policy,
                 dry_run=True,
             )
             _emit({"run": create_dry_run(request, db_path=args.db_path)})

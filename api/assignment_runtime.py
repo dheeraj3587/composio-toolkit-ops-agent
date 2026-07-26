@@ -11,6 +11,7 @@ Tests that import ``api.app`` continue to exercise the conservative core runtime
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
@@ -503,6 +504,7 @@ class AssignmentBrowserWorker(BrowserWorker):
         *,
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
+        credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
         self._assignment_research[context.session_id] = research
         return await self._run_assignment_task(
@@ -511,6 +513,7 @@ class AssignmentBrowserWorker(BrowserWorker):
             resume_signal=None,
             sensitive_data=sensitive_data,
             account_creation_requested=account_creation_requested,
+            credential_creation_policy=credential_creation_policy,
         )
 
     async def resume_after_hitl(
@@ -520,6 +523,7 @@ class AssignmentBrowserWorker(BrowserWorker):
         research: OperationalResearch | None = None,
         *,
         sensitive_data: Mapping[str, str] | None = None,
+        credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
         log_event(
@@ -563,6 +567,7 @@ class AssignmentBrowserWorker(BrowserWorker):
             research=resolved,
             resume_signal=signal,
             sensitive_data=sensitive_data,
+            credential_creation_policy=credential_creation_policy,
         )
 
     def provider_session_id(self, handle: str) -> str | None:
@@ -744,7 +749,9 @@ class AssignmentBrowserWorker(BrowserWorker):
         resume_signal: str | None,
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
+        credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
+        del credential_creation_policy
         self._require_configuration()
         allowed = assignment_allowed_hosts(research)
         patterns = validate_allowed_domains(allowed.patterns())
@@ -789,8 +796,25 @@ class AssignmentBrowserWorker(BrowserWorker):
             run_kwargs["start_url"] = target_url
 
         try:
-            result = await _await_if_needed(client.run(task, **run_kwargs))
-        except (httpx.TimeoutException, httpx.TransportError, TimeoutError) as exc:
+            result = await asyncio.wait_for(
+                _await_if_needed(client.run(task, **run_kwargs)),
+                timeout=self._settings.browser_use_task_timeout_seconds,
+            )
+        except TimeoutError:
+            # This is our explicit wall-clock bound, not an ambiguous SDK socket
+            # timeout. The provider session id is known, so stop it and its
+            # temporary profile rather than leaving paid work running remotely.
+            log_event(
+                "browser.run.deadline_exceeded",
+                level=40,
+                handle=context.session_id,
+            )
+            await self._safe_stop_handle(context.session_id)
+            raise ProviderOperationError(
+                capability="browser onboarding",
+                reason_code="provider_timeout",
+            ) from None
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
             # Ambiguous: a read/connect timeout means the remote agent MAY still be
             # running. Do NOT stop the session or record a clean failure — preserve
             # the session so a caller can reconcile it by id before any retry

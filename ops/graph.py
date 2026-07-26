@@ -15,6 +15,7 @@ from typing import Any, Protocol, cast
 
 from pydantic import SecretStr
 
+from ops.browser_api_trace_catalog import get_browser_api_trace
 from ops.browser_worker import BrowserObservation, BrowserSessionContext
 from ops.config import Settings
 from ops.effect_ledger import EffectStore
@@ -36,7 +37,7 @@ from ops.provider_errors import (
     ProviderOperationError,
 )
 from ops.routing import decide_access
-from ops.state import OperationsState
+from ops.state import BrowserProvider, OperationsState
 
 ResearchLoader = Callable[[str], OperationalResearch]
 
@@ -73,6 +74,7 @@ class WorkflowBrowser(Protocol):
         *,
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
+        credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation: ...
 
     async def resume_after_hitl(
@@ -82,6 +84,7 @@ class WorkflowBrowser(Protocol):
         research: OperationalResearch | None = None,
         *,
         sensitive_data: Mapping[str, str] | None = None,
+        credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
     ) -> BrowserObservation: ...
 
@@ -106,12 +109,22 @@ class WorkflowDependencies:
         *,
         research_loader: ResearchLoader | None = None,
         browser: WorkflowBrowser | None = None,
+        browsers: Mapping[BrowserProvider, WorkflowBrowser] | None = None,
         gmail: WorkflowGmail | None = None,
         browser_profile_id: str | None = None,
         effect_store: EffectStore | None = None,
         outreach_recipient: str | None = None,
     ) -> None:
         self.research_loader = research_loader or _load_verified_baseline
+        self.browsers: dict[BrowserProvider, WorkflowBrowser] = dict(browsers or {})
+        if browser is not None:
+            provider = cast(
+                BrowserProvider,
+                str(getattr(browser, "provider_name", "browser_use")),
+            )
+            self.browsers.setdefault(provider, browser)
+        # Compatibility attribute for older tests/injections. Runtime nodes use
+        # the immutable provider stored in each run instead.
         self.browser = browser
         self.gmail = gmail
         self.browser_profile_id = browser_profile_id
@@ -163,6 +176,7 @@ class DurableOperationsWorkflow:
         *,
         thread_id: str | None = None,
         sensitive_data: Mapping[str, str] | None = None,
+        research: OperationalResearch | None = None,
         seed: Mapping[str, object] | None = None,
     ) -> OperationsState:
         stable_thread_id = thread_id or str(uuid.uuid4())
@@ -182,6 +196,8 @@ class DurableOperationsWorkflow:
                 "run_id": stable_thread_id,
                 "thread_id": stable_thread_id,
                 "app_name": request.app_name,
+                "browser_provider": request.browser_provider,
+                "credential_creation_policy": request.credential_creation_policy,
                 "request": request.model_dump(mode="json"),
                 "status": "created",
                 "credential_refs": {},
@@ -193,6 +209,16 @@ class DurableOperationsWorkflow:
                 "capability_statuses": [],
                 "side_effect_keys": {},
             }
+            if research is not None:
+                initial.update(
+                    {
+                        "app_slug": research.app_slug,
+                        "operational_research": research.model_dump(mode="json"),
+                        "evidence_urls": list(research.evidence_urls),
+                        "missing_fields": _missing_research_fields(research),
+                        "audit_events": [{"event_type": "research_loaded"}],
+                    }
+                )
             # A caller may seed a pre-created browser session (session id + live
             # view metadata). When present, ``_browser_start`` is a no-op and the
             # bounded onboarding task runs against the already-live session, so the
@@ -303,13 +329,21 @@ class DurableOperationsWorkflow:
         graph.add_conditional_edges(
             "browser_navigate",
             self._after_browser,
-            {"human_interrupt": "human_interrupt", "finalize": "finalize"},
+            {
+                "human_interrupt": "human_interrupt",
+                "outreach_send": "outreach_send",
+                "finalize": "finalize",
+            },
         )
         graph.add_edge("human_interrupt", "browser_resume")
         graph.add_conditional_edges(
             "browser_resume",
             self._after_browser,
-            {"human_interrupt": "human_interrupt", "finalize": "finalize"},
+            {
+                "human_interrupt": "human_interrupt",
+                "outreach_send": "outreach_send",
+                "finalize": "finalize",
+            },
         )
         graph.add_edge("outreach_send", "finalize")
         graph.add_edge("finalize", end)
@@ -336,6 +370,23 @@ class DurableOperationsWorkflow:
     def _route(self, state: OperationsState) -> dict[str, object]:
         research = OperationalResearch.model_validate(state["operational_research"])
         decision = decide_access(research)
+        browser_route = decision.route in {"self_serve", "hybrid"}
+        missing_browser_urls = not research.login_url or not research.credential_management_url
+        untraced = get_browser_api_trace(research.app_slug) is None
+        if decision.is_final and browser_route and (missing_browser_urls or untraced):
+            reason_code = (
+                "browser_trace_not_reviewed" if untraced else "verified_browser_urls_missing"
+            )
+            return {
+                "access_route": decision.route,
+                "route_reason": decision.explanation,
+                "route_reason_code": reason_code,
+                "status": "configuration_required",
+                "audit_events": [
+                    *state.get("audit_events", []),
+                    {"event_type": "browser_route_not_ready", "reason_code": reason_code},
+                ],
+            }
         return {
             "access_route": decision.route,
             "route_reason": decision.explanation,
@@ -346,13 +397,21 @@ class DurableOperationsWorkflow:
 
     def _after_route(self, state: OperationsState) -> str:
         request = OperationsRequest.model_validate(state["request"])
-        if request.dry_run or state.get("access_route") in {"blocked", "unknown"}:
+        if (
+            request.dry_run
+            or state.get("status") == "configuration_required"
+            or state.get("access_route") in {"blocked", "unknown"}
+        ):
             return "finalize"
         if state.get("access_route") in {"self_serve", "hybrid"}:
             return "browser_start"
         return "outreach_send"
 
-    def _browser_provider_name(self) -> str:
+    def _browser_for_state(self, state: OperationsState) -> WorkflowBrowser | None:
+        provider = state.get("browser_provider", "browser_use")
+        return self._dependencies.browsers.get(provider)
+
+    def _browser_provider_name(self, state: OperationsState) -> str:
         """The effect-ledger provider identity of the wired browser backend.
 
         Recording a Playwright run as a ``browser_use`` effect would corrupt audit,
@@ -360,17 +419,18 @@ class DurableOperationsWorkflow:
         Browser Use worker keeps the historical default.
         """
 
-        return str(getattr(self._dependencies.browser, "provider_name", "browser_use"))
+        return str(getattr(self._browser_for_state(state), "provider_name", "browser_use"))
 
     def _browser_start(self, state: OperationsState) -> dict[str, object]:
         if state.get("browser_session_id"):
             return {}
-        if self._dependencies.browser is None:
+        browser = self._browser_for_state(state)
+        if browser is None:
             return _unavailable_update(
                 state,
                 ConfigurationRequiredError(
                     phase=5,
-                    capability="Browser Use",
+                    capability=f"{state.get('browser_provider', 'browser_use')} browser provider",
                     reason_code="browser_adapter_missing",
                 ),
             )
@@ -378,16 +438,15 @@ class DurableOperationsWorkflow:
         store = self._dependencies.effect_store
         if store is not None:
             reservation = store.reserve(
-                provider=self._browser_provider_name(),
+                provider=self._browser_provider_name(state),
                 action="start_session",
                 idempotency_key=effect_key,
             )
             if reservation.status == "reconcile_required":
-                return _outcome_unknown_update(state, "Browser Use session")
+                return _outcome_unknown_update(state, "browser session")
             if reservation.status == "completed":  # pragma: no cover - fresh key per run
                 return {}
         try:
-            browser = self._dependencies.browser
             # Supply the app slug, an OPAQUE account reference, the run scope (so
             # one-time login references are consumed only for this run) and the
             # storage-state flag. Both providers accept this signature; Browser Use
@@ -414,14 +473,14 @@ class DurableOperationsWorkflow:
             # is required before any further attempt.
             if store is not None:
                 store.mark_outcome_unknown(
-                    provider=self._browser_provider_name(),
+                    provider=self._browser_provider_name(state),
                     action="start_session",
                     idempotency_key=effect_key,
                 )
-            return _outcome_unknown_update(state, "Browser Use session")
+            return _outcome_unknown_update(state, "browser session")
         if store is not None:
             store.complete(
-                provider=self._browser_provider_name(),
+                provider=self._browser_provider_name(state),
                 action="start_session",
                 idempotency_key=effect_key,
                 receipt={"session_id": context.session_id},
@@ -446,7 +505,8 @@ class DurableOperationsWorkflow:
     def _browser_navigate(self, state: OperationsState) -> dict[str, object]:
         if state.get("status") in {"configuration_required", "failed"}:
             return {}
-        if self._dependencies.browser is None:
+        browser = self._browser_for_state(state)
+        if browser is None:
             return _failed_update(state, "browser onboarding", "browser_adapter_missing")
         research = OperationalResearch.model_validate(state["operational_research"])
         # Autonomous sign-in credentials (if the owner supplied any at create
@@ -458,19 +518,21 @@ class DurableOperationsWorkflow:
             request = OperationsRequest.model_validate(state["request"])
             if request.account_creation_requested:
                 observation = _run_async(
-                    self._dependencies.browser.navigate_onboarding(
+                    browser.navigate_onboarding(
                         _browser_context(state),
                         research,
                         sensitive_data=sensitive_data,
                         account_creation_requested=True,
+                        credential_creation_policy=request.credential_creation_policy,
                     )
                 )
             else:
                 observation = _run_async(
-                    self._dependencies.browser.navigate_onboarding(
+                    browser.navigate_onboarding(
                         _browser_context(state),
                         research,
                         sensitive_data=sensitive_data,
+                        credential_creation_policy=request.credential_creation_policy,
                     )
                 )
         except PhaseUnavailableError as exc:
@@ -502,7 +564,8 @@ class DurableOperationsWorkflow:
     def _browser_resume(self, state: OperationsState) -> dict[str, object]:
         if state.get("resume_signal") == "cancelled":
             return {"status": "blocked"}
-        if self._dependencies.browser is None:
+        browser = self._browser_for_state(state)
+        if browser is None:
             return _failed_update(state, "browser HITL resume", "browser_adapter_missing")
         # Login credentials (if the owner submitted any for this resume) are read
         # from the in-memory per-thread stash, never from graph state. They reach
@@ -513,11 +576,14 @@ class DurableOperationsWorkflow:
         provider_session = state.get("browser_provider_session_id")
         try:
             observation = _run_async(
-                self._dependencies.browser.resume_after_hitl(
+                browser.resume_after_hitl(
                     _browser_context(state),
                     state.get("resume_signal", "completed"),
                     research,
                     sensitive_data=sensitive_data,
+                    credential_creation_policy=OperationsRequest.model_validate(
+                        state["request"]
+                    ).credential_creation_policy,
                     provider_session_id=(
                         provider_session if isinstance(provider_session, str) else None
                     ),
@@ -542,7 +608,7 @@ class DurableOperationsWorkflow:
         live URL itself is never persisted.
         """
 
-        browser = self._dependencies.browser
+        browser = self._browser_for_state(state)
         handle = str(state.get("browser_session_id") or "")
         if browser is None or not handle:
             return update
@@ -562,6 +628,12 @@ class DurableOperationsWorkflow:
             and observation.get("status") == "human_action_required"
         ):
             return "human_interrupt"
+        if (
+            state.get("access_route") == "hybrid"
+            and isinstance(observation, Mapping)
+            and observation.get("status") == "credential_page_ready"
+        ):
+            return "outreach_send"
         return "finalize"
 
     def _outreach_send(self, state: OperationsState) -> dict[str, object]:

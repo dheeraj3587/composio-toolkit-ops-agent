@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Literal
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from pydantic import (
     BaseModel,
@@ -16,7 +17,7 @@ from pydantic import (
 )
 
 from ops.models import OperationalResearch
-from ops.state import AccessRoute, RunStatus
+from ops.state import AccessRoute, BrowserProvider, CredentialCreationPolicy, RunStatus
 
 CredentialFieldName = Annotated[
     str,
@@ -37,10 +38,6 @@ BoundedHttpUrl = Annotated[
     StringConstraints(min_length=8, max_length=2048),
 ]
 
-# The wired browser backend. A Playwright deployment is never reported as
-# Browser Use, so a client can render only what the backend actually supports.
-BrowserProvider = Literal["browser_use", "playwright"]
-
 # How the owner can watch (and possibly drive) a live browser session.
 LiveViewMode = Literal["hosted_url", "screenshot", "interactive_remote", "unavailable"]
 
@@ -54,6 +51,14 @@ RelativeViewerPath = Annotated[
         min_length=1,
         max_length=300,
     ),
+]
+
+# Private, one-use projection from browser-worker to the Next.js SERVER. The
+# server converts this exact address to the same-origin Caddy path; browser client
+# state must never retain this absolute URL.
+InteractiveGrantUrl = Annotated[
+    str,
+    StringConstraints(min_length=32, max_length=2300),
 ]
 
 # A sanitized, value-free explanation code (never provider or page text).
@@ -116,10 +121,9 @@ class CompanyInput(StrictApiModel):
 class BrowserLoginInput(StrictApiModel):
     """Owner-submitted app login credentials for autonomous sign-in.
 
-    The values are injected into the Browser Use provider as secure
-    ``sensitive_data`` placeholders (at session creation for create-time
-    credentials, or for a single resume call) and are never persisted to run
-    state, checkpoints, audit events, logs, or the IntegratorBundle.
+    The values cross the selected provider's secret boundary only for session
+    creation or one resume call and are never persisted to run state,
+    checkpoints, audit events, logs, or the IntegratorBundle.
     OTP/CAPTCHA/passkey/billing still require a human.
     """
 
@@ -132,15 +136,17 @@ class CreateRunRequest(StrictApiModel):
     company: CompanyInput
     requested_scope_policy: Literal["minimum", "recommended", "maximum"] = "maximum"
     execution_mode: Literal["plan_only", "execute_when_configured"] = "plan_only"
+    browser_provider: BrowserProvider = "browser_use"
+    credential_creation_policy: CredentialCreationPolicy = "reuse_only"
     # Deprecated compatibility alias for execution_mode="plan_only". Only an
     # explicitly supplied dry_run=true carries intent; execution_mode is the single
     # canonical control and dry_run is never rewritten from it.
     dry_run: bool = True
     outreach_recipient_override: str | None = Field(default=None, max_length=320)
     # Optional app sign-in credentials for autonomous login. When present they are
-    # injected into Browser Use as secure ``sensitive_data`` placeholders at
-    # session creation so the agent signs in on its own; they are never persisted
-    # to run state, checkpoints, the ledger, logs, or the IntegratorBundle.
+    # injected through the selected provider's secret boundary at session
+    # creation; they are never persisted to run state, checkpoints, the ledger,
+    # logs, or the IntegratorBundle.
     browser_login: BrowserLoginInput | None = None
 
     @field_validator("outreach_recipient_override")
@@ -268,6 +274,8 @@ class RunSummary(StrictApiModel):
     created_at: str
     updated_at: str
     execution_mode: Literal["plan_only", "execute_when_configured"]
+    browser_provider: BrowserProvider
+    credential_creation_policy: CredentialCreationPolicy
     external_actions: bool
 
 
@@ -336,6 +344,7 @@ class RunListResponse(StrictApiModel):
 
 
 class TimelineEvent(StrictApiModel):
+    event_id: int = Field(gt=0)
     event_type: str
     summary: str
     status: Literal["recorded", "completed", "blocked", "failed"]
@@ -362,13 +371,13 @@ class LiveViewResponse(StrictApiModel):
     * ``screenshot`` — the self-hosted Playwright harness has no hosted URL, so the
       client polls ``screenshot_url`` for masked PNG frames. Frames are viewable
       but not interactive, so ``interaction_available`` is False.
-    * ``interactive_remote`` — a same-origin interactive viewer path. It is only
-      ever advertised once that path is served end to end.
+    * ``interactive_remote`` — an exact, short-lived private grant consumed by the
+      Next.js server and converted to the reviewed same-origin viewer path.
     * ``unavailable`` — no viewer exists, so no viewer URL may be present.
 
-    ``screenshot_url``/``interactive_url`` are bounded RELATIVE same-origin API
-    paths for this exact run. A private browser-service address (the noVNC host on
-    the internal network) must never cross this boundary.
+    ``screenshot_url`` is a bounded same-origin API path. ``interactive_url`` is
+    allowed only for the exact private browser-worker relay and a bounded signed
+    session/token query; it is never durable or logged.
     """
 
     run_id: str
@@ -377,7 +386,7 @@ class LiveViewResponse(StrictApiModel):
     mode: LiveViewMode = "unavailable"
     live_url: str | None = None
     screenshot_url: RelativeViewerPath | None = None
-    interactive_url: RelativeViewerPath | None = None
+    interactive_url: InteractiveGrantUrl | None = None
     captured_at: str | None = None
     # Whether the owner can actually drive the browser through this view.
     interaction_available: bool = False
@@ -389,6 +398,38 @@ class LiveViewResponse(StrictApiModel):
         """A hosted live URL is absolute HTTPS; its signed query is left intact."""
 
         return _validate_http_url(value) if value is not None else None
+
+    @field_validator("interactive_url")
+    @classmethod
+    def interactive_url_is_exact_private_grant(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if any(ord(character) <= 0x20 or ord(character) == 0x7F for character in value):
+            raise ValueError("interactive grant contains invalid characters")
+        try:
+            parsed = urlsplit(value)
+            pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        except ValueError as exc:
+            raise ValueError("interactive grant is malformed") from exc
+        if (
+            parsed.scheme != "http"
+            or parsed.netloc != "browser-worker:8081"
+            or parsed.path != "/internal/browser/live-view/novnc"
+            or parsed.fragment
+            or len(pairs) != 2
+        ):
+            raise ValueError("interactive grant target is not approved")
+        query = dict(pairs)
+        session = query.get("session", "")
+        token = query.get("token", "")
+        if (
+            set(query) != {"session", "token"}
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,180}", session) is None
+            or len(token) > 2048
+            or re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", token) is None
+        ):
+            raise ValueError("interactive grant query is invalid")
+        return value
 
     @model_validator(mode="after")
     def _validate_mode_contract(self) -> LiveViewResponse:
@@ -415,13 +456,10 @@ class LiveViewResponse(StrictApiModel):
             # never claim interaction. Only a hosted or interactive viewer may.
             if self.mode == "screenshot" and self.interaction_available:
                 raise ValueError("a screenshot live view is not interactive")
-        for name, url in viewer_urls.items():
-            if (
-                name != "hosted_url"
-                and url is not None
-                and not url.startswith(f"/api/runs/{self.run_id}/")
-            ):
-                raise ValueError("a viewer path must address this run on the same origin")
+        if self.screenshot_url is not None and not self.screenshot_url.startswith(
+            f"/api/runs/{self.run_id}/"
+        ):
+            raise ValueError("a viewer path must address this run on the same origin")
         return self
 
 

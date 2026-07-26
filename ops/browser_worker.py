@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import ipaddress
 import re
@@ -76,6 +77,7 @@ BrowserObservationStatus = Literal[
 # a provider-specific code is still allowed) so callers share consistent names.
 BrowserReasonCode = Literal[
     "authentication_failed",
+    "login_required",
     "login_frame_unreviewed",
     "multiple_login_surfaces",
     "multiple_password_forms",
@@ -95,6 +97,7 @@ BrowserReasonCode = Literal[
 ]
 
 HumanActionType = Literal[
+    "login_required",
     "captcha",
     "email_otp",
     "phone_otp",
@@ -283,6 +286,7 @@ class BrowserWorker:
         *,
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
+        credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
         self._require_configuration()
         if context.session_id:
@@ -293,6 +297,7 @@ class BrowserWorker:
             resume_signal=None,
             sensitive_data=sensitive_data,
             account_creation_requested=account_creation_requested,
+            credential_creation_policy=credential_creation_policy,
         )
 
     async def resume_after_hitl(
@@ -302,6 +307,7 @@ class BrowserWorker:
         research: OperationalResearch | None = None,
         *,
         sensitive_data: Mapping[str, str] | None = None,
+        credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
         self._require_configuration()
@@ -321,6 +327,7 @@ class BrowserWorker:
             research=resolved,
             resume_signal=signal,
             sensitive_data=sensitive_data,
+            credential_creation_policy=credential_creation_policy,
         )
 
     def provider_session_id(self, handle: str) -> str | None:
@@ -370,7 +377,9 @@ class BrowserWorker:
         resume_signal: str | None,
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
+        credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
+        del credential_creation_policy
         try:
             allowed = build_browser_allowed_hosts(
                 research.app_slug,
@@ -414,7 +423,16 @@ class BrowserWorker:
             run_kwargs["sensitive_data"] = browser_secrets
         try:
             run_handle = client.run(task, **run_kwargs)
-            result = await _await_if_needed(run_handle)
+            result = await asyncio.wait_for(
+                _await_if_needed(run_handle),
+                timeout=self._settings.browser_use_task_timeout_seconds,
+            )
+        except TimeoutError:
+            await self._safe_stop(context.session_id)
+            raise ProviderOperationError(
+                capability="browser onboarding",
+                reason_code="provider_timeout",
+            ) from None
         except Exception:
             # Reclaim the session so a failed run never lingers idle burning credit.
             await self._safe_stop(context.session_id)

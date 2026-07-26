@@ -27,6 +27,7 @@ _PAYLOAD = {
         "callback_urls": [],
     },
     "requested_scope_policy": "maximum",
+    "browser_provider": "playwright",
     "dry_run": True,
 }
 

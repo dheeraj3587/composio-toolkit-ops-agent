@@ -102,4 +102,8 @@ HEALTHCHECK --interval=60s --timeout=40s --start-period=30s --retries=3 \
 
 # The entrypoint conditionally starts Xvfb/fluxbox/x11vnc, then execs this CMD.
 ENTRYPOINT ["/usr/local/bin/browser-entrypoint.sh"]
-CMD ["uvicorn", "browser_service.main:app", "--host", "0.0.0.0", "--port", "8081"]
+# The interactive grant is necessarily carried in the WebSocket query string.
+# Disable HTTP access logs here; browser_service.main separately filters the
+# uvicorn.error WebSocket handshake records that also include the query string.
+# Application logs emit only sanitized session/reason fields.
+CMD ["uvicorn", "browser_service.main:app", "--host", "0.0.0.0", "--port", "8081", "--no-access-log"]

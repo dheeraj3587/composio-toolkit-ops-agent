@@ -27,7 +27,8 @@ from ops.credential_validator import (
     hubspot_validation_policy,
 )
 from ops.graph import WorkflowDependencies, build_graph
-from ops.models import CompanyProfile, OperationsRequest
+from ops.models import CompanyProfile, OperationalResearch, OperationsRequest
+from ops.p1_adapter import P1LookupFound, P1OperationalAdapter, to_operational_research
 from ops.run_service import CredentialSubmissionError, RunService
 from ops.secret_store import SQLiteSecretStore
 
@@ -48,9 +49,14 @@ class _FakeBrowser:
         )
 
     async def navigate_onboarding(
-        self, context: object, research: object, *, sensitive_data: object = None
+        self,
+        context: object,
+        research: object,
+        *,
+        sensitive_data: object = None,
+        credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
-        del context, research, sensitive_data
+        del context, research, sensitive_data, credential_creation_policy
         return BrowserObservation(
             status="credential_page_ready",
             current_url="https://developers.hubspot.com/apps/new",
@@ -64,6 +70,7 @@ class _FakeBrowser:
         research: object = None,
         *,
         sensitive_data: object = None,
+        credential_creation_policy: str = "reuse_only",
         provider_session_id: object = None,
     ) -> BrowserObservation:
         raise AssertionError("resume is out of scope")
@@ -104,6 +111,17 @@ def _company() -> CompanyProfile:
     )
 
 
+def _reviewed_hubspot_research(app_name: str) -> OperationalResearch:
+    found = P1OperationalAdapter().lookup(app_name)
+    assert isinstance(found, P1LookupFound)
+    return to_operational_research(found.record).model_copy(
+        update={
+            "login_url": "https://app.hubspot.com/login",
+            "credential_management_url": "https://developers.hubspot.com/apps",
+        }
+    )
+
+
 def _validator(status_code: int) -> PolicyBoundCredentialValidator:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.host == "api.hubapi.com"
@@ -131,7 +149,10 @@ def _service(tmp: Path, *, status_code: int) -> RunService:
     workflow = build_graph(
         checkpoint_path=tmp / "private" / "checkpoints.db",
         encryption_key=secrets.token_bytes(32),
-        dependencies=WorkflowDependencies(browser=_FakeBrowser()),  # type: ignore[arg-type]
+        dependencies=WorkflowDependencies(
+            research_loader=_reviewed_hubspot_research,
+            browser=_FakeBrowser(),  # type: ignore[arg-type]
+        ),
     )
     service = RunService.from_paths(
         db_path=tmp / "private" / "ops.db",

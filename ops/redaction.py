@@ -26,6 +26,16 @@ _SENSITIVE_CODE_KEY = re.compile(
     r"one[_-]?time[_-]?code)$"
 )
 
+# These exact keys describe policy or public navigation metadata; they never hold
+# credential values. Values still pass through ``redact_text`` recursively, so a
+# provider key accidentally embedded in either field remains redacted.
+_SAFE_CREDENTIAL_METADATA_KEYS = frozenset(
+    {
+        "credential_creation_policy",
+        "credential_management_url",
+    }
+)
+
 _PRIVATE_KEY = re.compile(
     r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----.*?"
     r"-----END (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----",
@@ -85,6 +95,8 @@ def _is_reference_payload(value: object, *, key: str) -> bool:
 def _is_sensitive_key(key: str) -> bool:
     """Classify credential-bearing field names without hiding benign reason codes."""
 
+    if key.casefold() in _SAFE_CREDENTIAL_METADATA_KEYS:
+        return False
     return _SENSITIVE_KEY.search(key) is not None or _SENSITIVE_CODE_KEY.fullmatch(key) is not None
 
 

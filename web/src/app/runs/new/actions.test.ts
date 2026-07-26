@@ -39,6 +39,8 @@ function validForm(executionMode: string): FormData {
   form.set("outreach_recipient_override", "")
   form.set("requested_scope_policy", "minimum")
   form.set("execution_mode", executionMode)
+  form.set("browser_provider", "playwright")
+  form.set("credential_creation_policy", "create_if_missing")
   return form
 }
 
@@ -60,6 +62,8 @@ describe("createRunAction", () => {
     expect(request).toMatchObject({
       app_name: "Linear",
       execution_mode: "execute_when_configured",
+      browser_provider: "playwright",
+      credential_creation_policy: "create_if_missing",
       company: {
         legal_name: "Example Labs, Inc.",
         website: "https://example.com",
@@ -85,7 +89,7 @@ describe("createRunAction", () => {
     const request = mocks.createRun.mock.calls[0]?.[0]
     expect(request.browser_login).toEqual({
       email: "ops@example.com",
-      password: "  s p a c e d secret  ",
+      password: "  s p a c e d secret  ", // pragma: allowlist secret
     })
   })
 
@@ -97,5 +101,25 @@ describe("createRunAction", () => {
 
     expect(mocks.createRun).not.toHaveBeenCalled()
     expect(state.fields).toContain("app_login_password")
+  })
+
+  it("rejects a missing or invalid browser provider before calling the API", async () => {
+    const form = validForm("execute_when_configured")
+    form.set("browser_provider", "automatic")
+
+    const state = await createRunAction(initialState, form)
+
+    expect(mocks.createRun).not.toHaveBeenCalled()
+    expect(state.fields).toEqual(["browser_provider"])
+  })
+
+  it("rejects an invalid credential creation policy before calling the API", async () => {
+    const form = validForm("execute_when_configured")
+    form.set("credential_creation_policy", "always_create")
+
+    const state = await createRunAction(initialState, form)
+
+    expect(mocks.createRun).not.toHaveBeenCalled()
+    expect(state.fields).toEqual(["credential_creation_policy"])
   })
 })

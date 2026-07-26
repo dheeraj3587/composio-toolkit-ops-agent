@@ -142,6 +142,45 @@ def test_idempotency_replay_returns_original_run_without_duplicate_events(tmp_pa
     assert "request_fingerprint" not in replay
 
 
+def test_legacy_browser_use_fingerprint_replays_without_false_conflict(tmp_path: Path) -> None:
+    from ops.run_service import _legacy_request_fingerprint
+
+    service = RunService.from_paths(db_path=tmp_path / "private" / "ops.db")
+    request = request_for("HubSpot")
+    idempotency_key = "idem_1123456789abcdef0123456789abcdef"
+    first = service.create_run(request, idempotency_key=idempotency_key)
+    legacy = _legacy_request_fingerprint(request, "plan_only")
+    with service.storage._connect() as connection:  # noqa: SLF001 - migration compatibility test
+        connection.execute(
+            "UPDATE runs SET request_fingerprint = ? WHERE run_id = ?",
+            (legacy, first["run_id"]),
+        )
+
+    assert service.create_run(request, idempotency_key=idempotency_key) == first
+
+
+def test_idempotency_fingerprint_freezes_browser_provider(tmp_path: Path) -> None:
+    service = RunService.from_paths(db_path=tmp_path / "ops.db")
+    idempotency_key = "idem_2123456789abcdef0123456789abcdef"
+    browser_use = request_for("HubSpot")
+    playwright = browser_use.model_copy(update={"browser_provider": "playwright"})
+    service.create_run(browser_use, idempotency_key=idempotency_key)
+
+    with pytest.raises(IdempotencyConflictError):
+        service.create_run(playwright, idempotency_key=idempotency_key)
+
+
+def test_idempotency_fingerprint_freezes_credential_creation_policy(tmp_path: Path) -> None:
+    service = RunService.from_paths(db_path=tmp_path / "ops.db")
+    idempotency_key = "idem_3123456789abcdef0123456789abcdef"
+    reuse = request_for("HubSpot")
+    create = reuse.model_copy(update={"credential_creation_policy": "create_if_missing"})
+    service.create_run(reuse, idempotency_key=idempotency_key)
+
+    with pytest.raises(IdempotencyConflictError):
+        service.create_run(create, idempotency_key=idempotency_key)
+
+
 def test_concurrent_idempotency_replay_creates_exactly_one_atomic_run(tmp_path: Path) -> None:
     service = RunService.from_paths(db_path=tmp_path / "private" / "ops.db")
     request = request_for("HubSpot")

@@ -43,6 +43,7 @@ from ops.config import Settings, load_settings
 from ops.models import CompanyProfile, OperationalResearch, OperationsRequest
 from ops.run_service import CredentialSubmissionError
 from ops.run_service import RunService as CoreRunService
+from ops.state import BrowserProvider
 
 
 class RunNotFoundError(LookupError):
@@ -197,6 +198,8 @@ class LocalRunService:
             created_at=str(record["created_at"]),
             updated_at=str(record["updated_at"]),
             execution_mode=record.get("execution_mode", "plan_only"),  # type: ignore[arg-type]
+            browser_provider=record.get("browser_provider", "browser_use"),  # type: ignore[arg-type]
+            credential_creation_policy=record.get("credential_creation_policy", "reuse_only"),  # type: ignore[arg-type]
             external_actions=bool(record.get("external_actions", False)),
         )
 
@@ -219,10 +222,6 @@ class LocalRunService:
             return ProviderState(provider=provider, status=status, detail=detail)  # type: ignore[arg-type]
 
         live_browser_enabled = bool(getattr(settings, "allow_live_browser", False))
-        # Provider-aware: the shared helper decides "configured" for whichever
-        # backend is selected, so Playwright never requires a Browser Use key.
-        selected_browser = str(getattr(settings, "browser_provider", "browser_use"))
-        browser_configured = browser_configuration_state(settings)
         gmail_configured = bool(
             settings.composio_api_key is not None and settings.composio_gmail_connected_account_id
         )
@@ -257,17 +256,22 @@ class LocalRunService:
                     else "Gmail configuration has not been verified against the pinned schema."
                 ),
             ),
-            # Report under the SELECTED provider's identity. Browser Use keeps its
-            # exact previous wording/behaviour; Playwright is judged by its own
-            # requirements (no Browser Use key). Readiness for the service-backed
-            # Playwright path comes from the SERVICE's own cached probe — the API
-            # image has no Chromium and must never try to launch one here.
             state(
-                selected_browser,
-                configured=browser_configured,
+                "playwright",
+                configured=browser_configuration_state(settings, "playwright"),
                 enabled=live_browser_enabled,
                 detail=self._browser_provider_detail(
-                    provider=selected_browser,
+                    provider="playwright",
+                    settings=settings,
+                    live_enabled=live_browser_enabled,
+                ),
+            ),
+            state(
+                "browser_use",
+                configured=browser_configuration_state(settings, "browser_use"),
+                enabled=live_browser_enabled,
+                detail=self._browser_provider_detail(
+                    provider="browser_use",
                     settings=settings,
                     live_enabled=live_browser_enabled,
                 ),
@@ -281,6 +285,8 @@ class LocalRunService:
         if not live_enabled:
             return "Live browser execution is policy-disabled."
         if provider != "playwright":
+            if settings.browser_use_api_key is None:
+                return "Browser Use requires BROWSER_USE_API_KEY."
             return "Browser configuration is present but has not been verified."
         if getattr(settings, "playwright_in_process_sandbox", False):
             return (
@@ -350,8 +356,13 @@ class LocalRunService:
         )
         has_checkpoint_key = self._settings.langgraph_aes_key is not None
         # Provider-aware: a Playwright deployment needs no Browser Use key.
-        has_browser_configuration = browser_configuration_state(self._settings)
-        browser_provider = str(getattr(self._settings, "browser_provider", "browser_use"))
+        browser_provider: BrowserProvider = (
+            "playwright" if record.get("browser_provider") == "playwright" else "browser_use"
+        )
+        has_browser_configuration = browser_configuration_state(
+            self._settings,
+            browser_provider,
+        )
         # The detail text must describe the SELECTED provider. Reporting Browser Use's
         # v3 allowlist limitation on a Playwright deployment would be simply false:
         # the self-hosted harness enforces the host allowlist itself via route
@@ -459,6 +470,7 @@ class LocalRunService:
                 screenshot_present = False
         return project_browser_ui(
             settings=self._settings,
+            browser_provider=record.get("browser_provider", "browser_use"),  # type: ignore[arg-type]
             run_status=run_status,
             event_types=event_types,
             browser_session_id=session_id,
@@ -553,6 +565,7 @@ class LocalRunService:
         raw_events = self._service.get_timeline(run_id)
         items = [
             TimelineEvent(
+                event_id=int(event.get("id") or 0),
                 event_type=(
                     str(event.get("event_type"))
                     if event.get("event_type") in _EVENT_SUMMARIES
@@ -677,6 +690,8 @@ class LocalRunService:
             app_name=request.app_name,
             company=company,
             requested_scope_policy=request.requested_scope_policy,
+            browser_provider=request.browser_provider,
+            credential_creation_policy=request.credential_creation_policy,
             dry_run=True,
             outreach_recipient_override=request.outreach_recipient_override,
         )
@@ -804,8 +819,10 @@ class LocalRunService:
         )
 
     def _live_view_sync(self, run_id: str) -> LiveViewResponse:
-        if self._service.get_run(run_id) is None:
+        record = self._service.get_run(run_id)
+        if record is None:
             raise RunNotFoundError(run_id)
+        provider = record.get("browser_provider", "browser_use")
         # Browser Use keeps its exact existing behavior: a signed hosted URL the
         # owner can interact with directly.
         live_url = self._service.get_browser_live_url(run_id)
@@ -818,6 +835,22 @@ class LocalRunService:
                 live_url=live_url,
                 interaction_available=True,
                 reason_code="hosted_session_live",
+            )
+        # Interactive Playwright grants are minted only while this immutable run
+        # is paused for HITL. The private URL is transient: the Next server validates
+        # and converts it to the reviewed same-origin WebSocket path immediately.
+        grant_getter = getattr(self._service, "get_browser_interactive_grant", None)
+        grant = grant_getter(run_id) if callable(grant_getter) else None
+        if provider == "playwright" and grant is not None:
+            _, interactive_url, _expires_at = grant
+            return LiveViewResponse(
+                run_id=run_id,
+                provider="playwright",
+                available=True,
+                mode="interactive_remote",
+                interactive_url=interactive_url,
+                interaction_available=True,
+                reason_code="interactive_session_live",
             )
         # Self-hosted Playwright has no hosted URL; the client polls masked frames.
         # Frames are viewable but not drivable, so interaction is not advertised.
@@ -837,9 +870,7 @@ class LocalRunService:
         return LiveViewResponse(
             run_id=run_id,
             # Report the configured backend truthfully even with no live session.
-            provider="playwright"
-            if self._settings.browser_provider == "playwright"
-            else "browser_use",
+            provider=provider,
             available=False,
             mode="unavailable",
             interaction_available=False,
@@ -910,13 +941,16 @@ class LocalRunService:
         )
 
     async def retry(self, run_id: str, capability: str) -> ActionReceipt:
-        await self.get_run(run_id)
+        detail = await self.get_run(run_id)
         requirements = {
             "research": bool(
                 self._settings.perplexity_api_key and self._settings.google_genai_api_key
             ),
             # Provider-aware retry eligibility (no Browser Use key for Playwright).
-            "browser": browser_configuration_state(self._settings),
+            "browser": browser_configuration_state(
+                self._settings,
+                detail.run.browser_provider,
+            ),
             "email": bool(
                 self._settings.composio_api_key
                 and self._settings.composio_gmail_connected_account_id

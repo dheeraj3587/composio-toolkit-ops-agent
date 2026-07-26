@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ops.config import Settings
+from ops.state import BrowserProvider
 
 ReadinessStatus = Literal["ready", "not_configured", "unavailable"]
 
@@ -33,7 +34,10 @@ class BrowserReadiness:
         return self.status == "ready"
 
 
-def browser_configuration_state(settings: Settings) -> bool:
+def browser_configuration_state(
+    settings: Settings,
+    provider: BrowserProvider | None = None,
+) -> bool:
     """Whether the SELECTED browser provider is configured to run.
 
     Shared by wiring, health, and retry eligibility so a Playwright deployment is
@@ -46,8 +50,8 @@ def browser_configuration_state(settings: Settings) -> bool:
     factory fails closed in that state.
     """
 
-    provider = str(getattr(settings, "browser_provider", "browser_use"))
-    if provider == "playwright":
+    selected = provider or settings.browser_provider
+    if selected == "playwright":
         if not settings.allow_live_browser:
             return False
         if bool(getattr(settings, "playwright_in_process_sandbox", False)):

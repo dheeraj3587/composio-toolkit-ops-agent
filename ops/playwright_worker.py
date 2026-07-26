@@ -66,12 +66,17 @@ from ops.browser_egress import (
     EgressStage,
     EgressStageTracker,
     build_egress_policy,
+    reviewed_egress_extensions,
 )
 from ops.browser_host_policy import BrowserPolicyInactiveError, build_browser_allowed_hosts
+from ops.browser_link_log import log_event
 from ops.browser_login import (
     LoginInspection,
     apply_resume_secrets,
+    inspect_after_login_submit,
+    inspect_login,
     normalize_resume_signal,
+    visible_login_challenge,
 )
 from ops.browser_loop import BrowserLoop, BrowserOperationTimeout, shared_browser_loop
 from ops.browser_metrics import BrowserDecisionEvent, SelectionSource, build_decision_event
@@ -260,6 +265,8 @@ def make_egress_route_handler(
     error is treated as the STRICTEST stage rather than the most permissive.
     """
 
+    blocked_seen: set[tuple[str, str, str]] = set()
+
     async def _handler(route: Any) -> None:
         request = route.request
         try:
@@ -277,6 +284,16 @@ def make_egress_route_handler(
         if policy.permits(url=url, kind=kind, stage=stage):
             await route.continue_()
         else:
+            host = (urlsplit(url).hostname or "").casefold()
+            finding = (host, kind, stage.value)
+            if host and finding not in blocked_seen and len(blocked_seen) < 32:
+                blocked_seen.add(finding)
+                log_event(
+                    "playwright.egress.blocked",
+                    blocked_host=host,
+                    resource_kind=kind,
+                    stage=stage.value,
+                )
             await route.abort(error_code="blockedbyclient")
 
     return _handler
@@ -428,6 +445,13 @@ class _PwSession:
     last_active_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     # Guarantees the capacity semaphore is released exactly once per session.
     capacity_released: bool = False
+    # Login verification handoffs are bounded so Resume cannot loop forever.
+    login_handoff_count: int = 0
+    # An early target probe may reveal a provider challenge before authentication
+    # is complete. It must not consume the separate post-HITL navigation budget.
+    pre_auth_target_probed: bool = False
+    # The reviewed post-login target is retried at most once in this session.
+    post_login_target_retried: bool = False
 
     def is_expired(self, now: datetime) -> bool:
         return (
@@ -906,6 +930,9 @@ class PlaywrightBrowserWorker:
                 # cookies can be restored without a fresh login.
                 context = await browser.new_context(
                     service_workers="block",
+                    locale="en-SG",
+                    timezone_id="Asia/Singapore",
+                    viewport={"width": 1440, "height": 900},
                     **({"storage_state": storage_state} if storage_state else {}),
                 )
                 page = await context.new_page()
@@ -964,6 +991,7 @@ class PlaywrightBrowserWorker:
         *,
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
+        credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
         self._require_configuration()
         session = self._sessions.get(context.session_id)
@@ -990,6 +1018,19 @@ class PlaywrightBrowserWorker:
         # app's reviewed host patterns, which only exist once research resolves.
         await self._install_interaction_guards(session, patterns)
 
+        # A login-bound run must enter the reviewed authentication egress stage
+        # before the first document is requested. Modern login pages load their
+        # IdP/challenge iframe as part of that initial document, before our code can
+        # locate and fill the form. Advancing only inside ``_inject_credentials``
+        # was therefore too late: Pipedrive's reviewed reCAPTCHA document was
+        # blocked at PRE_AUTH and the vendor rejected the otherwise valid login.
+        # This does not broaden the host policy; it only activates the app's static,
+        # reviewed IdP set when owner-supplied credentials prove that authentication
+        # is the intended next operation. The tracker is monotonic, so the stage can
+        # never loosen again later in the run.
+        if sensitive_data:
+            session.egress.advance_to(EgressStage.AUTHENTICATING)
+
         async def _go() -> bool:
             # The staged egress route was already installed at CONTEXT level by
             # _install_interaction_guards (which fails closed), so navigation is
@@ -1006,7 +1047,17 @@ class PlaywrightBrowserWorker:
             # A blocked navigation (host guard) or a load failure: fail closed.
             return _blocked(target)
 
-        return await self._run_action_loop(session, research, sensitive_data=sensitive_data)
+        # Publish the first safe, masked frame before authentication begins. This
+        # gives the control plane something truthful to render immediately while
+        # the background browser task continues.
+        await self.refresh_live_view(session)
+
+        return await self._run_action_loop(
+            session,
+            research,
+            sensitive_data=sensitive_data,
+            credential_creation_policy=credential_creation_policy,
+        )
 
     async def resume_after_hitl(
         self,
@@ -1015,13 +1066,15 @@ class PlaywrightBrowserWorker:
         research: OperationalResearch | None = None,
         *,
         sensitive_data: Mapping[str, str] | None = None,
+        credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
         del provider_session_id
         self._require_configuration()
         # The resume signal is no longer discarded: only a recognized signal
         # resumes the run; an unknown signal fails closed with a typed reason.
-        if normalize_resume_signal(signal) is None:
+        normalized_signal = normalize_resume_signal(signal)
+        if normalized_signal is None:
             raise ProviderOperationError(
                 capability="Playwright browser", reason_code="unrecognized_resume_signal"
             )
@@ -1036,9 +1089,15 @@ class PlaywrightBrowserWorker:
                 capability="Playwright browser", reason_code="verified_research_required"
             )
         # A "cancelled" resume ends the run at a human gate rather than re-driving.
-        if normalize_resume_signal(signal) == "cancelled":
+        if normalized_signal == "cancelled":
             return self._human_required(session, "The human cancelled the browser step.")
-        return await self._run_action_loop(session, resolved, sensitive_data=sensitive_data)
+        return await self._run_action_loop(
+            session,
+            resolved,
+            sensitive_data=sensitive_data,
+            credential_creation_policy=credential_creation_policy,
+            resume_signal=normalized_signal,
+        )
 
     async def _run_action_loop(
         self,
@@ -1046,6 +1105,8 @@ class PlaywrightBrowserWorker:
         research: OperationalResearch,
         *,
         sensitive_data: Mapping[str, str] | None,
+        credential_creation_policy: str = "reuse_only",
+        resume_signal: str | None = None,
     ) -> BrowserObservation:
         """Drive the page toward the credential page under strict bounds.
 
@@ -1062,6 +1123,15 @@ class PlaywrightBrowserWorker:
         if trace is None:
             return self._human_required(session, "No reviewed navigation trace is available.")
 
+        if not sensitive_data and resume_signal in {
+            "human_completed",
+            "captcha_completed",
+            "account_selected",
+        }:
+            resume_observation = await self._resume_login_after_hitl(session, trace)
+            if resume_observation is not None:
+                return resume_observation
+
         # Code-owned login injection happens once, before the loop, and never via a
         # model action, so a credential value cannot reach a prompt. Its typed
         # result is HANDLED rather than discarded: a proven authentication failure
@@ -1075,6 +1145,23 @@ class PlaywrightBrowserWorker:
                 )
                 if login_observation is not None:
                     return login_observation
+                # The absence of a login surface is not success. Probe the reviewed
+                # credential target once, then let its structured predicate prove it.
+                if login_result.reason_code == "no_recognized_login_surface":
+                    post_login = await self._inspect_page(session)
+                    already_at_goal = (
+                        trace.success.has_positive_condition()
+                        and predicate_satisfied(trace.success, post_login)
+                    )
+                    if not already_at_goal and not await self._probe_reviewed_target_before_auth(
+                        session, trace
+                    ):
+                        return self._failed_observation(
+                            session, "credential_page_navigation_failed"
+                        )
+                    disposition = await self._login_disposition_after_target(session, trace)
+                    if disposition is not None:
+                        return disposition
 
         deadline = asyncio.get_running_loop().time() + _MAX_AGENT_SECONDS
         repeated: dict[str, int] = {}
@@ -1116,6 +1203,16 @@ class PlaywrightBrowserWorker:
             if gate is not None:
                 return gate
 
+            # A visible login form is a credential request, not evidence for a
+            # trace-authored CAPTCHA/provider-verification instruction. Classify
+            # the actual DOM before consulting the current checkpoint so an
+            # initial no-credential run asks for credentials explicitly. Resume
+            # secrets are handled above and never pass through this branch.
+            if not sensitive_data and resume_signal is None:
+                login_gate = await self._login_gate_for_current_page(session)
+                if login_gate is not None:
+                    return login_gate
+
             # Only now, on a page proven non-sensitive, refresh the live view.
             await self.refresh_live_view(session)
 
@@ -1132,9 +1229,23 @@ class PlaywrightBrowserWorker:
             # A checkpoint whose completion cannot be reliably auto-verified escalates
             # to a human rather than the agent inventing progress.
             if checkpoint.requires_hitl:
+                policy_note = ""
+                instruction = checkpoint.instruction.casefold()
+                is_creation_step = any(
+                    marker in instruction
+                    for marker in ("create", "generate", "new api", "new app", "new token")
+                )
+                if is_creation_step and credential_creation_policy == "reuse_only":
+                    policy_note = " The run policy permits reuse only; do not create anything."
+                elif is_creation_step and credential_creation_policy == "create_if_missing":
+                    policy_note = (
+                        " Creation was requested, but this reviewed trace keeps the irreversible "
+                        "step human-authorized."
+                    )
                 return self._human_required(
                     session,
-                    f"Checkpoint {checkpoint.order} requires a human: {checkpoint.instruction}",
+                    f"Checkpoint {checkpoint.order} requires a human: "
+                    f"{checkpoint.instruction}{policy_note}",
                 )
 
             # Rank the NEXT snapshot by this checkpoint's signals.
@@ -1495,7 +1606,7 @@ class PlaywrightBrowserWorker:
 
             if not candidate.value_ref:
                 raise BrowserActionExpectedError("approved_value_missing")
-            value = self._approved_value(candidate.value_ref)
+            value = self._approved_value(session, candidate.value_ref)
             if not value:
                 raise BrowserActionExpectedError("approved_value_unavailable")
             return value
@@ -1578,9 +1689,14 @@ class PlaywrightBrowserWorker:
             )
         return _result("executed", sanitize_url(after_url), session.dom_generation)
 
-    def _approved_value(self, value_ref: str) -> str:
+    def _approved_value(self, session: _PwSession, value_ref: str) -> str:
         """Resolve an approved NON-SECRET value reference from configuration."""
 
+        # Creation retries must search and fill the exact same name. Derive it
+        # solely from immutable reviewed run state, never page content or model
+        # output, so a restart cannot accidentally create a differently named app.
+        if value_ref == "application_name" and session.app_slug:
+            return f"composio-{session.app_slug}-integration"[:200]
         return self._value_resolver.resolve(value_ref) or ""
 
     async def verify_credential_page(
@@ -1617,6 +1733,212 @@ class PlaywrightBrowserWorker:
             non_secret_notes=("Verified the reviewed structured success predicate.",),
         )
 
+    async def _navigate_reviewed_target(self, session: _PwSession, trace: BrowserApiTrace) -> bool:
+        """Navigate to the reviewed credential target in the current context."""
+
+        target = trace.start_url
+        if not navigation_allowed(target, session.patterns):
+            return False
+
+        async def _goto() -> bool:
+            async with session.operation_lock:
+                page = _active_page(session)
+                try:
+                    response = await page.goto(
+                        target,
+                        wait_until="domcontentloaded",
+                        timeout=_NAV_TIMEOUT_MS,
+                    )
+                except Exception:
+                    return False
+                if response is not None and int(response.status) >= 400:
+                    return False
+                return True
+
+        try:
+            return await self._loop.run(_goto(), timeout=_OP_TIMEOUT_SECONDS)
+        except Exception:
+            return False
+
+    async def _probe_reviewed_target_before_auth(
+        self, session: _PwSession, trace: BrowserApiTrace
+    ) -> bool:
+        """Probe once while authentication may still be awaiting verification."""
+
+        if session.pre_auth_target_probed:
+            return False
+        session.pre_auth_target_probed = True
+        return await self._navigate_reviewed_target(session, trace)
+
+    async def _retry_reviewed_target_after_login(
+        self, session: _PwSession, trace: BrowserApiTrace
+    ) -> bool:
+        """Open the reviewed post-login target once after a human handoff."""
+
+        if session.post_login_target_retried:
+            return False
+        session.post_login_target_retried = True
+        return await self._navigate_reviewed_target(session, trace)
+
+    async def _inspect_login_after_handoff(
+        self, session: _PwSession, previous: str
+    ) -> LoginInspection | None:
+        """Briefly recheck a human-controlled login surface without resubmitting."""
+
+        try:
+            return await self._loop.run(
+                inspect_after_login_submit(
+                    _active_page(session),
+                    previous=previous,  # type: ignore[arg-type]
+                    patterns=session.patterns,
+                    timeout_seconds=0.5,
+                ),
+                timeout=_OP_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return None
+
+    async def _visible_login_challenge(self, session: _PwSession) -> bool:
+        """Inspect only a visible challenge frame; passive badges do not match."""
+
+        try:
+            return await self._loop.run(
+                visible_login_challenge(_active_page(session)),
+                timeout=_OP_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return False
+
+    async def _login_disposition_after_target(
+        self, session: _PwSession, trace: BrowserApiTrace
+    ) -> BrowserObservation | None:
+        """Prove the reviewed goal or classify the current login wall."""
+
+        verified = await self.verify_credential_page(session, trace)
+        if verified is not None:
+            return verified
+        try:
+            login = await self._loop.run(
+                inspect_login(_active_page(session), session.patterns),
+                timeout=_OP_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return self._failed_observation(session, "login_incomplete")
+
+        immediate = self._observation_from_login_result(session, login, had_credentials=False)
+        if immediate is not None:
+            return immediate
+        if await self._visible_login_challenge(session):
+            challenge = LoginInspection(
+                state="unknown",
+                email_field=None,
+                password_field=None,
+                otp_fields=(),
+                submit_control=None,
+                current_url=login.current_url,
+                reason_code="captcha_required",
+            )
+            return self._observation_from_login_result(session, challenge, had_credentials=True)
+        if login.state in {"email_required", "password_required", "credentials_ready"}:
+            after = await self._inspect_login_after_handoff(session, login.state)
+            if after is None:
+                return self._failed_observation(session, "login_incomplete")
+            return self._observation_from_login_result(session, after, had_credentials=True)
+        # A blank/home/error surface is not authentication evidence. Keep the
+        # operator in the same session under the bounded verification budget.
+        pending = LoginInspection(
+            state="unknown",
+            email_field=None,
+            password_field=None,
+            otp_fields=(),
+            submit_control=None,
+            current_url=login.current_url,
+            reason_code="login_verification_required",
+        )
+        return self._observation_from_login_result(session, pending, had_credentials=True)
+
+    async def _resume_login_after_hitl(
+        self, session: _PwSession, trace: BrowserApiTrace
+    ) -> BrowserObservation | None:
+        """Re-evaluate human progress, then probe the reviewed target exactly once."""
+
+        verified = await self.verify_credential_page(session, trace)
+        if verified is not None:
+            return verified
+        try:
+            login = await self._loop.run(
+                inspect_login(_active_page(session), session.patterns),
+                timeout=_OP_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return self._failed_observation(session, "login_incomplete")
+
+        immediate = self._observation_from_login_result(session, login, had_credentials=False)
+        if immediate is not None:
+            return immediate
+        # A challenge overlay can hide the email/password fields. Check it before
+        # navigating anywhere so Resume never leaves a still-active CAPTCHA.
+        if await self._visible_login_challenge(session):
+            challenge = LoginInspection(
+                state="unknown",
+                email_field=None,
+                password_field=None,
+                otp_fields=(),
+                submit_control=None,
+                current_url=login.current_url,
+                reason_code="captcha_required",
+            )
+            return self._observation_from_login_result(session, challenge, had_credentials=True)
+        if login.state in {"email_required", "password_required", "credentials_ready"}:
+            after = await self._inspect_login_after_handoff(session, login.state)
+            if after is None:
+                return self._failed_observation(session, "login_incomplete")
+            return self._observation_from_login_result(session, after, had_credentials=True)
+        if not session.post_login_target_retried:
+            if not await self._retry_reviewed_target_after_login(session, trace):
+                return self._failed_observation(session, "credential_page_navigation_failed")
+        return await self._login_disposition_after_target(session, trace)
+
+    async def _login_gate_for_current_page(self, session: _PwSession) -> BrowserObservation | None:
+        """Classify a real initial login surface before trace-prose fallback.
+
+        This path never guesses from checkpoint wording. A structurally visible
+        challenge retains its CAPTCHA classification; an email/password surface
+        becomes ``login_required`` so the owner can submit credentials into the
+        same browser session through the transient secret channel.
+        """
+
+        try:
+            login = await self._loop.run(
+                inspect_login(_active_page(session), session.patterns),
+                timeout=_OP_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return None
+
+        immediate = self._observation_from_login_result(session, login, had_credentials=False)
+        if immediate is not None:
+            return immediate
+        if await self._visible_login_challenge(session):
+            challenge = LoginInspection(
+                state="unknown",
+                email_field=None,
+                password_field=None,
+                otp_fields=(),
+                submit_control=None,
+                current_url=login.current_url,
+                reason_code="captcha_required",
+            )
+            return self._observation_from_login_result(session, challenge, had_credentials=True)
+        if login.state in {"email_required", "password_required", "credentials_ready"}:
+            return self._bounded_login_handoff(
+                session,
+                "Enter the account login credentials to continue in this browser session.",
+                reason_code="login_required",
+                action_type="login_required",
+            )
+        return None
+
     async def _inject_credentials(
         self, session: _PwSession, sensitive_data: Mapping[str, str]
     ) -> LoginInspection | None:
@@ -1648,7 +1970,9 @@ class PlaywrightBrowserWorker:
                     )
                 # Tighten BEFORE any fill: even an email/username is account data.
                 session.egress.advance_to(EgressStage.AUTHENTICATING)
-                session.screenshots_disabled = True
+                # Drop the pre-auth frame before filling. Screenshot requests are
+                # serialized on this same lock and can resume afterwards with all
+                # form fields masked; credential values never appear in a frame.
                 session.screenshot = None
                 session.screenshot_at = None
                 # apply_resume_secrets, not drive_login: it handles a resume-time
@@ -1675,7 +1999,15 @@ class PlaywrightBrowserWorker:
         the reviewed per-app patterns — never from page content or model output.
         """
 
-        session.egress_policy = build_egress_policy(patterns)
+        extras = reviewed_egress_extensions(session.app_slug)
+        session.egress_policy = build_egress_policy(
+            patterns,
+            identity_provider_hosts=extras.identity_provider_hosts,
+            active_api_hosts=extras.active_api_hosts,
+            active_script_hosts=extras.active_script_hosts,
+            passive_asset_hosts=extras.passive_asset_hosts,
+            post_auth_hosts=extras.post_auth_hosts,
+        )
         policy = session.egress_policy
         registry = BrowserPageRegistry(url_allowed=lambda url: navigation_allowed(url, patterns))
         dialog_policy = DialogPolicy()
@@ -1784,6 +2116,24 @@ class PlaywrightBrowserWorker:
         if result.state == "authentication_failed":
             return self._failed_observation(session, "authentication_failed")
 
+        if reason in {"captcha_required", "login_verification_required"}:
+            if reason == "captcha_required":
+                return self._bounded_login_handoff(
+                    session,
+                    "Pipedrive requires a browser verification step. Complete the visible "
+                    "CAPTCHA or security prompt in the live browser, then resume.",
+                    reason_code=reason,
+                    action_type="captcha",
+                )
+            return self._bounded_login_handoff(
+                session,
+                "The submitted login did not reach an authenticated page. Review "
+                "Pipedrive's verification or new-device prompt in the interactive "
+                "browser, complete it, then resume.",
+                reason_code=reason,
+                action_type="provider_verification",
+            )
+
         # Hard blocks: a reviewed-frame or safe-link violation is a failure.
         if reason in {"login_frame_unreviewed", "verification_link_blocked"}:
             return self._failed_observation(session, reason)
@@ -1797,7 +2147,7 @@ class PlaywrightBrowserWorker:
             "otp_injection_failed",
             "verification_link_navigation_failed",
         }:
-            return self._human_required(
+            return self._bounded_login_handoff(
                 session,
                 f"The deterministic login flow requires review ({reason}).",
                 reason_code=reason,
@@ -1805,21 +2155,21 @@ class PlaywrightBrowserWorker:
             )
 
         if result.state == "otp_required":
-            return self._human_required(
+            return self._bounded_login_handoff(
                 session,
                 "Enter the emailed one-time code.",
                 reason_code="otp_required",
                 action_type="email_otp",
             )
         if result.state == "magic_link_required":
-            return self._human_required(
+            return self._bounded_login_handoff(
                 session,
                 "Complete the reviewed email verification link.",
                 reason_code="magic_link_required",
                 action_type="provider_verification",
             )
         if result.state == "account_selection_required":
-            return self._human_required(
+            return self._bounded_login_handoff(
                 session,
                 "Select the intended account.",
                 reason_code="account_selection_required",
@@ -1838,6 +2188,26 @@ class PlaywrightBrowserWorker:
         # No recognised login surface: authentication is decided by the trace
         # predicate downstream, so let the loop continue.
         return None
+
+    def _bounded_login_handoff(
+        self,
+        session: _PwSession,
+        instruction: str,
+        *,
+        reason_code: str,
+        action_type: HumanActionType,
+    ) -> BrowserObservation:
+        """Issue at most two login-specific HITL pauses in one session."""
+
+        if session.login_handoff_count >= 2:
+            return self._failed_observation(session, "login_incomplete")
+        session.login_handoff_count += 1
+        return self._human_required(
+            session,
+            instruction,
+            reason_code=reason_code,
+            action_type=action_type,
+        )
 
     def _human_required(
         self,
@@ -1985,7 +2355,7 @@ class PlaywrightBrowserWorker:
             # failures yield NO screenshot, never an unmasked one.
             async with session.operation_lock:
                 live = _active_page(session)
-                if await _has_credential_content(live):
+                if await _has_unmasked_secret_content(live):
                     return None
                 return await _masked_screenshot(live)
 
@@ -2356,6 +2726,21 @@ async def _has_credential_content(page: Any) -> bool:
     return contains_secret_material(text if isinstance(text, str) else "")
 
 
+async def _has_unmasked_secret_content(page: Any) -> bool:
+    """Return true only when page text itself may expose credential material.
+
+    Login inputs are safe to capture only because ``_masked_screenshot`` masks
+    every form field. Plain-text secrets elsewhere in the page remain a hard
+    refusal, and inspection errors fail closed.
+    """
+
+    try:
+        text = await page.inner_text("body", timeout=3_000)
+    except Exception:
+        return True
+    return contains_secret_material(text if isinstance(text, str) else "")
+
+
 async def _masked_screenshot(page: Any) -> bytes | None:
     """Screenshot the viewport with every credential-bearing field masked.
 
@@ -2364,15 +2749,11 @@ async def _masked_screenshot(page: Any) -> bytes | None:
 
     try:
         masks = [
-            page.locator("input[type='password']"),
-            page.locator("input[name*='token' i]"),
-            page.locator("input[name*='secret' i]"),
-            page.locator("input[name*='key' i]"),
-            page.locator("input[name*='otp' i]"),
-            page.locator("input[name*='code' i]"),
-            page.locator("textarea[name*='token' i]"),
-            page.locator("textarea[name*='secret' i]"),
-            page.locator("textarea[name*='key' i]"),
+            # Mask every editable value, not only fields whose names look secret.
+            # Email/user identifiers are account data too.
+            page.locator("input"),
+            page.locator("textarea"),
+            page.locator("[contenteditable='true']"),
             page.locator("[data-secret]"),
             page.locator("[data-credential]"),
         ]

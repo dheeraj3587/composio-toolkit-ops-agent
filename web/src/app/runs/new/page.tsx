@@ -4,6 +4,8 @@ import { ArrowLeft, LockKeyhole } from "lucide-react"
 
 import { NewRunForm } from "@/components/new-run-form"
 import { Button } from "@/components/ui/button"
+import { getHealth } from "@/lib/api"
+import type { ProviderStatus } from "@/lib/types"
 
 export const metadata: Metadata = { title: "New operations plan" }
 
@@ -16,6 +18,14 @@ export default async function NewRunPage({
   const defaultAppName = typeof rawApp === "string" && /^[\p{L}\p{N} .+&'()-]{1,120}$/u.test(rawApp)
     ? rawApp
     : ""
+  let providerStates: ProviderStatus[] = []
+  try {
+    providerStates = (await getHealth()).providers?.filter(
+      (provider) => provider.provider === "playwright" || provider.provider === "browser_use",
+    ) ?? []
+  } catch {
+    providerStates = []
+  }
 
   return (
     <div className="page-enter page-stack mx-auto max-w-7xl">
@@ -35,7 +45,7 @@ export default async function NewRunPage({
           <p>Vault material stays reference-only. Optional app sign-in values use a secure owner flow and are never persisted in run state or displayed back to the operator.</p>
         </div>
       </header>
-      <NewRunForm defaultAppName={defaultAppName} />
+      <NewRunForm defaultAppName={defaultAppName} providerStates={providerStates} />
     </div>
   )
 }

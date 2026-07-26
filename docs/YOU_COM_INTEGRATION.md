@@ -8,8 +8,8 @@ page, developer portal, API settings/credentials page, and
 authentication/scope documentation faster and more accurately than Perplexity
 alone.
 
-> Browser Use remains the primary production browser harness.
-> You.com never controls the browser.
+> You.com never controls either browser provider. Playwright and Browser Use are
+> selected per run by the operator.
 
 You.com is used **only** for: official web-page discovery, official
 documentation retrieval, and finding login / signup / developer-portal /
@@ -32,7 +32,8 @@ Verified P1 snapshot
     -> Gemini strict structured extraction (the ONLY creator of OperationalResearch)
     -> Field-level evidence validation
     -> OperationalResearch
-    -> Existing routing and Browser Use workflow (unchanged)
+    -> Direct-route policy (reviewed trace + verified URLs required)
+    -> Run-selected Playwright or Browser Use workflow
 ```
 
 When `YDC_API_KEY` is absent or the You.com feature flags are disabled, provider
@@ -175,15 +176,32 @@ is made without `--execute`.
 python scripts/warm_you_research.py --all
 python scripts/warm_you_research.py --app-slug pipedrive --execute
 python scripts/warm_you_research.py --all --execute --limit 5 --concurrency 2
+python scripts/warm_you_research.py --all --execute --continue-on-error \
+  --output-summary private/you-url-coverage.json
 ```
 
 The command accepts `--app-slug` or `--all`, `--execute`, `--limit`,
 `--concurrency` (maximum 5), `--force-refresh`, `--max-age-seconds`,
 `--continue-on-error`, and `--output-summary`. It reports only each app slug,
 sanitized result code (`cache_hit`, `enriched`, `skipped`, or `failed`), missing
-field names/count, and verified-claim count. Fresh fully validated results are
-reused until their normal TTL expires; `--force-refresh` bypasses reads for that
-one invocation but writes refreshed values under the same normal cache keys.
+field names/count, verified-claim count, evidence-backed public operational URLs,
+route, reviewed-trace status, and coverage status. The JSON report also contains
+aggregate coverage counts. Fresh fully validated results are reused until their
+normal TTL expires; `--force-refresh` bypasses reads for that one invocation but
+writes refreshed values under the same normal cache keys.
+
+Live browser execution is fail-closed: self-service and hybrid routes require a
+reviewed trace plus verified `login_url` and `credential_management_url`. The
+first 25 P1 apps currently have reviewed traces; the other 75 remain research-only
+until a trace is reviewed. Existing-account sessions open the verified login URL,
+then the verified credential-management URL after authentication. Research URLs
+never expand the static browser host allowlist.
+
+Run creation accepts immutable `credential_creation_policy` values `reuse_only`
+and `create_if_missing`. API and CLI omission defaults to `reuse_only`; the web
+form explicitly defaults to `create_if_missing`. Any trace checkpoint marked
+HITL remains human-authorized under either policy, including every currently
+reviewed irreversible create/generate checkpoint.
 
 ## Error handling
 
@@ -249,10 +267,9 @@ URLs, one batch; Research one call at `standard` effort.
 
 ## Security boundaries (unchanged)
 
-Browser Use remains the primary production browser harness; `browser_provider`
-default (`browser_use`) is untouched. `ops/browser_host_policy` allowed_domains
+The legacy `browser_provider` default remains `browser_use`, while the website
+sends an explicit per-run selection. `ops/browser_host_policy` allowed_domains
 come only from the reviewed static dataset — never from `OperationalResearch`
 fields — so no You.com/Perplexity/Research result can expand a browser
 allowlist. You.com never receives a credential, OTP, cookie, or vault value, and
-is never used to bypass CAPTCHA/MFA. Playwright remains disabled by default and
-undeployed; nothing here touches it.
+is never used to bypass CAPTCHA/MFA.

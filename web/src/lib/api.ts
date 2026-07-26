@@ -306,7 +306,10 @@ export async function getLiveScreenshotBinary(
     throw new ApiError(502, "INVALID_SCREENSHOT_SIZE", "The browser screenshot is invalid.")
   }
 
-  if (!PNG_SIGNATURE.every((byte, index) => bytes[index] === byte)) {
+  const hasPngSignature =
+    bytes.length >= PNG_SIGNATURE.length
+    && PNG_SIGNATURE.every((byte, index) => bytes[index] === byte)
+  if (!hasPngSignature) {
     throw new ApiError(502, "INVALID_SCREENSHOT_DATA", "The browser screenshot is invalid.")
   }
 

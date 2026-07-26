@@ -177,3 +177,25 @@ def test_run_generic_error_is_clean_failure_and_stops_session() -> None:
 
     assert excinfo.value.reason_code == "provider_request_failed"
     assert client.sessions.stopped == ["provider-session-1"]  # clean fail stops it
+
+
+def test_assignment_wall_clock_timeout_stops_session_and_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _HardeningClient()
+    worker = AssignmentBrowserWorker(settings=_settings(), client=client)
+    context = asyncio.run(worker.start(None))
+
+    async def expire(awaitable: Any, *, timeout: float) -> Any:
+        assert timeout == 180
+        awaitable.close()
+        raise TimeoutError
+
+    monkeypatch.setattr("api.assignment_runtime.asyncio.wait_for", expire)
+
+    with pytest.raises(ProviderOperationError) as excinfo:
+        asyncio.run(worker.navigate_onboarding(context, _research()))
+
+    assert excinfo.value.reason_code == "provider_timeout"
+    assert client.sessions.stopped == ["provider-session-1"]
+    assert client.profiles.deleted == ["profile-1"]

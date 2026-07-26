@@ -44,7 +44,11 @@ _ACTIVE_KINDS = frozenset(
     {"document", "xhr", "fetch", "websocket", "eventsource", "manifest", "script"}
 )
 _PASSIVE_KINDS = frozenset({"image", "font", "stylesheet", "media"})
-KNOWN_KINDS = _ACTIVE_KINDS | _PASSIVE_KINDS
+# Chromium uses ``other`` for a small set of runtime-owned resources (including
+# a reCAPTCHA bootstrap artifact). It follows the active-host allowlist; the kind
+# does not grant a host by itself.
+_AUXILIARY_KINDS = frozenset({"other"})
+KNOWN_KINDS = _ACTIVE_KINDS | _PASSIVE_KINDS | _AUXILIARY_KINDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +74,7 @@ class BrowserEgressPolicy:
             base = (*vendor, *self.post_auth_hosts)
             if kind in _PASSIVE_KINDS:
                 return (*base, *self.passive_asset_hosts)
-            if kind == "script":
+            if kind in {"script", "other"}:
                 return (*base, *self.active_script_hosts)
             if kind in _ACTIVE_KINDS:
                 return (*base, *self.active_api_hosts)
@@ -80,7 +84,7 @@ class BrowserEgressPolicy:
             base = (*vendor, *self.identity_provider_hosts)
             if kind in _PASSIVE_KINDS:
                 return (*base, *self.passive_asset_hosts)
-            if kind == "script":
+            if kind in {"script", "other"}:
                 return (*base, *self.active_script_hosts)
             if kind in _ACTIVE_KINDS:
                 return (*base, *self.active_api_hosts)
@@ -89,7 +93,7 @@ class BrowserEgressPolicy:
         # PRE_AUTH
         if kind in _PASSIVE_KINDS:
             return (*vendor, *self.passive_asset_hosts)
-        if kind == "script":
+        if kind in {"script", "other"}:
             return (*vendor, *self.active_script_hosts)
         if kind in _ACTIVE_KINDS:
             return (*vendor, *self.active_api_hosts)
@@ -110,6 +114,44 @@ class BrowserEgressPolicy:
         if not patterns:
             return False
         return host_matches_patterns(host, tuple(patterns))
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewedEgressExtensions:
+    """Exact non-navigation hosts required by a reviewed vendor web app."""
+
+    identity_provider_hosts: tuple[str, ...] = ()
+    active_api_hosts: tuple[str, ...] = ()
+    active_script_hosts: tuple[str, ...] = ()
+    passive_asset_hosts: tuple[str, ...] = ()
+    post_auth_hosts: tuple[str, ...] = ()
+
+
+_REVIEWED_EGRESS_EXTENSIONS: dict[str, ReviewedEgressExtensions] = {
+    "pipedrive": ReviewedEgressExtensions(
+        # Pipedrive's login bundle is served from this vendor-owned CDN. Blocking
+        # it leaves a visually complete HTML form but omits the client-side auth
+        # state, causing the vendor to reject submit with `bad_request`.
+        identity_provider_hosts=("www.recaptcha.net",),
+        active_script_hosts=(
+            "*.pipedriveassets.com",
+            "www.gstatic.com",
+            "www.recaptcha.net",
+        ),
+        passive_asset_hosts=(
+            "*.pipedriveassets.com",
+            "www.gstatic.com",
+            "www.recaptcha.net",
+        ),
+        post_auth_hosts=(),
+    ),
+}
+
+
+def reviewed_egress_extensions(app_slug: str) -> ReviewedEgressExtensions:
+    """Return static, exact egress additions for one reviewed application."""
+
+    return _REVIEWED_EGRESS_EXTENSIONS.get(app_slug, ReviewedEgressExtensions())
 
 
 @dataclass(slots=True)
@@ -160,5 +202,7 @@ __all__ = [
     "BrowserEgressPolicy",
     "EgressStage",
     "EgressStageTracker",
+    "ReviewedEgressExtensions",
     "build_egress_policy",
+    "reviewed_egress_extensions",
 ]

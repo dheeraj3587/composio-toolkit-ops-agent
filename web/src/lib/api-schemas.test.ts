@@ -182,6 +182,17 @@ describe("live view contract synchronization", () => {
     reason_code: "screenshot_frames_available",
   }
 
+  const interactive = {
+    run_id: RUN_ID,
+    provider: "playwright",
+    available: true,
+    mode: "interactive_remote",
+    interactive_url:
+      "http://browser-worker:8081/internal/browser/live-view/novnc?session=pw_session_1&token=signed-grant",
+    interaction_available: true,
+    reason_code: "interactive_hitl_available",
+  }
+
   const unavailable = {
     run_id: RUN_ID,
     provider: "playwright",
@@ -214,6 +225,17 @@ describe("live view contract synchronization", () => {
     }
   })
 
+  it("accepts only the reviewed private Playwright interactive grant", () => {
+    const parsed = liveViewResponseSchema.safeParse(interactive)
+
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.mode).toBe("interactive_remote")
+      expect(parsed.data.interactive_url).toBe(interactive.interactive_url)
+      expect(parsed.data.interaction_available).toBe(true)
+    }
+  })
+
   it("accepts an unavailable view with no viewer URL", () => {
     expect(liveViewResponseSchema.safeParse(unavailable).success).toBe(true)
   })
@@ -227,9 +249,8 @@ describe("live view contract synchronization", () => {
     ).toBe(false)
     expect(
       liveViewResponseSchema.safeParse({
-        ...screenshot,
-        mode: "interactive_remote",
-        screenshot_url: null,
+        ...interactive,
+        interactive_url: null,
       }).success,
     ).toBe(false)
   })
@@ -252,24 +273,35 @@ describe("live view contract synchronization", () => {
     ).toBe(false)
   })
 
-  it("rejects a private browser-service address as a viewer path", () => {
+  it("rejects every interactive address except the exact reviewed private grant", () => {
     for (const address of [
       "http://browser-worker:8081/vnc.html?session=pw_1&token=t",
+      "http://browser-worker:8081/internal/browser/live-view/novnc?session=pw_1&token=t&extra=1",
+      "http://browser-worker:8081/internal/browser/live-view/novnc?session=bad%2Fsession&token=t",
+      "http://browser-worker:8081/internal/browser/live-view/novnc?session=pw_1&token=t%0Ainjected",
       "https://browser-worker.opsnet/vnc.html",
       "http://127.0.0.1:6080/vnc.html",
+      `/api/runs/${RUN_ID}/live-view/interactive`,
     ]) {
       expect(
         liveViewResponseSchema.safeParse({ ...screenshot, screenshot_url: address }).success,
       ).toBe(false)
       expect(
         liveViewResponseSchema.safeParse({
-          ...screenshot,
-          mode: "interactive_remote",
-          screenshot_url: null,
+          ...interactive,
           interactive_url: address,
         }).success,
       ).toBe(false)
     }
+  })
+
+  it("rejects an interactive grant that claims read-only access", () => {
+    expect(
+      liveViewResponseSchema.safeParse({
+        ...interactive,
+        interaction_available: false,
+      }).success,
+    ).toBe(false)
   })
 
   it("rejects a viewer path that addresses a different run", () => {

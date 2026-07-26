@@ -130,7 +130,13 @@ def test_settings_default_to_no_live_email_and_hide_secret_repr() -> None:
     )
 
     assert settings.allow_live_vendor_email is False
+    assert settings.browser_interactive_hitl_enabled is False
     assert settings.company_work_email_ref == "vault://company/work_email/profile_1"
     assert marker not in repr(settings)
     assert marker not in str(settings)
     assert "company_work_email" not in Settings.model_fields
+
+
+def test_interactive_browser_capability_is_explicitly_env_backed() -> None:
+    settings = Settings.from_env(env={"BROWSER_INTERACTIVE_HITL_ENABLED": "true"})
+    assert settings.browser_interactive_hitl_enabled is True

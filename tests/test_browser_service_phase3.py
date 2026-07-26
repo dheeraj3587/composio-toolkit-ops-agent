@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from browser_service.auth import OWNER_HEADER, TOKEN_HEADER
-from browser_service.main import create_app
+from browser_service.main import UvicornWebSocketLogFilter, create_app
 from browser_service.models import SessionSummary
 from browser_service.novnc import LiveViewDenied, VncTarget, authorize_live_view
 from browser_service.session_manager import SessionManager, SessionUnavailable
@@ -122,9 +123,14 @@ class _FakeWorker:
         )
 
     async def navigate_onboarding(
-        self, context: BrowserSessionContext, research: Any, *, sensitive_data: Any = None
+        self,
+        context: BrowserSessionContext,
+        research: Any,
+        *,
+        sensitive_data: Any = None,
+        credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
-        del research
+        del research, credential_creation_policy
         self.seen_sensitive.append(dict(sensitive_data or {}))
         if self.navigate_delay:
             await asyncio.sleep(self.navigate_delay)
@@ -145,9 +151,10 @@ class _FakeWorker:
         research: Any = None,
         *,
         sensitive_data: Any = None,
+        credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
-        del context, signal, research, provider_session_id
+        del context, signal, research, credential_creation_policy, provider_session_id
         self.seen_sensitive.append(dict(sensitive_data or {}))
         return BrowserObservation(
             status="succeeded",
@@ -187,13 +194,7 @@ def _settings(**overrides: Any) -> BrowserServiceSettings:
 
 
 def _interactive_settings(**overrides: Any) -> BrowserServiceSettings:
-    """Settings with interactive HITL forced on, bypassing the production validator.
-
-    Production config REJECTS interactive_hitl_enabled=true (the operator-facing
-    noVNC surface is deferred). These low-level tests still exercise the grant and
-    relay machinery that exists behind the flag, so they construct settings with
-    model_construct to bypass that guard deliberately.
-    """
+    """Valid one-display, one-session interactive HITL settings."""
 
     base: dict[str, Any] = {
         "service_token": SecretStr(TOKEN),
@@ -204,7 +205,7 @@ def _interactive_settings(**overrides: Any) -> BrowserServiceSettings:
         "interactive_hitl_enabled": True,
     }
     base.update(overrides)
-    return BrowserServiceSettings.model_construct(**base)
+    return BrowserServiceSettings(**base)
 
 
 def _headers(token: str | None = TOKEN, owner: str | None = OWNER) -> dict[str, str]:
@@ -566,6 +567,40 @@ class TestSessionManagerLifecycle:
 
         asyncio.run(scenario())
 
+    def test_janitor_retries_failed_teardown_without_releasing_capacity(self) -> None:
+        async def scenario() -> None:
+            attempts = 0
+
+            async def flaky_closer(_session: Any) -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("transient teardown failure")
+
+            manager = self._manager(
+                max_sessions=1,
+                inactivity_seconds=30,
+                closer=flaky_closer,
+            )
+            session = manager.create(
+                owner=OWNER, app_slug="pipedrive", live_view_mode="screenshot"
+            )
+            session.last_active_at = datetime.now(UTC) - timedelta(hours=1)
+
+            assert await manager.sweep() == ()
+            assert session.lifecycle == "CLOSING"
+            assert session.reason_code == "session_idle_expired:teardown_failed"
+            assert manager.capacity_in_use == 1
+            with pytest.raises(SessionUnavailable):
+                manager.create(owner=OWNER, app_slug="other", live_view_mode="screenshot")
+
+            assert await manager.sweep() == (session.session_id,)
+            assert attempts == 2
+            assert manager.get_if_present(session.session_id) is None
+            assert manager.capacity_in_use == 0
+
+        asyncio.run(scenario())
+
 
 # ------------------------------------------------------- 5. interactive HITL
 class TestInteractiveHitlGrants:
@@ -649,6 +684,12 @@ class TestInteractiveHitlGrants:
         client, _ = _client(_interactive_settings())
         with client:
             session_id = _create_session(client)["session_id"]
+            navigate = client.post(
+                f"/internal/browser/sessions/{session_id}/navigate",
+                json={"research": RESEARCH_PAYLOAD},
+                headers=_headers(),
+            )
+            assert navigate.status_code == 200
             response = client.post(
                 f"/internal/browser/sessions/{session_id}/live-view", headers=_headers()
             )
@@ -685,6 +726,7 @@ class TestInteractiveHitlGrants:
             "caller_owner": OWNER,
             "secret": TOKEN,
             "interactive_enabled": True,
+            "hitl_pending": True,
         }
         with pytest.raises(LiveViewDenied) as missing:
             authorize_live_view(session_owner=None, session_lifecycle=None, **common)
@@ -706,8 +748,24 @@ class TestInteractiveHitlGrants:
                 session_owner="victim",
                 session_lifecycle="ACTIVE",
                 interactive_enabled=True,
+                hitl_pending=True,
             )
         assert excinfo.value.reason_code == "session_not_found"
+
+    def test_authorize_live_view_refuses_when_hitl_is_not_pending(self) -> None:
+        token, _ = issue_live_view_token(session_id="bs_1", owner=OWNER, secret=TOKEN)
+        with pytest.raises(LiveViewDenied) as excinfo:
+            authorize_live_view(
+                token=token,
+                session_id="bs_1",
+                caller_owner=OWNER,
+                secret=TOKEN,
+                session_owner=OWNER,
+                session_lifecycle="ACTIVE",
+                interactive_enabled=True,
+                hitl_pending=False,
+            )
+        assert excinfo.value.reason_code == "hitl_not_pending"
 
     def test_websocket_relay_is_refused_without_a_valid_grant(self) -> None:
         from starlette.websockets import WebSocketDisconnect
@@ -722,6 +780,177 @@ class TestInteractiveHitlGrants:
                 ):
                     pass  # pragma: no cover - the socket must never be accepted
         assert excinfo.value.code == 1008
+
+    def test_websocket_accepts_without_a_binary_subprotocol(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from starlette.websockets import WebSocketDisconnect
+
+        import browser_service.novnc as novnc_module
+
+        async def closed_relay(**kwargs: Any) -> str:
+            del kwargs
+            return "live_view_closed"
+
+        monkeypatch.setattr(novnc_module, "relay_websocket_to_vnc", closed_relay)
+        client, _ = _client(_interactive_settings())
+        with client:
+            session_id = _create_session(client)["session_id"]
+            navigate = client.post(
+                f"/internal/browser/sessions/{session_id}/navigate",
+                json={"research": RESEARCH_PAYLOAD},
+                headers=_headers(),
+            )
+            assert navigate.status_code == 200
+            token, _ = issue_live_view_token(session_id=session_id, owner=OWNER, secret=TOKEN)
+            with client.websocket_connect(
+                f"/internal/browser/live-view/novnc?session={session_id}&token={token}",
+                headers=_headers(),
+            ) as socket:
+                assert socket.accepted_subprotocol is None
+                with pytest.raises(WebSocketDisconnect):
+                    socket.receive_bytes()
+
+    def test_resume_drains_an_authorized_handshake_before_accept_completes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from starlette.websockets import WebSocket
+
+        original_accept = WebSocket.accept
+        accept_started = threading.Event()
+        release_accept = threading.Event()
+
+        async def delayed_accept(self: WebSocket, *args: Any, **kwargs: Any) -> None:
+            accept_started.set()
+            while not release_accept.is_set():
+                await asyncio.sleep(0.01)
+            await original_accept(self, *args, **kwargs)
+
+        monkeypatch.setattr(WebSocket, "accept", delayed_accept)
+        client, _ = _client(_interactive_settings())
+        websocket_errors: list[BaseException] = []
+
+        with client:
+            session_id = _create_session(client)["session_id"]
+            assert (
+                client.post(
+                    f"/internal/browser/sessions/{session_id}/navigate",
+                    json={"research": RESEARCH_PAYLOAD},
+                    headers=_headers(),
+                ).status_code
+                == 200
+            )
+            token, _ = issue_live_view_token(
+                session_id=session_id, owner=OWNER, secret=TOKEN
+            )
+
+            def _open_socket() -> None:
+                try:
+                    with client.websocket_connect(
+                        f"/internal/browser/live-view/novnc?session={session_id}&token={token}",
+                        headers=_headers(),
+                    ):
+                        pass
+                except BaseException as exc:  # noqa: BLE001 - asserted thread outcome
+                    websocket_errors.append(exc)
+
+            thread = threading.Thread(target=_open_socket, daemon=True)
+            thread.start()
+            assert accept_started.wait(timeout=3.0)
+            # Reservation happens before the delayed accept await. The previous
+            # ordering left this empty and allowed autonomous Resume to race ahead.
+            assert client.app.state.live_attachments.get(session_id)
+
+            response = client.post(
+                f"/internal/browser/sessions/{session_id}/resume",
+                json={"signal": "human_completed", "research": RESEARCH_PAYLOAD},
+                headers=_headers(),
+            )
+            release_accept.set()
+            thread.join(timeout=3.0)
+
+            assert response.status_code == 200
+            assert not thread.is_alive()
+            assert not client.app.state.live_attachments.get(session_id)
+            assert client.app.state.manager.get_if_present(session_id).hitl_pending is False
+
+    def test_resume_revokes_an_already_issued_grant(self) -> None:
+        client, _ = _client(_interactive_settings())
+        with client:
+            session_id = _create_session(client)["session_id"]
+            assert (
+                client.post(
+                    f"/internal/browser/sessions/{session_id}/navigate",
+                    json={"research": RESEARCH_PAYLOAD},
+                    headers=_headers(),
+                ).status_code
+                == 200
+            )
+            grant = client.post(
+                f"/internal/browser/sessions/{session_id}/live-view", headers=_headers()
+            ).json()
+            assert grant["mode"] == "interactive_remote"
+            assert (
+                client.post(
+                    f"/internal/browser/sessions/{session_id}/resume",
+                    json={"signal": "human_completed", "research": RESEARCH_PAYLOAD},
+                    headers=_headers(),
+                ).status_code
+                == 200
+            )
+            # A fresh grant is no longer available, and the old signed token is
+            # rejected because authorization also consults live HITL state.
+            refreshed = client.post(
+                f"/internal/browser/sessions/{session_id}/live-view", headers=_headers()
+            ).json()
+            assert refreshed["mode"] == "screenshot"
+            token = grant["url"].split("token=", 1)[1].split("&", 1)[0]
+            with pytest.raises(LiveViewDenied) as excinfo:
+                authorize_live_view(
+                    token=token,
+                    session_id=session_id,
+                    caller_owner=OWNER,
+                    secret=TOKEN,
+                    session_owner=OWNER,
+                    session_lifecycle="ACTIVE",
+                    interactive_enabled=True,
+                    hitl_pending=False,
+                )
+            assert excinfo.value.reason_code == "hitl_not_pending"
+
+    def test_failed_attachment_drain_restores_hitl_for_retry(self) -> None:
+        class _DoneAttachment:
+            def done(self) -> bool:
+                return True
+
+        class _StuckSocket:
+            async def close(self, **_kwargs: Any) -> None:
+                return None
+
+        client, _ = _client(_interactive_settings())
+        with client:
+            session_id = _create_session(client)["session_id"]
+            assert (
+                client.post(
+                    f"/internal/browser/sessions/{session_id}/navigate",
+                    json={"research": RESEARCH_PAYLOAD},
+                    headers=_headers(),
+                ).status_code
+                == 200
+            )
+            client.app.state.live_attachments[session_id] = {  # type: ignore[index]
+                _DoneAttachment(): _StuckSocket()
+            }
+            response = client.post(
+                f"/internal/browser/sessions/{session_id}/resume",
+                json={"signal": "human_completed", "research": RESEARCH_PAYLOAD},
+                headers=_headers(),
+            )
+            session = client.app.state.manager.get_if_present(session_id)
+            client.app.state.live_attachments.pop(session_id, None)
+            assert response.status_code == 409
+            assert response.json()["detail"] == "live_attachment_drain_failed"
+            assert session is not None and session.hitl_pending is True
 
     def test_relay_refuses_a_non_loopback_vnc_target(self) -> None:
         """The relay must never become an SSRF primitive."""
@@ -789,6 +1018,80 @@ class TestRestartReattachment:
         client = self._service_client("http://browser-worker:8081", httpx.MockTransport(handler))
         assert asyncio.run(client.reconcile_session("bs_live")) == "resumable"
         assert client.supports_restart_reattach is True
+
+    def test_sync_live_frame_is_available_to_run_projection(self) -> None:
+        import httpx
+
+        from ops.browser_service_client import BrowserServiceClient
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers[TOKEN_HEADER] == TOKEN
+            assert request.url.path.endswith("/sessions/bs_live/screenshot")
+            return httpx.Response(200, content=b"\x89PNG\r\n\x1a\nframe")
+
+        sync_client = httpx.Client(
+            transport=httpx.MockTransport(handler),
+            base_url="http://browser-worker:8081",
+        )
+        client = BrowserServiceClient(
+            base_url="http://browser-worker:8081",
+            token=TOKEN,
+            owner=OWNER,
+            sync_client=sync_client,
+        )
+        try:
+            frame = client.latest_screenshot("bs_live")
+        finally:
+            sync_client.close()
+
+        assert frame is not None
+        assert frame[0].startswith(b"\x89PNG\r\n\x1a\n")
+        assert frame[1]
+
+    def test_sync_interactive_grant_is_fresh_and_not_cached(self) -> None:
+        import httpx
+
+        from ops.browser_service_client import BrowserServiceClient
+
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            assert request.method == "POST"
+            assert request.url.path.endswith("/sessions/bs_live/live-view")
+            return httpx.Response(
+                200,
+                json={
+                    "mode": "interactive_remote",
+                    "url": (
+                        "http://browser-worker:8081/internal/browser/live-view/novnc"
+                        f"?session=bs_live&token=e30.sig{calls}"
+                    ),
+                    "expires_at": "2026-07-25T00:05:00+00:00",
+                    "session_id": "bs_live",
+                },
+            )
+
+        sync_client = httpx.Client(
+            transport=httpx.MockTransport(handler),
+            base_url="http://browser-worker:8081",
+        )
+        client = BrowserServiceClient(
+            base_url="http://browser-worker:8081",
+            token=TOKEN,
+            owner=OWNER,
+            sync_client=sync_client,
+        )
+        try:
+            first = client.request_live_view_sync("bs_live")
+            second = client.request_live_view_sync("bs_live")
+        finally:
+            sync_client.close()
+
+        assert first is not None and second is not None
+        assert first[1] != second[1]
+        assert calls == 2
 
     def test_missing_session_is_reported_lost_not_resumable(self) -> None:
         import httpx
@@ -1050,6 +1353,26 @@ class TestNoSecretsCrossTheBoundary:
         assert "live view denied" in logged
         assert "invalid_signature" in logged
 
+    def test_denied_live_view_cannot_smuggle_a_token_through_session_log_field(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from starlette.websockets import WebSocketDisconnect
+
+        # Alphanumeric material would pass the identifier regex, so the logger
+        # must derive its value from a matching managed session rather than input.
+        smuggled = "SuperSecretPassword1234567890"
+        client, _ = _client(_interactive_settings())
+        with client, caplog.at_level(logging.DEBUG):
+            with pytest.raises(WebSocketDisconnect):
+                with client.websocket_connect(
+                    f"/internal/browser/live-view/novnc?session={smuggled}&token=forged",
+                    headers=_headers(),
+                ):
+                    pass  # pragma: no cover - rejected before accept
+        logged = "\n".join(record.getMessage() for record in caplog.records)
+        assert smuggled not in logged
+        assert "live view denied session=-" in logged
+
     def test_screenshot_is_never_a_stale_frame(self) -> None:
         """No frame available must be an explicit 409, not last page's image."""
 
@@ -1212,6 +1535,44 @@ class TestContainerIsolationShape:
         assert any(volume.endswith(":/browser-data") for volume in service["volumes"])
         assert any(entry.startswith("/tmp:") for entry in service["tmpfs"])
 
+    def test_uvicorn_access_log_cannot_capture_live_view_query_tokens(self) -> None:
+        dockerfile = self._dockerfile()
+        cmd = next(line for line in dockerfile.splitlines() if line.startswith("CMD ["))
+        assert '"--no-access-log"' in cmd
+
+    def test_uvicorn_websocket_filter_strips_live_grant_query_and_tokens(self) -> None:
+        secret = "signed-live-view-secret"
+        record = logging.LogRecord(
+            name="uvicorn.error",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg='%s - "WebSocket %s" [accepted]',
+            args=(
+                "127.0.0.1:1234",
+                "/internal/browser/live-view/novnc?session=bs_1&token=" + secret,
+            ),
+            exc_info=None,
+        )
+        assert UvicornWebSocketLogFilter().filter(record) is True
+        rendered = record.getMessage()
+        assert rendered.endswith('"WebSocket /internal/browser/live-view/novnc" [accepted]')
+        assert "session=" not in rendered
+        assert secret not in rendered
+
+        generic = logging.LogRecord(
+            name="uvicorn.error",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="websocket rejected url=%s",
+            args=("/another/path?token=" + secret + "&reason=denied",),
+            exc_info=None,
+        )
+        UvicornWebSocketLogFilter().filter(generic)
+        assert secret not in generic.getMessage()
+        assert "token=[REDACTED]" in generic.getMessage()
+
     def test_sandbox_stack_holds_no_secret_literals(self) -> None:
         raw = (REPO_ROOT / "compose.playwright.sandbox.yaml").read_text()
         service = self._compose()["services"]["browser-worker"]
@@ -1241,10 +1602,17 @@ class TestContainerIsolationShape:
 
     def test_dockerfile_serves_the_browser_service(self) -> None:
         content = self._dockerfile()
-        assert (
-            'CMD ["uvicorn", "browser_service.main:app", "--host", "0.0.0.0", "--port", "8081"]'
-            in content
-        )
+        cmd = next(line for line in content.splitlines() if line.startswith("CMD ["))
+        for argument in (
+            '"uvicorn"',
+            '"browser_service.main:app"',
+            '"--host"',
+            '"0.0.0.0"',
+            '"--port"',
+            '"8081"',
+            '"--no-access-log"',
+        ):
+            assert argument in cmd
         assert "USER ops" in content
         assert "browser_service ./browser_service" in content
         # Chromium belongs to THIS image, not the API image.
@@ -1266,15 +1634,17 @@ class TestContainerIsolationShape:
         # exec keeps uvicorn as the signal-receiving child.
         assert script.rstrip().endswith('exec "$@"')
 
-    def test_production_stack_does_not_activate_playwright(self) -> None:
-        """Phase 3 must not flip the production default."""
+    def test_production_stack_runs_playwright_outside_the_api(self) -> None:
+        """Production may wire Playwright, but Chromium must remain isolated."""
 
         production = yaml.safe_load((REPO_ROOT / "compose.prod.yaml").read_text())
-        for name, definition in production["services"].items():
-            environment = definition.get("environment") or {}
-            if isinstance(environment, dict):
-                assert environment.get("BROWSER_PROVIDER") != "playwright", name
-            assert "browser_service" not in json.dumps(definition), name
+        assert (
+            production["services"]["browser-worker"]["build"]["dockerfile"] == "Dockerfile.browser"
+        )
+        api = production["services"]["api"]
+        assert api["build"]["dockerfile"] == "Dockerfile.api"
+        assert api["environment"]["PLAYWRIGHT_IN_PROCESS_SANDBOX"] == "false"
+        assert "browser-worker:8081" in json.dumps(api)
 
 
 # ------------------------------------------------- 11. corrective-phase wiring
@@ -1336,6 +1706,54 @@ class TestServiceOwnsTheRealSession:
         # Exactly one stop: the endpoint no longer stops the browser separately from
         # the manager's closer.
         assert worker.stopped == ["pw_fake_1"]
+
+    def test_delete_holds_capacity_until_live_attachment_is_drained(self) -> None:
+        class _DoneAttachment:
+            def done(self) -> bool:
+                return True
+
+        class _StuckSocket:
+            async def close(self, **_kwargs: Any) -> None:
+                return None
+
+        client, worker = _client(_interactive_settings())
+        with client:
+            session_id = _create_session(client)["session_id"]
+            session = client.app.state.manager.get_if_present(session_id)
+            assert session is not None
+            session.hitl_pending = True
+            client.app.state.live_attachments[session_id] = {  # type: ignore[index]
+                _DoneAttachment(): _StuckSocket()
+            }
+
+            first = client.delete(f"/internal/browser/sessions/{session_id}", headers=_headers())
+            assert first.json()["reason_code"] == "closed_by_api:teardown_failed"
+            assert session.lifecycle == "CLOSING"
+            assert session.hitl_pending is False
+            assert worker.stopped == []
+            assert (
+                client.post(
+                    "/internal/browser/sessions",
+                    json={"app_slug": "pipedrive"},
+                    headers=_headers(),
+                ).status_code
+                == 429
+            )
+
+            # Once the stale relay is gone, retrying the same unified teardown
+            # closes Chromium and only then makes the display slot reusable.
+            client.app.state.live_attachments.pop(session_id, None)
+            retry = client.delete(f"/internal/browser/sessions/{session_id}", headers=_headers())
+            assert retry.json()["reason_code"] == "closed_by_api"
+            assert worker.stopped == ["pw_fake_1"]
+            assert (
+                client.post(
+                    "/internal/browser/sessions",
+                    json={"app_slug": "pipedrive"},
+                    headers=_headers(),
+                ).status_code
+                == 201
+            )
 
     def test_capacity_is_released_after_the_real_close(self) -> None:
         client, _ = _client(_settings(max_sessions=1))
@@ -1699,27 +2117,41 @@ class TestNoPrivateWorkerAccess:
         assert "_sessions" not in source.replace("its private ``_sessions`` dict", "")
 
 
-# --------------------------------------- P0-7: interactive HITL fails closed
-class TestInteractiveHitlFailsClosed:
-    """The interactive surface is deferred, so enabling it is a config error."""
+# ------------------------------- P0-7: interactive HITL is single-session only
+class TestInteractiveHitlSingleSession:
+    """One X display must never be shared by concurrent browser sessions."""
 
-    def test_production_config_rejects_enabling_interactive_hitl(self) -> None:
+    def test_config_allows_one_interactive_session(self) -> None:
+        settings = BrowserServiceSettings(
+            service_token=SecretStr(TOKEN),
+            interactive_hitl_enabled=True,
+            max_sessions=1,
+        )
+        assert settings.interactive_hitl_enabled is True
+
+    def test_config_rejects_multiple_interactive_sessions(self) -> None:
         from pydantic import ValidationError
 
-        with pytest.raises(ValidationError, match="not yet operator-usable"):
-            BrowserServiceSettings(service_token=SecretStr(TOKEN), interactive_hitl_enabled=True)
-
-    def test_env_true_is_rejected(self) -> None:
-        from pydantic import ValidationError
-
-        with pytest.raises(ValidationError):
-            BrowserServiceSettings.from_env(
-                {"BROWSER_SERVICE_TOKEN": TOKEN, "BROWSER_INTERACTIVE_HITL_ENABLED": "true"}
+        with pytest.raises(ValidationError, match="PLAYWRIGHT_MAX_SESSIONS=1"):
+            BrowserServiceSettings(
+                service_token=SecretStr(TOKEN),
+                interactive_hitl_enabled=True,
+                max_sessions=2,
             )
 
+    def test_env_true_is_allowed_with_capacity_one(self) -> None:
+        settings = BrowserServiceSettings.from_env(
+            {
+                "BROWSER_SERVICE_TOKEN": TOKEN,
+                "BROWSER_INTERACTIVE_HITL_ENABLED": "true",
+                "PLAYWRIGHT_MAX_SESSIONS": "1",
+            }
+        )
+        assert settings.interactive_hitl_enabled is True
+        assert settings.max_sessions == 1
+
     def test_screenshot_hitl_is_unaffected_when_interactive_is_disabled(self) -> None:
-        # With interactive off (the only allowed production state), the live-view
-        # endpoint still returns screenshot mode — screenshot HITL keeps working.
+        # Interactive remains opt-in; screenshot HITL keeps working when it is off.
         client, _ = _client()
         with client:
             session_id = _create_session(client)["session_id"]
@@ -1971,3 +2403,42 @@ class TestStorageStateBinding:
         # No state saved yet in this env, so None is handed over — the point is the
         # service passed the use_storage_state path through start() without error.
         assert worker.received_storage_state is None
+
+    def test_generic_success_does_not_persist_browser_storage_state(self, tmp_path: Path) -> None:
+        """Only a reviewed credential-page predicate may mint reusable auth state."""
+
+        from cryptography.fernet import Fernet
+
+        key = Fernet.generate_key().decode()
+        state_dir = tmp_path / "state"
+        client, _ = _client(
+            _settings(
+                storage_state_dir=state_dir,
+                storage_state_key=SecretStr(key),
+            )
+        )
+        with client:
+            session_id = _create_session(
+                client,
+                use_storage_state=True,
+                account_ref="acct-hash",
+            )["session_id"]
+            assert (
+                client.post(
+                    f"/internal/browser/sessions/{session_id}/navigate",
+                    json={"research": RESEARCH_PAYLOAD},
+                    headers=_headers(),
+                ).status_code
+                == 200
+            )
+            response = client.post(
+                f"/internal/browser/sessions/{session_id}/resume",
+                json={"signal": "human_completed", "research": RESEARCH_PAYLOAD},
+                headers=_headers(),
+            )
+            assert response.status_code == 200
+            assert response.json()["status"] == "succeeded"
+
+        binding = StorageStateBinding(app_slug="pipedrive", account_ref="acct-hash", owner=OWNER)
+        store = EncryptedStorageStateStore(state_dir, key)
+        assert store.load(binding) is None

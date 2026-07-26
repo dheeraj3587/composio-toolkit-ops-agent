@@ -134,7 +134,31 @@ def _summary_row(
     missing_fields: Sequence[str],
     verified_claim_count: int,
     reason_code: str = "",
+    research: Mapping[str, object] | None = None,
+    traced_apps: frozenset[str] = frozenset(),
 ) -> dict[str, object]:
+    payload = research or {}
+    verified_urls = {
+        field: payload.get(field)
+        for field in (
+            "login_url",
+            "signup_url",
+            "developer_portal_url",
+            "credential_management_url",
+            "contact_url",
+        )
+        if isinstance(payload.get(field), str)
+    }
+    route = str(payload.get("access_route") or "unknown")
+    browser_ready = bool(
+        record.slug in traced_apps
+        and verified_urls.get("login_url")
+        and verified_urls.get("credential_management_url")
+    )
+    gated_ready = bool(
+        route in {"approval_required", "partner_gated"}
+        and (payload.get("contact_email") or verified_urls.get("contact_url"))
+    )
     return {
         "app_slug": record.slug,
         "status": status,
@@ -142,11 +166,30 @@ def _summary_row(
         "missing_fields": list(missing_fields),
         "missing_field_count": len(missing_fields),
         "verified_claim_count": verified_claim_count,
+        "access_route": route,
+        "verified_urls": verified_urls,
+        "browser_trace_status": "reviewed" if record.slug in traced_apps else "not_reviewed",
+        "coverage_status": (
+            "browser_ready"
+            if browser_ready
+            else "gated_ready"
+            if gated_ready
+            else "research_only"
+            if verified_urls
+            else "incomplete"
+        ),
     }
+
+
+def _traced_apps() -> frozenset[str]:
+    from ops.browser_api_trace_catalog import load_browser_api_trace_catalog
+
+    return frozenset(app.app_slug for app in load_browser_api_trace_catalog().apps)
 
 
 def _dry_run(records: Sequence[P1AppRecord]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
+    traced = _traced_apps()
     for record in records:
         baseline = to_operational_research(record)
         missing = _missing_fields(baseline.model_dump(mode="json"))
@@ -157,6 +200,8 @@ def _dry_run(records: Sequence[P1AppRecord]) -> list[dict[str, object]]:
                 reason_code="dry_run",
                 missing_fields=missing,
                 verified_claim_count=len(baseline.operational_url_claims),
+                research=baseline.model_dump(mode="json"),
+                traced_apps=traced,
             )
         )
     return rows
@@ -201,11 +246,12 @@ async def _execute(
         )
     enricher = service._build_research_enricher(settings)
     if enricher is None:  # defensive: configuration was checked above
-        service.shutdown()
+        await asyncio.to_thread(service.shutdown)
         raise ValueError("operational_research_enricher_unavailable")
 
     semaphore = asyncio.Semaphore(concurrency)
     stop_after_error = asyncio.Event()
+    traced = _traced_apps()
 
     async def enrich_one(record: P1AppRecord) -> dict[str, object]:
         async with semaphore:
@@ -217,6 +263,8 @@ async def _execute(
                     reason_code="stopped_after_error",
                     missing_fields=_missing_fields(baseline.model_dump(mode="json")),
                     verified_claim_count=0,
+                    research=baseline.model_dump(mode="json"),
+                    traced_apps=traced,
                 )
             baseline = to_operational_research(record)
             try:
@@ -234,6 +282,8 @@ async def _execute(
                     reason_code="enrichment_failed",
                     missing_fields=_missing_fields(baseline.model_dump(mode="json")),
                     verified_claim_count=0,
+                    research=baseline.model_dump(mode="json"),
+                    traced_apps=traced,
                 )
 
             metrics = outcome.provider_metrics
@@ -253,12 +303,16 @@ async def _execute(
                 reason_code=reason_code,
                 missing_fields=outcome.missing_fields,
                 verified_claim_count=len(outcome.research.operational_url_claims),
+                research=outcome.research.model_dump(mode="json"),
+                traced_apps=traced,
             )
 
     try:
         rows = await asyncio.gather(*(enrich_one(record) for record in records))
     finally:
-        service.shutdown()
+        # RunService owns blocking/async cleanup bridges that expect no active
+        # event loop in the calling thread.
+        await asyncio.to_thread(service.shutdown)
     return list(rows)
 
 
@@ -279,7 +333,16 @@ def _print_summary(*, execute: bool, rows: Sequence[Mapping[str, object]]) -> No
 
 def _write_summary(path: Path, *, execute: bool, rows: Sequence[Mapping[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"mode": "execute" if execute else "dry_run", "results": list(rows)}
+    coverage_counts: dict[str, int] = {}
+    for row in rows:
+        status = str(row.get("coverage_status") or "incomplete")
+        coverage_counts[status] = coverage_counts.get(status, 0) + 1
+    payload = {
+        "mode": "execute" if execute else "dry_run",
+        "selected_app_count": len(rows),
+        "coverage_counts": coverage_counts,
+        "results": list(rows),
+    }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 

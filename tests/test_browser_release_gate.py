@@ -223,11 +223,9 @@ _CREDENTIAL_RENDERINGS = {
     "plain_text": f"<p>Token: {CANARY}</p>",
     "code": f"<code>{CANARY}</code>",
     "pre": f"<pre>{CANARY}</pre>",
-    "textarea": f"<textarea>{CANARY}</textarea>",
     "contenteditable": f"<div contenteditable='true'>{CANARY}</div>",
     "custom_component": f"<my-token data-secret='1'>{CANARY}</my-token>",
     "copy_button": f"<button data-credential='1'>Copy {CANARY}</button>",
-    "password_input": f"<input type='password' value='{CANARY}'>",
 }
 
 
@@ -265,6 +263,32 @@ def test_screenshot_is_produced_on_a_safe_page() -> None:
     latest = worker.latest_screenshot(context.session_id)  # type: ignore[attr-defined]
     asyncio.run(worker.stop(context))  # type: ignore[arg-type]
 
+    assert captured is True and latest is not None and latest[0].startswith(b"\x89PNG")
+
+
+def test_login_form_frame_is_available_with_all_editable_values_masked() -> None:
+    """The operator can see browser progress without exposing account values."""
+
+    worker = _worker()
+    context = _start(worker)
+    session = worker._sessions[context.session_id]  # type: ignore[attr-defined]
+
+    async def _load() -> bool:
+        await session.page.set_content(
+            f"<html><body><h1>Sign in</h1>"
+            f"<input type='email' value='person@example.test'>"
+            f"<input type='password' value='{CANARY}'>"
+            f"<textarea>{CANARY}</textarea>"
+            "<button>Continue</button></body></html>"
+        )
+        return await _has_credential_content(session.page)
+
+    structurally_sensitive = asyncio.run(worker._loop.run(_load()))
+    captured = asyncio.run(worker.refresh_live_view(session))
+    latest = worker.latest_screenshot(context.session_id)  # type: ignore[attr-defined]
+    asyncio.run(worker.stop(context))  # type: ignore[arg-type]
+
+    assert structurally_sensitive is True
     assert captured is True and latest is not None and latest[0].startswith(b"\x89PNG")
 
 

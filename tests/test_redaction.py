@@ -66,6 +66,24 @@ def test_recursive_redaction_uses_keys_and_preserves_vault_references() -> None:
     assert result["secret_object"] == REDACTED
 
 
+def test_public_credential_metadata_remains_visible_but_values_are_scanned() -> None:
+    result = redact_data(
+        {
+            "credential_creation_policy": "create_if_missing",
+            "credential_management_url": "https://example.test/settings/api-keys",
+            "credential_management_url_with_secret": (
+                "https://example.test/settings?token=temporary"
+            ),
+            "credential_value": "must-never-leak",
+        }
+    )
+
+    assert result["credential_creation_policy"] == "create_if_missing"
+    assert result["credential_management_url"] == "https://example.test/settings/api-keys"
+    assert "temporary" not in result["credential_management_url_with_secret"]
+    assert result["credential_value"] == REDACTED
+
+
 def test_logging_filter_sanitizes_format_args_and_extra_fields() -> None:
     record = logging.LogRecord(
         name="security-test",

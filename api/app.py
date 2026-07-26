@@ -399,7 +399,7 @@ def create_app(
     ) -> RunDetailResponse:
         # Autonomous sign-in credentials at create time are an owner action
         # (same gate as resume-with-browser_login). They are injected into
-        # Browser Use as secure placeholders and never persisted.
+        # the selected provider's secret boundary and never persisted.
         if payload.browser_login is not None:
             _require_owner_action(request)
         return await run_service.create_run(payload, idempotency_key=idempotency_key)
@@ -448,8 +448,8 @@ def create_app(
         credential injection (``browser_login``). These require the explicit
         opt-in (``ALLOW_LOCAL_CREDENTIAL_SUBMISSION``) and are then reachable from
         loopback or, in a deployed environment, through the trusted internal-token
-        caller. ``browser_login`` values are injected into Browser Use as secure
-        placeholders for a single resume and are never persisted; no stored secret
+        caller. ``browser_login`` values cross the selected provider's secret
+        boundary for a single resume and are never persisted; no stored secret
         is ever read back to the network by this path. Endpoints that return raw
         stored secrets (credential reveal) keep the stricter loopback-only gate.
         """
@@ -532,8 +532,8 @@ def create_app(
             # Submitting app login credentials for autonomous injection is an
             # owner action. In a deployed environment it is authorized by the
             # internal API token boundary; locally it works over loopback. The
-            # raw values are injected into Browser Use as secure placeholders for a
-            # single resume and are never persisted.
+            # raw values cross the selected provider's secret boundary for a single
+            # resume and are never persisted.
             _require_owner_action(request)
         return await run_service.resume(run_id, browser_login=browser_login, signal=signal)
 

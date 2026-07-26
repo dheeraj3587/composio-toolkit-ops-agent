@@ -17,8 +17,8 @@ export function Timeline({ items }: { items: TimelineItem[] }) {
 
   return (
     <ol className="panel rounded-md" aria-label="Sanitized run timeline">
-      {items.map((item, index) => (
-        <li key={`${item.event_type}-${item.created_at}-${index}`} className="grid gap-4 border-b border-border px-5 py-5 last:border-0 sm:grid-cols-[145px_24px_1fr]">
+      {items.map((item) => (
+        <li key={item.event_id} className="grid gap-4 border-b border-border px-5 py-5 last:border-0 sm:grid-cols-[145px_24px_1fr]">
           <time className="text-xs text-muted-foreground" dateTime={item.created_at} title={formatTimestamp(item.created_at)}>
             {relativeTimestamp(item.created_at)}
           </time>

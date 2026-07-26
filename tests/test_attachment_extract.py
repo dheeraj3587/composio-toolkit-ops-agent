@@ -83,9 +83,9 @@ def test_is_text_like(filename: str, mime: str, expected: bool) -> None:
 
 # --- Pure core: secret pair extraction ----------------------------------------
 def test_extract_secret_pairs_from_env_style_text() -> None:
-    text = "API_KEY=sk_live_abcdef123456\nnote: hello\nclient_secret: shhh_very_secret_value\n"
+    text = "API_KEY=sk_live_abcdef123456\nnote: hello\nclient_secret: shhh_very_secret_value\n"  # pragma: allowlist secret
     pairs = dict(extract_secret_pairs(text))
-    assert pairs["api_key"] == "sk_live_abcdef123456"
+    assert pairs["api_key"] == "sk_live_abcdef123456"  # pragma: allowlist secret
     assert pairs["client_secret"] == "shhh_very_secret_value"
     assert "hello" not in pairs.values()  # a non-credential line is ignored
 
@@ -168,7 +168,7 @@ def test_harvest_attachment_credentials_vaults_only_text_secrets(
 
     def _fake_download(url: str, max_bytes: int) -> bytes:
         downloads.append(url)
-        return b"API_KEY=sk_live_abcdef123456\nclient_secret: shhh_very_secret_value\n"
+        return b"API_KEY=sk_live_abcdef123456\nclient_secret: shhh_very_secret_value\n"  # pragma: allowlist secret
 
     monkeypatch.setattr(gmail_worker, "_download_bounded", _fake_download)
 
@@ -189,7 +189,9 @@ def test_harvest_attachment_credentials_vaults_only_text_secrets(
     assert len(refs) == 2
     assert all(ref.startswith("vault://email-attachment/") for ref in refs.values())
     vaulted_values = {value for _, _, value in store.puts}
-    assert vaulted_values == {"sk_live_abcdef123456", "shhh_very_secret_value"}
+    expected_api_key = "sk_live_abcdef123456"  # pragma: allowlist secret
+    expected_client_secret = "shhh_very_secret_value"  # pragma: allowlist secret
+    assert vaulted_values == {expected_api_key, expected_client_secret}
 
 
 def test_harvest_requires_secret_store() -> None:

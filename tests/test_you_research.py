@@ -21,6 +21,7 @@ from ops.models import OperationalResearch, OperationalUrlClaim, ScopeRequiremen
 from ops.operational_research import (
     EvidenceDocument,
     OperationalResearchEnricher,
+    _compact_extraction_evidence,
     _missing_fields,
     _validate_extracted_research,
     _validate_operational_urls,
@@ -51,6 +52,15 @@ from ops.you_research import (
 
 _HOST = "app.pipedrive.com"
 _DEV_HOST = "developers.pipedrive.com"
+
+
+def test_fallback_evidence_compaction_is_bounded_and_keeps_operational_windows() -> None:
+    source = "x" * 8_000 + " Login at https://app.pipedrive.com/login and create an API token."
+
+    compact = _compact_extraction_evidence(source)
+
+    assert len(compact) <= 6_000
+    assert "https://app.pipedrive.com/login" in compact
 
 
 class _FakeResolver:
@@ -474,7 +484,7 @@ class TestYouSearchDiscovery:
                 f, "_search_response", _search_response([_web(f"https://{_HOST}/login", "Login")])
             ),
         )
-        d = YouSearchDiscovery(api_key="dummy", count=5, max_calls=2)
+        d = YouSearchDiscovery(api_key="dummy", count=5, max_calls=2)  # pragma: allowlist secret
         result = asyncio.run(
             d.discover(
                 app_name="Pipedrive",
@@ -504,7 +514,7 @@ class TestYouSearchDiscovery:
                 ),
             ),
         )
-        d = YouSearchDiscovery(api_key="dummy", max_calls=1)
+        d = YouSearchDiscovery(api_key="dummy", max_calls=1)  # pragma: allowlist secret
         result = asyncio.run(
             d.discover(
                 app_name="Pipedrive", p1_record={}, baseline=_baseline(), official_hosts=(_HOST,)
@@ -521,7 +531,7 @@ class TestYouSearchDiscovery:
                 _search_response([], news=[_web(f"https://{_HOST}/news")]),
             ),
         )
-        d = YouSearchDiscovery(api_key="dummy", max_calls=1)
+        d = YouSearchDiscovery(api_key="dummy", max_calls=1)  # pragma: allowlist secret
         result = asyncio.run(
             d.discover(
                 app_name="Pipedrive", p1_record={}, baseline=_baseline(), official_hosts=(_HOST,)
@@ -531,7 +541,7 @@ class TestYouSearchDiscovery:
 
     def test_no_official_hosts_makes_no_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install_fake_you(monkeypatch)
-        d = YouSearchDiscovery(api_key="dummy")
+        d = YouSearchDiscovery(api_key="dummy")  # pragma: allowlist secret
         result = asyncio.run(
             d.discover(app_name="X", p1_record={}, baseline=_baseline(), official_hosts=())
         )
@@ -539,7 +549,7 @@ class TestYouSearchDiscovery:
 
     def test_max_calls_enforced(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install_fake_you(monkeypatch)
-        d = YouSearchDiscovery(api_key="dummy", max_calls=1)
+        d = YouSearchDiscovery(api_key="dummy", max_calls=1)  # pragma: allowlist secret
         asyncio.run(
             d.discover(
                 app_name="Pipedrive", p1_record={}, baseline=_baseline(), official_hosts=(_HOST,)
@@ -555,7 +565,8 @@ class TestYouSearchDiscovery:
             ),
         )
         cache = InMemoryResearchCache()
-        d = YouSearchDiscovery(api_key="dummy", max_calls=1, cache=cache)
+        dummy_key = "dummy"  # pragma: allowlist secret
+        d = YouSearchDiscovery(api_key=dummy_key, max_calls=1, cache=cache)
         args = dict(
             app_name="Pipedrive", p1_record={}, baseline=_baseline(), official_hosts=(_HOST,)
         )
@@ -580,7 +591,7 @@ class TestYouSearchDiscovery:
                 f._search_response = _search_response([_web(f"https://{_HOST}/settings/api")])
 
         _install_fake_you(monkeypatch, _cfg)
-        d = YouSearchDiscovery(api_key="dummy", max_calls=2)
+        d = YouSearchDiscovery(api_key="dummy", max_calls=2)  # pragma: allowlist secret
         result = asyncio.run(
             d.discover(
                 app_name="Pipedrive", p1_record={}, baseline=_baseline(), official_hosts=(_HOST,)
@@ -847,8 +858,10 @@ class TestErrorMapping:
 
     def test_error_text_never_in_reason(self) -> None:
         e = _StatusErr(401)
-        e.args = ("YDC_API_KEY=sk-should-never-appear",)
-        assert "sk-should-never-appear" not in map_you_error(e, capability="you_search")
+        e.args = ("YDC_API_KEY=sk-should-never-appear",)  # pragma: allowlist secret
+        assert "sk-should-never-appear" not in map_you_error(  # pragma: allowlist secret
+            e, capability="you_search"
+        )
 
 
 # ===========================================================================
@@ -1120,7 +1133,7 @@ class TestEnricherFullFlow:
         assert outcome.research.credential_management_url == cred  # type: ignore[attr-defined]
         assert isinstance(outcome.provider_metrics, dict)  # type: ignore[attr-defined]
 
-    def test_undocumented_url_rejected_degrades(self) -> None:
+    def test_undocumented_url_is_removed_without_discarding_supported_research(self) -> None:
         research = _baseline(
             app_slug="docs-app",
             app_name="Docs App",
@@ -1128,17 +1141,14 @@ class TestEnricherFullFlow:
             evidence_urls=[f"https://{_ALLOWED}/oauth"],
             confidence=0.9,
         )
-        # _validate_operational_urls raises inside enrich(); the enricher lets it
-        # propagate to the caller (RunService degrades to baseline). Here we call
-        # enrich directly, so we assert it raises.
-        with pytest.raises(ValueError, match="field-level evidence"):
-            self._run(
-                extractor=_ExtractorStub(research),
-                rich_discovery=_RichStub(
-                    (_candidate(f"https://{_ALLOWED}/oauth", category="oauth"),)
-                ),
-                content_fetcher_factory=lambda p: _ContentStub("no urls here"),
-            )
+        outcome = self._run(
+            extractor=_ExtractorStub(research),
+            rich_discovery=_RichStub((_candidate(f"https://{_ALLOWED}/oauth", category="oauth"),)),
+            content_fetcher_factory=lambda p: _ContentStub("no urls here"),
+        )
+
+        assert outcome.capability.status == "ready"  # type: ignore[attr-defined]
+        assert outcome.research.signup_url is None  # type: ignore[attr-defined]
 
 
 # ===========================================================================
@@ -1192,7 +1202,8 @@ class TestPersistentCache:
             ),
         )
         cache = SqliteResearchCache(tmp_path / "c.db")
-        d = YouSearchDiscovery(api_key="dummy", max_calls=1, cache=cache)
+        dummy_key = "dummy"  # pragma: allowlist secret
+        d = YouSearchDiscovery(api_key=dummy_key, max_calls=1, cache=cache)
         provider_calls = {"n": 0}
         orig = FakeYou.__init__
 

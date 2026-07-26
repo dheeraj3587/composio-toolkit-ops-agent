@@ -26,13 +26,14 @@ def _event_types(service: LocalRunService, record: Mapping[str, object]) -> set[
     return {str(event.get("event_type")) for event in timeline}
 
 
-def _browser_is_wired(service: LocalRunService) -> bool:
+def _browser_is_wired(service: LocalRunService, provider: str) -> bool:
     try:
         rows = service._service.wiring_audit()
     except Exception:
         return False
     return any(
-        row.get("dependency") == "browser" and row.get("runtime_wired") is True for row in rows
+        row.get("dependency") == f"browser:{provider}" and row.get("runtime_wired") is True
+        for row in rows
     )
 
 
@@ -56,11 +57,11 @@ def _assignment_phases(
     policy = get_browser_policy(research.app_slug) if research is not None else None
     # Provider-aware: the shared helper decides "configured" for whichever backend
     # is selected, so a Playwright deployment is never judged by a Browser Use key.
-    selected_provider = str(getattr(service._settings, "browser_provider", "browser_use"))
+    selected_provider = str(record.get("browser_provider") or "browser_use")
     browser_configured = bool(
-        browser_configuration_state(service._settings)
+        browser_configuration_state(service._settings, selected_provider)  # type: ignore[arg-type]
         and service._settings.langgraph_aes_key is not None
-        and _browser_is_wired(service)
+        and _browser_is_wired(service, selected_provider)
     )
     if selected_provider == "playwright":
         configuration_detail = (

@@ -17,6 +17,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 import httpx
 from pydantic import Field, SecretStr
 
+from ops.inference import JsonInference
 from ops.models import (
     CapabilityAvailability,
     OperationalResearch,
@@ -419,12 +420,14 @@ class GeminiStructuredExtractor:
         api_key: SecretStr | str,
         *,
         model: str | Sequence[str] = "gemini-3.6-flash",
+        fallback: JsonInference | None = None,
     ) -> None:
         self._api_key = api_key if isinstance(api_key, SecretStr) else SecretStr(api_key)
         models = (model,) if isinstance(model, str) else tuple(model)
         self._models = tuple(dict.fromkeys(name for name in models if name))
         if not self._models:
             raise ValueError("at least one Gemini model id is required")
+        self._fallback = fallback
         # The model that actually produced the last successful response.
         self.model_used: str | None = None
 
@@ -465,9 +468,90 @@ class GeminiStructuredExtractor:
             if not isinstance(text, str) or not text:
                 last_error = RuntimeError("structured extraction returned no content")
                 continue
+            try:
+                parsed = OperationalResearch.model_validate_json(text)
+            except ValueError as exc:
+                # A provider can return syntactically valid JSON that still misses
+                # the strict contract. Treat that as a provider result failure and
+                # continue to the next bounded extractor.
+                last_error = exc
+                continue
             self.model_used = model
-            return OperationalResearch.model_validate_json(text)
-        raise RuntimeError(f"all Gemini models failed ({', '.join(self._models)})") from last_error
+            return parsed
+        if self._fallback is not None:
+            schema = OperationalResearch.model_json_schema()
+            compact_documents = tuple(
+                document.model_copy(
+                    update={"relevant_text": _compact_extraction_evidence(document.relevant_text)}
+                )
+                for document in documents
+            )
+            compact_prompt = _render_extraction_prompt(
+                app_name,
+                p1_record,
+                compact_documents,
+            )
+            fallback_prompt = (
+                f"{compact_prompt}\n\nJSON SCHEMA\n"
+                f"{json.dumps(schema, separators=(',', ':'), sort_keys=True)}"
+            )
+            try:
+                result = await asyncio.to_thread(
+                    self._fallback.generate,
+                    fallback_prompt,
+                    schema=None,
+                    validate=OperationalResearch.model_validate,
+                )
+            except (TypeError, AttributeError, NameError, ImportError):
+                raise
+            except Exception as exc:
+                last_error = exc
+            else:
+                self.model_used = result.provider
+                return OperationalResearch.model_validate(result.payload)
+        raise RuntimeError(
+            f"all structured extractors failed ({', '.join(self._models)})"
+        ) from last_error
+
+
+def _compact_extraction_evidence(text: str, *, limit: int = 6_000) -> str:
+    """Keep URL/auth/onboarding evidence windows for bounded fallback inference."""
+
+    if len(text) <= limit:
+        return text
+    lowered = text.casefold()
+    markers = (
+        "https://",
+        "login",
+        "sign up",
+        "developer",
+        "api key",
+        "api token",
+        "credential",
+        "oauth",
+        "scope",
+        "approval",
+        "contact",
+    )
+    starts = {0}
+    for marker in markers:
+        offset = 0
+        while len(starts) < 24:
+            index = lowered.find(marker, offset)
+            if index < 0:
+                break
+            starts.add(max(0, index - 180))
+            offset = index + len(marker)
+    pieces: list[str] = []
+    used = 0
+    for start in sorted(starts):
+        if used >= limit:
+            break
+        piece = text[start : start + min(420, limit - used)].strip()
+        if piece:
+            pieces.append(piece)
+            used += len(piece) + 1
+    return "\n".join(pieces)[:limit]
 
 
 def _render_extraction_prompt(
@@ -677,7 +761,9 @@ class OperationalResearchEnricher:
                 {
                     "baseline": baseline.model_dump(mode="json"),
                     "p1_record": dict(p1_record),
-                    "version": "1",
+                    # Bump whenever extraction/validation semantics change so an
+                    # older incomplete outcome cannot mask newly verified routes.
+                    "version": "4",
                 },
                 separators=(",", ":"),
                 sort_keys=True,
@@ -770,16 +856,33 @@ class OperationalResearchEnricher:
                 if not documents:
                     return None
 
-                research = await self._extractor.extract(  # type: ignore[union-attr]
-                    app_name=app_name,
-                    p1_record=p1_record,
-                    documents=documents,
-                )
-                allowed_evidence = _validate_extracted_research(
-                    research, baseline, documents, p1_record
-                )
-                _validate_operational_urls(
-                    research, baseline, documents, effective_policy, allowed_evidence
+                try:
+                    research = await self._extractor.extract(  # type: ignore[union-attr]
+                        app_name=app_name,
+                        p1_record=p1_record,
+                        documents=documents,
+                    )
+                except (RuntimeError, ValueError):
+                    # Discovery + fetched official targets remain useful when all
+                    # bounded extractors are unavailable or return an invalid
+                    # shape. Fall back to the verified baseline, then merge only
+                    # fetched, categorized, allowlisted routes below.
+                    research = baseline
+                else:
+                    research = _retain_supported_extraction(
+                        research,
+                        baseline,
+                        documents,
+                        p1_record,
+                        effective_policy,
+                    )
+                research = _merge_discovered_operational_routes(
+                    research,
+                    baseline,
+                    discovered,
+                    documents,
+                    p1_record,
+                    effective_policy,
                 )
                 return research, documents
 
@@ -1004,6 +1107,193 @@ _OPERATIONAL_URL_FIELDS: tuple[str, ...] = (
 )
 
 
+def _retain_supported_extraction(
+    research: OperationalResearch,
+    baseline: OperationalResearch,
+    documents: Sequence[EvidenceDocument],
+    p1_record: Mapping[str, object],
+    policy: OfficialURLPolicy,
+) -> OperationalResearch:
+    """Drop unsupported model claims while preserving every evidence-backed fact."""
+
+    if research.app_slug != baseline.app_slug or research.app_name != baseline.app_name:
+        raise ValueError("structured extraction changed the canonical app identity")
+    fetched = {
+        normalized
+        for document in documents
+        if (normalized := _normalize_url(document.source_url)) is not None
+    }
+    allowed_evidence = set(fetched)
+    evidence_candidates: list[object] = [p1_record.get("primary_docs_url")]
+    p1_evidence = p1_record.get("evidence_urls")
+    if isinstance(p1_evidence, (list, tuple)):
+        evidence_candidates.extend(p1_evidence)
+    for value in evidence_candidates:
+        if isinstance(value, str) and (normalized := _normalize_url(value)) is not None:
+            allowed_evidence.add(normalized)
+    trusted_scope_names = {scope.name for scope in baseline.scopes}
+    candidate = research.model_copy(
+        update={
+            "evidence_urls": [
+                value
+                for value in research.evidence_urls
+                if (normalized := _normalize_url(value)) is not None
+                and normalized in allowed_evidence
+            ],
+            "scopes": [
+                scope
+                for scope in research.scopes
+                if scope.name in trusted_scope_names
+                or (
+                    (normalized := _normalize_url(scope.source_url)) is not None
+                    and normalized in fetched
+                )
+            ],
+        }
+    )
+    validated_evidence = _validate_extracted_research(candidate, baseline, documents, p1_record)
+    invalid_fields: set[str] = set()
+    baseline_urls = {
+        field_name: getattr(baseline, field_name, None) for field_name in _OPERATIONAL_URL_FIELDS
+    }
+    for field_name in _OPERATIONAL_URL_FIELDS:
+        value = getattr(candidate, field_name)
+        if value is None:
+            continue
+        probe_values = dict(baseline_urls)
+        probe_values[field_name] = value
+        probe = candidate.model_copy(update=probe_values)
+        try:
+            _validate_operational_urls(
+                probe,
+                baseline,
+                documents,
+                policy,
+                validated_evidence,
+            )
+        except ValueError:
+            invalid_fields.add(field_name)
+    if not invalid_fields:
+        return candidate
+    return candidate.model_copy(
+        update={
+            **{field_name: None for field_name in invalid_fields},
+            "operational_url_claims": tuple(
+                claim
+                for claim in candidate.operational_url_claims
+                if claim.field not in invalid_fields
+            ),
+        }
+    )
+
+
+def _merge_discovered_operational_routes(
+    research: OperationalResearch,
+    baseline: OperationalResearch,
+    discovered: Sequence[object],
+    documents: Sequence[EvidenceDocument],
+    p1_record: Mapping[str, object],
+    policy: OfficialURLPolicy,
+) -> OperationalResearch:
+    """Fill missing route fields from fetched, categorized discovery results."""
+
+    category_fields = {
+        "login": "login_url",
+        "signup": "signup_url",
+        "developer_portal": "developer_portal_url",
+        "credential_creation": "credential_management_url",
+    }
+    fetched = {
+        normalized
+        for document in documents
+        if (normalized := _normalize_url(document.source_url)) is not None
+    }
+    updates: dict[str, object] = {}
+    claims = list(research.operational_url_claims)
+    evidence_urls = list(research.evidence_urls)
+    management_fallback: str | None = None
+    for candidate in discovered:
+        category = str(getattr(candidate, "category", ""))
+        field_name = category_fields.get(category)
+        source_url = getattr(candidate, "source_url", None)
+        if field_name is None or not isinstance(source_url, str):
+            continue
+        if getattr(research, field_name) is not None or field_name in updates:
+            continue
+        normalized = _normalize_url(source_url)
+        if normalized is None or normalized not in fetched:
+            continue
+        try:
+            safe_url = policy.sanitize_candidate(source_url)
+        except ValueError:
+            continue
+        if category == "credential_creation" and not _looks_like_management_surface(safe_url):
+            continue
+        if category == "login" and _looks_like_management_surface(safe_url):
+            management_fallback = management_fallback or safe_url
+        updates[field_name] = safe_url
+        claims.append(
+            OperationalUrlClaim(
+                field=field_name,  # type: ignore[arg-type]
+                url=safe_url,
+                source_url=safe_url,
+            )
+        )
+        if safe_url not in evidence_urls:
+            evidence_urls.append(safe_url)
+    if (
+        research.credential_management_url is None
+        and "credential_management_url" not in updates
+        and management_fallback is not None
+    ):
+        updates["credential_management_url"] = management_fallback
+        claims.append(
+            OperationalUrlClaim(
+                field="credential_management_url",
+                url=management_fallback,
+                source_url=management_fallback,
+            )
+        )
+    if not updates:
+        return research
+    merged = research.model_copy(
+        update={
+            **updates,
+            "operational_url_claims": tuple(claims),
+            "evidence_urls": evidence_urls,
+        }
+    )
+    allowed_evidence = _validate_extracted_research(
+        merged,
+        baseline,
+        documents,
+        p1_record,
+    )
+    _validate_operational_urls(merged, baseline, documents, policy, allowed_evidence)
+    return merged
+
+
+def _looks_like_management_surface(url: str) -> bool:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").casefold()
+    path = parsed.path.casefold()
+    app_host = host.startswith(("app.", "admin.", "console.", "dashboard.", "account."))
+    management_path = any(
+        token in path
+        for token in (
+            "/settings",
+            "api-key",
+            "apikey",
+            "/tokens",
+            "/credentials",
+            "developer-hub",
+            "/applications",
+            "/integrations",
+        )
+    )
+    return app_host or management_path
+
+
 def _validate_operational_urls(
     research: OperationalResearch,
     baseline: OperationalResearch,
@@ -1066,8 +1356,11 @@ def _validate_operational_urls(
                 continue  # claim must cite a page we actually fetched/trust
             if source_key not in docs_documented:
                 continue
-            if normalized_value not in docs_documented[source_key]:
-                continue  # the URL must literally appear in THAT source's text
+            if (
+                normalized_value not in docs_documented[source_key]
+                and source_key != normalized_value
+            ):
+                continue  # direct fetched target or literal URL in the cited source
             try:
                 policy.sanitize_candidate(value)
             except ValueError:

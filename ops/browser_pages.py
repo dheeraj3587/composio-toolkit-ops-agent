@@ -270,12 +270,12 @@ def install_download_guard(
     async def _on_download(download: Any) -> None:
         name = str(getattr(download, "suggested_filename", "") or "")
         if not policy.allowed:
-            await _safe_cancel(download)
             records.append(DownloadRecord(False, "download_blocked_by_policy", name))
+            await _safe_cancel(download)
             return
         if policy.forbidden_name.search(name):
-            await _safe_cancel(download)
             records.append(DownloadRecord(False, "download_forbidden_filetype", name))
+            await _safe_cancel(download)
             return
         target_root = temp_root or Path("/tmp") / f"pw-dl-{uuid4().hex[:8]}"
         try:

@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from ops.browser_egress import EgressStage
 from ops.browser_loop import BrowserLoop, BrowserOperationTimeout
 from ops.config import Settings
 from ops.models import OperationalResearch
@@ -173,11 +174,231 @@ def test_loop_submits_login_follows_checkpoints_and_verifies_success(
             sensitive_data={"login_email": "ops@example.test", "login_password": "pw-not-logged"},
         )
     )
+    assert worker._sessions[handle].egress.stage is EgressStage.CREDENTIAL_SURFACE
     asyncio.run(worker.stop(context))  # type: ignore[arg-type]
 
     # Success is declared ONLY from the structured predicate (path + label).
     assert observation.status == "credential_page_ready"
     assert "structured success predicate" in observation.non_secret_notes[0]
+
+
+def test_initial_login_requires_credentials_then_resume_injects_them_in_same_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trace mentioning CAPTCHA must not mislabel an ordinary login form.
+
+    The first pass has no secrets and pauses as ``login_required``. Supplying
+    credentials on Resume must inject them before generic HITL inspection and
+    reach the reviewed target in the original Chromium context.
+    """
+
+    from ops.browser_api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
+
+    _install_trace(
+        monkeypatch,
+        _synthetic_trace(
+            checkpoints=(
+                BrowserApiTraceStep(
+                    order=1,
+                    instruction="Complete login and any CAPTCHA, then open API settings.",
+                    expected_signals=("API",),
+                    requires_hitl=True,
+                ),
+            ),
+            success=CheckpointPredicate(
+                url_path_contains=("/done",), visible_text_contains=("API token",)
+            ),
+        ),
+    )
+
+    worker = _worker()
+    context = _start(worker)
+    handle = context.session_id  # type: ignore[attr-defined]
+    session_before = worker._sessions[handle]
+    login = (
+        "<html><body><h1>Sign in</h1><form action='/done' method='get'>"
+        "<input type='email' name='email'>"
+        "<input type='password' name='password'>"
+        "<button type='submit'>Sign in</button>"
+        "</form></body></html>"
+    )
+    credential_page = (
+        "<html><body><h1>API token</h1>"
+        "<p>API token controls</p>"
+        f"<input name='api_token' readonly value='{_TOKEN}'>"
+        "</body></html>"
+    )
+    _route_pages(worker, handle, {"/settings/api": login, "*": credential_page})
+
+    first = asyncio.run(worker.navigate_onboarding(context, _research()))  # type: ignore[arg-type]
+    assert first.status == "human_action_required"
+    assert first.human_action_type == "login_required"
+    assert first.reason_code == "login_required"
+
+    resumed = asyncio.run(
+        worker.resume_after_hitl(
+            context,  # type: ignore[arg-type]
+            "human_completed",
+            _research(),
+            sensitive_data={
+                "login_email": "ops@example.test",
+                "login_password": "pw-not-logged",
+            },
+        )
+    )
+    assert worker._sessions[handle] is session_before
+    asyncio.run(worker.stop(context))  # type: ignore[arg-type]
+
+    assert resumed.status == "credential_page_ready"
+    assert resumed.current_url.endswith("/done")
+
+
+def test_pre_auth_challenge_does_not_consume_post_hitl_target_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A target probe redirected to CAPTCHA must preserve the post-HITL retry."""
+
+    from ops.browser_api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
+
+    _install_trace(
+        monkeypatch,
+        _synthetic_trace(
+            checkpoints=(
+                BrowserApiTraceStep(
+                    order=1,
+                    instruction="Reach API settings after authentication.",
+                    expected_signals=("API token",),
+                ),
+            ),
+            success=CheckpointPredicate(
+                url_path_contains=("/settings/api",),
+                visible_text_contains=("API token",),
+            ),
+        ),
+    )
+
+    worker = _worker()
+    context = _start(worker)
+    handle = context.session_id  # type: ignore[attr-defined]
+    session = worker._sessions[handle]
+    session.patterns = _PATTERNS
+    settings_visits = 0
+
+    login = (
+        "<html><body><h1>Sign in</h1><form action='/home' method='get'>"
+        "<input type='email' name='email'>"
+        "<input type='password' name='password'>"
+        "<button type='submit'>Sign in</button>"
+        "</form></body></html>"
+    )
+    challenge = (
+        "<html><body><h1>Verify this login</h1>"
+        "<iframe title='reCAPTCHA challenge' src='/recaptcha' "
+        "style='width:300px;height:200px'></iframe>"
+        "</body></html>"
+    )
+    home = "<html><body><h1>Welcome back</h1></body></html>"
+    credential_page = (
+        "<html><body><h1>API token</h1>"
+        "<p>API token controls</p>"
+        f"<input name='api_token' readonly value='{_TOKEN}'>"
+        "</body></html>"
+    )
+
+    async def _install() -> None:
+        async def _handler(route: object) -> None:
+            nonlocal settings_visits
+            url = route.request.url  # type: ignore[attr-defined]
+            path = url.split(_HOST, 1)[1].split("?")[0] if _HOST in url else "/"
+            if path == "/settings/api":
+                settings_visits += 1
+                body = (login, challenge, credential_page)[min(settings_visits - 1, 2)]
+            elif path == "/recaptcha":
+                body = "<html><body>Challenge</body></html>"
+            else:
+                body = home
+            await route.fulfill(status=200, content_type="text/html", body=body)  # type: ignore[attr-defined]
+
+        await session.page.route(f"https://{_HOST}/**", _handler)
+
+    asyncio.run(worker._loop.run(_install()))
+
+    first = asyncio.run(
+        worker.navigate_onboarding(
+            context,  # type: ignore[arg-type]
+            _research(),
+            sensitive_data={
+                "login_email": "ops@example.test",
+                "login_password": "pw-not-logged",
+            },
+        )
+    )
+    assert first.status == "human_action_required"
+    assert first.human_action_type == "captcha"
+    assert session.pre_auth_target_probed is True
+    assert session.post_login_target_retried is False
+    assert settings_visits == 2
+
+    async def _complete_challenge() -> None:
+        await session.page.goto(
+            f"https://{_HOST}/home", wait_until="domcontentloaded", timeout=20_000
+        )
+
+    asyncio.run(worker._loop.run(_complete_challenge()))
+    resumed = asyncio.run(
+        worker.resume_after_hitl(
+            context,  # type: ignore[arg-type]
+            "captcha_completed",
+            _research(),
+        )
+    )
+    assert session.post_login_target_retried is True
+    assert settings_visits == 3
+    asyncio.run(worker.stop(context))  # type: ignore[arg-type]
+
+    assert resumed.status == "credential_page_ready"
+    assert resumed.current_url.endswith("/settings/api")
+
+
+def test_login_bound_navigation_enters_authentication_stage_before_first_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reviewed IdP documents needed by the login shell must not be blocked pre-auth."""
+
+    worker = _worker()
+    context = _start(worker)
+    handle = context.session_id  # type: ignore[attr-defined]
+    session = worker._sessions[handle]
+    observed_stages: list[EgressStage] = []
+    original_goto = session.page.goto
+
+    async def _recording_goto(*args: object, **kwargs: object) -> object:
+        observed_stages.append(session.egress.stage)
+        return await original_goto(*args, **kwargs)
+
+    monkeypatch.setattr(session.page, "goto", _recording_goto)
+    _route_pages(
+        worker,
+        handle,
+        {
+            "/settings/api": (
+                "<html><body><form><input type='email'><input type='password'>"
+                "<button type='submit'>Sign in</button></form></body></html>"
+            )
+        },
+    )
+
+    asyncio.run(
+        worker.navigate_onboarding(
+            context,  # type: ignore[arg-type]
+            _research(),
+            sensitive_data={"login_email": "ops@example.test", "login_password": "pw"},
+        )
+    )
+    asyncio.run(worker.stop(context))  # type: ignore[arg-type]
+
+    assert observed_stages
+    assert observed_stages[0] is EgressStage.AUTHENTICATING
 
 
 def test_loop_reports_hitl_for_a_captcha_page() -> None:

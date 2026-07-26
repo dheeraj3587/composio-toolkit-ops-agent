@@ -15,6 +15,7 @@ import { StatusBadge } from "@/components/status-badge"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { humanize } from "@/lib/format"
+import { phaseMap } from "@/lib/phases"
 import type {
   HitlRequest,
   IntegratorOutput,
@@ -31,20 +32,6 @@ const phaseBlueprint = [
   { key: "email", name: "Email", icon: Mail, copy: "Locked Gmail operations and reply classification." },
   { key: "output", name: "Output", icon: KeyRound, copy: "Validated, reference-only IntegratorBundle." },
 ] as const
-
-export function phaseMap(collection: PhaseCollection): Map<string, PhaseState> {
-  const result = new Map<string, PhaseState>()
-  if (Array.isArray(collection)) {
-    for (const phase of collection) {
-      if (phase.key) result.set(phase.key, phase)
-    }
-  } else if (collection && typeof collection === "object") {
-    for (const [key, phase] of Object.entries(collection)) {
-      result.set(key, typeof phase === "string" ? { key, status: phase } : { key, ...(phase ?? {}) })
-    }
-  }
-  return result
-}
 
 export function PhaseGrid({ phases }: { phases: PhaseCollection }) {
   const reported = phaseMap(phases)

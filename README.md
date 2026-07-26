@@ -12,7 +12,7 @@ The same asset is included in the website image at `/architecture.svg`.
 
 1. **Research:** P1 evidence and optional configured research providers identify API endpoints, authentication, scopes, developer portals, and access route.
 2. **Route:** deterministic policy selects self-serve onboarding or a gated vendor-contact flow.
-3. **Self-serve:** Browser Use can navigate the portal and create an auth application when explicitly enabled.
+3. **Self-serve:** the run-selected Playwright or Browser Use engine can navigate the portal when explicitly enabled.
 4. **Gated:** Composio Gmail can manage controlled outreach and replies when explicitly enabled.
 5. **Human gates:** CAPTCHA, OTP, passkeys, billing, approval, and other sensitive steps pause for an operator.
 6. **Output:** only evidenced results become a normalized bundle. Credential material is represented publicly only by exact `vault://...` references.
@@ -25,7 +25,7 @@ The same asset is included in the website image at `/architecture.svg`.
 | Route planning | Available offline and deterministic |
 | `plan_only` runs | Safe default; performs no browser, email, credential-validation, or other provider side effects |
 | `execute_when_configured` runs | Requests configured capabilities but still obeys every provider and owner safety gate |
-| Browser onboarding | Requires Browser Use configuration and `ALLOW_LIVE_BROWSER=true` |
+| Browser onboarding | Per-run Playwright or Browser Use; each provider reports readiness independently and requires `ALLOW_LIVE_BROWSER=true` |
 | Vendor email | Requires Composio Gmail configuration and explicit email authorization |
 | HITL resume and retry | Available from the run page when the backend state permits it |
 | Encrypted vault and checkpoints | Require stable vault and LangGraph encryption keys |
@@ -82,7 +82,8 @@ Provider variables can remain empty for offline planning:
 |---|---|
 | Research enrichment | `PERPLEXITY_API_KEY`, `GOOGLE_GENAI_API_KEY` |
 | Gmail outreach | `COMPOSIO_API_KEY`, `COMPOSIO_USER_ID`, `COMPOSIO_GMAIL_CONNECTED_ACCOUNT_ID` |
-| Browser onboarding | `BROWSER_USE_API_KEY` |
+| Browser Use | `BROWSER_USE_API_KEY` |
+| Playwright | `BROWSER_SERVICE_TOKEN`; production Compose provides the private service URL |
 | Company context | `COMPANY_LEGAL_NAME`, `COMPANY_WEBSITE`, `COMPANY_WORK_EMAIL_REF`, `COMPANY_USE_CASE` |
 
 A configured key means only “configured,” not “verified” or “successful.” Check the website's provider state and run timeline for actual evidence.
@@ -112,11 +113,20 @@ The Next.js website is the primary operator interface.
 
 1. Open **New run** at `/runs/new`.
 2. Enter the app name and company profile: legal name, website, work-email vault reference, and use case.
-3. Select the requested scope policy.
-4. Select an execution mode:
+3. Select the requested scope policy and browser engine. Playwright is preferred
+   when ready; unavailable engines remain visible with their readiness reason.
+4. Select the credential policy. The website defaults to **Create if missing**;
+   API and CLI callers that omit it remain **Reuse only** for compatibility.
+5. Select an execution mode:
    - **Plan only** researches and plans without external actions.
    - **Execute when configured** may invoke approved providers when all required configuration and safety flags are present.
-5. Submit the form. The server creates an idempotent run and redirects to its run page.
+6. Submit the form. The server creates an idempotent run and redirects to its run page.
+
+Browser execution requires an evidence-backed login URL, an evidence-backed
+credential-management URL, and a reviewed static trace. The 25 traced apps can
+run when those prerequisites are present; the remaining 75 are research-only.
+Creation checkpoints marked HITL remain human-authorized even under **Create if
+missing**, and retry/resume always reuse the run's frozen engine and policy.
 
 Use **Plan only** when exploring an app or validating setup. Do not select live execution merely because provider keys exist.
 
@@ -189,7 +199,7 @@ The CLI is useful for local diagnostics and ledger inspection:
 source .venv/bin/activate
 python -m ops.cli --help
 python -m ops.cli doctor
-python -m ops.cli run "HubSpot"
+python -m ops.cli run "HubSpot" --browser-provider playwright
 python -m ops.cli status <run_id>
 ```
 
@@ -206,7 +216,7 @@ make streamlit
 Live actions are disabled by default. Normal tests are offline-safe. A live provider test or operation requires explicit authorization, the relevant account configuration, and all applicable safety flags.
 
 - `RUN_LIVE_TESTS=1` permits tests marked `live`.
-- `ALLOW_LIVE_BROWSER=true` permits paid/live Browser Use execution.
+- `ALLOW_LIVE_BROWSER=true` permits live execution by either configured browser provider.
 - `ALLOW_LIVE_VENDOR_EMAIL=true` permits vendor email; otherwise use only a controlled override.
 - `ALLOW_LOCAL_CREDENTIAL_SUBMISSION=true` permits owner credential boundaries under their additional network restrictions.
 
@@ -214,13 +224,16 @@ Review the exact intended side effect before enabling a flag. Use controlled acc
 
 ## Private deployment
 
-Production uses three containers:
+Production uses four containers:
 
 ```text
-Internet -> Caddy (TLS + Basic Auth) -> Next.js -> FastAPI -> private SQLite volume
+Internet -> Caddy -> Next.js -> FastAPI -> private SQLite volumes
+                                  |
+                                  +-> isolated Playwright browser-worker
 ```
 
-Only Caddy publishes public ports. FastAPI stays on the private Docker network, and the browser talks to Next.js rather than directly to the API.
+Only Caddy publishes public ports. FastAPI and the Playwright RPC service stay on
+the private Docker network. Chromium is not installed in the API image.
 
 1. Point the chosen domain's DNS record at the host.
 2. Copy and fill the production template:

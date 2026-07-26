@@ -14,6 +14,7 @@ const PROVIDER_TITLES: Record<string, string> = {
   gemini: "Gemini extraction",
   composio: "Composio capability preflight",
   browser_use: "Browser Use agent",
+  playwright: "Playwright browser service",
 }
 
 const PROVIDER_DESCRIPTIONS: Record<string, string> = {
@@ -24,6 +25,7 @@ const PROVIDER_DESCRIPTIONS: Record<string, string> = {
   composio:
     "Read-only toolkit and connected-account capability evaluation. Gmail delivery is a separate policy-controlled action.",
   browser_use: "Cloud browser agent for onboarding navigation and live evaluator inspection.",
+  playwright: "Isolated self-hosted Chromium with policy-bounded navigation and screenshot HITL.",
 }
 
 // ---------------------------------------------------------------------------
@@ -35,7 +37,7 @@ const CONFIGURED_STATUSES = new Set([
   "configured_not_verified",
   "ready",
 ])
-const POLICY_GATED_PROVIDERS = new Set(["composio", "browser_use"])
+const POLICY_GATED_PROVIDERS = new Set(["composio", "browser_use", "playwright"])
 
 function configurationFact(status: string): string {
   if (status === "disabled") return "Not reported by this state"
@@ -48,7 +50,7 @@ function configurationFact(status: string): string {
 function policyFact(provider: string, status: string): string {
   if (status === "disabled") return "Policy disabled"
   if (provider === "composio") return "Read-only preflight"
-  if (provider === "browser_use") return "Allowed"
+  if (provider === "browser_use" || provider === "playwright") return "Allowed"
   if (POLICY_GATED_PROVIDERS.has(provider)) return "Allowed"
   return "No policy gate"
 }

@@ -199,6 +199,9 @@ def test_catalog_url_is_only_preferred_inside_existing_allowlist() -> None:
 def test_trace_is_rendered_into_browser_task_with_fail_closed_divergence() -> None:
     trace = get_browser_api_trace("pipedrive")
     assert trace is not None
+    # The trace owns the reviewed post-authentication destination. Existing-account
+    # runs still start from their separately verified login_url claim.
+    assert trace.start_url == "https://app.pipedrive.com/settings/api"
 
     guidance = render_browser_api_trace(trace)
     task = _render_browser_task(

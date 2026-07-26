@@ -109,12 +109,14 @@ class _OpenAICompatibleBackend:
         model: str,
         strict_models: Sequence[str] = (),
         use_max_completion_tokens: bool = True,
+        max_completion_tokens: int = _MAX_COMPLETION_TOKENS,
     ) -> None:
         self._api_key = api_key
         self._url = url
         self._model = model
         self._strict_models = tuple(strict_models)
         self._use_max_completion_tokens = use_max_completion_tokens
+        self._max_completion_tokens = max_completion_tokens
 
     def _response_format(self, schema: Mapping[str, object] | None) -> dict[str, object]:
         # Strict constrained decoding when the vendor documents it for this model;
@@ -139,7 +141,7 @@ class _OpenAICompatibleBackend:
             "response_format": self._response_format(schema),
         }
         token_key = "max_completion_tokens" if self._use_max_completion_tokens else "max_tokens"
-        payload[token_key] = _MAX_COMPLETION_TOKENS
+        payload[token_key] = self._max_completion_tokens
         headers = {
             "Authorization": f"Bearer {self._api_key.get_secret_value()}",
             "Content-Type": "application/json",
@@ -159,39 +161,60 @@ class _OpenAICompatibleBackend:
 class OpenRouterJsonBackend(_OpenAICompatibleBackend):
     name = "openrouter"
 
-    def __init__(self, api_key: SecretStr, *, model: str) -> None:
+    def __init__(
+        self,
+        api_key: SecretStr,
+        *,
+        model: str,
+        max_completion_tokens: int = _MAX_COMPLETION_TOKENS,
+    ) -> None:
         super().__init__(
             api_key,
             url="https://openrouter.ai/api/v1/chat/completions",
             model=model,
             strict_models=(),  # varies by upstream model: use plain JSON mode
             use_max_completion_tokens=False,
+            max_completion_tokens=max_completion_tokens,
         )
 
 
 class GroqJsonBackend(_OpenAICompatibleBackend):
     name = "groq"
 
-    def __init__(self, api_key: SecretStr, *, model: str) -> None:
+    def __init__(
+        self,
+        api_key: SecretStr,
+        *,
+        model: str,
+        max_completion_tokens: int = _MAX_COMPLETION_TOKENS,
+    ) -> None:
         super().__init__(
             api_key,
             url="https://api.groq.com/openai/v1/chat/completions",
             model=model,
             strict_models=_GROQ_STRICT_MODELS,
             use_max_completion_tokens=True,
+            max_completion_tokens=max_completion_tokens,
         )
 
 
 class CerebrasJsonBackend(_OpenAICompatibleBackend):
     name = "cerebras"
 
-    def __init__(self, api_key: SecretStr, *, model: str) -> None:
+    def __init__(
+        self,
+        api_key: SecretStr,
+        *,
+        model: str,
+        max_completion_tokens: int = _MAX_COMPLETION_TOKENS,
+    ) -> None:
         super().__init__(
             api_key,
             url="https://api.cerebras.ai/v1/chat/completions",
             model=model,
             strict_models=_CEREBRAS_STRICT_MODELS,
             use_max_completion_tokens=True,
+            max_completion_tokens=max_completion_tokens,
         )
 
 
@@ -416,7 +439,12 @@ class JsonInference:
         raise DecisionFailed(reasons[-1] if reasons else "all_providers_failed")
 
 
-def build_json_inference(settings: object) -> JsonInference | None:
+def build_json_inference(
+    settings: object,
+    *,
+    budget: DecisionBudget | None = None,
+    max_completion_tokens: int = _MAX_COMPLETION_TOKENS,
+) -> JsonInference | None:
     """Build the ordered free-tier chain, skipping unconfigured providers.
 
     Order favours strict-schema-capable, high-throughput free tiers first:
@@ -428,17 +456,35 @@ def build_json_inference(settings: object) -> JsonInference | None:
     groq_key = getattr(settings, "groq_api_key", None)
     if isinstance(groq_key, SecretStr):
         model = getattr(settings, "groq_model", "") or "openai/gpt-oss-120b"
-        backends.append(GroqJsonBackend(groq_key, model=model))
+        backends.append(
+            GroqJsonBackend(
+                groq_key,
+                model=model,
+                max_completion_tokens=max_completion_tokens,
+            )
+        )
 
     cerebras_key = getattr(settings, "cerebras_api_key", None)
     if isinstance(cerebras_key, SecretStr):
         model = getattr(settings, "cerebras_model", "") or "gpt-oss-120b"
-        backends.append(CerebrasJsonBackend(cerebras_key, model=model))
+        backends.append(
+            CerebrasJsonBackend(
+                cerebras_key,
+                model=model,
+                max_completion_tokens=max_completion_tokens,
+            )
+        )
 
     openrouter_key = getattr(settings, "openrouter_api_key", None)
     if isinstance(openrouter_key, SecretStr):
         model = getattr(settings, "openrouter_model", "") or "openai/gpt-oss-120b"
-        backends.append(OpenRouterJsonBackend(openrouter_key, model=model))
+        backends.append(
+            OpenRouterJsonBackend(
+                openrouter_key,
+                model=model,
+                max_completion_tokens=max_completion_tokens,
+            )
+        )
 
     gemini_key = getattr(settings, "google_genai_api_key", None)
     if isinstance(gemini_key, SecretStr):
@@ -446,7 +492,7 @@ def build_json_inference(settings: object) -> JsonInference | None:
         if models:
             backends.append(GeminiJsonBackend(gemini_key, models=models))
 
-    return JsonInference(backends) if backends else None
+    return JsonInference(backends, budget=budget) if backends else None
 
 
 __all__ = [

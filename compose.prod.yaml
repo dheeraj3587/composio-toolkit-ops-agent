@@ -30,9 +30,9 @@ services:
       - path: .env.production
         required: false
     # Production-safe defaults are defined here. Live provider capabilities stay
-    # disabled unless the untracked production environment explicitly opts in;
-    # this keeps an intentional Browser Use policy setting from being silently
-    # overridden by Compose at runtime.
+    # disabled unless the untracked production environment explicitly opts in.
+    # BROWSER_PROVIDER is only the compatibility default for callers that omit a
+    # per-run choice; both configured adapters are wired independently.
     environment:
       ALLOW_LIVE_VENDOR_EMAIL: ${ALLOW_LIVE_VENDOR_EMAIL:-false}
       ALLOW_LIVE_BROWSER: ${ALLOW_LIVE_BROWSER:-false}
@@ -43,13 +43,18 @@ services:
       # Per-session Browser Use cost ceiling. Kept high so a live onboarding task
       # never stops mid-run on the cap; lower it deliberately if desired.
       BROWSER_USE_MAX_COST_USD: ${BROWSER_USE_MAX_COST_USD:-50.0}
+      BROWSER_PROVIDER: ${BROWSER_PROVIDER:-browser_use}
+      BROWSER_SERVICE_URL: http://browser-worker:8081
+      BROWSER_SERVICE_TOKEN: ${BROWSER_SERVICE_TOKEN:?BROWSER_SERVICE_TOKEN is required}
+      BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-production-owner}
+      PLAYWRIGHT_IN_PROCESS_SANDBOX: "false"
       OPS_ENABLE_API_DOCS: "false"
       RUN_LIVE_TESTS: "0"
       OPS_INTERNAL_API_TOKEN: ${OPS_INTERNAL_API_TOKEN:?OPS_INTERNAL_API_TOKEN is required}
       LANGGRAPH_STRICT_MSGPACK: "true"
       OPS_DB_PATH: /data/ops.db
       CHECKPOINT_DB_PATH: /data/checkpoints.db
-      SECRET_VAULT_DB_PATH: /data/secret_vault.db
+      SECRET_VAULT_DB_PATH: /vault/credentials.db
       PROVIDER_EFFECTS_DB_PATH: /data/provider_effects.db
       # The Composio SDK creates a local metadata cache at import time. The API
       # root filesystem is intentionally read-only, so keep that ephemeral cache
@@ -57,6 +62,10 @@ services:
       COMPOSIO_CACHE_DIR: /tmp/composio
     volumes:
       - ops_data:/data
+      - credential_vault:/vault
+    depends_on:
+      browser-worker:
+        condition: service_healthy
     networks:
       - opsnet
     restart: unless-stopped
@@ -77,6 +86,69 @@ services:
       interval: 30s
       timeout: 5s
       start_period: 20s
+      retries: 3
+
+  browser-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.browser
+    init: true
+    ipc: host
+    shm_size: 1gb
+    pids_limit: 512
+    user: ops
+    environment:
+      BROWSER_PROVIDER: playwright
+      ALLOW_LIVE_BROWSER: ${ALLOW_LIVE_BROWSER:-false}
+      ALLOW_LIVE_VENDOR_EMAIL: "false"
+      BROWSER_SERVICE_TOKEN: ${BROWSER_SERVICE_TOKEN:?BROWSER_SERVICE_TOKEN is required}
+      BROWSER_SERVICE_PORT: "8081"
+      BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-production-owner}
+      BROWSER_SESSION_INACTIVITY_SECONDS: ${BROWSER_SESSION_INACTIVITY_SECONDS:-900}
+      BROWSER_SESSION_MAX_AGE_SECONDS: ${BROWSER_SESSION_MAX_AGE_SECONDS:-3600}
+      PLAYWRIGHT_MAX_SESSIONS: ${PLAYWRIGHT_MAX_SESSIONS:-2}
+      PLAYWRIGHT_DISABLE_SANDBOX: ${PLAYWRIGHT_DISABLE_SANDBOX:-true}
+      # The policy-constrained browser action loop needs at least one JSON
+      # inference backend. Values stay inside this private service.
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      CEREBRAS_MODEL: ${CEREBRAS_MODEL:-gpt-oss-120b}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-nvidia/nemotron-3-ultra-550b-a55b:free}
+      GOOGLE_GENAI_API_KEY: ${GOOGLE_GENAI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
+      BROWSER_INTERACTIVE_HITL_ENABLED: "false"
+      BROWSER_STORAGE_STATE_KEY: ${BROWSER_STORAGE_STATE_KEY:-}
+      BROWSER_STORAGE_STATE_DIR: /browser-data/storage-state
+      SECRET_VAULT_KEY: ${SECRET_VAULT_KEY:-}
+      SECRET_VAULT_DB_PATH: /vault/credentials.db
+      PYTHONPATH: /app
+    volumes:
+      - browser_profiles:/browser-data
+      - credential_vault:/vault
+    networks:
+      - opsnet
+    restart: unless-stopped
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=1g,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import json, sys, urllib.request
+          response = urllib.request.urlopen("http://127.0.0.1:8081/internal/health", timeout=30)
+          state = json.load(response).get("state")
+          sys.exit(0 if state in ("ready", "configured_not_verified", "capacity_exhausted") else 1)
+      interval: 60s
+      timeout: 40s
+      start_period: 30s
       retries: 3
 
   web:
@@ -168,6 +240,8 @@ volumes:
   # provider_effects.db. A first-run named volume inherits the ops:0700
   # ownership pre-created in Dockerfile.api at /data.
   ops_data:
+  browser_profiles:
+  credential_vault:
   # Caddy certificate + ACME account state. Preserve across redeploys to avoid
   # re-issuing certificates and hitting rate limits.
   caddy_data:

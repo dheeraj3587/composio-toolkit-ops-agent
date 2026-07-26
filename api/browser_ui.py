@@ -2,10 +2,10 @@
 
 The interface previously derived its permissions from ``run.status`` alone, which
 is wrong in both directions: a ``browser_running`` run is not necessarily on a
-credential page, and a Playwright run has no interactive view even while it is
-healthy. Only the backend can see provider capability, trusted recorded events,
-and the policy opt-ins that gate each mutation endpoint, so the decision is made
-here, once, and shipped to the client as explicit booleans.
+credential page, and Playwright interaction is available only during an explicit,
+configuration-gated HITL pause. Only the backend can see provider capability,
+trusted recorded events, and the policy opt-ins that gate each mutation endpoint,
+so the decision is made here, once, and shipped to the client as explicit booleans.
 
 Every capability defaults to False and becomes True only on positive evidence.
 """
@@ -16,13 +16,13 @@ from collections.abc import Collection, Mapping
 
 from api.models import (
     BrowserLifecycle,
-    BrowserProvider,
     BrowserUiState,
     HitlRequestView,
     LiveViewMode,
 )
 from ops.browser_readiness import browser_configuration_state
 from ops.config import Settings
+from ops.state import BrowserProvider
 
 # A credential may be submitted only after THIS trusted event was recorded. A
 # running session proves nothing about having reached the credential page.
@@ -50,10 +50,13 @@ TERMINAL_RUN_STATUSES = frozenset({"completed", "blocked", "failed"})
 OTP_SUBMISSION_SUPPORTED = False
 
 
-def resolve_provider(settings: Settings) -> BrowserProvider:
-    """The wired backend, from configuration only (rule 1)."""
+def resolve_provider(
+    settings: Settings,
+    provider: BrowserProvider | None = None,
+) -> BrowserProvider:
+    """Resolve an explicit run provider, with the legacy setting as fallback."""
 
-    return (
+    return provider or (
         "playwright"
         if str(getattr(settings, "browser_provider", "")) == "playwright"
         else ("browser_use")
@@ -76,6 +79,7 @@ def session_lost_recorded(events: Collection[Mapping[str, object]]) -> bool:
 def project_browser_ui(
     *,
     settings: Settings,
+    browser_provider: BrowserProvider | None = None,
     run_status: str,
     event_types: Collection[str],
     browser_session_id: str | None = None,
@@ -91,8 +95,8 @@ def project_browser_ui(
     from the worker, never an assumption from the provider or the run status.
     """
 
-    provider = resolve_provider(settings)
-    configured = browser_configuration_state(settings)
+    provider = resolve_provider(settings, browser_provider)
+    configured = browser_configuration_state(settings, provider)
     credential_page_verified = CREDENTIAL_PAGE_EVENT in event_types
     session_started = bool(browser_session_id) or "browser_session_started" in event_types
     terminal = run_status in TERMINAL_RUN_STATUSES
@@ -110,7 +114,13 @@ def project_browser_ui(
     # A live session is the precondition for any view at all.
     session_live = lifecycle in {"running", "waiting_for_hitl", "credential_page_ready"}
     live_view_mode = _live_view_mode(
-        provider=provider, session_live=session_live, screenshot_present=screenshot_present
+        provider=provider,
+        lifecycle=lifecycle,
+        session_live=session_live,
+        screenshot_present=screenshot_present,
+        interactive_enabled=bool(
+            getattr(settings, "browser_interactive_hitl_enabled", False)
+        ),
     )
     # Rule 9: interactivity is a provider capability, not a run state. Only a
     # hosted provider view (or a real interactive remote) can be driven; masked
@@ -199,20 +209,28 @@ def _lifecycle(
 
 
 def _live_view_mode(
-    *, provider: BrowserProvider, session_live: bool, screenshot_present: bool
+    *,
+    provider: BrowserProvider,
+    lifecycle: BrowserLifecycle,
+    session_live: bool,
+    screenshot_present: bool,
+    interactive_enabled: bool,
 ) -> LiveViewMode:
     """The view this provider can actually offer right now.
 
     The signed hosted URL itself is resolved by the live-view endpoint from
     in-memory worker state; run detail reports only that a hosted view is expected
     for a live session, so a run projection never triggers a provider call.
-    ``interactive_remote`` is deliberately never projected until that same-origin
-    path is served end to end.
+    Interactive Playwright is advertised only while a human gate is active and the
+    deployment explicitly enabled the one-session relay. Autonomous running remains
+    screenshot-only, so the UI never offers control before a handoff.
     """
 
     if not session_live:
         return "unavailable"
     if provider == "playwright":
+        if lifecycle == "waiting_for_hitl" and interactive_enabled:
+            return "interactive_remote"
         return "screenshot" if screenshot_present else "unavailable"
     return "hosted_url"
 

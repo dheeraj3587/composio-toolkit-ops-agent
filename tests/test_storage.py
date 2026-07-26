@@ -241,6 +241,43 @@ def test_initialize_migrates_an_existing_database_for_internal_idempotency(tmp_p
             ("run-migrated",),
         ).fetchone()
 
-    assert {"idempotency_key", "request_fingerprint"} <= columns
+    assert {
+        "idempotency_key",
+        "request_fingerprint",
+        "browser_provider",
+        "credential_creation_policy",
+    } <= columns
     assert "idx_runs_idempotency_key" in index_names
     assert stored == ("idem_0123456789abcdef0123456789abcdef", "a" * 64)
+    assert record["browser_provider"] == "browser_use"
+    assert record["credential_creation_policy"] == "reuse_only"
+
+
+def test_browser_provider_is_immutable_after_creation(tmp_path) -> None:
+    storage = OperationsStorage(tmp_path / "ops.db")
+    created = storage.create_run(
+        run_id="run-provider",
+        thread_id="thread-provider",
+        app_name="Example App",
+        app_slug="example-app",
+        browser_provider="playwright",
+    )
+
+    assert created["browser_provider"] == "playwright"
+    with pytest.raises(ValueError, match="unsupported"):
+        storage.update_run("run-provider", browser_provider="browser_use")
+
+
+def test_credential_creation_policy_is_immutable_after_creation(tmp_path) -> None:
+    storage = OperationsStorage(tmp_path / "ops.db")
+    created = storage.create_run(
+        run_id="run-creation-policy",
+        thread_id="thread-creation-policy",
+        app_name="Example App",
+        app_slug="example-app",
+        credential_creation_policy="create_if_missing",
+    )
+
+    assert created["credential_creation_policy"] == "create_if_missing"
+    with pytest.raises(ValueError, match="unsupported"):
+        storage.update_run("run-creation-policy", credential_creation_policy="reuse_only")

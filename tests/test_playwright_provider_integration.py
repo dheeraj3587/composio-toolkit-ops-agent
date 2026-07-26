@@ -20,6 +20,10 @@ from ops.models import CompanyProfile, OperationsRequest
 from ops.run_service import RunService
 
 _REPO = Path(__file__).resolve().parents[1]
+_INTERACTIVE_GRANT = (
+    "http://browser-worker:8081/internal/browser/live-view/novnc"
+    "?session=bs_1&token=e30.c2lnbmF0dXJl"
+)
 
 
 def _request(app_name: str = "Pipedrive") -> OperationsRequest:
@@ -56,14 +60,22 @@ class _ScreenshotWorker:
         return (b"\x89PNG\r\n\x1a\nfake", "2026-07-25T00:00:00+00:00")
 
 
+class _InteractiveGrantWorker(_ScreenshotWorker):
+    def request_live_view_sync(self, session_id: str) -> tuple[str, str, str]:
+        assert session_id == "bs_1"
+        return "interactive_remote", _INTERACTIVE_GRANT, "2026-07-25T00:05:00+00:00"
+
+
 def _service_with_worker(tmp_path: Path, worker: object, *, session_id: str = "s1") -> RunService:
     service = RunService.from_paths(db_path=tmp_path / "ops.db")
     service.initialize()
-    run = service.create_run(_request(), execution_mode="plan_only")
+    provider = getattr(worker, "provider_name", "browser_use")
+    request = _request().model_copy(update={"browser_provider": provider})
+    run = service.create_run(request, execution_mode="plan_only")
     run_id = run["run_id"]
     with service.storage.unit_of_work() as transaction:
         transaction.update_run(run_id, browser_session_id=session_id)
-    service._browser_worker = worker  # type: ignore[assignment]
+    service._browser_workers = {provider: worker}  # type: ignore[dict-item]
     service._test_run_id = run_id  # type: ignore[attr-defined]
     return service
 
@@ -92,6 +104,24 @@ def test_screenshot_lookup_requires_a_session(tmp_path: Path) -> None:
     assert service.get_browser_screenshot(run_id) is None
 
 
+def test_playwright_grant_is_minted_only_for_waiting_hitl_and_never_persisted(
+    tmp_path: Path,
+) -> None:
+    service = _service_with_worker(tmp_path, _InteractiveGrantWorker(), session_id="bs_1")
+    run_id = service._test_run_id  # type: ignore[attr-defined]
+    assert service.get_browser_interactive_grant(run_id) is None
+
+    with service.storage.unit_of_work() as transaction:
+        transaction.update_run(run_id, status="waiting_for_hitl")
+    grant = service.get_browser_interactive_grant(run_id)
+
+    assert grant is not None and grant[1] == _INTERACTIVE_GRANT
+    persisted = service.storage.get_run(run_id)
+    assert persisted is not None
+    assert "c2lnbmF0dXJl" not in str(persisted)
+    assert "c2lnbmF0dXJl" not in str(service.get_timeline(run_id))
+
+
 def test_live_view_modes_are_provider_aware_and_self_consistent() -> None:
     # Browser Use keeps its hosted, interactive shape.
     hosted = LiveViewResponse(
@@ -115,6 +145,16 @@ def test_live_view_modes_are_provider_aware_and_self_consistent() -> None:
         captured_at="2026-07-25T00:00:00+00:00",
     )
     assert shot.live_url is None and shot.interaction_available is False
+
+    interactive = LiveViewResponse(
+        run_id="run_1",
+        provider="playwright",
+        available=True,
+        mode="interactive_remote",
+        interactive_url=_INTERACTIVE_GRANT,
+        interaction_available=True,
+    )
+    assert interactive.interactive_url == _INTERACTIVE_GRANT
 
     idle = LiveViewResponse(
         run_id="run_1",
@@ -184,8 +224,8 @@ def test_live_view_rejects_inconsistent_mode_and_url_combinations(
         "/api/runs/run_1/live-view/../../internal",
     ],
 )
-def test_live_view_rejects_private_browser_service_addresses(address: str) -> None:
-    """The private noVNC/browser-service address must never cross the API boundary."""
+def test_live_view_rejects_unapproved_browser_service_addresses(address: str) -> None:
+    """Only the exact bounded browser-worker grant may cross to the Next server."""
 
     for field in ("screenshot_url", "interactive_url"):
         with pytest.raises(ValidationError):
@@ -201,12 +241,25 @@ def test_live_view_rejects_private_browser_service_addresses(address: str) -> No
 class _FakeCoreService:
     """Minimal core-service surface the live-view projection actually reads."""
 
-    def __init__(self, *, live_url: str | None, screenshot: tuple[bytes, str] | None) -> None:
+    def __init__(
+        self,
+        *,
+        live_url: str | None,
+        screenshot: tuple[bytes, str] | None,
+        browser_provider: str,
+        interactive_grant: tuple[str, str, str] | None = None,
+    ) -> None:
         self._live_url = live_url
         self._screenshot = screenshot
+        self._browser_provider = browser_provider
+        self._interactive_grant = interactive_grant
 
     def get_run(self, run_id: str) -> dict[str, object]:
-        return {"run_id": run_id}
+        return {
+            "run_id": run_id,
+            "browser_provider": self._browser_provider,
+            "status": "waiting_for_hitl" if self._interactive_grant else "browser_running",
+        }
 
     def get_browser_live_url(self, run_id: str) -> str | None:
         del run_id
@@ -216,17 +269,27 @@ class _FakeCoreService:
         del run_id
         return self._screenshot
 
+    def get_browser_interactive_grant(self, run_id: str) -> tuple[str, str, str] | None:
+        del run_id
+        return self._interactive_grant
+
 
 def _projected_live_view(
     *,
     live_url: str | None,
     screenshot: tuple[bytes, str] | None,
     browser_provider: str = "browser_use",
+    interactive_grant: tuple[str, str, str] | None = None,
 ) -> LiveViewResponse:
     from api.service import LocalRunService
 
     service = LocalRunService(
-        core_service=_FakeCoreService(live_url=live_url, screenshot=screenshot),  # type: ignore[arg-type]
+        core_service=_FakeCoreService(
+            live_url=live_url,
+            screenshot=screenshot,
+            browser_provider=browser_provider,
+            interactive_grant=interactive_grant,
+        ),  # type: ignore[arg-type]
         settings=Settings(browser_provider=browser_provider),  # type: ignore[arg-type]
     )
     return service._live_view_sync("run_1")  # noqa: SLF001 - projection under test
@@ -256,6 +319,23 @@ def test_playwright_live_view_is_screenshot_only() -> None:
     assert view.interaction_available is False
     assert view.screenshot_url == "/api/runs/run_1/live-view/screenshot"
     assert view.interactive_url is None
+
+
+def test_playwright_hitl_live_view_returns_a_fresh_interactive_grant() -> None:
+    view = _projected_live_view(
+        live_url=None,
+        screenshot=None,
+        browser_provider="playwright",
+        interactive_grant=(
+            "interactive_remote",
+            _INTERACTIVE_GRANT,
+            "2026-07-25T00:05:00+00:00",
+        ),
+    )
+
+    assert view.mode == "interactive_remote"
+    assert view.interactive_url == _INTERACTIVE_GRANT
+    assert view.interaction_available is True
 
 
 def test_idle_live_view_reports_the_configured_provider_without_a_viewer() -> None:
@@ -324,8 +404,9 @@ class _NoReattachWorker:
     supports_restart_reattach = False
 
 
-def _run_at(service: RunService, status: str) -> str:
-    run = service.create_run(_request(), execution_mode="plan_only")
+def _run_at(service: RunService, status: str, *, provider: str = "browser_use") -> str:
+    request = _request().model_copy(update={"browser_provider": provider})
+    run = service.create_run(request, execution_mode="plan_only")
     run_id = run["run_id"]
     service.guarded_status_update(
         run_id, expected_revision=1, next_status="browser_running", command="test"
@@ -340,7 +421,7 @@ def _run_at(service: RunService, status: str) -> str:
 def test_browser_use_waiting_for_hitl_stays_resumable(tmp_path: Path) -> None:
     service = RunService.from_paths(db_path=tmp_path / "ops.db")
     service.initialize()
-    service._browser_worker = _ReattachWorker()  # type: ignore[assignment]
+    service._browser_workers = {"browser_use": _ReattachWorker()}  # type: ignore[dict-item]
     hitl = _run_at(service, "waiting_for_hitl")
     running = _run_at(service, "browser_running")
 
@@ -355,9 +436,9 @@ def test_browser_use_waiting_for_hitl_stays_resumable(tmp_path: Path) -> None:
 def test_playwright_sessions_are_reconciled_from_both_states(tmp_path: Path) -> None:
     service = RunService.from_paths(db_path=tmp_path / "ops.db")
     service.initialize()
-    service._browser_worker = _NoReattachWorker()  # type: ignore[assignment]
-    hitl = _run_at(service, "waiting_for_hitl")
-    running = _run_at(service, "browser_running")
+    service._browser_workers = {"playwright": _NoReattachWorker()}  # type: ignore[dict-item]
+    hitl = _run_at(service, "waiting_for_hitl", provider="playwright")
+    running = _run_at(service, "browser_running", provider="playwright")
 
     service._reconcile_stranded_runs()
 
@@ -397,36 +478,37 @@ def test_terminal_playwright_sessions_are_stopped(tmp_path: Path) -> None:
 
     service = RunService.from_paths(db_path=tmp_path / "ops.db")
     playwright = _StoppingWorker()
-    service._browser_worker = playwright  # type: ignore[assignment]
+    service._browser_workers = {"playwright": playwright}  # type: ignore[dict-item]
     for status in ("completed", "failed", "blocked", "configuration_required"):
-        service._stop_terminal_playwright_session(object(), status)  # type: ignore[arg-type]
+        service._stop_terminal_playwright_session(object(), status, "playwright")  # type: ignore[arg-type]
     assert len(playwright.stopped) == 4
 
     # Non-terminal states keep the session (the human/loop still needs it).
     playwright.stopped.clear()
     for status in ("browser_running", "waiting_for_hitl"):
-        service._stop_terminal_playwright_session(object(), status)  # type: ignore[arg-type]
+        service._stop_terminal_playwright_session(object(), status, "playwright")  # type: ignore[arg-type]
     assert playwright.stopped == []
 
     # Browser Use is never stopped by this branch.
     browser_use = _BrowserUseWorker()
-    service._browser_worker = browser_use  # type: ignore[assignment]
-    service._stop_terminal_playwright_session(object(), "completed")  # type: ignore[arg-type]
+    service._browser_workers = {"browser_use": browser_use}  # type: ignore[dict-item]
+    service._stop_terminal_playwright_session(object(), "completed", "browser_use")  # type: ignore[arg-type]
     assert browser_use.stopped == []
 
 
-# --- Production deployment files remain untouched ------------------------------
-def test_production_deployment_does_not_enable_playwright() -> None:
+# --- Production keeps the API browser-free and service-backs Playwright --------
+def test_production_deployment_wires_isolated_playwright() -> None:
     compose = (_REPO / "compose.prod.yaml").read_text(encoding="utf-8")
-    assert "BROWSER_PROVIDER" not in compose
-    assert "Dockerfile.browser" not in compose
-    assert "playwright" not in compose.casefold()
+    assert "Dockerfile.browser" in compose
+    assert "BROWSER_SERVICE_URL: http://browser-worker:8081" in compose
+    assert 'PLAYWRIGHT_IN_PROCESS_SANDBOX: "false"' in compose
+    assert "Dockerfile.api" in compose
 
 
 def test_production_env_example_keeps_browser_use_default() -> None:
     example = (_REPO / ".env.production.example").read_text(encoding="utf-8")
-    # No Playwright switch is offered in the production example.
-    assert "BROWSER_PROVIDER=playwright" not in example
+    assert "BROWSER_PROVIDER=browser_use" in example
+    assert "BROWSER_SERVICE_TOKEN=" in example
 
 
 def test_vault_key_is_not_required_for_these_tests() -> None:

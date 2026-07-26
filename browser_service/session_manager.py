@@ -100,11 +100,11 @@ class ManagedSession:
             # True. Now reports what is actually available.
             live_view_available=self.screenshot_available or self.interactive_ready,
             hitl_pending=self.hitl_pending,
-            # Distinct capability facts. Interactive is deferred (config-rejected),
-            # so interactive_supported/available are both False today.
+            # Distinct capability facts. The build includes the interactive relay;
+            # availability remains session-specific and false unless enabled.
             screenshot_supported=True,
             screenshot_available=self.screenshot_available,
-            interactive_supported=False,
+            interactive_supported=True,
             interactive_available=self.interactive_ready,
             current_url_path=self.current_url_path,
             reason_code=self.reason_code,
@@ -263,8 +263,14 @@ class SessionManager:
             session.reason_code = f"{reason_code}:operations_cancelled"
 
         if self._closer is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await self._closer(session)
+            except Exception:
+                # Never release a single-display capacity slot while its browser
+                # or live RFB attachment may still exist. The CLOSING session is
+                # retained so teardown can be retried once the dependency clears.
+                session.reason_code = f"{reason_code}:teardown_failed"
+                return session.reason_code
 
         with self._lock:
             session.lifecycle = "CLOSED"
@@ -285,7 +291,21 @@ class SessionManager:
         expired: list[tuple[str, str]] = []
         with self._lock:
             for session in self._sessions.values():
-                if session.lifecycle != "ACTIVE" or session.active_operations > 0:
+                if session.active_operations > 0:
+                    continue
+                if session.lifecycle == "CLOSING" and session.reason_code.endswith(
+                    ":teardown_failed"
+                ):
+                    # Retry one failed closer on the next bounded janitor sweep.
+                    # Capacity remains held until a retry actually succeeds.
+                    expired.append(
+                        (
+                            session.session_id,
+                            session.reason_code.removesuffix(":teardown_failed"),
+                        )
+                    )
+                    continue
+                if session.lifecycle != "ACTIVE":
                     continue
                 if session.is_age_expired(moment):
                     expired.append((session.session_id, "session_max_age_exceeded"))
@@ -299,7 +319,8 @@ class SessionManager:
         closed: list[str] = []
         for session_id, reason in self.expired_session_ids():
             await self.close(session_id, reason_code=reason)
-            closed.append(session_id)
+            if self.get_if_present(session_id) is None:
+                closed.append(session_id)
         return tuple(closed)
 
     async def run_janitor(self, interval_seconds: float = 60.0) -> None:

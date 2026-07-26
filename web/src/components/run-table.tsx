@@ -46,7 +46,7 @@ export function RunTable({ runs }: { runs: RunSummary[] }) {
               <TableCell>
                 <span className="block text-sm font-semibold leading-tight">{run.app_name}</span>
                 <span className="mt-1 block max-w-48 truncate font-mono text-[10px] text-muted-foreground">
-                  {run.run_id}
+                  {humanize(run.browser_provider)} · {humanize(run.credential_creation_policy)} · {run.run_id}
                 </span>
               </TableCell>
               <TableCell className="font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">

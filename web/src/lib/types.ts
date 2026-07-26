@@ -21,6 +21,7 @@ export type RunStatus =
   | "completed"
 
 export type ExecutionMode = "plan_only" | "execute_when_configured"
+export type CredentialCreationPolicy = "reuse_only" | "create_if_missing"
 
 export interface RunSummary {
   run_id: string
@@ -30,6 +31,8 @@ export interface RunSummary {
   status: RunStatus
   access_route?: AccessRoute | null
   execution_mode: ExecutionMode
+  browser_provider: BrowserProvider
+  credential_creation_policy: CredentialCreationPolicy
   external_actions: boolean
   created_at: string
   updated_at: string
@@ -190,6 +193,7 @@ export interface RunDetailResponse {
 }
 
 export interface TimelineItem {
+  event_id: number
   event_type: string
   summary: string
   status: "recorded" | "completed" | "blocked" | "failed"
@@ -248,9 +252,11 @@ export interface OperationsRequestInput {
   company: CompanyProfileInput
   requested_scope_policy: "minimum" | "recommended" | "maximum"
   execution_mode: ExecutionMode
+  browser_provider: BrowserProvider
+  credential_creation_policy: CredentialCreationPolicy
   outreach_recipient_override: string | null
   // Optional app sign-in credentials for autonomous login. Injected into
-  // Browser Use as secure placeholders at session creation; never persisted.
+  // the selected provider's secret boundary at session creation; never persisted.
   browser_login?: { email: string; password: string } | null
 }
 
@@ -298,12 +304,13 @@ export type LiveViewMode = "hosted_url" | "screenshot" | "interactive_remote" | 
  * - `screenshot`: the self-hosted Playwright service has no hosted URL, so the
  *   client polls `screenshot_url` for masked PNG frames (cache-busted by
  *   `captured_at`). Frames are viewable only, so `interaction_available` is false.
- * - `interactive_remote`: a same-origin interactive viewer path, advertised only
- *   once that path is served end to end.
+ * - `interactive_remote`: the private browser service supplies a short-lived,
+ *   signed grant. Server-only code validates and converts it to a same-origin
+ *   path before it can enter client state.
  * - `unavailable`: no viewer exists and no viewer URL is present.
  *
- * `screenshot_url`/`interactive_url` are bounded same-origin RELATIVE API paths.
- * A private browser-service (noVNC) address never crosses the API boundary.
+ * `screenshot_url` is a bounded same-origin relative API path. `interactive_url`
+ * is an internal-only grant and must never be passed directly to browser code.
  */
 export interface LiveViewResponse {
   run_id: string

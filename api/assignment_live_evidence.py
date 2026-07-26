@@ -351,10 +351,8 @@ async def _compatible_gemini_extract(
 def _assignment_provider_states(service: LocalRunService) -> list[ProviderState]:
     """Report initialized runtime adapters as ready instead of amber placeholders.
 
-    The browser entry follows the SELECTED provider: the core report emits exactly
-    one browser state, named ``playwright`` or ``browser_use``, so this projection
-    must never assume a fixed provider list (indexing ``browser_use`` used to raise
-    a KeyError on a Playwright deployment).
+    Both browser entries are retained and promoted independently when their
+    corresponding runtime adapter is actually wired.
     """
 
     original_states = _ORIGINAL_PROVIDER_STATES(service)
@@ -371,7 +369,6 @@ def _assignment_provider_states(service: LocalRunService) -> list[ProviderState]
         row = wiring.get(name)
         return bool(row and row.get("runtime_wired") is True)
 
-    selected_browser = str(getattr(service._settings, "browser_provider", "browser_use"))
     readiness: dict[str, tuple[bool, str]] = {
         "langgraph": (
             wired("workflow"),
@@ -393,15 +390,13 @@ def _assignment_provider_states(service: LocalRunService) -> list[ProviderState]
             wired("composio_preflight"),
             "Read-only Composio toolkit and connected-account preflight is initialized for each run.",
         ),
-        selected_browser: (
-            wired("browser"),
-            (
-                "The isolated Playwright browser service is wired with live execution "
-                "enabled and per-app domain policy."
-                if selected_browser == "playwright"
-                else "Browser Use is initialized with live execution enabled and per-app "
-                "domain policy."
-            ),
+        "playwright": (
+            wired("browser:playwright"),
+            "The isolated Playwright browser service is wired with live execution enabled and per-app domain policy.",
+        ),
+        "browser_use": (
+            wired("browser:browser_use"),
+            "Browser Use is initialized with live execution enabled and per-app domain policy.",
         ),
     }
 
