@@ -7,7 +7,9 @@ const rfbMocks = vi.hoisted(() => ({
     target: HTMLElement
     url: string
     disconnect: ReturnType<typeof vi.fn>
-    listeners: Map<string, () => void>
+    clipboardPasteFrom: ReturnType<typeof vi.fn>
+    sendKey: ReturnType<typeof vi.fn>
+    listeners: Map<string, (event?: unknown) => void>
     scaleViewport: boolean
     resizeSession: boolean
     viewOnly: boolean
@@ -19,7 +21,9 @@ vi.mock("@novnc/novnc", () => ({
     target: HTMLElement
     url: string
     disconnect = vi.fn()
-    listeners = new Map<string, () => void>()
+    clipboardPasteFrom = vi.fn()
+    sendKey = vi.fn()
+    listeners = new Map<string, (event?: unknown) => void>()
     scaleViewport = false
     resizeSession = true
     viewOnly = true
@@ -30,7 +34,7 @@ vi.mock("@novnc/novnc", () => ({
       rfbMocks.instances.push(this)
     }
 
-    addEventListener(event: string, callback: () => void) {
+    addEventListener(event: string, callback: (event?: unknown) => void) {
       this.listeners.set(event, callback)
     }
 
@@ -99,6 +103,37 @@ describe("PlaywrightRemoteView", () => {
     await user.click(reconnect)
     expect(onReconnect).toHaveBeenCalledOnce()
     expect(rfbMocks.instances).toHaveLength(1)
+  })
+
+  it("pastes typed text into the remote session and clears it from the DOM", async () => {
+    const user = userEvent.setup()
+    render(<PlaywrightRemoteView interactivePath={INTERACTIVE_PATH} onReconnect={vi.fn()} />)
+
+    await waitFor(() => expect(rfbMocks.instances).toHaveLength(1))
+    const rfb = rfbMocks.instances[0]
+    rfb?.listeners.get("connect")?.()
+
+    const field = await screen.findByLabelText(/send text into the remote browser/i)
+    await user.type(field, "hello-remote")
+    await user.click(screen.getByRole("button", { name: /^send text$/i }))
+
+    expect(rfb?.clipboardPasteFrom).toHaveBeenCalledWith("hello-remote")
+    // Setting the clipboard alone cannot fill a field, so the paste chord must
+    // actually be synthesized inside the session.
+    expect(rfb?.sendKey).toHaveBeenCalled()
+    expect((field as HTMLInputElement).value).toBe("")
+  })
+
+  it("surfaces text copied inside the remote browser", async () => {
+    render(<PlaywrightRemoteView interactivePath={INTERACTIVE_PATH} onReconnect={vi.fn()} />)
+
+    await waitFor(() => expect(rfbMocks.instances).toHaveLength(1))
+    const rfb = rfbMocks.instances[0]
+    rfb?.listeners.get("connect")?.()
+    rfb?.listeners.get("clipboard")?.({ detail: { text: "copied-from-remote" } })
+
+    const mirrored = await screen.findByLabelText(/copied inside the remote browser/i)
+    await waitFor(() => expect((mirrored as HTMLTextAreaElement).value).toBe("copied-from-remote"))
   })
 
   it("fails closed before noVNC sees a cross-origin path", async () => {

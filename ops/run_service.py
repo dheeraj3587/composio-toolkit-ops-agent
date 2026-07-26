@@ -82,7 +82,7 @@ from ops.provider_errors import (
 from ops.redaction import redact_data, redact_text
 from ops.research_cache import SqliteResearchCache
 from ops.routing import RoutingDecision, decide_access
-from ops.secret_store import SecretStoreError, SQLiteSecretStore
+from ops.secret_store import REUSABLE_LOGIN_FIELDS, SecretStoreError, SQLiteSecretStore
 from ops.state import (
     AccessRoute,
     BrowserProvider,
@@ -112,6 +112,12 @@ IDEMPOTENCY_KEY_PATTERN = re.compile(r"^idem_[0-9a-f]{32}$")
 _TERMINAL_BROWSER_STATUSES: frozenset[str] = frozenset(
     {"completed", "failed", "blocked", "configuration_required"}
 )
+
+# Human gates the agent may retry on its own. Everything omitted here needs a
+# real person in the live browser (captcha, passkey, security key, device
+# approval, account selection, legal acceptance, billing) or has its own
+# autonomous resolver with inbox access (email_otp).
+_AUTO_ADVANCEABLE_GATES: frozenset[str] = frozenset({"login_required", "provider_verification"})
 _GATED_OUTREACH_ROUTES = frozenset({"approval_required", "partner_gated"})
 
 # Persisted reason codes for a gated run whose outreach the Composio capability
@@ -415,6 +421,13 @@ class RunService:
         # Background email poller (autonomous "listen for replies").
         self._email_poller_thread: threading.Thread | None = None
         self._email_poller_stop = threading.Event()
+        # Autonomous advancement: bounded per-run count of machine-resolved human
+        # gates (e.g. a login form we already hold credentials for), plus its own
+        # sweep thread. Kept separate from the email poller because it must run
+        # even when Gmail is not configured.
+        self._autonomous_advances: dict[str, int] = {}
+        self._advance_thread: threading.Thread | None = None
+        self._advance_stop = threading.Event()
         # Asynchronous browser execution: when enabled (production live mode), a
         # self-serve browser run commits at browser_running with the live view
         # available immediately, and the bounded onboarding task runs in a
@@ -566,6 +579,10 @@ class RunService:
         # Start the autonomous email poller so the agent listens for and answers
         # provider replies on its own, with no manual polling.
         self._start_email_poller()
+        # Start the autonomous advancement sweep so a human gate the agent can
+        # resolve itself (a login form whose credentials are already authorized)
+        # is retried without anyone pressing Resume.
+        self._start_autonomous_advancer()
 
     def _reconcile_stranded_runs(self) -> None:
         """Recover runs stranded by the previous shutdown.
@@ -761,6 +778,97 @@ class RunService:
             action = observation.get("human_action_type")
             return str(action) if action else None
         return None
+
+    def _start_autonomous_advancer(self) -> None:
+        """Start the sweep that auto-resumes machine-resolvable human gates.
+
+        Deliberately independent of the email poller: that thread only starts when
+        Gmail is configured, so autonomous login continuation would never have run
+        on a deployment without an inbox.
+        """
+
+        settings = self._settings or Settings.from_env()
+        if int(getattr(settings, "max_autonomous_advances", 0)) <= 0:
+            return
+        if self._advance_thread is not None and self._advance_thread.is_alive():
+            return
+        interval = max(5, int(getattr(settings, "autonomous_advance_interval_seconds", 20)))
+        self._advance_stop.clear()
+        thread = threading.Thread(
+            target=self._advance_loop,
+            args=(interval,),
+            name="autonomous-advancer",
+            daemon=True,
+        )
+        self._advance_thread = thread
+        thread.start()
+
+    def _advance_loop(self, interval: int) -> None:
+        while not self._advance_stop.wait(interval):
+            try:
+                self.advance_autonomous_runs()
+            except Exception:  # pragma: no cover - the loop must never die
+                pass
+
+    def advance_autonomous_runs(self, *, limit: int = 100) -> int:
+        """Resume every waiting run whose human gate the agent can resolve itself.
+
+        Only gates that are genuinely machine-resolvable are advanced:
+
+        * ``login_required`` — advanced ONLY when reusable credentials for the app
+          are stored, so this never becomes a pointless retry loop.
+        * ``provider_verification`` — the generic "needs another look" gate the
+          worker also raises for an ambiguous page. With a decision backend now
+          configured, one bounded retry lets the action loop re-plan instead of
+          parking the run forever.
+
+        A CAPTCHA, passkey, device approval, billing or legal gate is never
+        advanced: those require a real human in the live browser. ``email_otp`` is
+        left to ``resolve_pending_otps``, which has the inbox.
+
+        Every advance is bounded per run by ``max_autonomous_advances``, so a login
+        that keeps failing settles into a truthful human gate.
+        """
+
+        settings = self._settings or Settings.from_env()
+        budget = int(getattr(settings, "max_autonomous_advances", 0))
+        if budget <= 0:
+            return 0
+        advanced = 0
+        for record in self.storage.list_runs(limit=limit, offset=0):
+            if record.get("status") != "waiting_for_hitl":
+                continue
+            run_id = str(record.get("run_id") or "")
+            if not run_id:
+                continue
+            action_type = self._hitl_action_type(record)
+            if action_type not in _AUTO_ADVANCEABLE_GATES:
+                continue
+            if self._autonomous_advances.get(run_id, 0) >= budget:
+                continue
+            if action_type == "login_required" and not self._reusable_login_values(
+                str(record.get("app_slug") or "unknown")
+            ):
+                # Nothing to inject: asking the worker again would just re-raise
+                # the same gate. The owner still needs to supply credentials once.
+                continue
+            self._autonomous_advances[run_id] = self._autonomous_advances.get(run_id, 0) + 1
+            try:
+                # resume_run injects the remembered credentials on its own.
+                self.resume_run(run_id, signal="completed")
+            except (RunConflictError, CredentialSubmissionError, KeyError):
+                continue  # another writer owns the run, or it already moved on
+            except Exception:
+                log_event("browser.autonomous_advance.error", level=40, run_id=run_id)
+                continue
+            log_event(
+                "browser.autonomous_advance.resumed",
+                run_id=run_id,
+                gate=action_type,
+                attempt=self._autonomous_advances[run_id],
+            )
+            advanced += 1
+        return advanced
 
     def resolve_pending_otps(self, *, limit: int = 100) -> int:
         """Autonomously resolve every run waiting on an emailed login code."""
@@ -1161,6 +1269,66 @@ class RunService:
             app_slug=app_slug, scope_id=scope_id, values=raw
         )
 
+    def _remember_reusable_login(
+        self, *, app_slug: str, values: Mapping[str, SecretStr]
+    ) -> tuple[str, ...]:
+        """Persist the owner's reusable sign-in credentials for this app.
+
+        Only ``login_email``/``login_password`` are durable; a one-time OTP or
+        verification link is deliberately never remembered. Returns the sanitized
+        field names actually stored (never a value) so the caller can audit the
+        act of remembering without recording the secret.
+
+        A vault failure here must not break the run in progress: the credentials
+        were already injected for THIS run, so failing to remember them only
+        costs autonomy on a later run.
+        """
+
+        store = self._secret_store
+        settings = self._settings or Settings.from_env()
+        if store is None or not getattr(settings, "browser_login_credential_reuse", True):
+            return ()
+        remembered: list[str] = []
+        for login_field in sorted(REUSABLE_LOGIN_FIELDS):
+            secret = values.get(login_field)
+            if secret is None:
+                continue
+            value = secret.get_secret_value()
+            if not value:
+                continue
+            try:
+                store.put_account_login(app_slug=app_slug, field=login_field, value=value)
+            except Exception:
+                continue  # sanitized: never log the value or the failure detail
+            remembered.append(login_field)
+        return tuple(remembered)
+
+    def _reusable_login_values(self, app_slug: str) -> dict[str, SecretStr]:
+        """Load the remembered sign-in credentials for an app, if complete.
+
+        A partial pair is useless to the deterministic login state machine (it
+        would type an email and then stop at the password), so an incomplete set
+        is treated as "nothing stored" and the run still asks the owner once.
+        """
+
+        store = self._secret_store
+        settings = self._settings or Settings.from_env()
+        if store is None or not getattr(settings, "browser_login_credential_reuse", True):
+            return {}
+        reader = getattr(store, "get_account_login", None)
+        if not callable(reader):
+            return {}
+        values: dict[str, SecretStr] = {}
+        for login_field in sorted(REUSABLE_LOGIN_FIELDS):
+            try:
+                value = reader(app_slug=app_slug, field=login_field)
+            except Exception:
+                return {}
+            if not value:
+                return {}
+            values[login_field] = SecretStr(value)
+        return values
+
     def _store_transient_browser_secrets(
         self, *, app_slug: str, scope_id: str, values: Mapping[str, str]
     ) -> dict[str, str]:
@@ -1298,6 +1466,9 @@ class RunService:
         self._email_poller_stop.set()
         if self._email_poller_thread is not None:
             self._email_poller_thread.join(timeout=5)
+        self._advance_stop.set()
+        if self._advance_thread is not None:
+            self._advance_thread.join(timeout=5)
             self._email_poller_thread = None
         workflow = self._workflow
         self._workflow = None
@@ -1529,6 +1700,11 @@ class RunService:
             # (Option A). Carries the pre-created live session so the background
             # navigate can be started once the creation transaction commits.
             pending_async_navigate: tuple[Any, dict[str, str] | None] | None = None
+            # Sanitized autonomous-login bookkeeping: field NAMES and the source
+            # only. A credential value never reaches these variables.
+            login_remembered_fields: tuple[str, ...] = ()
+            injected_login_source: str | None = None
+            injected_login_fields: tuple[str, ...] = ()
 
             if (
                 execution_mode == "execute_when_configured"
@@ -1602,7 +1778,26 @@ class RunService:
                     # values are passed to the workflow only as a call argument and
                     # never persisted to state, checkpoints, the ledger, or logs.
                     start_sensitive_data: dict[str, str] | None = None
-                    if browser_login and run_provider_action:
+                    # Autonomy: when the owner did not supply credentials for THIS
+                    # run, reuse the ones they already authorized for this app.
+                    # Without this a second run always stopped at the login form
+                    # even though the credentials were known.
+                    login_values: Mapping[str, SecretStr] | None = browser_login
+                    login_source = "owner_supplied"
+                    if not login_values and run_provider_action:
+                        remembered = self._reusable_login_values(research.app_slug)
+                        if remembered:
+                            login_values = remembered
+                            login_source = "vault_reuse"
+                    if browser_login:
+                        remembered_fields = self._remember_reusable_login(
+                            app_slug=research.app_slug, values=browser_login
+                        )
+                        if remembered_fields:
+                            login_remembered_fields = remembered_fields
+                    if login_values and run_provider_action:
+                        injected_login_source = login_source
+                        injected_login_fields = tuple(sorted(login_values))
                         start_sensitive_data = self._browser_login_payload(
                             provider=request.browser_provider,
                             # The verified slug and the newly created run id are
@@ -1612,7 +1807,9 @@ class RunService:
                             # Scope the transient references to THIS run, so the
                             # service will only consume them for the matching run.
                             scope_id=run_id,
-                            values=browser_login,
+                            # The resolved set, which may be the remembered
+                            # credentials rather than an owner submission.
+                            values=login_values,
                         )
                     selected_worker = self._browser_worker_for(request.browser_provider)
                     browser_research_ready = bool(
@@ -1972,6 +2169,27 @@ class RunService:
                     run_id=run_id,
                     event_type="outreach_sent",
                     payload=outreach_event,
+                )
+            if injected_login_source is not None:
+                # Field NAMES and the source only, so the timeline proves the
+                # agent signed itself in without recording any credential value.
+                transaction.append_audit_event(
+                    run_id=run_id,
+                    event_type="login_credentials_injected",
+                    payload={
+                        "fields": list(injected_login_fields),
+                        "source": injected_login_source,
+                        "external_actions": True,
+                    },
+                )
+            if login_remembered_fields:
+                transaction.append_audit_event(
+                    run_id=run_id,
+                    event_type="login_credentials_remembered",
+                    payload={
+                        "fields": list(login_remembered_fields),
+                        "external_actions": False,
+                    },
                 )
             for browser_event_type, browser_payload in browser_events:
                 transaction.append_audit_event(
@@ -3350,17 +3568,34 @@ class RunService:
             if current["status"] != "waiting_for_hitl":
                 raise CredentialSubmissionError("run_not_waiting_for_hitl")
             thread_id = str(current.get("thread_id") or run_id)
-            injected_login_fields: list[str] = sorted(browser_login) if browser_login else []
-            sensitive_data: dict[str, str] | None = None
+            app_slug = str(current.get("app_slug") or "unknown")
+            remembered_fields: tuple[str, ...] = ()
             if browser_login:
+                # Remember the owner's sign-in credentials so the NEXT resume (or
+                # the next run) can authenticate without asking again.
+                remembered_fields = self._remember_reusable_login(
+                    app_slug=app_slug, values=browser_login
+                )
+            login_values: Mapping[str, SecretStr] | None = browser_login
+            login_source = "owner_supplied"
+            if not login_values and signal != "cancelled":
+                # Autonomy: a login gate we already hold credentials for must be
+                # resolved by the agent, not by asking the human a second time.
+                reusable = self._reusable_login_values(app_slug)
+                if reusable:
+                    login_values = reusable
+                    login_source = "vault_reuse"
+            injected_login_fields: list[str] = sorted(login_values) if login_values else []
+            sensitive_data: dict[str, str] | None = None
+            if login_values:
                 sensitive_data = self._browser_login_payload(
                     provider=cast(
                         BrowserProvider,
                         current.get("browser_provider", "browser_use"),
                     ),
-                    app_slug=str(current.get("app_slug") or "unknown"),
+                    app_slug=app_slug,
                     scope_id=run_id,
-                    values=browser_login,
+                    values=login_values,
                 )
             try:
                 state = self._workflow.resume(thread_id, signal, sensitive_data=sensitive_data)
@@ -3546,13 +3781,25 @@ class RunService:
                 )
                 if injected_login_fields:
                     # Record ONLY the non-secret field names that were injected;
-                    # the values never touch the ledger, state, or logs.
+                    # the values never touch the ledger, state, or logs. The
+                    # source distinguishes an owner submission from an autonomous
+                    # vault reuse, which is what makes the timeline auditable.
                     transaction.append_audit_event(
                         run_id=run_id,
                         event_type="login_credentials_injected",
                         payload={
                             "fields": injected_login_fields,
+                            "source": login_source,
                             "external_actions": True,
+                        },
+                    )
+                if remembered_fields:
+                    transaction.append_audit_event(
+                        run_id=run_id,
+                        event_type="login_credentials_remembered",
+                        payload={
+                            "fields": list(remembered_fields),
+                            "external_actions": False,
                         },
                     )
                 if next_status == "waiting_for_hitl":

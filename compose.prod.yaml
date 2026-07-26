@@ -110,6 +110,11 @@ services:
       PLAYWRIGHT_DISABLE_SANDBOX: ${PLAYWRIGHT_DISABLE_SANDBOX:-true}
       # The policy-constrained browser action loop needs at least one JSON
       # inference backend. Values stay inside this private service.
+      # Groq is FIRST in build_json_inference's chain and the only strict-schema
+      # free tier we depend on, so it must be passed through here: without it the
+      # loop had no working backend and every ambiguous page became a human gate.
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
       CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
       CEREBRAS_MODEL: ${CEREBRAS_MODEL:-gpt-oss-120b}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}

@@ -160,14 +160,18 @@
       "checkpoints": [
         {
           "order": 1,
-          "instruction": "Open the Pipedrive API settings URL. If redirected to login, account selection, CAPTCHA, or verification, stop for the owner.",
+          "instruction": "Open the Pipedrive API settings URL. Navigate only within Pipedrive account settings; do not open marketplace, billing, or subscription pages.",
           "expected_signals": [
             "Pipedrive login",
             "Personal preferences",
             "API"
           ],
-          "completion": {},
-          "requires_hitl": true,
+          "completion": {
+            "url_path_contains": [
+              "/settings/api"
+            ]
+          },
+          "requires_hitl": false,
           "allowed_value_refs": []
         },
         {

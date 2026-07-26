@@ -1204,7 +1204,11 @@ class PlaywrightBrowserWorker:
             # Inspect the actual form BEFORE generic structural gates on the
             # initial no-secret pass. Real challenges still win when no login form
             # is present, and post-submit challenges are classified by drive_login.
-            if not sensitive_data and resume_signal is None:
+            # Applies on a resumed pass too: an action inside the loop can be
+            # redirected back to the sign-in wall, and the checkpoint matcher must
+            # never be asked to interpret a login page. The per-session handoff
+            # bound still caps how many login pauses one session may raise.
+            if not sensitive_data:
                 login_gate = await self._login_gate_for_current_page(session)
                 if login_gate is not None:
                     return login_gate
@@ -1854,18 +1858,17 @@ class PlaywrightBrowserWorker:
             if after is None:
                 return self._failed_observation(session, "login_incomplete")
             return self._observation_from_login_result(session, after, had_credentials=True)
-        # A blank/home/error surface is not authentication evidence. Keep the
-        # operator in the same session under the bounded verification budget.
-        pending = LoginInspection(
-            state="unknown",
-            email_field=None,
-            password_field=None,
-            otp_fields=(),
-            submit_control=None,
-            current_url=login.current_url,
-            reason_code="login_verification_required",
-        )
-        return self._observation_from_login_result(session, pending, had_credentials=True)
+        # No login surface, no challenge, and not yet at the reviewed goal: this is
+        # an ordinary post-login landing page (a dashboard or a redirect), so the
+        # bounded trace loop must keep driving toward the credential page.
+        #
+        # This previously returned a login_verification_required human gate, which
+        # is what stopped every run one step after authentication: the agent was
+        # already signed in and simply needed to navigate. Returning None is not a
+        # claim of success — success is still proven ONLY by the trace predicate,
+        # and the loop remains bounded by its step, wall-clock and repeated-state
+        # budgets, so a genuinely stuck page still ends at an honest gate.
+        return None
 
     async def _resume_login_after_hitl(
         self, session: _PwSession, trace: BrowserApiTrace

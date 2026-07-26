@@ -242,6 +242,18 @@ class Settings(BaseModel):
     max_unclear_retries: int = Field(default=1, ge=0)
     max_browser_attempts: int = Field(default=2, ge=1)
     max_hitl_count: int = Field(default=3, ge=0)
+    # Autonomous sign-in: remember the owner's app login credentials in the
+    # encrypted vault so a LATER run (or an automatic resume) can authenticate
+    # itself instead of stopping for a human every time. Every other login path
+    # is one-time and run-scoped, which is precisely why autonomy was impossible.
+    # Opt-out with BROWSER_LOGIN_CREDENTIAL_REUSE=false.
+    browser_login_credential_reuse: bool = True
+    # How many times a run may be auto-advanced past a machine-resolvable human
+    # gate (e.g. a login form we hold credentials for) before it truly waits for
+    # a human. Bounded so a persistently failing login can never loop forever.
+    max_autonomous_advances: int = Field(default=2, ge=0, le=10)
+    # Cadence of the autonomous advancement sweep, in seconds.
+    autonomous_advance_interval_seconds: int = Field(default=20, ge=5)
     # Bounded retry for transient Composio Gmail READ failures only (sends are
     # guarded by the effect ledger and never retried here). The per-attempt delay
     # grows exponentially from the base; set the base to 0 to disable waiting.
@@ -373,6 +385,13 @@ class Settings(BaseModel):
                 source.get("EMAIL_POLL_INTERVAL_SECONDS"), default=45
             ),
             "max_unclear_retries": _integer(source.get("MAX_UNCLEAR_RETRIES"), default=1),
+            "browser_login_credential_reuse": _boolean(
+                source.get("BROWSER_LOGIN_CREDENTIAL_REUSE"), default=True
+            ),
+            "max_autonomous_advances": _integer(source.get("MAX_AUTONOMOUS_ADVANCES"), default=2),
+            "autonomous_advance_interval_seconds": _integer(
+                source.get("AUTONOMOUS_ADVANCE_INTERVAL_SECONDS"), default=20
+            ),
             "max_browser_attempts": _integer(source.get("MAX_BROWSER_ATTEMPTS"), default=2),
             "max_hitl_count": _integer(source.get("MAX_HITL_COUNT"), default=3),
             "gmail_retry_max_attempts": _integer(source.get("GMAIL_RETRY_MAX_ATTEMPTS"), default=3),

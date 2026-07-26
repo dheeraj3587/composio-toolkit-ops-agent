@@ -29,9 +29,7 @@ _PLAYWRIGHT = Settings(
     browser_service_token=SecretStr("service-token"),
     allow_local_credential_submission=True,
 )
-_PLAYWRIGHT_INTERACTIVE = _PLAYWRIGHT.model_copy(
-    update={"browser_interactive_hitl_enabled": True}
-)
+_PLAYWRIGHT_INTERACTIVE = _PLAYWRIGHT.model_copy(update={"browser_interactive_hitl_enabled": True})
 _BROWSER_USE = Settings(
     allow_live_browser=True,
     browser_use_api_key=SecretStr("bu-key"),
@@ -141,7 +139,7 @@ def test_waiting_for_hitl_exposes_the_correct_capability() -> None:
         run_status="waiting_for_hitl",
         event_types={"browser_session_started", "browser_hitl_required"},
         browser_session_id="bu_1",
-        hitl=_hitl("provider_verification"),
+        hitl=_hitl("login_required"),
     )
 
     assert state.lifecycle == "waiting_for_hitl"
@@ -151,6 +149,26 @@ def test_waiting_for_hitl_exposes_the_correct_capability() -> None:
     # No OTP submission surface exists in the API yet, so it stays closed.
     assert state.can_submit_otp is False
     assert state.can_submit_credential is False
+
+
+def test_provider_verification_is_cleared_in_the_browser_not_by_a_login_form() -> None:
+    """Only a missing-login gate may offer another email/password submission.
+
+    ``LOGIN_HITL_ACTIONS`` is deliberately just ``login_required``: a provider
+    verification or new-device prompt is completed in the live browser, so
+    advertising the login form there would offer a control that cannot clear it.
+    """
+
+    state = project_browser_ui(
+        settings=_BROWSER_USE,
+        run_status="waiting_for_hitl",
+        event_types={"browser_session_started", "browser_hitl_required"},
+        browser_session_id="bu_1",
+        hitl=_hitl("provider_verification"),
+    )
+
+    assert state.can_resume is True
+    assert state.can_submit_login is False
 
 
 def test_a_captcha_gate_does_not_offer_the_login_form() -> None:

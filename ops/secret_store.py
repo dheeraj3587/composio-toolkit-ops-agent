@@ -74,6 +74,24 @@ def parse_vault_reference(reference: str) -> VaultReferenceParts:
     )
 
 
+# Reusable account-login secrets live in their OWN kind namespace so that a
+# durable sign-in credential can never be confused with (or read through the
+# same path as) a captured integration credential.
+ACCOUNT_LOGIN_KIND_PREFIX = "account_login_"
+
+# Only the sign-in fields the deterministic login state machine can actually
+# use. An unknown field is refused rather than stored under a new kind.
+REUSABLE_LOGIN_FIELDS: frozenset[str] = frozenset({"login_email", "login_password"})
+
+
+def _account_login_kind(field: str) -> str:
+    """Map a permitted login field to its durable vault kind."""
+
+    if field not in REUSABLE_LOGIN_FIELDS:
+        raise ValueError("field is not a reusable login credential")
+    return f"{ACCOUNT_LOGIN_KIND_PREFIX}{field}"
+
+
 @runtime_checkable
 class SecretStore(Protocol):
     def put(self, *, app_slug: str, kind: str, value: str) -> str: ...
@@ -146,6 +164,86 @@ class SQLiteSecretStore:
                 (identifier, app_slug, kind, ciphertext),
             )
         return f"vault://{app_slug}/{kind}/{identifier}"
+
+    def put_account_login(self, *, app_slug: str, field: str, value: str) -> str:
+        """Store (or replace) ONE reusable account-login secret for an app.
+
+        Autonomous sign-in needs the owner's app credentials to survive a single
+        run: every other login path here is one-time and run-scoped, so a second
+        run could never authenticate itself and always stopped at a human gate.
+
+        Deliberately narrow so this cannot become a general secret-reading API:
+        only ``login_*`` fields are accepted, the row is stored under a distinct
+        ``account_login_`` kind (never the same namespace as a captured
+        integration credential), and it is addressable only by (app, field) —
+        which is why the previous value is REPLACED rather than accumulated.
+        """
+
+        kind = _account_login_kind(field)
+        if not isinstance(value, str) or not value:
+            raise ValueError("secret value must be a non-empty string")
+        if _APP_SLUG.fullmatch(app_slug) is None:
+            raise ValueError("app_slug must contain lowercase letters, digits, or hyphens")
+
+        identifier = secrets.token_urlsafe(18)
+        ciphertext = self._fernet.encrypt(value.encode("utf-8"))
+        with self._connect() as connection:
+            # Replace, so exactly one current credential exists per (app, field)
+            # and a rotated password can never be shadowed by a stale row.
+            connection.execute(
+                "DELETE FROM vault_entries WHERE app_slug = ? AND kind = ?",
+                (app_slug, kind),
+            )
+            connection.execute(
+                """
+                INSERT INTO vault_entries (id, app_slug, kind, ciphertext)
+                VALUES (?, ?, ?, ?)
+                """,
+                (identifier, app_slug, kind, ciphertext),
+            )
+        return f"vault://{app_slug}/{kind}/{identifier}"
+
+    def get_account_login(self, *, app_slug: str, field: str) -> str | None:
+        """Return a stored reusable login value, or None when none is stored.
+
+        Returns None (never raises) for the absent case: "no stored credential"
+        is a normal autonomous-run condition, not an error. A row that cannot be
+        decrypted with the ACTIVE key is also None, so a rotated vault key
+        degrades to "log in again" instead of crashing a run.
+        """
+
+        kind = _account_login_kind(field)
+        if _APP_SLUG.fullmatch(app_slug) is None:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT ciphertext
+                FROM vault_entries
+                WHERE app_slug = ? AND kind = ? AND one_time = 0
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (app_slug, kind),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return self._fernet.decrypt(bytes(row[0])).decode("utf-8")
+        except (InvalidToken, UnicodeDecodeError):
+            return None
+
+    def delete_account_login(self, *, app_slug: str, field: str) -> None:
+        """Forget a stored reusable login secret (idempotent)."""
+
+        kind = _account_login_kind(field)
+        if _APP_SLUG.fullmatch(app_slug) is None:
+            return
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM vault_entries WHERE app_slug = ? AND kind = ?",
+                (app_slug, kind),
+            )
 
     def put_transient(
         self,

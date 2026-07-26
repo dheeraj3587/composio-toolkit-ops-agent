@@ -123,6 +123,12 @@ Rules that make progression trustworthy:
   with an empty success predicate. **Only `pipedrive` currently has real
   predicates**, because it is the only app tested live. The other 24 are honest
   placeholders rather than invented evidence.
+- `requires_hitl` is for a checkpoint whose completion genuinely cannot be
+  auto-verified — **not** for "a login or CAPTCHA might appear". Login surfaces,
+  visible challenges and structural gates are detected on every iteration *before*
+  checkpoints are consulted, so a precautionary `requires_hitl` on the first
+  checkpoint only makes an already-authenticated run pause forever. Pipedrive's
+  first checkpoint therefore asserts the reviewed URL (`/settings/api`) instead.
 
 ---
 
