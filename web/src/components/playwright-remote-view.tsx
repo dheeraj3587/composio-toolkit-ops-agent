@@ -183,7 +183,7 @@ export const PlaywrightRemoteView = forwardRef<
         ref={targetRef}
         tabIndex={0}
         aria-label="Remote Chromium desktop; mouse and keyboard controls are active"
-        className="min-h-[420px] w-full overflow-hidden bg-black outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 sm:min-h-[560px] xl:min-h-[640px]"
+        className="relative h-[420px] w-full overflow-hidden bg-black outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 sm:h-[560px] xl:h-[640px]"
       />
     </section>
   )

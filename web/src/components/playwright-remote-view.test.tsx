@@ -60,9 +60,18 @@ describe("PlaywrightRemoteView", () => {
     expect(rfb?.scaleViewport).toBe(true)
     expect(rfb?.resizeSession).toBe(false)
     expect(rfb?.viewOnly).toBe(false)
-    expect(screen.getByLabelText(/remote chromium desktop/i).outerHTML).not.toContain(
-      "signed-grant",
+    const remoteDesktop = screen.getByLabelText(/remote chromium desktop/i)
+    expect(remoteDesktop.outerHTML).not.toContain("signed-grant")
+    // noVNC sizes its internal screen to 100% of this host. A minimum height is
+    // not a definite percentage basis, so its ResizeObserver can autoscale the
+    // canvas to zero after the first visible frame while RFB stays connected.
+    expect(remoteDesktop).toHaveClass(
+      "relative",
+      "h-[420px]",
+      "sm:h-[560px]",
+      "xl:h-[640px]",
     )
+    expect(remoteDesktop.className).not.toContain("min-h-")
 
     rfb?.listeners.get("connect")?.()
     expect(await screen.findByText(/browser connection · connected/i)).toBeInTheDocument()
