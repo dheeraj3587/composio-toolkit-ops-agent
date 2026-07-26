@@ -347,6 +347,28 @@ def _clean_credential_value(value: str) -> str:
     return without_format.strip()
 
 
+def _browser_result_reason(state: Mapping[str, object], default: str) -> str:
+    """Return one typed browser reason without exposing page or exception text."""
+
+    observation = state.get("browser_observation")
+    candidates: list[object] = [observation]
+    for field_name in ("errors", "capability_statuses"):
+        values = state.get(field_name)
+        if isinstance(values, list) and values:
+            candidates.append(values[-1])
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        reason = candidate.get("reason_code")
+        if (
+            isinstance(reason, str)
+            and len(reason) <= 100
+            and re.fullmatch(r"[a-z0-9_:-]+", reason) is not None
+        ):
+            return reason
+    return default
+
+
 def _strip_quoted_reply(body: str) -> str:
     """Keep only the new reply text, dropping quoted history ('On ... wrote:')."""
 
@@ -1726,6 +1748,7 @@ class RunService:
             capability_report: ComposioCapabilityReport | None = None
             capability_event: dict[str, object] | None = None
             browser_events: list[tuple[str, dict[str, object]]] = []
+            observation_status: str | None = None
             # Set when the self-serve browser run is dispatched asynchronously
             # (Option A). Carries the pre-created live session so the background
             # navigate can be started once the creation transaction commits.
@@ -1842,10 +1865,17 @@ class RunService:
                             values=login_values,
                         )
                     selected_worker = self._browser_worker_for(request.browser_provider)
+                    trace_available = get_browser_api_trace(research.app_slug) is not None
+                    # Trace-only readiness is scoped to the assignment's async
+                    # runtime. Conservative/synchronous workflows still load their
+                    # own reviewed operational URLs instead of receiving an
+                    # incomplete baseline from RunService.
                     browser_research_ready = bool(
-                        research.login_url
-                        and research.credential_management_url
-                        and get_browser_api_trace(research.app_slug) is not None
+                        trace_available
+                        and (
+                            self._async_browser_enabled
+                            or (research.login_url and research.credential_management_url)
+                        )
                     )
                     # The pre-created session is attempted first, but a provider
                     # failure must NOT abort run creation. It previously raised
@@ -1995,6 +2025,62 @@ class RunService:
                                 {
                                     "session_id": browser_session,
                                     "status": "browser_running",
+                                    "external_actions": True,
+                                },
+                            ),
+                        ]
+                    elif (
+                        (
+                            persisted_status in {"failed", "blocked"}
+                            or (
+                                persisted_status == "configuration_required"
+                                and observation_status
+                                not in {"credential_page_ready", "developer_console_ready"}
+                            )
+                        )
+                        and isinstance(browser_session, str)
+                        and browser_session
+                    ):
+                        # A workflow can retain the session id after navigation
+                        # fails. The old projection treated any non-empty id as
+                        # success, invented credential_page_ready events, and left
+                        # the UI polling a blank/dead browser forever.
+                        fallback_reason = {
+                            "blocked": "browser_navigation_blocked",
+                            "configuration_required": "browser_configuration_required",
+                            "failed": "browser_operation_failed",
+                        }.get(persisted_status, "browser_operation_failed")
+                        persisted_reason = _browser_result_reason(workflow_state, fallback_reason)
+                        if persisted_status == "configuration_required":
+                            decision_event = "configuration_required"
+                        outreach_updates = {
+                            "browser_session_id": browser_session,
+                            "external_actions": True,
+                            "provider_status": {
+                                "research": "baseline_ready",
+                                "browser": persisted_status,
+                                "email": "not_started",
+                                "validation": "not_started",
+                            },
+                        }
+                        browser_events = [
+                            (
+                                "browser_session_started",
+                                {
+                                    "session_id": browser_session,
+                                    "status": "browser_running",
+                                    "external_actions": True,
+                                },
+                            ),
+                            (
+                                (
+                                    "browser_navigation_blocked"
+                                    if persisted_status == "blocked"
+                                    else "browser_navigation_failed"
+                                ),
+                                {
+                                    "status": persisted_status,
+                                    "reason_code": persisted_reason,
                                     "external_actions": True,
                                 },
                             ),
@@ -2243,6 +2329,20 @@ class RunService:
                 context,
                 async_sensitive,
             )
+        elif persisted_status in _TERMINAL_BROWSER_STATUSES and not (
+            persisted_status == "configuration_required"
+            and observation_status in {"credential_page_ready", "developer_console_ready"}
+        ):
+            # A synchronous workflow may have created a Playwright session and
+            # then failed before returning an observation. Release that terminal
+            # session now instead of serving its blank frame until the janitor TTL.
+            # A verified credential page remains attached for the existing owner
+            # handoff even when capture/validation needs configuration.
+            self._release_browser_session(
+                self._session_context_for(run_id),
+                request.browser_provider,
+                reason=f"sync_terminal_{persisted_status}",
+            )
         return _public_run(created)
 
     def _spawn_async_browser(
@@ -2349,6 +2449,12 @@ class RunService:
         )
         wf_status = str(workflow_state.get("status") or "")
         current_url = workflow_state.get("current_url")
+        outcome_fallback = {
+            "blocked": "browser_navigation_blocked",
+            "configuration_required": "browser_configuration_required",
+            "failed": "browser_operation_failed",
+        }.get(wf_status, "browser_operation_failed")
+        outcome_reason = _browser_result_reason(workflow_state, outcome_fallback)
         try:
             interrupts = self._workflow.get_interrupts(thread_id) if self._workflow else ()
         except Exception:
@@ -2408,11 +2514,44 @@ class RunService:
                 next_status = "blocked"
                 provider_browser = "blocked"
                 events.append(
-                    ("browser_navigation_blocked", {"status": "blocked", "external_actions": True})
+                    (
+                        "browser_navigation_blocked",
+                        {
+                            "status": "blocked",
+                            "reason_code": outcome_reason,
+                            "external_actions": True,
+                        },
+                    )
                 )
             elif wf_status == "failed":
                 next_status = "failed"
                 provider_browser = "failed"
+                events.append(
+                    (
+                        "browser_navigation_failed",
+                        {
+                            "status": "failed",
+                            "reason_code": outcome_reason,
+                            "external_actions": True,
+                        },
+                    )
+                )
+            elif wf_status == "configuration_required" and observation_status not in {
+                "credential_page_ready",
+                "developer_console_ready",
+            }:
+                next_status = "configuration_required"
+                provider_browser = "configuration_required"
+                events.append(
+                    (
+                        "browser_navigation_failed",
+                        {
+                            "status": "configuration_required",
+                            "reason_code": outcome_reason,
+                            "external_actions": True,
+                        },
+                    )
+                )
             elif observation_status in {"credential_page_ready", "developer_console_ready"}:
                 events.append(
                     (
@@ -2526,11 +2665,16 @@ class RunService:
                     transaction.append_audit_event(
                         run_id=run_id, event_type=event_type, payload=payload
                     )
-        self._stop_terminal_playwright_session(
-            context,
-            next_status,
-            request.browser_provider,
-        )
+        preserve_owner_handoff = next_status == "configuration_required" and observation_status in {
+            "credential_page_ready",
+            "developer_console_ready",
+        }
+        if not preserve_owner_handoff:
+            self._stop_terminal_playwright_session(
+                context,
+                next_status,
+                request.browser_provider,
+            )
         log_event("browser.async.applied", run_id=run_id, status=next_status)
 
     def _stop_terminal_playwright_session(

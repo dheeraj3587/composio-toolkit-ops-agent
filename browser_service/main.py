@@ -312,9 +312,15 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
 
     def _worker() -> Any:
         if app.state.worker is None:
+            # ``api.main`` and this isolated service are different processes. The
+            # assignment host matrix therefore has to be installed here too;
+            # otherwise HubSpot remains inactive in the Playwright process and
+            # its first frame is a real white ``about:blank`` page.
+            from api.assignment_runtime import install_assignment_browser_policies
             from ops.config import Settings
             from ops.playwright_worker import PlaywrightBrowserWorker
 
+            install_assignment_browser_policies()
             app.state.worker = PlaywrightBrowserWorker(
                 settings=Settings.from_env(dotenv_path=None),
                 # Headed ONLY when interactive HITL is enabled: a headless browser

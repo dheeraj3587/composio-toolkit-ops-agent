@@ -54,11 +54,14 @@ from ops.composio_capability import (
     ComposioCapabilityReport,
 )
 from ops.config import Settings
+from ops.graph import DurableOperationsWorkflow
 from ops.models import OperationalResearch, OperationsRequest
 from ops.provider_errors import ProviderContractError, ProviderOperationError
+from ops.routing import decide_access
 
 _INACTIVITY_WINDOW = timedelta(minutes=15)
 _MAXIMUM_WINDOW = timedelta(hours=4)
+_CORE_ROUTE = DurableOperationsWorkflow._route
 
 # Reviewed apps with a real official browser surface, keyed by canonical slug.
 # The first block is the original live matrix; the self-serve batch below it was
@@ -891,6 +894,46 @@ class AssignmentBrowserWorker(BrowserWorker):
         )
 
 
+def _assignment_route(
+    workflow: DurableOperationsWorkflow,
+    state: Mapping[str, object],
+) -> dict[str, object]:
+    """Allow trace-backed assignment runs without weakening the core route gate."""
+
+    result = _CORE_ROUTE(workflow, state)  # type: ignore[arg-type]
+    if result.get("route_reason_code") != "verified_browser_urls_missing":
+        return result
+
+    request = OperationsRequest.model_validate(state["request"])
+    if request.dry_run:
+        return result
+
+    research = OperationalResearch.model_validate(state["operational_research"])
+    policy = assignment_policy(research.app_slug)
+    trace = get_browser_api_trace(research.app_slug)
+    decision = decide_access(research)
+    if (
+        policy is None
+        or not policy.active
+        or trace is None
+        or not decision.is_final
+        or decision.route not in {"self_serve", "hybrid"}
+    ):
+        return result
+
+    audit_events = state.get("audit_events")
+    audit_history = list(audit_events) if isinstance(audit_events, list) else []
+    # The strict trace's start_url is validated when the catalog loads and is
+    # checked against this active app policy again by the worker before use.
+    return {
+        "access_route": decision.route,
+        "route_reason": decision.explanation,
+        "route_reason_code": decision.reason_code,
+        "status": "route_selected",
+        "audit_events": [*audit_history, {"event_type": "route_selected"}],
+    }
+
+
 def _assignment_after_route(
     workflow: object,
     state: Mapping[str, object],
@@ -951,6 +994,20 @@ def _install_demo_aware_lookup() -> None:
 _INSTALLED = False
 
 
+def install_assignment_browser_policies() -> None:
+    """Install the reviewed assignment host matrix in the current process.
+
+    The API and isolated Playwright service are separate processes. Installing
+    the matrix only from ``api.main`` left the browser service on the conservative
+    core defaults, where HubSpot is intentionally inactive, so Chromium opened a
+    blank page and then refused the first navigation. Keep this installer narrow:
+    it changes only host-policy metadata and does not install Browser Use adapters
+    or workflow monkey patches in the Playwright process.
+    """
+
+    browser_policy_module._BROWSER_POLICIES.update(_ASSIGNMENT_POLICIES)
+
+
 def install_assignment_runtime() -> None:
     """Install the production-only assignment execution adapters once."""
 
@@ -958,7 +1015,7 @@ def install_assignment_runtime() -> None:
     if _INSTALLED:
         return
 
-    browser_policy_module._BROWSER_POLICIES.update(_ASSIGNMENT_POLICIES)
+    install_assignment_browser_policies()
     _install_demo_aware_lookup()
     browser_worker_module.BrowserWorker = AssignmentBrowserWorker  # type: ignore[misc]
     composio_module.ComposioCapabilityPreflight = (  # type: ignore[misc]
@@ -973,6 +1030,7 @@ def install_assignment_runtime() -> None:
 
     graph_module = importlib.import_module("ops.graph")
     workflow_type = cast(Any, graph_module).DurableOperationsWorkflow
+    workflow_type._route = _assignment_route
     workflow_type._after_route = _assignment_after_route
     _INSTALLED = True
 
@@ -982,5 +1040,6 @@ __all__ = [
     "AssignmentComposioCapabilityPreflight",
     "assignment_allowed_hosts",
     "assignment_policy",
+    "install_assignment_browser_policies",
     "install_assignment_runtime",
 ]
