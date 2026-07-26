@@ -506,6 +506,13 @@ export const appSearchResponseSchema = z.strictObject({
   total: z.number().int().nonnegative(),
 })
 
+export const appCatalogResponseSchema = z.strictObject({
+  // The whole verified snapshot, so the bound is the catalog size rather than a
+  // page of matches.
+  items: z.array(appSearchItemSchema).max(500),
+  total: z.number().int().nonnegative(),
+})
+
 export const appResearchResponseSchema = z.strictObject({
   app: appSearchItemSchema,
   research: operationalResearchSchema,

@@ -14,6 +14,7 @@ from starlette.concurrency import run_in_threadpool
 from api.browser_ui import project_browser_ui, session_lost_recorded
 from api.models import (
     ActionReceipt,
+    AppCatalogResponse,
     AppResearchResponse,
     AppSearchResponse,
     AppSummary,
@@ -123,6 +124,8 @@ class RunService(Protocol):
     async def retry(self, run_id: str, capability: str) -> ActionReceipt: ...
 
     async def search_apps(self, query: str) -> AppSearchResponse: ...
+
+    async def list_apps(self) -> AppCatalogResponse: ...
 
     async def get_app_research(self, app_slug: str) -> AppResearchResponse: ...
 
@@ -652,6 +655,10 @@ class LocalRunService:
         items = [AppSummary.model_validate(item) for item in self._service.search_apps(query)]
         return AppSearchResponse(query=query, items=items, total=len(items))
 
+    def _list_apps_sync(self) -> AppCatalogResponse:
+        items = [AppSummary.model_validate(item) for item in self._service.list_apps()]
+        return AppCatalogResponse(items=items, total=len(items))
+
     def _get_app_research_sync(self, app_slug: str) -> AppResearchResponse:
         result = self._service.get_app_research(app_slug)
         if result is None:
@@ -975,6 +982,10 @@ class LocalRunService:
     async def search_apps(self, query: str) -> AppSearchResponse:
         self._require_started()
         return await run_in_threadpool(self._search_apps_sync, query)
+
+    async def list_apps(self) -> AppCatalogResponse:
+        self._require_started()
+        return await run_in_threadpool(self._list_apps_sync)
 
     async def get_app_research(self, app_slug: str) -> AppResearchResponse:
         self._require_started()

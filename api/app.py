@@ -22,6 +22,7 @@ from starlette.responses import Response
 
 from api.models import (
     ActionReceipt,
+    AppCatalogResponse,
     AppResearchResponse,
     AppSearchResponse,
     CreateRunRequest,
@@ -629,6 +630,20 @@ def create_app(
         # initiated the run to use directly in their application.
         _require_local_owner_submission(request)
         return await run_service.reveal_credentials(run_id)
+
+    @application.get(
+        "/api/apps",
+        response_model=AppCatalogResponse,
+        response_model_exclude_none=True,
+        responses={500: {"model": InternalErrorResponse}},
+    )
+    async def list_apps(run_service: ServiceDependency) -> AppCatalogResponse:
+        """Every verified app, so the UI can offer a selector instead of a guess.
+
+        Declared BEFORE /api/apps/search so the static path is matched first.
+        """
+
+        return await run_service.list_apps()
 
     @application.get(
         "/api/apps/search",

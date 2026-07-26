@@ -4,6 +4,7 @@ import type { ZodType } from "zod"
 
 import {
   actionReceiptSchema,
+  appCatalogResponseSchema,
   appResearchResponseSchema,
   appSearchResponseSchema,
   healthResponseSchema,
@@ -15,6 +16,7 @@ import {
 } from "@/lib/api-schemas"
 import type {
   ActionReceipt,
+  AppCatalogResponse,
   AppResearchResponse,
   AppSearchResponse,
   CompanyProfileInput,
@@ -187,6 +189,10 @@ export function searchApps(query: string): Promise<AppSearchResponse> {
   const normalized = query.trim().slice(0, 120)
   const search = new URLSearchParams({ q: normalized })
   return apiRequest(`/api/apps/search?${search}`, appSearchResponseSchema)
+}
+
+export function listApps(): Promise<AppCatalogResponse> {
+  return apiRequest("/api/apps", appCatalogResponseSchema)
 }
 
 export function getAppResearch(slug: string): Promise<AppResearchResponse> {

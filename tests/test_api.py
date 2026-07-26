@@ -117,6 +117,9 @@ def test_exact_requested_routes_are_registered(harness: ApiHarness) -> None:
         ("/api/runs/{run_id}/poll-email", "POST"),
         ("/api/runs/{run_id}/retry", "POST"),
         ("/api/runs/{run_id}/output", "GET"),
+        # The full verified catalog, so the interface can offer a selector
+        # instead of requiring the operator to know an app's exact name.
+        ("/api/apps", "GET"),
         ("/api/apps/search", "GET"),
         ("/api/apps/{app_slug}/research", "GET"),
         ("/api/system/health", "GET"),
@@ -590,3 +593,34 @@ def test_unhandled_exception_response_is_generic_and_sanitized(tmp_path: Path) -
         "message": "Request could not be completed.",
     }
     assert "internal-exception-marker" not in response.text
+
+
+def test_app_catalog_lists_every_verified_app(harness: ApiHarness) -> None:
+    """The catalog endpoint must return the whole snapshot, not a page of matches.
+
+    Search alone required knowing an app's name, which is unusable for an operator
+    who does not know what the snapshot contains.
+    """
+
+    response = harness.client.get("/api/apps")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == len(payload["items"])
+    # More than the 20-result search cap, and ordered by display name.
+    assert payload["total"] > 20
+    names = [item["app_name"] for item in payload["items"]]
+    assert names == sorted(names, key=str.casefold)
+    assert any(item["app_slug"] == "pipedrive" for item in payload["items"])
+    # Same non-secret projection as search: no extra fields leak through.
+    assert set(payload["items"][0]) <= {
+        "app_name",
+        "app_slug",
+        "category",
+        "api_type",
+        "auth_methods",
+        "access_route",
+        "buildability",
+        "verification_status",
+        "confidence",
+    }

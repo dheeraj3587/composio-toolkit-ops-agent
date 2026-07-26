@@ -121,9 +121,7 @@ def project_browser_ui(
         lifecycle=lifecycle,
         session_live=session_live,
         screenshot_present=screenshot_present,
-        interactive_enabled=bool(
-            getattr(settings, "browser_interactive_hitl_enabled", False)
-        ),
+        interactive_enabled=bool(getattr(settings, "browser_interactive_hitl_enabled", False)),
     )
     # Rule 9: interactivity is a provider capability, not a run state. Only a
     # hosted provider view (or a real interactive remote) can be driven; masked

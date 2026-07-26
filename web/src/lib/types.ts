@@ -362,6 +362,11 @@ export interface AppSearchResponse {
   total: number
 }
 
+export interface AppCatalogResponse {
+  items: AppSearchItem[]
+  total: number
+}
+
 export interface AppResearchResponse {
   app: AppSearchItem
   research: OperationalResearch

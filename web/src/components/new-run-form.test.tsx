@@ -7,6 +7,35 @@ vi.mock("@/app/runs/new/actions", () => ({
   createRunAction: vi.fn(),
 }))
 
+// The app field is now a selector over the verified catalog. The catalog hook is
+// stubbed so these tests stay about the form, not about fetching.
+vi.mock("@/lib/app-catalog", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/app-catalog")>()
+  return {
+    ...actual,
+    useAppCatalog: () => ({
+      data: {
+        items: [
+          {
+            app_name: "Pipedrive",
+            app_slug: "pipedrive",
+            category: "CRM",
+            api_type: "REST",
+            access_route: "self_serve",
+            auth_methods: ["API Key"],
+            confidence: 0.9,
+            buildability: "Easy",
+            verification_status: "Hand-Checked",
+          },
+        ],
+        total: 1,
+      },
+      isPending: false,
+      isError: false,
+    }),
+  }
+})
+
 describe("NewRunForm", () => {
   it("shows the required company fields and makes execute-mode boundaries explicit", () => {
     render(
@@ -19,7 +48,9 @@ describe("NewRunForm", () => {
       />,
     )
 
-    expect(screen.getByRole("textbox", { name: "Application name" })).toHaveValue("Pipedrive")
+    // The prefilled app is selected in the catalog selector, so nobody has to
+    // know or retype its exact name.
+    expect(screen.getByRole("combobox", { name: "Application" })).toHaveTextContent("Pipedrive")
     expect(screen.getByRole("textbox", { name: "Legal name" })).toBeInTheDocument()
     expect(screen.getByRole("textbox", { name: "Company website" })).toBeInTheDocument()
     expect(screen.getByRole("textbox", { name: "Integration use case" })).toBeInTheDocument()

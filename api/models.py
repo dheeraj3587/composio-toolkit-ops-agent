@@ -570,6 +570,18 @@ class AppSearchResponse(StrictApiModel):
     total: int = Field(ge=0)
 
 
+class AppCatalogResponse(StrictApiModel):
+    """Every verified app, so a selector can offer a choice without a query.
+
+    Deliberately separate from ``AppSearchResponse``: this response has no query
+    to echo, and its ``total`` is the size of the verified snapshot rather than a
+    match count.
+    """
+
+    items: list[AppSummary]
+    total: int = Field(ge=0)
+
+
 class AppResearchResponse(StrictApiModel):
     app: AppSummary
     research: OperationalResearch

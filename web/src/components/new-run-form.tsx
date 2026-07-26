@@ -8,6 +8,7 @@ import { z } from "zod"
 import { ArrowRight, Check, LockKeyhole, ShieldCheck } from "lucide-react"
 
 import { createRunAction, type CreateRunFormState } from "@/app/runs/new/actions"
+import { AppNameField } from "@/components/app-name-field"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { BrowserEngineField, browserProviderIsSelectable } from "@/components/browser-engine-field"
@@ -137,8 +138,13 @@ export function NewRunForm({
           <legend className="mb-5 font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
             01 · Target and policy
           </legend>
-          <Field label="Application name" htmlFor="app_name" error={fieldError(errors.app_name?.message, serverInvalid.has("app_name"))}>
-            <Input id="app_name" maxLength={120} placeholder="e.g. Pipedrive" aria-invalid={invalid("app_name")} {...register("app_name")} />
+          <Field
+            label="Application"
+            htmlFor="app_name"
+            hint="Every app in the verified P1 snapshot is listed. Choose “Other” only for an app outside the snapshot, which uses one bounded enrichment probe."
+            error={fieldError(errors.app_name?.message, serverInvalid.has("app_name"))}
+          >
+            <AppNameField control={control} invalid={invalid("app_name")} />
           </Field>
           <Field label="Scope policy" htmlFor="requested_scope_policy" hint="The backend still limits scopes to evidence-backed provider requirements.">
             <Controller

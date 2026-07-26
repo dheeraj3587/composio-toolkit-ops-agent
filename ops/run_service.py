@@ -113,6 +113,36 @@ _TERMINAL_BROWSER_STATUSES: frozenset[str] = frozenset(
     {"completed", "failed", "blocked", "configuration_required"}
 )
 
+
+def _app_projection(record: P1AppRecord) -> dict[str, Any]:
+    """The ONE minimal, non-secret projection of a verified P1 record.
+
+    Shared by catalog search and the full listing so the two can never drift into
+    exposing different fields for the same record.
+    """
+
+    return {
+        "app_name": record.app,
+        "app_slug": record.slug,
+        "category": record.category,
+        "api_type": record.api_type,
+        "auth_methods": list(record.auth_methods),
+        "access_route": to_operational_research(record).access_route,
+        "buildability": record.buildability,
+        "verification_status": record.verification_status,
+        "confidence": record.confidence,
+    }
+
+
+def _sanitized_app_list(items: list[dict[str, Any]], *, capability: str) -> list[dict[str, Any]]:
+    """Redact a catalog projection, refusing to return an unexpected shape."""
+
+    sanitized = redact_data(items)
+    if not isinstance(sanitized, list):  # pragma: no cover - fixed list invariant
+        raise RuntimeError(f"{capability} response could not be sanitized")
+    return cast("list[dict[str, Any]]", sanitized)
+
+
 # Human gates the agent may retry on its own. Everything omitted here needs a
 # real person in the live browser (captcha, passkey, security key, device
 # approval, account selection, legal acceptance, billing) or has its own
@@ -2951,25 +2981,28 @@ class RunService:
             haystack = " ".join((record.app, record.slug, record.category)).casefold()
             if normalized and normalized not in haystack:
                 continue
-            matches.append(
-                {
-                    "app_name": record.app,
-                    "app_slug": record.slug,
-                    "category": record.category,
-                    "api_type": record.api_type,
-                    "auth_methods": list(record.auth_methods),
-                    "access_route": to_operational_research(record).access_route,
-                    "buildability": record.buildability,
-                    "verification_status": record.verification_status,
-                    "confidence": record.confidence,
-                }
-            )
+            matches.append(_app_projection(record))
             if len(matches) >= limit:
                 break
-        sanitized = redact_data(matches)
-        if not isinstance(sanitized, list):  # pragma: no cover - fixed list invariant
-            raise RuntimeError("app search response could not be sanitized")
-        return cast(list[dict[str, Any]], sanitized)
+        return _sanitized_app_list(matches, capability="app search")
+
+    def list_apps(self) -> list[dict[str, Any]]:
+        """Return EVERY verified app, so the interface can offer a real choice.
+
+        Search alone required the operator to already know an app's name. This
+        returns the whole snapshot (ordered by display name) so a selector can be
+        populated before anyone types, which is the difference between "guess the
+        spelling" and "pick from the verified catalog".
+
+        Same minimal projection and sanitization as ``search_apps``; the response
+        is derived only from the provenance-verified snapshot.
+        """
+
+        snapshot = load_verified_snapshot(self.p1_adapter.snapshot_root)
+        ordered = sorted(snapshot.records, key=lambda record: record.app.casefold())
+        return _sanitized_app_list(
+            [_app_projection(record) for record in ordered], capability="app catalog"
+        )
 
     def get_app_research(self, app_slug: str) -> tuple[dict[str, Any], OperationalResearch] | None:
         """Return a verified app summary and its conservative operational baseline."""
