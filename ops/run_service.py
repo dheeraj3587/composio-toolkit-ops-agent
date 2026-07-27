@@ -56,7 +56,6 @@ from ops.integrator import build_integrator_bundle
 from ops.models import (
     CapabilityAvailability,
     CompanyProfile,
-    IntegratorBundle,
     OperationalResearch,
     OperationsRequest,
     validate_vault_reference,
@@ -85,7 +84,6 @@ from ops.provider_errors import (
     ProviderContractError,
     ProviderOperationError,
 )
-from ops.redaction import redact_data
 from ops.research_cache import SqliteResearchCache
 from ops.routing import RoutingDecision, decide_access
 
@@ -126,7 +124,8 @@ from ops.run_projections import (  # noqa: F401
     _strip_quoted_reply,
     decode_stored_payload,
 )
-from ops.secret_store import REUSABLE_LOGIN_FIELDS, SecretStoreError, SQLiteSecretStore
+from ops.run_queries import RunQueryService
+from ops.secret_store import REUSABLE_LOGIN_FIELDS, SQLiteSecretStore
 from ops.state import (
     AccessRoute,
     BrowserProvider,
@@ -326,6 +325,10 @@ class RunService:
         self._effect_store: SQLiteEffectStore | None = None
         # Sanitized startup wiring audit rows; never contains secrets.
         self._wiring: list[dict[str, object]] = []
+        # Read-only query collaborator. It holds a reference to this service and
+        # resolves storage, the snapshot adapter and the secret store on every
+        # call, so adapters assigned after construction are still honored.
+        self._queries = RunQueryService(self)
 
     @classmethod
     def from_paths(
@@ -3264,139 +3267,41 @@ class RunService:
         )
 
     def list_runs(self, *, limit: int = 50, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
-        records = self.storage.list_runs(limit=limit, offset=offset)
-        return ([_public_run(record) for record in records], self.storage.count_runs())
+        return self._queries.list_runs(limit=limit, offset=offset)
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
-        record = self.storage.get_run(run_id)
-        return _public_run(record) if record is not None else None
+        return self._queries.get_run(run_id)
 
     def get_timeline(self, run_id: str) -> list[dict[str, Any]]:
-        if self.storage.get_run(run_id) is None:
-            return []
-        return self.storage.list_audit_events(run_id)
+        return self._queries.get_timeline(run_id)
 
     def get_research(self, run_id: str) -> OperationalResearch | None:
         """Return the persisted sanitized research projection for a run."""
 
-        record = self.storage.get_run(run_id)
-        if record is None:
-            return None
-        persisted = record.get("operational_research")
-        if isinstance(persisted, Mapping):
-            return OperationalResearch.model_validate(persisted)
-        return None
+        return self._queries.get_research(run_id)
 
     def search_apps(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
         """Search the verified P1 catalog and return a minimal safe projection."""
 
-        if limit < 1 or limit > 100:
-            raise ValueError("limit must be between 1 and 100")
-        normalized = " ".join(query.casefold().split())
-        snapshot = load_verified_snapshot(self.p1_adapter.snapshot_root)
-        matches: list[dict[str, Any]] = []
-        for record in snapshot.records:
-            haystack = " ".join((record.app, record.slug, record.category)).casefold()
-            if normalized and normalized not in haystack:
-                continue
-            matches.append(_app_projection(record))
-            if len(matches) >= limit:
-                break
-        return _sanitized_app_list(matches, capability="app search")
+        return self._queries.search_apps(query, limit=limit)
 
     def list_apps(self) -> list[dict[str, Any]]:
-        """Return EVERY verified app, so the interface can offer a real choice.
+        """Return EVERY verified app, so the interface can offer a real choice."""
 
-        Search alone required the operator to already know an app's name. This
-        returns the whole snapshot (ordered by display name) so a selector can be
-        populated before anyone types, which is the difference between "guess the
-        spelling" and "pick from the verified catalog".
-
-        Same minimal projection and sanitization as ``search_apps``; the response
-        is derived only from the provenance-verified snapshot.
-        """
-
-        snapshot = load_verified_snapshot(self.p1_adapter.snapshot_root)
-        ordered = sorted(snapshot.records, key=lambda record: record.app.casefold())
-        return _sanitized_app_list(
-            [_app_projection(record) for record in ordered], capability="app catalog"
-        )
+        return self._queries.list_apps()
 
     def get_app_research(self, app_slug: str) -> tuple[dict[str, Any], OperationalResearch] | None:
         """Return a verified app summary and its conservative operational baseline."""
 
-        lookup = self.p1_adapter.lookup(app_slug)
-        if not isinstance(lookup, P1LookupFound):
-            return None
-        record = lookup.record
-        research, _baseline_version = apply_reviewed_operational_baseline(
-            to_operational_research(record)
-        )
-        summary = {
-            "app_name": record.app,
-            "app_slug": record.slug,
-            "category": record.category,
-            "api_type": record.api_type,
-            "auth_methods": list(record.auth_methods),
-            "access_route": research.access_route,
-            "buildability": record.buildability,
-            "verification_status": record.verification_status,
-            "confidence": record.confidence,
-        }
-        return summary, research
+        return self._queries.get_app_research(app_slug)
 
     def get_output(self, run_id: str) -> dict[str, Any] | None:
-        record = self.storage.get_run(run_id)
-        if record is None:
-            return None
-        bundle = record.get("integrator_bundle")
-        if bundle is None:
-            return {}
-        validated = IntegratorBundle.model_validate(bundle)
-        sanitized = redact_data(validated.model_dump(mode="json"))
-        if not isinstance(sanitized, dict):  # pragma: no cover - model invariant
-            raise RuntimeError("output response could not be sanitized")
-        return cast(dict[str, Any], sanitized)
+        return self._queries.get_output(run_id)
 
     def reveal_credentials(self, run_id: str) -> dict[str, str] | None:
-        """Owner-only raw credential reveal resolved live from the encrypted vault.
+        """Owner-only raw credential reveal resolved live from the encrypted vault."""
 
-        This is the single, deliberate boundary that returns obtained credential
-        VALUES, for the authenticated owner to use directly in their own app. The
-        run's ``vault://`` references are resolved in-memory and returned; the raw
-        values are never written to run state, checkpoints, the ledger, or logs.
-        Only a sanitized ``credentials_revealed`` audit event (kinds only) is
-        recorded. Returns ``None`` when the run is absent and ``{}`` when no
-        credential references exist yet.
-        """
-
-        record = self.storage.get_run(run_id)
-        if record is None:
-            return None
-        store = self._secret_store
-        if store is None:
-            raise CredentialSubmissionError("credential_boundary_not_configured")
-        bundle = record.get("integrator_bundle")
-        if not isinstance(bundle, Mapping):
-            return {}
-        references = bundle.get("credential_refs")
-        if not isinstance(references, Mapping) or not references:
-            return {}
-        revealed: dict[str, str] = {}
-        try:
-            for kind, reference in references.items():
-                validated_reference = validate_vault_reference(str(reference))
-                revealed[str(kind)] = store.get(validated_reference)
-        except SecretStoreError:
-            raise CredentialSubmissionError("credential_reference_unresolved") from None
-        with self.storage.unit_of_work() as transaction:
-            if transaction.get_run(run_id) is not None:
-                transaction.append_audit_event(
-                    run_id=run_id,
-                    event_type="credentials_revealed",
-                    payload={"kinds": sorted(revealed), "external_actions": False},
-                )
-        return revealed
+        return self._queries.reveal_credentials(run_id)
 
     def project(
         self,
@@ -4374,4 +4279,4 @@ class RunService:
         return projected
 
     def snapshot_provenance(self) -> P1SnapshotProvenance:
-        return load_verified_snapshot(self.p1_adapter.snapshot_root).provenance
+        return self._queries.snapshot_provenance()
