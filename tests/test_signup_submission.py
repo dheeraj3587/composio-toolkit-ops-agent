@@ -23,14 +23,24 @@ from ops.signup_forms import (
     detect_signup_form,
 )
 from ops.signup_state_machine import SignupState
-from ops.signup_submission import SignupSubmissionResult, submit_signup_form
+from ops.signup_submission import (
+    SignupSubmissionResult,
+    _signup_effect_key,
+    submit_signup_form,
+)
+
+# Obviously synthetic and assembled rather than stored as a password-shaped
+# fixture literal. The value exists only in the fake in-memory secret store.
+SYNTHETIC_CREDENTIAL_VALUE = "".join(("Example", "Account", "42"))
 
 
 class FakeSecretStore:
     def __init__(self, values: dict[str, str]) -> None:
         self.values = values
+        self.reads = 0
 
     def get(self, reference: str) -> str:
+        self.reads += 1
         return self.values[reference]
 
 
@@ -56,6 +66,7 @@ class FakeLocator:
         submit_metadata: dict[str, object] | None = None,
         page: FakePage | None = None,
         fail_click: bool = False,
+        count_value: int = 1,
     ) -> None:
         self.value = value
         self.accessible_name = accessible_name
@@ -76,11 +87,12 @@ class FakeLocator:
         self.submit_metadata = submit_metadata
         self.page = page
         self.fail_click = fail_click
+        self.count_value = count_value
         self.trial_clicks = 0
         self.actual_clicks = 0
 
     async def count(self) -> int:
-        return 1
+        return self.count_value
 
     async def is_visible(self) -> bool:
         return True
@@ -190,7 +202,7 @@ def contract() -> BrowserAutomationContract:
 def candidate(index: int, *, kind: str, name: str) -> SignupControlCandidate:
     return SignupControlCandidate(
         token=f"sf_{index:032x}",
-        control_kind=kind,  # type: ignore[arg-type]
+        control_kind=kind,  # type: ignore[arg-type] - fixture validates runtime vocabulary
         accessible_name=name,
     )
 
@@ -255,16 +267,15 @@ def page_for(
     fail_click: bool = False,
     form_method: str = "post",
 ) -> tuple[FakePage, FakeLocator]:
-    fields = inspection.fields
     values = {
         "email": "owner@example.com",
-        "password": "StrongPassword123",
-        "password_confirmation": "StrongPassword123",
+        "password": SYNTHETIC_CREDENTIAL_VALUE,  # pragma: allowlist secret
+        "password_confirmation": SYNTHETIC_CREDENTIAL_VALUE,  # pragma: allowlist secret
         "company_name": "Example Labs",
     }
     locators: dict[str, FakeLocator] = {}
     submit_locator: FakeLocator | None = None
-    for field in fields:
+    for field in inspection.fields:
         if field.semantic_field == "signup_submit":
             locator = FakeLocator(
                 accessible_name="Create account",
@@ -315,12 +326,12 @@ def submission_dependencies() -> tuple[
     SignupAccountBinding,
 ]:
     email_ref = "vault://example/signup_email/email_1"
-    password_ref = "vault://example/account_password/password_1"
+    password_ref = "vault://example/account_password/password_1"  # pragma: allowlist secret
     values = approved_values(email_ref=email_ref, password_ref=password_ref)
     secret_store = FakeSecretStore(
         {
             email_ref: "owner@example.com",
-            password_ref: "StrongPassword123",
+            password_ref: SYNTHETIC_CREDENTIAL_VALUE,
         }
     )
     binding = SignupAccountBinding(
@@ -337,6 +348,9 @@ async def dispatch(
     page: FakePage,
     inspection: SignupFormInspection,
     fill_result: SignupFillResult,
+    *,
+    effect_store: SQLiteEffectStore | None = None,
+    capture_guard: bool = True,
 ) -> SignupSubmissionResult:
     values, store, manager, binding = submission_dependencies()
     return await submit_signup_form(
@@ -349,10 +363,11 @@ async def dispatch(
         current_state=SignupState.SIGNUP_SUBMISSION_READY,
         run_id="run_1",
         session_id="bs_1",
-        secret_store=store,  # type: ignore[arg-type]
-        credential_manager=manager,  # type: ignore[arg-type]
+        secret_store=store,  # type: ignore[arg-type] - focused fake store
+        credential_manager=manager,  # type: ignore[arg-type] - focused fake manager
         account_binding=binding,
-        effect_store=SQLiteEffectStore(tmp_path / "effects.db"),
+        effect_store=effect_store or SQLiteEffectStore(tmp_path / "effects.db"),
+        assert_secret_capture_disabled=(lambda: None) if capture_guard else None,
     )
 
 
@@ -363,8 +378,6 @@ async def test_approved_signup_submission_is_dispatched_at_most_once(
     page, submit = page_for(inspection)
 
     first = await dispatch(tmp_path, page, inspection, fill_result)
-    # Simulate a crash after the click and a resumed browser already on the next
-    # page. A completed effect must replay without requiring the old form DOM.
     page.token_locators = {}
     page.gate_locators = []
     second = await dispatch(tmp_path, page, inspection, fill_result)
@@ -423,8 +436,7 @@ async def test_legal_and_payment_gates_never_submit(
     gate: str,
 ) -> None:
     inspection, fill_result = prepared_form()
-    gate_locator = FakeLocator(gate_metadata=metadata)
-    page, submit = page_for(inspection, gate_locator=gate_locator)
+    page, submit = page_for(inspection, gate_locator=FakeLocator(gate_metadata=metadata))
 
     result = await dispatch(tmp_path, page, inspection, fill_result)
 
@@ -450,9 +462,7 @@ async def test_ambiguous_click_outcome_is_never_blindly_retried(
     assert submit.actual_clicks == 1
 
 
-async def test_get_form_is_blocked_before_click(
-    tmp_path: Path,
-) -> None:
+async def test_get_form_is_blocked_before_click(tmp_path: Path) -> None:
     inspection, fill_result = prepared_form()
     page, submit = page_for(inspection, form_method="get")
 
@@ -460,4 +470,102 @@ async def test_get_form_is_blocked_before_click(
 
     assert result.status == "configuration_required"
     assert result.reason_code == "signup_submit_get_form_blocked"
+    assert submit.actual_clicks == 0
+
+
+async def test_duplicate_page_token_safe_stops_before_click(tmp_path: Path) -> None:
+    inspection, fill_result = prepared_form()
+    page, submit = page_for(inspection)
+    submit.count_value = 2
+
+    result = await dispatch(tmp_path, page, inspection, fill_result)
+
+    assert result.status == "failed"
+    assert result.reason_code == "signup_submit_control_stale_or_ambiguous"
+    assert submit.actual_clicks == 0
+    assert submit.trial_clicks == 0
+
+
+async def test_secret_capture_guard_is_required_before_dom_comparison(
+    tmp_path: Path,
+) -> None:
+    inspection, fill_result = prepared_form()
+    page, submit = page_for(inspection)
+
+    result = await dispatch(
+        tmp_path,
+        page,
+        inspection,
+        fill_result,
+        capture_guard=False,
+    )
+
+    assert result.status == "configuration_required"
+    assert result.reason_code == "signup_secret_capture_guard_missing"
+    assert submit.actual_clicks == 0
+
+
+def test_effect_key_changes_with_every_stable_identity_component() -> None:
+    baseline = _signup_effect_key(
+        run_id="run_1",
+        contract_version="2026.07.27",
+        account_binding_id="binding_1",
+    )
+
+    assert baseline != _signup_effect_key(
+        run_id="run_2",
+        contract_version="2026.07.27",
+        account_binding_id="binding_1",
+    )
+    assert baseline != _signup_effect_key(
+        run_id="run_1",
+        contract_version="2026.07.28",
+        account_binding_id="binding_1",
+    )
+    assert baseline != _signup_effect_key(
+        run_id="run_1",
+        contract_version="2026.07.27",
+        account_binding_id="binding_2",
+    )
+
+
+async def test_completed_receipt_must_match_exact_account_binding(
+    tmp_path: Path,
+) -> None:
+    inspection, fill_result = prepared_form()
+    page, submit = page_for(inspection)
+    values, _store, _manager, binding = submission_dependencies()
+    effects = SQLiteEffectStore(tmp_path / "effects.db")
+    key = _signup_effect_key(
+        run_id=values.run_id,
+        contract_version=contract().contract_version,
+        account_binding_id=binding.binding_id,
+    )
+    effects.reserve(
+        provider="example",
+        action="signup_submit",
+        idempotency_key=key,
+    )
+    effects.complete(
+        provider="example",
+        action="signup_submit",
+        idempotency_key=key,
+        receipt={
+            "result": "dispatched",
+            "purpose": "signup_submit",
+            "contract_version": contract().contract_version,
+            "account_binding_id": "different_binding",
+        },
+    )
+
+    result = await dispatch(
+        tmp_path,
+        page,
+        inspection,
+        fill_result,
+        effect_store=effects,
+    )
+
+    assert result.status == "outcome_unknown"
+    assert result.reason_code == "signup_submit_receipt_invalid"
     assert submit.actual_clicks == 0
