@@ -131,6 +131,50 @@ async def test_transient_observation_failure_does_not_become_signup_failure() ->
     assert responses == []
 
 
+async def test_blind_spot_resets_the_stability_streak() -> None:
+    responses = [
+        SignupResultCapture(
+            status="captured",
+            reason_code="signup_result_observation_captured",
+            observation=success_observation(),
+        ),
+        SignupResultCapture(
+            status="retryable",
+            reason_code="signup_result_surface_unavailable",
+        ),
+        SignupResultCapture(
+            status="captured",
+            reason_code="signup_result_observation_captured",
+            observation=success_observation(),
+        ),
+        SignupResultCapture(
+            status="captured",
+            reason_code="signup_result_observation_captured",
+            observation=success_observation(),
+        ),
+    ]
+    calls = 0
+
+    async def reader(_page, _contract) -> SignupResultCapture:
+        nonlocal calls
+        calls += 1
+        return responses.pop(0)
+
+    result = await wait_for_signup_result(
+        FakePage(),
+        contract(),
+        timeout_seconds=1.0,
+        poll_seconds=0.05,
+        stable_observations=2,
+        observation_reader=reader,
+        gate_reader=clear_gates,
+    )
+
+    assert result.outcome == "account_created_authenticated"
+    assert calls == 4
+    assert responses == []
+
+
 async def test_unproven_timeout_remains_outcome_unknown() -> None:
     unknown = SignupResultObservation(
         page_url="https://app.example.test/loading",
