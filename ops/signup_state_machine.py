@@ -144,7 +144,7 @@ class SQLiteSignupStateStore:
             connection.execute("PRAGMA secure_delete = ON")
 
             # Normal reads take a read-only fast path once the additive schema is
-            # current. Only a missing table or column acquires the write reservation.
+            # current. Only a missing table or column acquires a write reservation.
             columns = _signup_state_columns(connection)
             if {"reason_code", "outcome"} <= columns:
                 return
@@ -374,18 +374,50 @@ def _signup_state_columns(connection: sqlite3.Connection) -> set[str]:
     return {
         str(row[1])
         for row in connection.execute("PRAGMA table_info(signup_states)").fetchall()
+        if len(row) > 1
     }
 
 
 def _snapshot(row: tuple[object, ...]) -> SignupStateSnapshot:
+    if len(row) != 6:
+        raise RuntimeError("signup state row has an invalid shape")
     return SignupStateSnapshot(
-        run_id=str(row[0]),
-        state=SignupState(str(row[1])),
-        revision=int(row[2]),
-        updated_at=str(row[3]),
-        reason_code=str(row[4] or "signup_state_legacy"),
-        outcome=str(row[5]) if row[5] is not None else None,
+        run_id=_required_text(row[0], "run id"),
+        state=SignupState(_required_text(row[1], "state")),
+        revision=_revision(row[2]),
+        updated_at=_required_text(row[3], "updated timestamp"),
+        reason_code=(
+            _required_text(row[4], "reason code")
+            if row[4] is not None
+            else "signup_state_legacy"
+        ),
+        outcome=_optional_text(row[5], "signup outcome"),
     )
+
+
+def _revision(value: object) -> int:
+    # SQLite should return INTEGER as int. Refuse bool and malformed adapters rather
+    # than coercing an arbitrary object through int(), which hid corrupt rows from
+    # strict type checking and could produce misleading revision conflicts.
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+        return int(value)
+    raise RuntimeError("signup state revision is invalid")
+
+
+def _required_text(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(f"signup state {label} is invalid")
+    return value
+
+
+def _optional_text(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(f"signup state {label} is invalid")
+    return value
 
 
 def _validate_metadata(value: str, label: str) -> None:
