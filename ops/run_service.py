@@ -77,7 +77,6 @@ from ops.p1_adapter import (
 )
 from ops.provider_errors import (
     ConfigurationRequiredError,
-    ProviderOperationError,
 )
 from ops.research_cache import SqliteResearchCache
 from ops.routing import RoutingDecision, decide_access
@@ -99,6 +98,7 @@ from ops.run_idempotency import (  # noqa: F401
 )
 from ops.run_idempotency import validate_idempotency_key as validate_idempotency_key
 from ops.run_live_view import RunLiveViewService
+from ops.run_login_secrets import RunLoginSecretService
 
 # Imported for use below AND deliberately re-exported: tests and debugging
 # surfaces import these internals from ``ops.run_service``, which stays their
@@ -134,7 +134,7 @@ from ops.run_verification import (  # noqa: F401
     _verification_backoff,
     _VerificationBinding,
 )
-from ops.secret_store import REUSABLE_LOGIN_FIELDS, SQLiteSecretStore
+from ops.secret_store import SQLiteSecretStore
 from ops.state import (
     AccessRoute,
     BrowserProvider,
@@ -298,6 +298,12 @@ class RunService:
         """Startup and periodic recovery of runs holding a dead browser."""
 
         return RunReconciliationService(self)
+
+    @property
+    def _login_secrets(self) -> RunLoginSecretService:
+        """Browser sign-in secret transport, reuse and transient vaulting."""
+
+        return RunLoginSecretService(self)
 
     @property
     def _projection(self) -> RunProjectionService:
@@ -888,136 +894,35 @@ class RunService:
         scope_id: str,
         values: Mapping[str, SecretStr],
     ) -> dict[str, str]:
-        """Build the credential payload for the ACTIVE browser provider.
+        """Build the credential payload for the ACTIVE browser provider."""
 
-        Browser Use receives raw values in-process, exactly as before. The browser
-        SERVICE must never receive a raw value over RPC, so each permitted secret is
-        first stored as a TRANSIENT (one-time, run-scoped, expiring) ``vault://``
-        reference and only the reference travels; the service consumes it once.
-        """
-
-        raw = {name: secret.get_secret_value() for name, secret in values.items()}
-        worker = self._browser_worker_for(provider)
-        if getattr(worker, "provider_name", "") != "playwright":
-            return raw
-        if not callable(getattr(worker, "reconcile_session", None)):
-            # In-process Playwright: same process, no RPC boundary to cross.
-            return raw
-        return self._store_transient_browser_secrets(
-            app_slug=app_slug, scope_id=scope_id, values=raw
+        return self._login_secrets.browser_login_payload(
+            provider=provider,
+            app_slug=app_slug,
+            scope_id=scope_id,
+            values=values,
         )
 
     def _remember_reusable_login(
         self, *, app_slug: str, values: Mapping[str, SecretStr]
     ) -> tuple[str, ...]:
-        """Persist the owner's reusable sign-in credentials for this app.
+        """Persist the owner's reusable sign-in credentials for this app."""
 
-        Only ``login_email``/``login_password`` are durable; a one-time OTP or
-        verification link is deliberately never remembered. Returns the sanitized
-        field names actually stored (never a value) so the caller can audit the
-        act of remembering without recording the secret.
-
-        A vault failure here must not break the run in progress: the credentials
-        were already injected for THIS run, so failing to remember them only
-        costs autonomy on a later run.
-        """
-
-        store = self._secret_store
-        settings = self._settings or Settings.from_env()
-        if store is None or not getattr(settings, "browser_login_credential_reuse", True):
-            return ()
-        remembered: list[str] = []
-        for login_field in sorted(REUSABLE_LOGIN_FIELDS):
-            secret = values.get(login_field)
-            if secret is None:
-                continue
-            value = secret.get_secret_value()
-            if not value:
-                continue
-            try:
-                store.put_account_login(app_slug=app_slug, field=login_field, value=value)
-            except Exception:
-                continue  # sanitized: never log the value or the failure detail
-            remembered.append(login_field)
-        return tuple(remembered)
+        return self._login_secrets.remember_reusable_login(app_slug=app_slug, values=values)
 
     def _reusable_login_values(self, app_slug: str) -> dict[str, SecretStr]:
-        """Load the remembered sign-in credentials for an app, if complete.
+        """Load the remembered sign-in credentials for an app, if complete."""
 
-        A partial pair is useless to the deterministic login state machine (it
-        would type an email and then stop at the password), so an incomplete set
-        is treated as "nothing stored" and the run still asks the owner once.
-        """
-
-        store = self._secret_store
-        settings = self._settings or Settings.from_env()
-        if store is None or not getattr(settings, "browser_login_credential_reuse", True):
-            return {}
-        reader = getattr(store, "get_account_login", None)
-        if not callable(reader):
-            return {}
-        values: dict[str, SecretStr] = {}
-        for login_field in sorted(REUSABLE_LOGIN_FIELDS):
-            try:
-                value = reader(app_slug=app_slug, field=login_field)
-            except Exception:
-                return {}
-            if not value:
-                return {}
-            values[login_field] = SecretStr(value)
-        return values
+        return self._login_secrets.reusable_login_values(app_slug)
 
     def _store_transient_browser_secrets(
         self, *, app_slug: str, scope_id: str, values: Mapping[str, str]
     ) -> dict[str, str]:
-        """Vault each permitted secret as a one-time, run-scoped reference.
+        """Vault each permitted secret as a one-time, run-scoped reference."""
 
-        A field outside the reviewed set is refused. A vault-write failure is NOT
-        suppressed: every reference created so far is rolled back (deleted) and the
-        whole payload fails, so a run never proceeds with a partial secret set or a
-        raw value on the wire.
-        """
-
-        from ops.browser_service_client import ALLOWED_BROWSER_SECRET_FIELDS
-
-        store = self._secret_store
-        if store is None:
-            raise ConfigurationRequiredError(
-                phase=5,
-                capability="browser service secrets",
-                reason_code="secret_vault_required_for_browser_service",
-            )
-        references: dict[str, str] = {}
-        created: list[str] = []
-        try:
-            for name, value in values.items():
-                if name not in ALLOWED_BROWSER_SECRET_FIELDS:
-                    raise ProviderOperationError(
-                        capability="browser service secrets",
-                        reason_code="browser_secret_field_not_allowed",
-                    )
-                if not value:
-                    continue
-                reference = store.put_transient(
-                    app_slug=app_slug,
-                    # Namespaced so a browser-login secret is distinguishable from a
-                    # captured integration credential in the vault.
-                    kind=f"browser_login_{name}",
-                    scope_id=scope_id,
-                    value=value,
-                    ttl_seconds=600,
-                )
-                references[name] = reference
-                created.append(reference)
-        except Exception:
-            for reference in created:
-                with contextlib.suppress(Exception):
-                    store.delete(reference)
-            raise ProviderOperationError(
-                capability="browser service secrets",
-                reason_code="browser_secret_store_failed",
-            ) from None
-        return references
+        return self._login_secrets.store_transient_browser_secrets(
+            app_slug=app_slug, scope_id=scope_id, values=values
+        )
 
     def _build_browser_worker(
         self,
