@@ -234,6 +234,12 @@ class SQLiteSignupStateStore:
                 connection.rollback()
                 raise SignupStateConflict("signup state revision changed")
 
+            # Preserve the pre-Part-15 idempotency contract: an ordinary same-state
+            # transition with no metadata is a no-op. Metadata updates are explicit.
+            if current.state == next_state and reason_code is None and outcome is None:
+                connection.commit()
+                return current
+
             target_reason = reason_code or next_state.value
             _validate_metadata(target_reason, "reason code")
             if outcome is not None:
