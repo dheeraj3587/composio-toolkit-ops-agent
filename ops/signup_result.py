@@ -18,7 +18,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ops.automation_contracts import BrowserAutomationContract
 from ops.signup_state_machine import SignupState
-from ops.signup_submission_gates import SignupSubmissionGateInspection
+from ops.signup_submission_gates import (
+    SignupSubmissionGateInspection,
+    SubmissionGate,
+)
 
 SignupResultOutcome = Literal[
     "account_created_authenticated",
@@ -45,6 +48,13 @@ SignupResultNextPhase = Literal[
     "retry_signup",
     "failed",
     "reconcile",
+]
+_ResultRoute = tuple[
+    str,
+    SignupState,
+    SignupResultNextPhase,
+    bool,
+    bool,
 ]
 
 _MAX_PAGE_TEXT = 12_000
@@ -111,6 +121,100 @@ _BILLING_MARKERS = (
     "subscribe",
     "upgrade",
 )
+
+_OUTCOME_ROUTES: dict[SignupResultOutcome, _ResultRoute] = {
+    "account_created_authenticated": (
+        "signup_account_created_authenticated",
+        SignupState.ACCOUNT_CREATED,
+        "authenticated",
+        False,
+        False,
+    ),
+    "email_verification_required": (
+        "signup_email_verification_required",
+        SignupState.EMAIL_VERIFICATION_REQUIRED,
+        "gmail_verification",
+        False,
+        True,
+    ),
+    "otp_required": (
+        "signup_otp_required",
+        SignupState.EMAIL_VERIFICATION_REQUIRED,
+        "gmail_verification",
+        False,
+        True,
+    ),
+    "activation_link_required": (
+        "signup_activation_link_required",
+        SignupState.EMAIL_VERIFICATION_REQUIRED,
+        "gmail_verification",
+        False,
+        True,
+    ),
+    "account_already_exists": (
+        "signup_account_already_exists",
+        SignupState.ACCOUNT_EXISTS_DETECTED,
+        "login",
+        False,
+        True,
+    ),
+    "password_policy_rejected": (
+        "signup_password_policy_rejected",
+        SignupState.SIGNUP_FAILED,
+        "retry_signup",
+        False,
+        True,
+    ),
+    "captcha_required": (
+        "signup_captcha_required",
+        SignupState.SIGNUP_HITL_REQUIRED,
+        "hitl",
+        True,
+        True,
+    ),
+    "phone_verification_required": (
+        "signup_phone_verification_required",
+        SignupState.SIGNUP_HITL_REQUIRED,
+        "hitl",
+        True,
+        True,
+    ),
+    "billing_required": (
+        "signup_billing_required",
+        SignupState.SIGNUP_HITL_REQUIRED,
+        "hitl",
+        True,
+        True,
+    ),
+    "legal_acceptance_required": (
+        "signup_legal_acceptance_required",
+        SignupState.SIGNUP_HITL_REQUIRED,
+        "hitl",
+        True,
+        True,
+    ),
+    "provider_approval_required": (
+        "signup_provider_approval_required",
+        SignupState.PROVIDER_APPROVAL_REQUIRED,
+        "provider_approval",
+        False,
+        True,
+    ),
+    "generic_failure": (
+        "signup_provider_failure",
+        SignupState.SIGNUP_FAILED,
+        "failed",
+        False,
+        False,
+    ),
+    "outcome_unknown": (
+        "signup_result_not_yet_proven",
+        SignupState.SIGNUP_SUBMITTED,
+        "reconcile",
+        False,
+        True,
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,18 +304,21 @@ class SignupResultClassification(BaseModel):
     stable_observations: int = Field(default=1, ge=0, le=10)
 
     @model_validator(mode="after")
-    def _classification_is_consistent(self) -> "SignupResultClassification":
+    def _classification_is_consistent(self) -> SignupResultClassification:
         if self.status == "classified" and self.outcome == "outcome_unknown":
             raise ValueError("classified signup result requires a concrete outcome")
         if self.status != "classified" and self.outcome != "outcome_unknown":
             raise ValueError("unresolved signup result must use outcome_unknown")
         if self.next_phase == "hitl" and not self.hitl_required:
             raise ValueError("HITL routing must declare hitl_required")
-        if self.durable_state == SignupState.ACCOUNT_CREATED and self.next_phase != "authenticated":
+        if (
+            self.durable_state == SignupState.ACCOUNT_CREATED
+            and self.next_phase != "authenticated"
+        ):
             raise ValueError("account-created state must route to authenticated")
         return self
 
-    def with_stable_observations(self, count: int) -> "SignupResultClassification":
+    def with_stable_observations(self, count: int) -> SignupResultClassification:
         return self.model_copy(update={"stable_observations": count})
 
     def prompt_safe_projection(self) -> dict[str, object]:
@@ -268,9 +375,6 @@ def classify_signup_result(
             reason_code="signup_result_contract_predicate_invalid",
         )
 
-    candidates: set[SignupResultOutcome] = set()
-    groups: dict[SignupResultOutcome, str] = {}
-
     if "ownership_or_admin_change" in gates.present_gates:
         return _unresolved(
             contract,
@@ -278,15 +382,13 @@ def classify_signup_result(
             reason_code="signup_ownership_or_admin_change_detected",
         )
 
+    candidates: set[SignupResultOutcome] = set()
+    groups: dict[SignupResultOutcome, str] = {}
     for gate in gates.present_gates:
-        outcome: SignupResultOutcome = {
-            "captcha": "captcha_required",
-            "phone_verification": "phone_verification_required",
-            "billing": "billing_required",
-            "legal_acceptance": "legal_acceptance_required",
-        }[gate]
-        candidates.add(outcome)
-        groups[outcome] = "signup.live_gate"
+        outcome = _outcome_for_gate(gate)
+        if outcome is not None:
+            candidates.add(outcome)
+            groups[outcome] = "signup.live_gate"
 
     _add_contract_gate_candidates(candidates, groups, evidence)
 
@@ -377,57 +479,97 @@ def classify_signup_result(
     )
 
 
+def _outcome_for_gate(gate: SubmissionGate) -> SignupResultOutcome | None:
+    if gate == "captcha":
+        return "captcha_required"
+    if gate == "phone_verification":
+        return "phone_verification_required"
+    if gate == "billing":
+        return "billing_required"
+    if gate == "legal_acceptance":
+        return "legal_acceptance_required"
+    return None
+
+
 def _add_contract_gate_candidates(
     candidates: set[SignupResultOutcome],
     groups: dict[SignupResultOutcome, str],
     evidence: _ContractEvidence,
 ) -> None:
-    for present, outcome, group in (
-        (evidence.captcha, "captcha_required", "signup.captcha"),
-        (evidence.phone, "phone_verification_required", "signup.phone_verification"),
-        (evidence.legal, "legal_acceptance_required", "signup.legal_billing"),
-        (evidence.billing, "billing_required", "signup.legal_billing"),
-    ):
-        if present:
-            candidates.add(outcome)
-            groups[outcome] = group
+    if evidence.captcha:
+        candidates.add("captcha_required")
+        groups["captcha_required"] = "signup.captcha"
+    if evidence.phone:
+        candidates.add("phone_verification_required")
+        groups["phone_verification_required"] = "signup.phone_verification"
+    if evidence.legal:
+        candidates.add("legal_acceptance_required")
+        groups["legal_acceptance_required"] = "signup.legal_billing"
+    if evidence.billing:
+        candidates.add("billing_required")
+        groups["billing_required"] = "signup.legal_billing"
 
 
 def _evaluate_contract_evidence(
     observation: SignupResultObservation,
     contract: BrowserAutomationContract,
 ) -> _ContractEvidence:
-    groups = (
-        ("success", contract.signup.success_predicates),
-        ("authenticated", contract.login.authentication_success_predicates),
-        ("account_exists", contract.signup.existing_account_predicates),
-        ("verification", contract.signup.verification_predicates),
-        ("captcha", contract.signup.captcha_predicates),
-        ("phone", contract.signup.phone_verification_predicates),
-        ("authentication_failure", contract.login.authentication_failure_predicates),
+    success, success_invalid = _matches_any_contract_predicate(
+        observation,
+        contract.signup.success_predicates,
     )
-    values: dict[str, bool] = {}
-    invalid = False
-    for name, predicates in groups:
-        matched, malformed = _matches_any_contract_predicate(observation, predicates)
-        values[name] = matched
-        invalid = invalid or malformed
-
-    legal, billing, malformed = _evaluate_legal_billing_predicates(
+    authenticated, authenticated_invalid = _matches_any_contract_predicate(
+        observation,
+        contract.login.authentication_success_predicates,
+    )
+    account_exists, account_exists_invalid = _matches_any_contract_predicate(
+        observation,
+        contract.signup.existing_account_predicates,
+    )
+    verification, verification_invalid = _matches_any_contract_predicate(
+        observation,
+        contract.signup.verification_predicates,
+    )
+    captcha, captcha_invalid = _matches_any_contract_predicate(
+        observation,
+        contract.signup.captcha_predicates,
+    )
+    phone, phone_invalid = _matches_any_contract_predicate(
+        observation,
+        contract.signup.phone_verification_predicates,
+    )
+    authentication_failure, authentication_failure_invalid = (
+        _matches_any_contract_predicate(
+            observation,
+            contract.login.authentication_failure_predicates,
+        )
+    )
+    legal, billing, legal_billing_invalid = _evaluate_legal_billing_predicates(
         observation,
         contract.signup.legal_billing_predicates,
     )
     return _ContractEvidence(
-        success=values["success"],
-        authenticated=values["authenticated"],
-        account_exists=values["account_exists"],
-        verification=values["verification"],
-        captcha=values["captcha"],
-        phone=values["phone"],
+        success=success,
+        authenticated=authenticated,
+        account_exists=account_exists,
+        verification=verification,
+        captcha=captcha,
+        phone=phone,
         legal=legal,
         billing=billing,
-        authentication_failure=values["authentication_failure"],
-        invalid_predicate=invalid or malformed,
+        authentication_failure=authentication_failure,
+        invalid_predicate=any(
+            (
+                success_invalid,
+                authenticated_invalid,
+                account_exists_invalid,
+                verification_invalid,
+                captcha_invalid,
+                phone_invalid,
+                authentication_failure_invalid,
+                legal_billing_invalid,
+            )
+        ),
     )
 
 
@@ -534,103 +676,7 @@ def _classified(
     outcome: SignupResultOutcome,
     matched_contract_group: str | None,
 ) -> SignupResultClassification:
-    mapping: dict[
-        SignupResultOutcome,
-        tuple[str, SignupState, SignupResultNextPhase, bool, bool],
-    ] = {
-        "account_created_authenticated": (
-            "signup_account_created_authenticated",
-            SignupState.ACCOUNT_CREATED,
-            "authenticated",
-            False,
-            False,
-        ),
-        "email_verification_required": (
-            "signup_email_verification_required",
-            SignupState.EMAIL_VERIFICATION_REQUIRED,
-            "gmail_verification",
-            False,
-            True,
-        ),
-        "otp_required": (
-            "signup_otp_required",
-            SignupState.EMAIL_VERIFICATION_REQUIRED,
-            "gmail_verification",
-            False,
-            True,
-        ),
-        "activation_link_required": (
-            "signup_activation_link_required",
-            SignupState.EMAIL_VERIFICATION_REQUIRED,
-            "gmail_verification",
-            False,
-            True,
-        ),
-        "account_already_exists": (
-            "signup_account_already_exists",
-            SignupState.ACCOUNT_EXISTS_DETECTED,
-            "login",
-            False,
-            True,
-        ),
-        "password_policy_rejected": (
-            "signup_password_policy_rejected",
-            SignupState.SIGNUP_FAILED,
-            "retry_signup",
-            False,
-            True,
-        ),
-        "captcha_required": (
-            "signup_captcha_required",
-            SignupState.SIGNUP_HITL_REQUIRED,
-            "hitl",
-            True,
-            True,
-        ),
-        "phone_verification_required": (
-            "signup_phone_verification_required",
-            SignupState.SIGNUP_HITL_REQUIRED,
-            "hitl",
-            True,
-            True,
-        ),
-        "billing_required": (
-            "signup_billing_required",
-            SignupState.SIGNUP_HITL_REQUIRED,
-            "hitl",
-            True,
-            True,
-        ),
-        "legal_acceptance_required": (
-            "signup_legal_acceptance_required",
-            SignupState.SIGNUP_HITL_REQUIRED,
-            "hitl",
-            True,
-            True,
-        ),
-        "provider_approval_required": (
-            "signup_provider_approval_required",
-            SignupState.PROVIDER_APPROVAL_REQUIRED,
-            "provider_approval",
-            False,
-            True,
-        ),
-        "generic_failure": (
-            "signup_provider_failure",
-            SignupState.SIGNUP_FAILED,
-            "failed",
-            False,
-            False,
-        ),
-        "outcome_unknown": (
-            "signup_result_not_yet_proven",
-            SignupState.SIGNUP_SUBMITTED,
-            "reconcile",
-            False,
-            True,
-        ),
-    }
-    reason, state, phase, hitl, retryable = mapping[outcome]
+    reason, state, phase, hitl, retryable = _OUTCOME_ROUTES[outcome]
     return SignupResultClassification(
         status="classified",
         outcome=outcome,
