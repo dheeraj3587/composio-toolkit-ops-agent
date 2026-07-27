@@ -124,10 +124,11 @@ The second live pass closes the normal check-to-use window: if the DOM,
 contract, fields, control, page origin, or gates change after the first pass, no
 click is sent.
 
-The effect key is stable for the run and contract version. Outcomes are:
+The effect key is stable for the run, exact account binding, and contract version.
+Outcomes are:
 
-- completed reservation: return the previous dispatch receipt without clicking
-  again;
+- completed reservation: validate the exact purpose, contract version, and
+  account-binding receipt, then return it without clicking again;
 - pending or unknown reservation: return `outcome_unknown` and require
   reconciliation;
 - failed preflight before click: mark the reservation failed so a safe retry is
