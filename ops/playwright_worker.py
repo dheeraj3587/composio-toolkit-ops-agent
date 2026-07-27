@@ -95,13 +95,20 @@ from ops.config import Settings
 from ops.credential_capture_specs import get_capture_spec
 from ops.inference import build_json_inference
 from ops.model_input_dlp import (
-    DROPPED,
     contains_secret_material,
     sanitize_page_text,
     sanitize_reason,
     sanitize_url,
 )
 from ops.models import OperationalResearch, validate_vault_reference
+from ops.playwright_capture_safety import (  # noqa: F401
+    _CREDENTIAL_SURFACE_SELECTOR,
+    _MAX_SCREENSHOT_BYTES,
+    _has_credential_content,
+    _has_unmasked_secret_content,
+    _looks_credential_bearing,
+    _masked_screenshot,
+)
 from ops.playwright_gates import (  # noqa: F401
     _ACCOUNT_CHOICE,
     _ACTIVE_CAPTCHA_IFRAME,
@@ -175,7 +182,6 @@ _NAV_TIMEOUT_MS = 45_000
 # Per-action Playwright timeout. Playwright auto-waits for actionability, so this
 # is a ceiling on that wait rather than a substitute for it.
 _ACTION_TIMEOUT_MS = 10_000
-_MAX_SCREENSHOT_BYTES = 4_000_000
 _JANITOR_INTERVAL_SECONDS = 60.0
 _OP_TIMEOUT_SECONDS = 90.0
 
@@ -2167,87 +2173,6 @@ class PlaywrightBrowserWorker:
             session.screenshot = None
             session.screenshot_at = None
             self._release_capacity(session)
-
-
-_CREDENTIAL_SURFACE_SELECTOR = (
-    "input[type='password'], input[name*='token' i], input[name*='secret' i], "
-    "input[name*='key' i], input[name*='otp' i], code, pre, samp, kbd, textarea, "
-    "[data-secret], [data-credential], [contenteditable='true']"
-)
-
-
-def _looks_credential_bearing(inspection: PageInspection) -> bool:
-    """True when the inspected page structurally exposes credential material.
-
-    Structural, not substring-based: a secret-ish INPUT, or a dropped unsafe region
-    in the snapshot, means a credential could be rendered on this page.
-    """
-
-    if any(element.secretish for element in inspection.elements):
-        return True
-    if DROPPED in inspection.visible_text:
-        return True
-    return any(DROPPED in element.name for element in inspection.elements)
-
-
-async def _has_credential_content(page: Any) -> bool:
-    """Structural check for credential-bearing surfaces before any capture.
-
-    Covers plain-text tokens in code/pre, textarea, contenteditable and custom
-    components carrying data-secret/data-credential — cases that masking selectors
-    alone would miss. Fails CLOSED when safety cannot be established.
-    """
-
-    try:
-        locator = page.locator(_CREDENTIAL_SURFACE_SELECTOR)
-        if int(await locator.count()) > 0:
-            return True
-    except Exception:
-        return True  # cannot prove safety -> treat as sensitive
-    try:
-        text = await page.inner_text("body", timeout=3_000)
-    except Exception:
-        return True
-    return contains_secret_material(text if isinstance(text, str) else "")
-
-
-async def _has_unmasked_secret_content(page: Any) -> bool:
-    """Return true only when page text itself may expose credential material.
-
-    Login inputs are safe to capture only because ``_masked_screenshot`` masks
-    every form field. Plain-text secrets elsewhere in the page remain a hard
-    refusal, and inspection errors fail closed.
-    """
-
-    try:
-        text = await page.inner_text("body", timeout=3_000)
-    except Exception:
-        return True
-    return contains_secret_material(text if isinstance(text, str) else "")
-
-
-async def _masked_screenshot(page: Any) -> bytes | None:
-    """Screenshot the viewport with every credential-bearing field masked.
-
-    If masking cannot be applied, NO screenshot is returned — never an unmasked one.
-    """
-
-    try:
-        masks = [
-            # Mask every editable value, not only fields whose names look secret.
-            # Email/user identifiers are account data too.
-            page.locator("input"),
-            page.locator("textarea"),
-            page.locator("[contenteditable='true']"),
-            page.locator("[data-secret]"),
-            page.locator("[data-credential]"),
-        ]
-        data = await page.screenshot(type="png", full_page=False, mask=masks, timeout=15_000)
-    except Exception:
-        return None
-    if not isinstance(data, bytes) or not data or len(data) > _MAX_SCREENSHOT_BYTES:
-        return None
-    return data
 
 
 __all__ = [

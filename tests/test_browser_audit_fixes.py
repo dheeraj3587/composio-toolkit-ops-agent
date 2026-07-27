@@ -213,7 +213,11 @@ def test_unknown_resource_type_fails_closed() -> None:
 
 # --- A7 / A10: masked screenshots, opt-in sandbox flag -------------------------
 def test_screenshot_masks_credential_fields() -> None:
-    source = (_REPO / "ops" / "playwright_worker.py").read_text(encoding="utf-8")
+    # Reads the module that OWNS capture masking. The helpers moved out of
+    # playwright_worker.py, and asserting on the old file would have kept passing
+    # for the wrong reason (an unrelated password selector elsewhere in it) while
+    # no longer covering the masking code at all.
+    source = (_REPO / "ops" / "playwright_capture_safety.py").read_text(encoding="utf-8")
     assert "mask=masks" in source
     assert "input[type='password']" in source
 
