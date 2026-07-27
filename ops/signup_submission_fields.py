@@ -9,7 +9,8 @@ inside this function, compared inside the page context, and discarded.
 from __future__ import annotations
 
 import re
-from typing import Any, Protocol
+from collections.abc import Callable
+from typing import Any, Protocol, cast
 
 from ops.approved_run_values import ApprovedRunValues
 from ops.automation_contracts import (
@@ -24,6 +25,8 @@ from ops.signup_forms import SignupFillResult, SignupFormInspection
 
 _TOKEN = re.compile(r"^sf_[0-9a-f]{32}$")
 _EMAIL = re.compile(r"^[^@\s<>;,]+@[^@\s<>;,]+$")
+
+SecretCaptureGuard = Callable[[], None]
 
 
 class SignupVerificationPage(Protocol):
@@ -40,11 +43,20 @@ async def verify_required_signup_fields(
     secret_store: SecretStore,
     credential_manager: SignupCredentialManager,
     account_binding: SignupAccountBinding,
+    assert_secret_capture_disabled: SecretCaptureGuard | None = None,
 ) -> tuple[tuple[SignupSemanticField, ...], str | None]:
-    """Return verified semantic fields and a stable failure reason, never values."""
+    """Return verified semantic fields and a stable failure reason, never values.
 
-    required: set[SignupSemanticField] = set(
-        contract.signup.required_semantic_fields
+    ``ContractSignup`` validates every semantic-field string before this boundary.
+    The explicit cast narrows that already-validated tuple for static typing; it
+    does not suppress validation or widen the accepted contract vocabulary.
+    """
+
+    required = set(
+        cast(
+            tuple[SignupSemanticField, ...],
+            contract.signup.required_semantic_fields,
+        )
     )
     required.update(
         field.semantic_field
@@ -54,6 +66,20 @@ async def verify_required_signup_fields(
     required.discard("signup_submit")
     if not required.issubset(set(fill_result.verified_fields)):
         return (), "signup_submit_fields_not_verified"
+
+    secret_required = bool(
+        required & {"email", "password", "password_confirmation"}
+    )
+    if secret_required:
+        if assert_secret_capture_disabled is None:
+            return (), "signup_secret_capture_guard_missing"
+        try:
+            # Playwright evaluate arguments may be retained by tracing/HAR/video
+            # tooling. The trusted worker must prove those captures are disabled
+            # before plaintext is resolved or passed into the page process.
+            assert_secret_capture_disabled()
+        except Exception:
+            return (), "signup_secret_capture_guard_failed"
 
     values: dict[SignupSemanticField, str | None] = {
         "first_name": approved_values.first_name,
@@ -230,6 +256,7 @@ def _full_name(values: ApprovedRunValues) -> str | None:
 
 
 __all__ = [
+    "SecretCaptureGuard",
     "strict_signup_token_locator",
     "verify_required_signup_fields",
 ]
