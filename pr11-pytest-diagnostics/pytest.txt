@@ -1,0 +1,58 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.15, pytest-9.0.3, pluggy-1.6.0 -- /opt/hostedtoolcache/Python/3.11.15/x64/bin/python
+cachedir: .pytest_cache
+rootdir: /home/runner/work/composio-toolkit-ops-agent/composio-toolkit-ops-agent/target
+configfile: pyproject.toml
+testpaths: tests
+plugins: anyio-4.14.2, asyncio-1.4.0, langsmith-0.10.10
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 1243 items
+
+tests/live/test_you_contents_live.py::test_live_contents_extracts_reviewed_pages SKIPPED [  0%]
+tests/live/test_you_discovery_live.py::test_live_you_search_discovery_precision_and_recall SKIPPED [  0%]
+tests/live/test_you_discovery_live.py::test_live_you_then_perplexity_fallback_frequency SKIPPED [  0%]
+tests/live/test_you_discovery_live.py::test_live_evaluation_never_imports_browser_worker SKIPPED [  0%]
+tests/live/test_you_research_live.py::test_live_one_call_research SKIPPED [  0%]
+tests/test_api.py::test_exact_requested_routes_are_registered PASSED     [  0%]
+tests/test_api.py::test_create_and_detail_expose_verified_phase_two_contract FAILED [  0%]
+
+=================================== FAILURES ===================================
+__________ test_create_and_detail_expose_verified_phase_two_contract ___________
+
+harness = ApiHarness(client=<starlette.testclient.TestClient object at 0x7f2617afa5d0>, service=<test_api.TrackingRunService obj...at 0x7f2618235510>, db_path=PosixPath('/tmp/pytest-of-runner/pytest-0/test_create_and_detail_expose_0/private/ops.db'))
+
+    def test_create_and_detail_expose_verified_phase_two_contract(harness: ApiHarness) -> None:
+>       created = create_run(harness)
+                  ^^^^^^^^^^^^^^^^^^^
+
+tests/test_api.py:130: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+harness = ApiHarness(client=<starlette.testclient.TestClient object at 0x7f2617afa5d0>, service=<test_api.TrackingRunService obj...at 0x7f2618235510>, db_path=PosixPath('/tmp/pytest-of-runner/pytest-0/test_create_and_detail_expose_0/private/ops.db'))
+app_name = 'HubSpot'
+
+    def create_run(
+        harness: ApiHarness,
+        app_name: str = "HubSpot",
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, object]:
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key is not None else None
+        response = harness.client.post("/api/runs", json=create_payload(app_name), headers=headers)
+>       assert response.status_code == 201
+E       assert 500 == 201
+E        +  where 500 = <Response [500 Internal Server Error]>.status_code
+
+tests/test_api.py:93: AssertionError
+------------------------------ Captured log call -------------------------------
+ERROR    composio_ops.api:app.py:372 Unhandled API exception type=ValidationError
+=========================== short test summary info ============================
+SKIPPED [1] tests/live/test_you_contents_live.py:43: opt-in live Contents test: set RUN_LIVE_YOU_CONTENTS_TESTS=1 to run
+SKIPPED [1] tests/live/test_you_discovery_live.py:76: opt-in live evaluation: set RUN_LIVE_YOU_TESTS=1 to run
+SKIPPED [1] tests/live/test_you_discovery_live.py:120: opt-in live evaluation: set RUN_LIVE_YOU_TESTS=1 to run
+SKIPPED [1] tests/live/test_you_discovery_live.py:158: opt-in live evaluation: set RUN_LIVE_YOU_TESTS=1 to run
+SKIPPED [1] tests/live/test_you_research_live.py:36: opt-in live Research test: set RUN_LIVE_YOU_RESEARCH_TESTS=1 to run
+FAILED tests/test_api.py::test_create_and_detail_expose_verified_phase_two_contract - assert 500 == 201
+ +  where 500 = <Response [500 Internal Server Error]>.status_code
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+==================== 1 failed, 1 passed, 5 skipped in 2.90s ====================
