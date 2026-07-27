@@ -1590,7 +1590,7 @@ class TestContainerIsolationShape:
         assert '"--no-access-log"' in cmd
 
     def test_uvicorn_websocket_filter_strips_live_grant_query_and_tokens(self) -> None:
-        secret = "signed-live-view-secret"
+        secret = "signed-live-view-secret"  # pragma: allowlist secret
         record = logging.LogRecord(
             name="uvicorn.error",
             level=logging.INFO,

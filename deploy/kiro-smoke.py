@@ -39,7 +39,10 @@ def main() -> None:
     )
     created = call(
         "/internal/browser/sessions",
-        {"app_slug": "pipedrive", "secret_scope": "production-classifier-smoke"},
+        {
+            "app_slug": "pipedrive",
+            "secret_scope": "production-classifier-smoke",  # pragma: allowlist secret
+        },
     )
     session_id = str(created["session_id"])
     print("session_created", flush=True)
