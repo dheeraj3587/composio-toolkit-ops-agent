@@ -25,11 +25,59 @@ ContractRoute = Literal[
     "blocked",
     "unsupported",
 ]
+SignupSemanticField = Literal[
+    "email",
+    "password",
+    "password_confirmation",
+    "first_name",
+    "last_name",
+    "full_name",
+    "company_name",
+    "website",
+    "workspace_name",
+    "country",
+    "role_title",
+    "signup_submit",
+]
+SelectOptionMode = Literal[
+    "approved_label",
+    "approved_value",
+    "fixed_label",
+    "fixed_value",
+]
 
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _EVIDENCE_HASH = re.compile(r"^[0-9a-f]{64}$")
 _SEMANTIC_FIELD = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_TEST_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
+_SIGNUP_FIELDS = frozenset(
+    {
+        "email",
+        "password",
+        "password_confirmation",
+        "first_name",
+        "last_name",
+        "full_name",
+        "company_name",
+        "website",
+        "workspace_name",
+        "country",
+        "role_title",
+        "signup_submit",
+    }
+)
+_SIGNUP_FIELD_ALIASES = {
+    "signup_email": "email",
+    "account_password": "password",
+    "confirm_password": "password_confirmation",
+    "legal_name": "company_name",
+    "company_website": "website",
+    "account_name": "workspace_name",
+    "account_display_name": "workspace_name",
+    "job_title": "role_title",
+    "role": "role_title",
+}
 
 
 class ContractValidationError(ValueError):
@@ -66,8 +114,7 @@ class ContractHosts(_StrictContractModel):
     @field_validator("*")
     @classmethod
     def _hosts_are_normalized(cls, values: tuple[str, ...]) -> tuple[str, ...]:
-        normalized = tuple(dict.fromkeys(_normalize_host_pattern(value) for value in values))
-        return normalized
+        return tuple(dict.fromkeys(_normalize_host_pattern(value) for value in values))
 
     @model_validator(mode="after")
     def _prohibited_hosts_do_not_overlap(self) -> ContractHosts:
@@ -99,13 +146,60 @@ class ContractPasswordPolicy(_StrictContractModel):
             raise ValueError("password maximum length is below minimum length")
         if any(character.isspace() for character in self.allowed_symbols):
             raise ValueError("password symbols cannot contain whitespace")
+        if len(set(self.allowed_symbols)) != len(self.allowed_symbols):
+            raise ValueError("password symbols must be unique")
         return self
+
+
+class ContractSelectOption(_StrictContractModel):
+    """Reviewed rule for a select or combobox value."""
+
+    mode: SelectOptionMode
+    fixed_option: str | None = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def _mode_matches_value_source(self) -> ContractSelectOption:
+        fixed = self.mode.startswith("fixed_")
+        if fixed and not self.fixed_option:
+            raise ValueError("fixed select modes require a reviewed option")
+        if not fixed and self.fixed_option is not None:
+            raise ValueError("approved-value select modes cannot carry a fixed option")
+        if self.fixed_option is not None and "\x00" in self.fixed_option:
+            raise ValueError("reviewed select option is invalid")
+        return self
+
+
+class ContractSignupFieldHints(_StrictContractModel):
+    """Reviewed, value-free hints for one semantic signup field."""
+
+    reviewed_test_ids: tuple[str, ...] = Field(default=(), max_length=12)
+    accessible_names: tuple[str, ...] = Field(default=(), max_length=20)
+    placeholders: tuple[str, ...] = Field(default=(), max_length=20)
+    nearby_headings: tuple[str, ...] = Field(default=(), max_length=12)
+    select_option: ContractSelectOption | None = None
+
+    @field_validator("reviewed_test_ids")
+    @classmethod
+    def _test_ids_are_bounded(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        result = tuple(dict.fromkeys(values))
+        if any(_TEST_ID.fullmatch(value) is None for value in result):
+            raise ValueError("reviewed test id is invalid")
+        return result
+
+    @field_validator("accessible_names", "placeholders", "nearby_headings")
+    @classmethod
+    def _hints_are_bounded(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        result = tuple(dict.fromkeys(values))
+        if any(not value or len(value) > 200 or "\x00" in value for value in result):
+            raise ValueError("signup field hint is invalid")
+        return result
 
 
 class ContractSignup(_StrictContractModel):
     entrypoints: tuple[str, ...] = Field(default=(), max_length=10)
     required_semantic_fields: tuple[str, ...] = Field(default=(), max_length=30)
     optional_semantic_fields: tuple[str, ...] = Field(default=(), max_length=30)
+    field_hints: dict[str, ContractSignupFieldHints] = Field(default_factory=dict, max_length=30)
     password_policy: ContractPasswordPolicy = Field(default_factory=ContractPasswordPolicy)
     success_predicates: tuple[str, ...] = Field(default=(), max_length=30)
     existing_account_predicates: tuple[str, ...] = Field(default=(), max_length=20)
@@ -114,18 +208,50 @@ class ContractSignup(_StrictContractModel):
     phone_verification_predicates: tuple[str, ...] = Field(default=(), max_length=20)
     legal_billing_predicates: tuple[str, ...] = Field(default=(), max_length=20)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_historical_semantic_names(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        for key in ("required_semantic_fields", "optional_semantic_fields"):
+            raw = normalized.get(key, ())
+            if isinstance(raw, (list, tuple)):
+                normalized[key] = tuple(
+                    dict.fromkeys(_normalize_signup_field(str(item)) for item in raw)
+                )
+        raw_hints = normalized.get("field_hints")
+        if isinstance(raw_hints, dict):
+            hints: dict[str, object] = {}
+            for raw_key, hint in raw_hints.items():
+                key = _normalize_signup_field(str(raw_key))
+                if key in hints:
+                    raise ValueError("duplicate signup field hints after normalization")
+                hints[key] = hint
+            normalized["field_hints"] = hints
+        return normalized
+
     @field_validator("entrypoints")
     @classmethod
     def _entrypoints_are_https(cls, values: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(_validated_https(value) for value in values)
+        return tuple(dict.fromkeys(_validated_https(value) for value in values))
 
     @field_validator("required_semantic_fields", "optional_semantic_fields")
     @classmethod
-    def _semantic_fields_are_bounded(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+    def _semantic_fields_are_supported(cls, values: tuple[str, ...]) -> tuple[str, ...]:
         result = tuple(dict.fromkeys(values))
-        if any(_SEMANTIC_FIELD.fullmatch(value) is None for value in result):
-            raise ValueError("semantic field name is invalid")
+        if any(value not in _SIGNUP_FIELDS for value in result):
+            raise ValueError("signup semantic field is unsupported")
         return result
+
+    @field_validator("field_hints")
+    @classmethod
+    def _field_hint_keys_are_supported(
+        cls, values: dict[str, ContractSignupFieldHints]
+    ) -> dict[str, ContractSignupFieldHints]:
+        if any(key not in _SIGNUP_FIELDS for key in values):
+            raise ValueError("signup field hint key is unsupported")
+        return values
 
     @field_validator(
         "success_predicates",
@@ -137,9 +263,23 @@ class ContractSignup(_StrictContractModel):
     )
     @classmethod
     def _predicates_are_bounded(cls, values: tuple[str, ...]) -> tuple[str, ...]:
-        if any(not value or len(value) > 300 or "\x00" in value for value in values):
+        result = tuple(dict.fromkeys(values))
+        if any(not value or len(value) > 300 or "\x00" in value for value in result):
             raise ValueError("contract predicate is invalid")
-        return tuple(dict.fromkeys(values))
+        return result
+
+    @model_validator(mode="after")
+    def _field_sets_are_consistent(self) -> ContractSignup:
+        required = set(self.required_semantic_fields)
+        optional = set(self.optional_semantic_fields)
+        if required & optional:
+            raise ValueError("signup field cannot be both required and optional")
+        if "signup_submit" in optional:
+            raise ValueError("signup submit control cannot be optional")
+        for field, hints in self.field_hints.items():
+            if hints.select_option is not None and field not in {"country", "role_title"}:
+                raise ValueError("reviewed select options are limited to country and role/title")
+        return self
 
 
 class ContractLogin(_StrictContractModel):
@@ -151,7 +291,7 @@ class ContractLogin(_StrictContractModel):
     @field_validator("entrypoints")
     @classmethod
     def _entrypoints_are_https(cls, values: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(_validated_https(value) for value in values)
+        return tuple(dict.fromkeys(_validated_https(value) for value in values))
 
 
 class ContractDeveloperApp(_StrictContractModel):
@@ -163,7 +303,7 @@ class ContractDeveloperApp(_StrictContractModel):
     @field_validator("console_entrypoints")
     @classmethod
     def _entrypoints_are_https(cls, values: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(_validated_https(value) for value in values)
+        return tuple(dict.fromkeys(_validated_https(value) for value in values))
 
 
 class ContractCredentials(_StrictContractModel):
@@ -189,10 +329,12 @@ class ContractEvidence(_StrictContractModel):
     def _field_sources_are_https(
         cls, values: dict[str, tuple[str, ...]]
     ) -> dict[str, tuple[str, ...]]:
-        return {
-            key: tuple(dict.fromkeys(_validated_https(value) for value in urls))
-            for key, urls in values.items()
-        }
+        result: dict[str, tuple[str, ...]] = {}
+        for key, urls in values.items():
+            if _SEMANTIC_FIELD.fullmatch(key) is None:
+                raise ValueError("evidence field name is invalid")
+            result[key] = tuple(dict.fromkeys(_validated_https(value) for value in urls))
+        return result
 
 
 class BrowserAutomationContract(_StrictContractModel):
@@ -361,6 +503,14 @@ def evidence_hash_for(source_urls: tuple[str, ...] | list[str]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _normalize_signup_field(value: str) -> str:
+    normalized = value.strip().casefold()
+    normalized = _SIGNUP_FIELD_ALIASES.get(normalized, normalized)
+    if normalized not in _SIGNUP_FIELDS:
+        raise ValueError("signup semantic field is unsupported")
+    return normalized
+
+
 def _validated_https(value: str) -> str:
     parsed = urlsplit(value)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
@@ -399,8 +549,12 @@ __all__ = [
     "ContractPasswordPolicy",
     "ContractRoute",
     "ContractRouting",
+    "ContractSelectOption",
     "ContractSignup",
+    "ContractSignupFieldHints",
     "ContractValidationError",
     "SQLiteAutomationContractRegistry",
+    "SelectOptionMode",
+    "SignupSemanticField",
     "evidence_hash_for",
 ]
