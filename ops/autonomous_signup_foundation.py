@@ -1,10 +1,10 @@
-"""RunService-facing bridge for autonomous signup Parts 6-14.
+"""RunService-facing bridge for autonomous signup Parts 6-15.
 
 The browser service chooses the session ID. Values are prepared UNBOUND for
 session creation, then immutably bound after the create response and before
 navigation. Parts 12-13 record deterministic form detection and verified
 pre-submit filling. Part 14 records a crash-safe, policy-authorized submission;
-classification of the provider response remains Part 15.
+Part 15 records the deterministic provider result and stable routing reason.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from ops.automation_contracts import (
 from ops.contract_routing import ContractRouteDecision, decide_contract_route
 from ops.models import OperationsRequest
 from ops.signup_forms import SignupFillResult, SignupFormInspection
+from ops.signup_result import SignupResultClassification
 from ops.signup_state_machine import (
     SQLiteSignupStateStore,
     SignupPolicyDecision,
@@ -108,7 +109,7 @@ class AutonomousSignupFoundation:
         *,
         contract_db_path: str | Path,
         signup_state_db_path: str | Path,
-    ) -> AutonomousSignupFoundation:
+    ) -> "AutonomousSignupFoundation":
         return cls(
             values_registry=ApprovedRunValuesRegistry(),
             contract_registry=SQLiteAutomationContractRegistry(contract_db_path),
@@ -294,6 +295,33 @@ class AutonomousSignupFoundation:
         }:
             raise RuntimeError("signup submission result is not expected in the current state")
         return current
+
+    def record_signup_result(
+        self,
+        bound: BoundSignupSession,
+        result: SignupResultClassification,
+    ) -> SignupStateSnapshot:
+        """Persist Part 15's exact outcome without persisting browser content."""
+
+        self._assert_bound_session(bound)
+        if result.contract_version != bound.automation_contract.contract_version:
+            raise ValueError("signup result belongs to another contract version")
+        current = self._signup_state_machine.snapshot(bound.run_id)
+        if (
+            current.state == result.durable_state
+            and current.reason_code == result.reason_code
+            and current.outcome == result.outcome
+        ):
+            return current
+        if current.state != SignupState.SIGNUP_SUBMITTED:
+            raise RuntimeError("signup result is not expected in the current state")
+        return self._signup_state_machine.advance(
+            bound.run_id,
+            result.durable_state,
+            expected_revision=current.revision,
+            reason_code=result.reason_code,
+            outcome=result.outcome,
+        )
 
     def get_values(self, *, run_id: str, session_id: str) -> ApprovedRunValues:
         return self._values_registry.get(run_id=run_id, session_id=session_id)
