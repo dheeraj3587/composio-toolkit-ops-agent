@@ -1,0 +1,316 @@
+name: PR11 patch build
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      ALLOW_LIVE_BROWSER: "false"
+      ALLOW_LIVE_VENDOR_EMAIL: "false"
+      RUN_LIVE_TESTS: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: python -m pip install --requirement requirements-dev.txt
+      - run: python -m playwright install --with-deps chromium
+      - name: Apply verified source fixes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one exact snippet, found {count}")
+              target.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          for path in (
+              "tests/test_credential_capture_bundle.py",
+              "tests/test_owner_credential_submission.py",
+              "tests/test_self_serve_browser.py",
+          ):
+              replace_once(
+                  path,
+                  '''        sensitive_data: object = None,
+        credential_creation_policy: str = "reuse_only",
+    ) -> BrowserObservation:
+        del context, research, sensitive_data, credential_creation_policy''',
+                  '''        sensitive_data: object = None,
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
+    ) -> BrowserObservation:
+        del context, research, sensitive_data, account_policy
+        del developer_app_policy, credential_policy''',
+              )
+
+          replace_once(
+              "tests/test_credential_capture_bundle.py",
+              '''        sensitive_data: object = None,
+        credential_creation_policy: str = "reuse_only",
+        provider_session_id: object = None,
+    ) -> BrowserObservation:
+        del context, signal, research, sensitive_data, credential_creation_policy
+        del provider_session_id''',
+              '''        sensitive_data: object = None,
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
+        provider_session_id: object = None,
+    ) -> BrowserObservation:
+        del context, signal, research, sensitive_data, account_policy
+        del developer_app_policy, credential_policy, provider_session_id''',
+          )
+
+          for path in (
+              "tests/test_owner_credential_submission.py",
+              "tests/test_self_serve_browser.py",
+          ):
+              replace_once(
+                  path,
+                  '''        sensitive_data: object = None,
+        credential_creation_policy: str = "reuse_only",
+        provider_session_id: object = None,
+    ) -> BrowserObservation:
+        raise AssertionError(''',
+                  '''        sensitive_data: object = None,
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
+        provider_session_id: object = None,
+    ) -> BrowserObservation:
+        del context, signal, research, sensitive_data, account_policy
+        del developer_app_policy, credential_policy, provider_session_id
+        raise AssertionError(''',
+              )
+
+          replace_once(
+              "tests/test_browser_service_phase3.py",
+              '''        sensitive_data: Any = None,
+        credential_creation_policy: str = "reuse_only",
+    ) -> BrowserObservation:
+        del research, credential_creation_policy''',
+              '''        sensitive_data: Any = None,
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
+    ) -> BrowserObservation:
+        del research, account_policy, developer_app_policy, credential_policy''',
+          )
+          replace_once(
+              "tests/test_browser_service_phase3.py",
+              '''        sensitive_data: Any = None,
+        credential_creation_policy: str = "reuse_only",
+        provider_session_id: str | None = None,
+    ) -> BrowserObservation:
+        del context, signal, research, credential_creation_policy, provider_session_id''',
+              '''        sensitive_data: Any = None,
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
+        provider_session_id: str | None = None,
+    ) -> BrowserObservation:
+        del context, signal, research, account_policy, developer_app_policy
+        del credential_policy, provider_session_id''',
+          )
+
+          replace_once(
+              "tests/test_run_service.py",
+              "def test_idempotency_fingerprint_freezes_credential_creation_policy(",
+              "def test_idempotency_fingerprint_freezes_credential_policy(",
+          )
+          replace_once(
+              "tests/test_run_service.py",
+              'create = reuse.model_copy(update={"credential_creation_policy": "create_if_missing"})',
+              'create = reuse.model_copy(update={"credential_policy": "create_if_missing"})',
+          )
+          replace_once(
+              "tests/test_signup_submission.py",
+              '''    page, submit = page_for(inspection)
+
+    result = await dispatch(
+        tmp_path,
+        page,
+        inspection,
+        fill_result,
+        capture_guard=False,''',
+              '''    page, submit = page_for(inspection)
+    page.gate_locators = []
+
+    result = await dispatch(
+        tmp_path,
+        page,
+        inspection,
+        fill_result,
+        capture_guard=False,''',
+          )
+          replace_once(
+              "ops/signup_result.py",
+              "    if observation.native_password_invalid or (",
+              "    if observation.native_password_invalid or (  # pragma: allowlist secret",
+          )
+          replace_once(
+              "ops/signup_result.py",
+              '''    if len(candidates) == 1:
+        outcome = next(iter(candidates))
+        return _classified(
+            contract,
+            outcome=outcome,
+            matched_contract_group=groups.get(outcome),
+        )''',
+              '''    if len(candidates) == 1:
+        sole_outcome = next(iter(candidates))
+        return _classified(
+            contract,
+            outcome=sole_outcome,
+            matched_contract_group=groups.get(sole_outcome),
+        )''',
+          )
+          replace_once(
+              "tests/test_signup_result_state.py",
+              '        account_password_ref="vault://example/account_password/password_1",',
+              '        account_password_ref=(  # pragma: allowlist secret\n            "vault://example/account_password/password_1"\n        ),',
+          )
+          replace_once(
+              "ops/signup_submission_fields.py",
+              "from typing import Any, Protocol, cast",
+              "from typing import Any, Protocol",
+          )
+          replace_once(
+              "ops/signup_submission_fields.py",
+              '''    required = set(
+        cast(
+            tuple[SignupSemanticField, ...],
+            contract.signup.required_semantic_fields,
+        )
+    )''',
+              "    required = set(contract.signup.required_semantic_fields)",
+          )
+          replace_once(
+              "ops/playwright_signup.py",
+              '''    required = set(
+        cast(
+            tuple[SignupSemanticField, ...],
+            contract.signup.required_semantic_fields,
+        )
+    )''',
+              "    required = set(contract.signup.required_semantic_fields)",
+          )
+          replace_once(
+              "ops/signup_submission.py",
+              '''    decision = risk_policy.authorize_purpose(
+        ActionAuthorizationContext(
+''',
+              '''    if verification_reason is not None:
+        return _DeniedPreflight(
+            status="configuration_required",
+            reason_code=verification_reason,
+            verified_fields=verified_fields,
+            present_gates=gates.present_gates,
+        )
+
+    decision = risk_policy.authorize_purpose(
+        ActionAuthorizationContext(
+''',
+          )
+          replace_once(
+              "ops/signup_submission.py",
+              '''    if verification_reason is not None:
+        return _DeniedPreflight(
+            status="configuration_required",
+            reason_code=verification_reason,
+            verified_fields=verified_fields,
+            present_gates=gates.present_gates,
+        )
+
+    try:
+''',
+              "    try:\n",
+          )
+          PY
+      - name: Apply repository formatting
+        run: |
+          ruff check --fix .
+          ruff format .
+          ruff check .
+          ruff format --check .
+      - name: Run strict backend checks
+        shell: bash
+        run: |
+          set +e
+          mkdir -p patch-results
+          statuses=()
+          run_check() {
+            local name="$1"
+            shift
+            "$@" >"patch-results/${name}.log" 2>&1
+            local status=$?
+            printf '%s=%s\n' "$name" "$status" | tee -a patch-results/statuses.txt
+            statuses+=("$status")
+          }
+          mapfile -d '' files < <(git ls-files -z --cached --others --exclude-standard | while IFS= read -r -d '' path; do
+            case "$path" in .secrets.baseline|PLAN.md|data/p1/SNAPSHOT.json) continue;; esac
+            printf '%s\0' "$path"
+          done)
+          run_check detect-secrets detect-secrets-hook --baseline .secrets.baseline "${files[@]}"
+          run_check mypy mypy ops api streamlit_app.py
+          run_check compileall python -m compileall -q ops api streamlit_app.py
+          run_check targeted-pytest pytest -q \
+            tests/test_credential_capture_bundle.py \
+            tests/test_browser_service_phase3.py \
+            tests/test_owner_credential_submission.py \
+            tests/test_self_serve_browser.py \
+            tests/test_run_service.py \
+            tests/test_signup_form_detection.py \
+            tests/test_signup_form_fill.py \
+            tests/test_signup_submission.py \
+            tests/test_signup_submission_state.py \
+            tests/test_signup_result_classifier.py \
+            tests/test_signup_result_conflicts.py \
+            tests/test_signup_result_waiter.py \
+            tests/test_signup_result_state.py \
+            tests/test_browser_provider_protocol.py --tb=short -rf
+          failed=0
+          for status in "${statuses[@]}"; do
+            [[ "$status" == "0" ]] || failed=1
+          done
+          printf '%s' "$failed" > patch-results/exit-status
+      - name: Archive patched source
+        if: always()
+        run: |
+          tar --exclude=.git --exclude=web/node_modules --exclude=web/.next \
+            -czf /tmp/pr11-patched-source.tar.gz .
+      - name: Upload patch results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr11-patch-results
+          path: patch-results
+          if-no-files-found: error
+          retention-days: 2
+      - name: Upload patched source
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr11-patched-source
+          path: /tmp/pr11-patched-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+      - name: Enforce checks
+        run: test "$(cat patch-results/exit-status)" = "0"
