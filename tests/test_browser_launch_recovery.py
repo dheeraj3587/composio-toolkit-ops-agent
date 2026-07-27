@@ -197,7 +197,10 @@ def test_failed_precreated_session_still_persists_the_run(tmp_path: Path) -> Non
     worker = _FailingWorker()
     service = _service(tmp_path, worker)
     try:
-        with patch("ops.run_service.get_browser_api_trace", return_value=object()):
+        # Patched where create_run RESOLVES the name. A shim re-exported from
+        # ops.run_service would make this patch silently ineffective rather than
+        # failing, so the target has to follow the implementation.
+        with patch("ops.run_creation.get_browser_api_trace", return_value=object()):
             record = service.create_run(_request(), execution_mode="execute_when_configured")
         rows, total = service.list_runs(limit=10, offset=0)
     finally:
