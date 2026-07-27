@@ -450,7 +450,7 @@ async def test_ambiguous_click_outcome_is_never_blindly_retried(
     assert submit.actual_clicks == 1
 
 
-async def test_get_form_is_blocked_before_effect_reservation(
+async def test_get_form_is_blocked_before_click(
     tmp_path: Path,
 ) -> None:
     inspection, fill_result = prepared_form()
