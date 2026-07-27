@@ -108,12 +108,22 @@ from ops.inference import build_json_inference
 from ops.model_input_dlp import (
     DROPPED,
     contains_secret_material,
-    sanitize_element_name,
     sanitize_page_text,
     sanitize_reason,
     sanitize_url,
 )
 from ops.models import OperationalResearch, validate_vault_reference
+
+# Imported for use below AND re-exported: ``ops.playwright_worker`` stays the
+# import home these names already have across ops, api and the tests.
+from ops.playwright_page_inspection import (  # noqa: F401
+    _SECRETISH_FIELD,
+    _describe_element,
+    _fingerprint,
+    _page_url,
+    _visible_text,
+)
+from ops.playwright_page_inspection import PageInspection as PageInspection
 from ops.provider_errors import ConfigurationRequiredError, ProviderOperationError
 from ops.secret_store import SecretStore
 
@@ -459,23 +469,6 @@ class _PwSession:
             now - self.last_active_at > _INACTIVITY_WINDOW
             or now - self.created_at > _MAXIMUM_WINDOW
         )
-
-
-@dataclass(frozen=True, slots=True)
-class PageInspection:
-    """A bounded, secret-free view of the current page for one decision step."""
-
-    url: str
-    title: str
-    visible_text: str
-    elements: tuple[SnapshotElement, ...]
-    locators: tuple[Any, ...]
-    fingerprint: str
-    # Monotonic DOM generation this inspection was taken at (item 3).
-    generation: int = 0
-
-    def accessible_names(self) -> tuple[str, ...]:
-        return tuple(element.name for element in self.elements if element.name)
 
 
 # Typed reason codes for core browser/action failures. A programming error
@@ -2519,69 +2512,6 @@ class PlaywrightBrowserWorker:
             self._release_capacity(session)
 
 
-# --- small helpers (kept module-level for unit testing) -----------------------
-async def _describe_element(locator: Any) -> dict[str, object]:
-    """Describe ONE element with accessibility-relevant, non-secret attributes.
-
-    Collects role/tag, accessible name, input type, and whether a NON-secret field
-    is filled. It never reads an input's value, cookies, storage, or headers.
-    """
-
-    async def _attr(name: str) -> str:
-        try:
-            value = await locator.get_attribute(name, timeout=2_000)
-        except Exception:
-            return ""
-        return value if isinstance(value, str) else ""
-
-    tag = ""
-    try:
-        tag = str(await locator.evaluate("el => el.tagName.toLowerCase()")) or ""
-    except Exception:
-        tag = ""
-    element_type = await _attr("type")
-    # Accessible name, preferring the sources Playwright/ARIA recommend.
-    name = await _attr("aria-label") or await _attr("placeholder") or await _attr("title")
-    if not name:
-        try:
-            text = await locator.inner_text(timeout=2_000)
-            name = text.strip()[:120] if isinstance(text, str) else ""
-        except Exception:
-            name = ""
-    role = await _attr("role") or tag or "element"
-    field_name = await _attr("name")
-    secretish = bool(_SECRETISH_FIELD.search(f"{name} {element_type} {field_name}"))
-    # Sanitize the accessible name at the source: a credential-describing name
-    # becomes a semantic placeholder, and any token-shaped text is redacted.
-    origin = "contenteditable" if tag == "div" and await _attr("contenteditable") else tag
-    name = sanitize_element_name(name, element_type=element_type, origin=origin, role=tag or role)
-    value_present = False
-    if not secretish and tag in {"input", "textarea"}:
-        try:
-            current = await locator.input_value(timeout=2_000)
-            value_present = bool(isinstance(current, str) and current)
-        except Exception:
-            value_present = False
-    return {
-        "role": role,
-        "tag": tag,
-        "name": name,
-        "type": element_type,
-        "value_present": value_present,
-    }
-
-
-_SECRETISH_FIELD = re.compile(r"(?i)pass|secret|token|otp|code|cvv|card|credential|api.?key")
-
-
-def _fingerprint(url: str, elements: Sequence[SnapshotElement]) -> str:
-    """A stable, non-secret signature of the current page state."""
-
-    parts = [urlsplit(url).path or "/"]
-    parts.extend(f"{element.role}:{element.name}" for element in elements[:15])
-    return "|".join(parts)[:2_000]
-
-
 def current_checkpoint(trace: BrowserApiTrace, index: int) -> BrowserApiTraceStep | None:
     """Return the checkpoint at ``index``, or None when the trace is exhausted."""
 
@@ -2867,11 +2797,6 @@ async def _safe(coro_fn: Any) -> None:
         pass
 
 
-def _page_url(page: Any) -> str:
-    url = getattr(page, "url", "")
-    return url if isinstance(url, str) and url else "https://unknown.invalid/"
-
-
 async def _login_frames_are_reviewed(page: Any, patterns: tuple[str, ...]) -> bool:
     """True when every frame hosting a password field is on a reviewed origin.
 
@@ -2967,16 +2892,6 @@ async def _submit_login(page: Any) -> bool:
         except Exception:
             pass
     return submitted
-
-
-async def _visible_text(page: Any, *, limit: int = 20_000) -> str:
-    """Best-effort visible body text, bounded. Used only for signal matching."""
-
-    try:
-        text = await page.inner_text("body", timeout=5_000)
-    except Exception:
-        return ""
-    return text[:limit] if isinstance(text, str) else ""
 
 
 def _normalize_signal(value: str) -> str:
