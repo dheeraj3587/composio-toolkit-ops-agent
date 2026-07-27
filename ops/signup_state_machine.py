@@ -142,9 +142,15 @@ class SQLiteSignupStateStore:
         try:
             finalize_private_database(self.db_path, existed=existed)
             connection.execute("PRAGMA secure_delete = ON")
-            # Serialize schema discovery and additive migration across processes.
-            # Without a write reservation, two cold starts can both observe a
-            # missing column and race on ALTER TABLE.
+
+            # Normal reads take a read-only fast path once the additive schema is
+            # current. Only a missing table or column acquires the write reservation.
+            columns = _signup_state_columns(connection)
+            if {"reason_code", "outcome"} <= columns:
+                return
+
+            # Recheck after acquiring the reservation. Another process may have
+            # completed the migration while this connection was waiting.
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
@@ -158,12 +164,7 @@ class SQLiteSignupStateStore:
                 )
                 """
             )
-            columns = {
-                str(row[1])
-                for row in connection.execute(
-                    "PRAGMA table_info(signup_states)"
-                ).fetchall()
-            }
+            columns = _signup_state_columns(connection)
             if "reason_code" not in columns:
                 connection.execute(
                     """
@@ -367,6 +368,13 @@ class SignupStateMachine:
             reason_code=reason_code,
             outcome=outcome,
         )
+
+
+def _signup_state_columns(connection: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(signup_states)").fetchall()
+    }
 
 
 def _snapshot(row: tuple[object, ...]) -> SignupStateSnapshot:
