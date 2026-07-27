@@ -1,0 +1,63 @@
+name: Extract PR11 merge baseline
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out report branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/signup-foundation-ci-diagnostics
+          path: report
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Check out exact PR11 merge commit
+        uses: actions/checkout@v4
+        with:
+          ref: 2d8634b8a1d42ce01cba40a5ad4ae7f43ca1a68c
+          path: target
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: python -m pip install -q detect-secrets==1.5.0
+
+      - name: Refresh merge baseline only
+        run: |
+          cd target
+          files=()
+          while IFS= read -r -d '' candidate; do
+            case "$candidate" in
+              .secrets.baseline | PLAN.md | data/p1/SNAPSHOT.json) continue ;;
+            esac
+            [[ -f "$candidate" ]] && files+=("$candidate")
+          done < <(git ls-files -z --cached --others --exclude-standard)
+          set +e
+          detect-secrets-hook --baseline .secrets.baseline "${files[@]}"
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
+            exit "$status"
+          fi
+          cp .secrets.baseline ../report/pr11-merge-baseline.json
+
+      - name: Commit extracted baseline
+        working-directory: report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pr11-merge-baseline.json
+          git commit -m "chore: extract PR11 merge baseline"
+          git push origin HEAD:agent/signup-foundation-ci-diagnostics
