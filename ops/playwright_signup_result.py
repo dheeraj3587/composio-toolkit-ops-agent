@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypeVar
 
 from ops.automation_contracts import BrowserAutomationContract
 from ops.signup_result import (
@@ -28,6 +28,7 @@ _MAX_RESULT_CONTROLS = 160
 _DEFAULT_TIMEOUT_SECONDS = 20.0
 _DEFAULT_POLL_SECONDS = 0.25
 _DEFAULT_STABLE_OBSERVATIONS = 2
+_T = TypeVar("_T")
 
 _RESULT_OBSERVATION_SCRIPT = r"""
 () => {
@@ -225,7 +226,9 @@ async def wait_for_signup_result(
 
     Two equal positive observations are required by default. This prevents a
     transient loading message or intermediate redirect from becoming durable
-    workflow truth. Unproven timeouts remain ``outcome_unknown``.
+    workflow truth. Every observation and gate read shares the same hard deadline;
+    an individual browser call cannot hang beyond the classification budget.
+    Unproven timeouts remain ``outcome_unknown``.
     """
 
     if not 0.5 <= timeout_seconds <= 120.0:
@@ -243,7 +246,18 @@ async def wait_for_signup_result(
     last_retry_reason = "signup_result_not_yet_proven"
 
     while loop.time() < deadline:
-        capture = await observation_reader(page, contract)
+        try:
+            capture = await _await_before_deadline(
+                lambda: observation_reader(page, contract),
+                deadline=deadline,
+            )
+        except TimeoutError:
+            return _unresolved_result(
+                contract,
+                status="outcome_unknown",
+                reason_code="signup_result_observation_timeout",
+            )
+
         if capture.status == "safe_stop":
             return _unresolved_result(
                 contract,
@@ -254,10 +268,21 @@ async def wait_for_signup_result(
             last_retry_reason = capture.reason_code
             previous_key = None
             stable_count = 0
-            await asyncio.sleep(poll_seconds)
+            await _sleep_before_deadline(deadline=deadline, seconds=poll_seconds)
             continue
 
-        gates = await gate_reader(page, contract)
+        try:
+            gates = await _await_before_deadline(
+                lambda: gate_reader(page, contract),
+                deadline=deadline,
+            )
+        except TimeoutError:
+            return _unresolved_result(
+                contract,
+                status="outcome_unknown",
+                reason_code="signup_result_observation_timeout",
+            )
+
         if gates.status == "safe_stop":
             if gates.reason_code in {
                 "signup_gate_surface_unavailable",
@@ -266,7 +291,7 @@ async def wait_for_signup_result(
                 last_retry_reason = gates.reason_code
                 previous_key = None
                 stable_count = 0
-                await asyncio.sleep(poll_seconds)
+                await _sleep_before_deadline(deadline=deadline, seconds=poll_seconds)
                 continue
             return _unresolved_result(
                 contract,
@@ -281,7 +306,7 @@ async def wait_for_signup_result(
             last_unknown = classified
             previous_key = None
             stable_count = 0
-            await asyncio.sleep(poll_seconds)
+            await _sleep_before_deadline(deadline=deadline, seconds=poll_seconds)
             continue
 
         key = (
@@ -296,7 +321,7 @@ async def wait_for_signup_result(
             stable_count = 1
         if stable_count >= stable_observations:
             return classified.with_stable_observations(stable_count)
-        await asyncio.sleep(poll_seconds)
+        await _sleep_before_deadline(deadline=deadline, seconds=poll_seconds)
 
     if last_unknown is not None and last_unknown.reason_code != "signup_result_not_yet_proven":
         return last_unknown.model_copy(update={"stable_observations": 0})
@@ -309,6 +334,27 @@ async def wait_for_signup_result(
             else "signup_result_observation_timeout"
         ),
     )
+
+
+async def _await_before_deadline(
+    factory: Callable[[], Awaitable[_T]],
+    *,
+    deadline: float,
+) -> _T:
+    """Run one browser read within the caller's absolute deadline."""
+
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise TimeoutError
+    return await asyncio.wait_for(factory(), timeout=remaining)
+
+
+async def _sleep_before_deadline(*, deadline: float, seconds: float) -> None:
+    """Yield between observations without extending the absolute deadline."""
+
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining > 0:
+        await asyncio.sleep(min(seconds, remaining))
 
 
 def _unresolved_result(
