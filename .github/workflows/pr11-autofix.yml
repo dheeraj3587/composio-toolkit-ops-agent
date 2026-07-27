@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - agent/autonomous-signup-foundation-complete
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -12,7 +11,6 @@ permissions:
 
 jobs:
   autofix:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
