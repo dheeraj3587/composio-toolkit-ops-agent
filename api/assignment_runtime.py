@@ -24,8 +24,7 @@ from uuid import uuid4
 import httpx
 
 import ops.browser_host_policy as browser_policy_module
-import ops.browser_worker as browser_worker_module
-import ops.composio_capability as composio_module
+from ops import runtime_extensions
 from ops.browser_api_trace_catalog import get_browser_api_trace
 from ops.browser_host_policy import (
     BrowserAllowedHosts,
@@ -65,27 +64,11 @@ from ops.routing import decide_access
 
 _INACTIVITY_WINDOW = timedelta(minutes=15)
 _MAXIMUM_WINDOW = timedelta(hours=4)
-# The unpatched core graph nodes this layer wraps. ``api`` must not import
-# ``ops.graph`` (the workflow is reached only through the application service), so
-# the type is resolved through the module registry instead of an import.
-#
-# Resolution is cached and MUST happen before the node is replaced: resolving a
-# node after patching would return this module's own wrapper and recurse forever.
-# ``install_assignment_runtime`` therefore primes the cache before it assigns, and
-# a direct call before installation still resolves the genuine core node.
-_CORE_NODES: dict[str, Any] = {}
-
-
-def _core_workflow_type() -> Any:
-    return cast(Any, importlib.import_module("ops.graph")).DurableOperationsWorkflow
-
-
-def _core_node(name: str) -> Any:
-    """Return the original core graph node, resolved once on first use."""
-
-    if name not in _CORE_NODES:
-        _CORE_NODES[name] = getattr(_core_workflow_type(), name)
-    return _CORE_NODES[name]
+# These wrappers build on the core routing decision by calling the workflow's own
+# ``_core_*`` methods. No import of ``ops.graph`` is needed (``api`` must not import
+# it), and no cached "original" is needed either: the core method is a separate
+# method from the dispatching node, so a wrapper can never resolve itself and
+# recurse the way an attribute patch could.
 
 
 # Routes that cannot yield a self-serve credential on their own: the browser
@@ -988,7 +971,7 @@ def _assignment_route(
     every non-browser route, is returned untouched.
     """
 
-    result = cast("dict[str, object]", _core_node("_route")(workflow, state))
+    result = cast("dict[str, object]", workflow._core_route(state))
     if result.get("route_reason_code") not in {
         "verified_browser_urls_missing",
         "browser_trace_not_reviewed",
@@ -1073,7 +1056,7 @@ def _assignment_after_browser(
     vendor, so the controlled Gmail outreach is still sent once.
     """
 
-    node = cast("str", _core_node("_after_browser")(workflow, state))
+    node = cast("str", workflow._core_after_browser(state))
     if node != "finalize" or state.get("gmail_thread_id"):
         return node
     if state.get("access_route") not in _GATED_ROUTES:
@@ -1146,25 +1129,20 @@ def install_assignment_runtime() -> None:
 
     install_assignment_browser_policies()
     _install_demo_aware_lookup()
-    browser_worker_module.BrowserWorker = AssignmentBrowserWorker  # type: ignore[misc]
-    composio_module.ComposioCapabilityPreflight = (  # type: ignore[misc]
-        AssignmentComposioCapabilityPreflight
+
+    # Registered through the declared extension surface instead of rewriting class
+    # attributes on the ops modules. The core code resolves these at call time, so an
+    # override cannot be silently disabled by moving the code that consumes it, and
+    # the effective classes no longer depend on import order.
+    runtime_extensions.install(
+        browser_worker_factory=lambda settings: AssignmentBrowserWorker(settings=settings),
+        capability_preflight_factory=lambda settings: AssignmentComposioCapabilityPreflight(
+            settings=settings
+        ),
+        route=_assignment_route,
+        after_route=_assignment_after_route,
+        after_browser=_assignment_after_browser,
     )
-
-    # ops.run_service imports these classes directly, so updating only their
-    # defining modules does not replace already-bound runtime aliases.
-    run_service_module = cast(Any, importlib.import_module("ops.run_service"))
-    run_service_module.BrowserWorker = AssignmentBrowserWorker
-    run_service_module.ComposioCapabilityPreflight = AssignmentComposioCapabilityPreflight
-
-    workflow_type = _core_workflow_type()
-    # Capture the originals BEFORE replacing them, so the wrappers can never
-    # resolve themselves and recurse.
-    _core_node("_route")
-    _core_node("_after_browser")
-    workflow_type._route = _assignment_route
-    workflow_type._after_route = _assignment_after_route
-    workflow_type._after_browser = _assignment_after_browser
     _INSTALLED = True
 
 

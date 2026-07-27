@@ -20,6 +20,7 @@ from typing import Any, Literal, Protocol, cast
 import httpx
 from pydantic import SecretStr
 
+from ops import runtime_extensions
 from ops.browser_worker import BrowserWorker
 from ops.composio_capability import ComposioCapabilityPreflight, ComposioCapabilityReport
 from ops.config import Settings
@@ -379,7 +380,12 @@ class RunService:
 
         # Read-only Composio capability preflight; fails closed when unconfigured.
         if self._capability_preflight is None:
-            self._capability_preflight = ComposioCapabilityPreflight(settings=settings)
+            preflight_factory = runtime_extensions.active().capability_preflight_factory
+            self._capability_preflight = (
+                preflight_factory(settings)
+                if preflight_factory is not None
+                else ComposioCapabilityPreflight(settings=settings)
+            )
         self._record_wiring("composio_preflight", self._capability_preflight, configured=True)
 
         # One-probe research enricher (Perplexity discovery optional, Gemini
@@ -936,8 +942,10 @@ class RunService:
     ) -> BrowserWorker:
         """Select the browser backend.
 
-        Default resolves the (possibly assignment-patched) ``BrowserWorker`` in this
-        module's namespace, so the Browser Use path is byte-for-byte unchanged.
+        The Browser Use default comes from the installed browser-worker factory when a
+        deployment registered one (see ``ops.runtime_extensions``), otherwise from the
+        core ``BrowserWorker``. Resolving through the registry rather than through this
+        module's namespace means the choice no longer depends on where this code lives.
 
         For ``playwright`` the NORMAL path is now the isolated browser service over
         authenticated RPC. Previously this always returned the in-process worker, so
@@ -979,6 +987,9 @@ class RunService:
                     owner=settings.browser_service_owner,
                 ),
             )
+        worker_factory = runtime_extensions.active().browser_worker_factory
+        if worker_factory is not None:
+            return worker_factory(settings)
         return BrowserWorker(settings=settings)
 
     def _record_wiring(

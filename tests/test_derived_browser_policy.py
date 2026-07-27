@@ -23,6 +23,7 @@ from ops.derived_browser_policy import (
     derive_browser_host_policy,
     registrable_domain,
 )
+from ops.graph import DurableOperationsWorkflow
 from ops.models import CompanyProfile, OperationalResearch, OperationsRequest
 from ops.operational_baselines import apply_reviewed_operational_baseline
 from ops.p1_adapter import load_verified_snapshot, to_operational_research
@@ -167,18 +168,22 @@ def test_derived_self_serve_app_reaches_the_browser_node() -> None:
 
 
 def test_gated_app_still_sends_outreach_after_a_browser_inspection() -> None:
+    # The wrapper builds on the workflow's own core branch, so it needs a workflow to
+    # call it on. An uninitialized instance is enough and keeps the REAL core decision
+    # in the test: _core_after_browser reads only the passed state, never self.
+    workflow = DurableOperationsWorkflow.__new__(DurableOperationsWorkflow)
     state: dict[str, Any] = {
         "access_route": "partner_gated",
         "browser_observation": {"status": "credential_page_ready"},
     }
 
-    assert _assignment_after_browser(None, state) == "outreach_send"  # type: ignore[arg-type]
+    assert _assignment_after_browser(workflow, state) == "outreach_send"
 
     already_sent = {**state, "gmail_thread_id": "thread-1"}
-    assert _assignment_after_browser(None, already_sent) == "finalize"  # type: ignore[arg-type]
+    assert _assignment_after_browser(workflow, already_sent) == "finalize"
 
     self_serve = {**state, "access_route": "self_serve"}
-    assert _assignment_after_browser(None, self_serve) == "finalize"  # type: ignore[arg-type]
+    assert _assignment_after_browser(workflow, self_serve) == "finalize"
 
 
 def test_every_verified_app_is_executable_or_verifiably_blocked() -> None:
