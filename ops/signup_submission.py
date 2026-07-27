@@ -148,7 +148,10 @@ async def submit_signup_form(
 
     provider = contract.app_slug
     action = "signup_submit"
-    idempotency_key = f"signup-submit:v1:{run_id}:{contract.contract_version}"
+    idempotency_key = (
+        f"signup-submit:v1:{run_id}:{contract.contract_version}:"
+        f"{account_binding.binding_id}"
+    )
     try:
         reservation = effect_store.reserve(
             provider=provider,
@@ -164,6 +167,17 @@ async def submit_signup_form(
         )
 
     if reservation.status == "completed":
+        if not _completed_receipt_valid(
+            reservation.receipt,
+            contract_version=contract.contract_version,
+            account_binding_id=account_binding.binding_id,
+        ):
+            return SignupSubmissionResult(
+                status="outcome_unknown",
+                reason_code="signup_submit_receipt_invalid",
+                contract_version=contract.contract_version,
+                verified_fields=tuple(fill_result.verified_fields),
+            )
         return SignupSubmissionResult(
             status="submitted",
             reason_code="signup_submit_already_dispatched",
@@ -257,6 +271,7 @@ async def submit_signup_form(
                 "result": "dispatched",
                 "purpose": "signup_submit",
                 "contract_version": contract.contract_version,
+                "account_binding_id": account_binding.binding_id,
             },
         )
     except Exception:
@@ -603,6 +618,21 @@ def _host_matches(host: str, pattern: str) -> bool:
         suffix = normalized[2:]
         return host == suffix or host.endswith(f".{suffix}")
     return host == normalized
+
+
+def _completed_receipt_valid(
+    receipt: dict[str, str] | None,
+    *,
+    contract_version: str,
+    account_binding_id: str,
+) -> bool:
+    expected = {
+        "result": "dispatched",
+        "purpose": "signup_submit",
+        "contract_version": contract_version,
+        "account_binding_id": account_binding_id,
+    }
+    return receipt == expected
 
 
 def _result_from_preflight(
