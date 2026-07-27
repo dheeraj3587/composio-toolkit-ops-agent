@@ -1,4 +1,4 @@
-name: Extract PR11 merge secret result
+name: Capture PR11 API validation error
 
 on:
   pull_request:
@@ -8,10 +8,14 @@ permissions:
   contents: write
 
 jobs:
-  extract:
+  capture:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
+    env:
+      ALLOW_LIVE_BROWSER: "false"
+      ALLOW_LIVE_VENDOR_EMAIL: "false"
+      RUN_LIVE_TESTS: "0"
     steps:
       - name: Check out report branch
         uses: actions/checkout@v4
@@ -21,10 +25,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Check out exact PR11 merge commit
+      - name: Check out exact final PR11 merge commit
         uses: actions/checkout@v4
         with:
-          ref: 2d8634b8a1d42ce01cba40a5ad4ae7f43ca1a68c
+          ref: 8f5277aeb910a534eab82d2e1ef0e0f3eef87a22
           path: target
           persist-credentials: false
 
@@ -32,31 +36,66 @@ jobs:
         with:
           python-version: "3.11"
 
-      - run: python -m pip install -q detect-secrets==1.5.0
+      - run: python -m pip install --requirement target/requirements-dev.txt
 
-      - name: Capture merge secret result
+      - name: Capture direct API service validation error
         run: |
           cd target
-          files=()
-          while IFS= read -r -d '' candidate; do
-            case "$candidate" in
-              .secrets.baseline | PLAN.md | data/p1/SNAPSHOT.json) continue ;;
-            esac
-            [[ -f "$candidate" ]] && files+=("$candidate")
-          done < <(git ls-files -z --cached --others --exclude-standard)
-          set +e
-          detect-secrets-hook --baseline .secrets.baseline "${files[@]}" \
-            > ../report/pr11-merge-secret-output.txt 2>&1
-          status=$?
-          set -e
-          printf 'exit_status=%s\n' "$status" > ../report/pr11-merge-secret-status.txt
-          cp .secrets.baseline ../report/pr11-merge-baseline.json
+          python - <<'PY' > ../report/pr11-api-validation.txt 2>&1
+          from __future__ import annotations
 
-      - name: Commit captured result
+          import asyncio
+          import tempfile
+          import traceback
+          from pathlib import Path
+
+          from pydantic import ValidationError
+
+          from api.models import CreateRunRequest
+          from api.service import LocalRunService
+          from ops.run_service import RunService as CoreRunService
+
+          payload = {
+              "app_name": "HubSpot",
+              "company": {
+                  "legal_name": "Example Company",
+                  "website": "https://example.test",
+                  "work_email_ref": "vault://company/work_email/test-operator",
+                  "use_case": "Evaluate documented integration access.",
+                  "callback_urls": ["https://example.test/oauth/callback"],
+              },
+              "requested_scope_policy": "maximum",
+              "dry_run": True,
+              "outreach_recipient_override": "controlled@example.test",
+          }
+
+          async def main() -> None:
+              with tempfile.TemporaryDirectory() as directory:
+                  db_path = Path(directory) / "private" / "ops.db"
+                  core = CoreRunService.from_paths(db_path=db_path)
+                  service = LocalRunService(db_path, core_service=core)
+                  await service.startup()
+                  try:
+                      request = CreateRunRequest.model_validate(payload)
+                      result = await service.create_run(request)
+                      print(result.model_dump(mode="json"))
+                  except ValidationError as exc:
+                      print("VALIDATION_ERROR")
+                      for item in exc.errors(include_url=False, include_input=False):
+                          print(item)
+                  except Exception:
+                      traceback.print_exc()
+                  finally:
+                      await service.shutdown()
+
+          asyncio.run(main())
+          PY
+
+      - name: Commit validation output
         working-directory: report
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pr11-merge-secret-output.txt pr11-merge-secret-status.txt pr11-merge-baseline.json
-          git commit -m "chore: capture PR11 merge secret result"
+          git add pr11-api-validation.txt
+          git commit -m "chore: capture PR11 API validation error"
           git push origin HEAD:agent/signup-foundation-ci-diagnostics
