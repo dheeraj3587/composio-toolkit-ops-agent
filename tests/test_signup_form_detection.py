@@ -16,7 +16,7 @@ def candidate(
 ) -> SignupControlCandidate:
     return SignupControlCandidate(
         token=f"sf_{index:032x}",
-        control_kind=kind,
+        control_kind=kind,  # type: ignore[arg-type] - focused fixture vocabulary
         accessible_name=name,
         aria_label=aria_label,
         associated_labels=associated_labels,
@@ -59,8 +59,8 @@ def test_simple_one_page_signup_form_is_detected() -> None:
         field.semantic_field: field.strategy for field in inspection.fields
     } == {
         "email": "accessible_role_name",
-        "password": "accessible_label",
-        "password_confirmation": "associated_label",
+        "password": "accessible_label",  # pragma: allowlist secret
+        "password_confirmation": "associated_label",  # pragma: allowlist secret
         "company_name": "placeholder",
         "signup_submit": "accessible_role_name",
     }
