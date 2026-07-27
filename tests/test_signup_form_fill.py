@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import cast
 
 from cryptography.fernet import Fernet
 
@@ -15,9 +16,10 @@ from ops.automation_contracts import (
     ContractSelectOption,
     ContractSignup,
     ContractSignupFieldHints,
+    SignupSemanticField,
     evidence_hash_for,
 )
-from ops.playwright_signup import fill_signup_form
+from ops.playwright_signup import _build_fill_plan, fill_signup_form
 from ops.secret_store import SQLiteSecretStore
 from ops.signup_credentials import (
     SQLiteSignupCredentialRegistry,
@@ -130,7 +132,7 @@ def contract(*, require_first_name: bool = False) -> BrowserAutomationContract:
 def candidate(index: int, *, kind: str, name: str) -> SignupControlCandidate:
     return SignupControlCandidate(
         token=f"sf_{index:032x}",
-        control_kind=kind,
+        control_kind=kind,  # type: ignore[arg-type] - focused fixture vocabulary
         accessible_name=name,
     )
 
@@ -177,70 +179,7 @@ def approved_values(
     )
 
 
-async def test_required_fields_are_filled_and_verified_without_submit(
-    tmp_path: Path,
-) -> None:
-    vault = SQLiteSecretStore(tmp_path / "vault.db", Fernet.generate_key().decode())
-    email_ref = vault.put(
-        app_slug="pipedrive",
-        kind="signup_email",
-        value="owner@example.com",
-    )
-    registry = SQLiteSignupCredentialRegistry(tmp_path / "signup.db")
-    manager = SignupCredentialManager(vault, registry)
-    binding = SignupAccountBinding(
-        owner_ref="owner_1",
-        app_slug="pipedrive",
-        gmail_account_fingerprint="a" * 64,
-    )
-    generated = manager.generate_account_password(binding)
-    values = approved_values(
-        email_ref=email_ref,
-        password_ref=generated.password_ref,
-    )
-    current_contract = contract()
-    inspection = inspection_for(current_contract)
-    locators = {
-        field.token: FakeLocator(kind=field.control_kind)
-        for field in inspection.fields
-    }
-    page = FakePage(locators)
-    screenshot_state = {"disabled": False}
-
-    result = await fill_signup_form(
-        page,
-        inspection=inspection,
-        contract=current_contract,
-        approved_values=values,
-        run_id="run_1",
-        session_id="bs_1",
-        secret_store=vault,
-        credential_manager=manager,
-        account_binding=binding,
-        disable_screenshots=lambda: screenshot_state.update(disabled=True),
-    )
-
-    assert result.status == "filled"
-    assert result.reason_code == "signup_form_filled_and_verified"
-    assert set(result.filled_fields) == {
-        "email",
-        "password",
-        "password_confirmation",
-        "company_name",
-        "country",
-    }
-    assert result.filled_fields == result.verified_fields
-    assert result.submit_clicked is False
-    assert screenshot_state["disabled"] is True
-    submit = inspection.match_for("signup_submit")
-    assert submit is not None
-    assert locators[submit.token].fill_calls == []
-    assert locators[submit.token].click_calls == 0
-
-
-async def test_password_never_enters_prompt_safe_or_result_models(
-    tmp_path: Path,
-) -> None:
+def setup_dependencies(tmp_path: Path):
     vault = SQLiteSecretStore(tmp_path / "vault.db", Fernet.generate_key().decode())
     email_ref = vault.put(
         app_slug="pipedrive",
@@ -254,9 +193,65 @@ async def test_password_never_enters_prompt_safe_or_result_models(
     binding = SignupAccountBinding(
         owner_ref="owner_1",
         app_slug="pipedrive",
-        gmail_account_fingerprint="b" * 64,
+        gmail_account_fingerprint="a" * 64,
     )
     generated = manager.generate_account_password(binding)
+    return vault, email_ref, manager, binding, generated
+
+
+async def test_required_fields_are_filled_and_verified_without_submit(
+    tmp_path: Path,
+) -> None:
+    vault, email_ref, manager, binding, generated = setup_dependencies(tmp_path)
+    values = approved_values(
+        email_ref=email_ref,
+        password_ref=generated.password_ref,
+    )
+    current_contract = contract()
+    inspection = inspection_for(current_contract)
+    locators = {
+        field.token: FakeLocator(kind=field.control_kind)
+        for field in inspection.fields
+    }
+    page = FakePage(locators)
+    capture_state = {"screenshots": False, "browser_capture": False}
+
+    result = await fill_signup_form(
+        page,
+        inspection=inspection,
+        contract=current_contract,
+        approved_values=values,
+        run_id="run_1",
+        session_id="bs_1",
+        secret_store=vault,
+        credential_manager=manager,
+        account_binding=binding,
+        disable_screenshots=lambda: capture_state.update(screenshots=True),
+        assert_secret_capture_disabled=lambda: capture_state.update(browser_capture=True),
+    )
+
+    assert result.status == "filled"
+    assert result.reason_code == "signup_form_filled_and_verified"
+    assert set(result.filled_fields) == {
+        "email",
+        "password",
+        "password_confirmation",
+        "company_name",
+        "country",
+    }
+    assert result.filled_fields == result.verified_fields
+    assert result.submit_clicked is False
+    assert capture_state == {"screenshots": True, "browser_capture": True}
+    submit = inspection.match_for("signup_submit")
+    assert submit is not None
+    assert locators[submit.token].fill_calls == []
+    assert locators[submit.token].click_calls == 0
+
+
+async def test_password_never_enters_prompt_safe_or_result_models(
+    tmp_path: Path,
+) -> None:
+    vault, email_ref, manager, binding, generated = setup_dependencies(tmp_path)
     raw_password = vault.get(generated.password_ref)
     values = approved_values(
         email_ref=email_ref,
@@ -282,6 +277,7 @@ async def test_password_never_enters_prompt_safe_or_result_models(
         credential_manager=manager,
         account_binding=binding,
         disable_screenshots=lambda: None,
+        assert_secret_capture_disabled=lambda: None,
     )
 
     model_material = json.dumps(
@@ -297,25 +293,74 @@ async def test_password_never_enters_prompt_safe_or_result_models(
     assert email_ref not in model_material
 
 
+def test_secret_plan_contains_no_plaintext_or_sentinel(tmp_path: Path) -> None:
+    _vault, email_ref, _manager, _binding, generated = setup_dependencies(tmp_path)
+    values = approved_values(
+        email_ref=email_ref,
+        password_ref=generated.password_ref,
+    )
+    current_contract = contract()
+    inspection = inspection_for(current_contract)
+    required = set(
+        cast(
+            tuple[SignupSemanticField, ...],
+            current_contract.signup.required_semantic_fields,
+        )
+    )
+
+    planned, missing, reason = _build_fill_plan(
+        inspection=inspection,
+        signup=current_contract.signup,
+        approved_values=values,
+        required=required,
+    )
+
+    assert missing == []
+    assert reason is None
+    secret_items = [item for item in planned if item.secret]
+    assert {item.match.semantic_field for item in secret_items} == {
+        "email",
+        "password",
+        "password_confirmation",
+    }
+    assert all(item.value is None for item in secret_items)
+    assert "__secret" not in repr(planned)
+
+
+async def test_missing_capture_guard_fails_before_secret_resolution(
+    tmp_path: Path,
+) -> None:
+    vault, email_ref, manager, binding, generated = setup_dependencies(tmp_path)
+    values = approved_values(email_ref=email_ref, password_ref=generated.password_ref)
+    current_contract = contract()
+    inspection = inspection_for(current_contract)
+    locators = {
+        field.token: FakeLocator(kind=field.control_kind)
+        for field in inspection.fields
+    }
+
+    result = await fill_signup_form(
+        FakePage(locators),
+        inspection=inspection,
+        contract=current_contract,
+        approved_values=values,
+        run_id="run_1",
+        session_id="bs_1",
+        secret_store=vault,
+        credential_manager=manager,
+        account_binding=binding,
+        disable_screenshots=lambda: None,
+    )
+
+    assert result.status == "configuration_required"
+    assert result.reason_code == "signup_secret_capture_guard_missing"
+    assert all(not locator.fill_calls for locator in locators.values())
+
+
 async def test_missing_required_value_returns_configuration_required_before_fill(
     tmp_path: Path,
 ) -> None:
-    vault = SQLiteSecretStore(tmp_path / "vault.db", Fernet.generate_key().decode())
-    email_ref = vault.put(
-        app_slug="pipedrive",
-        kind="signup_email",
-        value="owner@example.com",
-    )
-    manager = SignupCredentialManager(
-        vault,
-        SQLiteSignupCredentialRegistry(tmp_path / "signup.db"),
-    )
-    binding = SignupAccountBinding(
-        owner_ref="owner_1",
-        app_slug="pipedrive",
-        gmail_account_fingerprint="c" * 64,
-    )
-    generated = manager.generate_account_password(binding)
+    vault, email_ref, manager, binding, generated = setup_dependencies(tmp_path)
     values = approved_values(
         email_ref=email_ref,
         password_ref=generated.password_ref,
@@ -340,6 +385,9 @@ async def test_missing_required_value_returns_configuration_required_before_fill
         account_binding=binding,
         disable_screenshots=lambda: (_ for _ in ()).throw(
             AssertionError("screenshots should not be disabled before planning succeeds")
+        ),
+        assert_secret_capture_disabled=lambda: (_ for _ in ()).throw(
+            AssertionError("capture guard should not run before planning succeeds")
         ),
     )
 
