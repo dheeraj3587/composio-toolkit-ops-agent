@@ -7,6 +7,7 @@ import importlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, NoReturn
 
 import httpx
@@ -14,6 +15,21 @@ import httpx
 from ops.attachment_extract import AttachmentRef, extract_secret_pairs, is_text_like
 from ops.config import Settings
 from ops.effect_ledger import EffectStore, SQLiteEffectStore
+from ops.email_verification import (
+    DEFAULT_CLOCK_SKEW_SECONDS,
+    MAX_VERIFICATION_AGE_SECONDS,
+    ResolvedVerification,
+    VerificationCandidate,
+    VerificationDecision,
+    VerificationEvidence,
+    VerificationPurpose,
+    extract_verification_code,
+    extract_verification_link,
+    gmail_freshness_query,
+    parse_received_at_ms,
+    select_verification,
+    sender_domain_of,
+)
 from ops.provider_errors import (
     ConfigurationRequiredError,
     PhaseUnavailableError,
@@ -398,31 +414,41 @@ class GmailWorker:
     async def fetch_latest_otp(
         self,
         *,
-        query: str = "newer_than:1h in:anywhere",
+        query: str | None = None,
         trusted_domains: tuple[str, ...] = (),
+        max_age_seconds: int = 900,
     ) -> str | None:
         """Return the most recent one-time login code from the connected inbox.
 
-        Reads recent messages (raw, never logged), prefers senders on a trusted
-        domain when one is supplied, finds the newest message whose subject/body is
-        a verification/OTP email, and extracts the code with hardened, false-
-        positive-resistant heuristics. The value is a short-lived secret: it is
-        returned only to be injected as a Browser Use ``sensitive_data``
-        placeholder and is never persisted, logged, or sent to an LLM.
+        Legacy convenience wrapper. It prefers (rather than requires) a trusted
+        sender and performs no recipient binding, so it must not be used for a new
+        autonomous flow; use :meth:`fetch_verification` instead.
+
+        The freshness bound is enforced here against each message's own receive
+        timestamp. It previously relied on a ``newer_than:1h`` query, which Gmail
+        does not support (its relative age units are day, month, and year only), so
+        the intended one-hour window was never actually applied and an arbitrarily
+        old code could be returned.
         """
 
+        resolved_query = query or gmail_freshness_query(
+            now=datetime.now(UTC), max_age_seconds=max_age_seconds
+        )
         data = await self._execute_read(
             "GMAIL_FETCH_EMAILS",
-            {"max_results": 8, "query": query},
+            {"max_results": 8, "query": resolved_query},
             capability="Composio Gmail OTP fetch",
         )
         messages = data.get("messages")
         if not isinstance(messages, list):
             return None
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
         for message in _order_messages_by_trust(messages, trusted_domains):
+            if not _within_age(message, now_ms=now_ms, max_age_seconds=max_age_seconds):
+                continue
             subject = _first_string(message, ("subject",)) or ""
             body = _first_string(message, ("messageText", "preview", "snippet", "body")) or ""
-            code = _extract_otp(subject, body)
+            code = extract_verification_code(subject, body)
             if code:
                 return code
         return None
@@ -430,35 +456,218 @@ class GmailWorker:
     async def fetch_latest_login_link(
         self,
         *,
-        query: str = "newer_than:1h in:anywhere",
+        query: str | None = None,
         trusted_domains: tuple[str, ...] = (),
+        allowed_link_host_patterns: Sequence[str] = (),
+        max_age_seconds: int = 900,
     ) -> str | None:
         """Return the most recent emailed sign-in verification LINK, if any.
 
-        Some providers (e.g. HubSpot device verification) send a magic link rather
-        than a numeric code: the agent must open the link in its own live session
-        to complete sign-in. This reads recent messages, prefers senders on a
-        trusted domain when one is supplied, finds the newest sign-in verification
-        email, and extracts the verification URL. The URL is a short-lived secret
-        returned only to be injected as a Browser Use ``sensitive_data``
-        placeholder; it is never persisted or logged.
+        Some providers (for example HubSpot device verification) send a magic link
+        rather than a numeric code: the agent must open the link in its own live
+        session to finish signing in.
+
+        Legacy convenience wrapper with the same caveats as
+        :meth:`fetch_latest_otp` - trusted senders are preferred, not required, and
+        no recipient binding is performed. When ``allowed_link_host_patterns`` is
+        supplied the link is additionally required to be HTTPS on a reviewed host,
+        which callers that will actually open the link should always pass. The
+        freshness bound is enforced against each message's own timestamp because
+        Gmail cannot express an hour-scale window.
         """
 
+        resolved_query = query or gmail_freshness_query(
+            now=datetime.now(UTC), max_age_seconds=max_age_seconds
+        )
         data = await self._execute_read(
             "GMAIL_FETCH_EMAILS",
-            {"max_results": 8, "query": query},
+            {"max_results": 8, "query": resolved_query},
             capability="Composio Gmail verification-link fetch",
         )
         messages = data.get("messages")
         if not isinstance(messages, list):
             return None
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        require_host = bool(allowed_link_host_patterns)
         for message in _order_messages_by_trust(messages, trusted_domains):
+            if not _within_age(message, now_ms=now_ms, max_age_seconds=max_age_seconds):
+                continue
             subject = _first_string(message, ("subject",)) or ""
             body = _first_string(message, ("messageText", "body", "preview", "snippet")) or ""
-            link = _extract_login_link(subject, body)
+            link = extract_verification_link(
+                subject,
+                body,
+                allowed_host_patterns=tuple(allowed_link_host_patterns),
+                require_reviewed_host=require_host,
+            )
             if link:
                 return link
         return None
+
+    async def fetch_verification(
+        self,
+        *,
+        purpose: VerificationPurpose,
+        expected_recipient: str,
+        reviewed_sender_patterns: Sequence[str],
+        allowed_link_host_patterns: Sequence[str],
+        run_id: str,
+        max_age_seconds: int = 900,
+        max_results: int = 10,
+        prefer_link: bool = True,
+        require_reviewed_sender: bool = True,
+        require_reviewed_link_host: bool = True,
+        consume: bool = True,
+    ) -> VerificationDecision:
+        """Resolve the one verification message this run is waiting for.
+
+        This is the only Gmail entry point that may be used to obtain a secret an
+        agent will then type into, or open on, a live provider page. Unlike
+        :meth:`fetch_latest_otp` and :meth:`fetch_latest_login_link`, every binding
+        is *required* rather than preferred:
+
+        * the message must be inside ``max_age_seconds`` of now, judged from its own
+          receive timestamp (the server-side query is only a coarse pre-filter,
+          because Gmail cannot express an hour-scale bound);
+        * it must have been delivered to ``expected_recipient`` exactly, plus-tag
+          aware, so another run's verification cannot be consumed;
+        * its sender domain must be inside ``reviewed_sender_patterns``;
+        * a magic link must be HTTPS on a host inside ``allowed_link_host_patterns``.
+
+        When ``consume`` is set, the chosen message is reserved in the effect ledger
+        so the same message cannot be injected twice. A message already completed in
+        the ledger is skipped and the next candidate is considered, which is what
+        stops a resume loop from replaying one expired code forever.
+
+        Returns a :class:`VerificationDecision`. The secret lives only in
+        ``decision.resolved.secret`` as a ``SecretStr``; ``decision.resolved.evidence``
+        is the value-free projection safe to log or persist.
+        """
+
+        if not 1 <= max_results <= 25:
+            raise ValueError("max_results must be between 1 and 25")
+        if not 1 <= max_age_seconds <= MAX_VERIFICATION_AGE_SECONDS:
+            raise ValueError("max_age_seconds must be between 1 second and 1 hour")
+        safe_run_id = _validate_identifier(run_id, "run_id")
+
+        query = gmail_freshness_query(
+            now=datetime.now(UTC),
+            max_age_seconds=max_age_seconds,
+            recipient=expected_recipient,
+        )
+        data = await self._execute_read(
+            "GMAIL_FETCH_EMAILS",
+            {"max_results": max_results, "query": query},
+            capability="Composio Gmail verification fetch",
+        )
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return VerificationDecision(resolved=None, reason_code="verification_message_not_found")
+
+        candidates = tuple(
+            _verification_candidate(message) for message in messages if isinstance(message, Mapping)
+        )
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        consumed: list[str] = []
+        # Re-run selection after skipping an already-consumed message so a stale
+        # code that is still the newest mail cannot deadlock the run.
+        for _round in range(max_results):
+            decision = select_verification(
+                candidates,
+                purpose=purpose,
+                expected_recipient=expected_recipient,
+                now_ms=now_ms,
+                max_age_seconds=max_age_seconds,
+                allowed_host_patterns=tuple(allowed_link_host_patterns),
+                reviewed_sender_patterns=tuple(reviewed_sender_patterns),
+                require_reviewed_sender=require_reviewed_sender,
+                require_reviewed_link_host=require_reviewed_link_host,
+                prefer_link=prefer_link,
+                consumed_message_ids=tuple(consumed),
+            )
+            resolved = decision.resolved
+            if resolved is None or not consume:
+                return decision
+            claimed = self._claim_verification(resolved, run_id=safe_run_id, purpose=purpose)
+            if claimed is True:
+                return decision
+            if claimed is False:
+                consumed.append(resolved.evidence.message_id)
+                continue
+            return VerificationDecision(
+                resolved=None,
+                reason_code="verification_claim_failed",
+                examined=decision.examined,
+                rejections=decision.rejections,
+            )
+        return VerificationDecision(
+            resolved=None, reason_code="verification_all_candidates_consumed"
+        )
+
+    def _claim_verification(
+        self,
+        resolved: ResolvedVerification,
+        *,
+        run_id: str,
+        purpose: VerificationPurpose,
+    ) -> bool | None:
+        """Reserve one message as this run's verification exactly once.
+
+        Returns ``True`` when this call owns the message, ``False`` when it was
+        already consumed (so the caller should consider an older candidate), and
+        ``None`` when the ledger itself could not be used - which fails closed
+        rather than allowing an unbounded number of injections of the same code.
+        """
+
+        evidence = resolved.evidence
+        key = f"gmail-verification:v1:{run_id}:{purpose}:{evidence.message_id}"
+        try:
+            store = self._get_effect_store()
+        except PhaseUnavailableError:
+            return None
+        try:
+            reservation = store.reserve(
+                provider="composio_gmail",
+                action="fetch_verification",
+                idempotency_key=key,
+            )
+        except Exception:
+            return None
+        if reservation.status == "completed":
+            return False
+        if reservation.status == "reconcile_required":
+            # A previous attempt claimed this message and never finished. Treat it
+            # as spent instead of re-injecting a code of unknown status.
+            return False
+        try:
+            store.complete(
+                provider="composio_gmail",
+                action="fetch_verification",
+                idempotency_key=key,
+                receipt={
+                    # Field names deliberately avoid the redaction layer's
+                    # credential vocabulary. A receipt key such as "secret_kind"
+                    # is rejected by the ledger's guard even when its value is
+                    # inert, and the same name would also be masked in logs and
+                    # tripped by the repository secret scanner.
+                    "purpose": purpose,
+                    "message_id": evidence.message_id,
+                    "verification_kind": evidence.verification_kind,
+                    "sender_domain": evidence.sender_domain,
+                    "recipient_binding": evidence.recipient_binding,
+                },
+            )
+        except Exception:
+            try:
+                store.mark_outcome_unknown(
+                    provider="composio_gmail",
+                    action="fetch_verification",
+                    idempotency_key=key,
+                )
+            except Exception:
+                pass
+            return None
+        return True
 
     async def reply(self, thread_id: str, body: str, idempotency_key: str) -> GmailSendResult:
         safe_thread_id = _validate_identifier(thread_id, "thread_id")
@@ -920,91 +1129,155 @@ def _message_sequence(payload: Mapping[str, object]) -> tuple[Mapping[str, objec
     return tuple(candidates)
 
 
-# Cue words a genuine one-time code sits next to. Word-bounded so "pin" does not
-# match inside "shipping" and "code" does not match inside "encoded". Used both as
-# the presence gate and for proximity scoring.
-_OTP_CUE = re.compile(
-    r"\b(?:one[\s-]?time|verification|verify|security|confirmation|confirm|access|"
-    r"log[\s-]?in|login|sign[\s-]?in|authentication|auth|passcode|otp|pin|code)\b",
-    re.IGNORECASE,
-)
-# A numeric code: 4-8 digits, optionally split once by a single space or hyphen
-# ("123-456", "123 456"); never embedded in a longer number, word, URL, path,
-# decimal, or version. A trailing sentence period is allowed (the code may end a
-# sentence), but a "." or "-" or "/" FOLLOWED BY A DIGIT is not (that is a
-# decimal/version/IP/path, not a code).
-_OTP_CANDIDATE = re.compile(r"(?<![\w./-])(\d{3}[\s-]\d{3}|\d{4,8})(?![\w]|[./-]\d)")
-# An alphanumeric code, trusted ONLY when directly attached to an explicit cue word.
-# The cue is case-insensitive; the code stays uppercase-only so it cannot match a
-# lowercase prose word.
-_OTP_ALNUM_NEAR = re.compile(r"(?i:code|otp|passcode|pin)\b[^0-9A-Za-z]{0,12}([A-Z0-9]{5,8})\b")
-_OTP_YEARISH = re.compile(r"^(?:19|20)\d{2}$")
-
-
-def _normalize_code(token: str) -> str:
-    return re.sub(r"[\s-]", "", token)
-
-
-def _plausible_numeric_code(norm: str) -> bool:
-    if not norm.isdigit() or not 4 <= len(norm) <= 8:
-        return False
-    if len(norm) == 4 and _OTP_YEARISH.match(norm):
-        return False  # a bare 4-digit year is almost never an issued one-time code
-    if len(set(norm)) == 1:
-        return False  # 0000 / 111111: implausible as an issued code
-    return True
-
-
-def _extract_otp(subject: str, body: str) -> str | None:
-    """Extract a one-time verification code from an OTP/verification email.
-
-    Deterministic and local by design: a code is a short-lived secret and is never
-    sent to an LLM. Hardened against false positives — a numeric candidate is
-    accepted only when it sits near a verification cue, subject-line codes are
-    strongly preferred, split codes ("123-456") are normalized, and 4-digit years
-    or repeated-digit runs are rejected. Returns None rather than guessing when no
-    candidate is clearly a code.
-    """
-
-    text = f"{subject}\n{body}"
-    cue_positions = [match.start() for match in _OTP_CUE.finditer(text)]
-    if not cue_positions:
-        return None
-    # An alphanumeric code attached to an explicit cue word wins outright.
-    alnum = _OTP_ALNUM_NEAR.search(text)
-    if alnum and not alnum.group(1).isdigit():
-        return alnum.group(1)
-    subject_boundary = len(subject) + 1
-    best: str | None = None
-    best_distance = 10**9
-    for match in _OTP_CANDIDATE.finditer(text):
-        norm = _normalize_code(match.group(1))
-        if not _plausible_numeric_code(norm):
-            continue
-        distance = min(abs(match.start() - pos) for pos in cue_positions)
-        if match.start() < subject_boundary:
-            distance = min(distance, 15)  # subject codes frequently stand alone
-        if distance < best_distance:
-            best, best_distance = norm, distance
-    # Require the winning candidate to be reasonably near a cue; otherwise decline.
-    if best is not None and best_distance <= 60:
-        return best
-    return None
+# The one-time-code and verification-link heuristics live in
+# ``ops.email_verification`` so the hardened verification path and these
+# historical helpers can never drift apart. The private aliases are retained
+# because existing call sites and tests import them from this module.
+_extract_otp = extract_verification_code
 
 
 def _sender_domain(message: Mapping[str, object]) -> str:
     """Return the lowercased domain of a raw message's sender, or ''."""
 
     sender = _first_string(message, ("from", "sender", "fromEmail", "from_email")) or ""
-    match = re.search(r"@([A-Za-z0-9.-]+)", sender)
-    return match.group(1).rstrip(".").casefold() if match else ""
+    return sender_domain_of(sender)
 
 
-def _message_timestamp(message: object) -> str:
-    if isinstance(message, Mapping):
-        value = message.get("messageTimestamp") or message.get("internal_date")
-        return str(value) if value else ""
-    return ""
+def _message_recipients(message: Mapping[str, object]) -> tuple[str, ...]:
+    """Collect every address a provider payload claims the message was sent to.
+
+    Several header spellings are checked because the delivered-to address is what
+    binds a verification message to one signup identity, and different payload
+    shapes surface it differently. ``Delivered-To`` is included since it survives
+    plus-tagged delivery even when a provider rewrites ``To``.
+    """
+
+    values: list[str] = []
+    for key in (
+        "to",
+        "To",
+        "recipient",
+        "recipients",
+        "toEmail",
+        "to_email",
+        "delivered_to",
+        "deliveredTo",
+        "Delivered-To",
+        "cc",
+        "Cc",
+    ):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            values.append(value)
+        elif isinstance(value, (list, tuple)):
+            values.extend(item for item in value if isinstance(item, str) and item.strip())
+    payload = message.get("payload")
+    if isinstance(payload, Mapping):
+        headers = payload.get("headers")
+        if isinstance(headers, list):
+            for header in headers:
+                if not isinstance(header, Mapping):
+                    continue
+                name = str(header.get("name") or "").casefold()
+                if name in {"to", "delivered-to", "x-original-to", "cc"}:
+                    header_value = header.get("value")
+                    if isinstance(header_value, str) and header_value.strip():
+                        values.append(header_value)
+    return tuple(dict.fromkeys(values))
+
+
+def _within_age(
+    message: Mapping[str, object],
+    *,
+    now_ms: int,
+    max_age_seconds: int,
+) -> bool:
+    """Whether a message is inside the freshness window, failing closed.
+
+    A message whose timestamp cannot be parsed is refused rather than assumed
+    fresh: accepting it would reintroduce exactly the unbounded window that the
+    unsupported ``newer_than:<hours>`` query produced.
+    """
+
+    received_at_ms = _message_timestamp(message)
+    if received_at_ms <= 0:
+        return False
+    age_ms = now_ms - received_at_ms
+    if age_ms < -DEFAULT_CLOCK_SKEW_SECONDS * 1000:
+        return False
+    return age_ms <= max_age_seconds * 1000
+
+
+def _verification_candidate(message: Mapping[str, object]) -> VerificationCandidate:
+    """Project a raw provider message onto the value-bearing candidate shape.
+
+    The subject/body captured here may contain a one-time secret, so the result is
+    used only inside the selection call and never logged or persisted.
+    """
+
+    return VerificationCandidate(
+        message_id=_first_string(message, ("message_id", "messageId", "id")) or "",
+        sender=_first_string(message, ("from", "sender", "fromEmail", "from_email")) or "",
+        recipients=_message_recipients(message),
+        received_at=(
+            message.get("internalDate")
+            or message.get("internal_date")
+            or message.get("messageTimestamp")
+            or message.get("sent_at")
+            or message.get("date")
+        ),
+        subject=_first_string(message, ("subject",)) or "",
+        body=_first_string(message, ("messageText", "body", "preview", "snippet")) or "",
+    )
+
+
+_TIMESTAMP_KEYS = ("internalDate", "internal_date", "messageTimestamp", "sent_at", "date")
+
+
+def _message_timestamp(message: object) -> int:
+    """Return a message's receive time as epoch milliseconds, or 0 when unknown.
+
+    Strict: only a value that parses to a plausible calendar instant is accepted,
+    because this feeds the freshness decision for one-time secrets and a value that
+    cannot be understood must never satisfy a recency bound.
+
+    Numeric on purpose. Provider payloads mix epoch seconds, epoch milliseconds and
+    ISO strings, and comparing those as strings silently misorders them, so an older
+    message could be treated as the newest.
+    """
+
+    if not isinstance(message, Mapping):
+        return 0
+    for key in _TIMESTAMP_KEYS:
+        parsed = parse_received_at_ms(message.get(key))
+        if parsed is not None:
+            return parsed
+    return 0
+
+
+def _ordering_timestamp(message: Mapping[str, object]) -> int:
+    """Best-effort sort key for display ordering only.
+
+    Unlike :func:`_message_timestamp` this tolerates a bare counter-style value so
+    newest-first ordering still holds for payloads whose timestamp is not a real
+    epoch. It is deliberately NOT used for any freshness or authorization decision;
+    those go through the strict parser above.
+    """
+
+    strict = _message_timestamp(message)
+    if strict:
+        return strict
+    for key in _TIMESTAMP_KEYS:
+        value = message.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+    return 0
 
 
 def _order_messages_by_trust(
@@ -1015,10 +1288,14 @@ def _order_messages_by_trust(
     Trusted-domain preference guards against a spoofed email injecting a fake code
     while never hard-excluding a legitimate provider that sends from a different
     mail subdomain (a common real-world case), so it cannot cause false negatives.
+
+    This ordering is a display/discovery convenience only. Anything that consumes a
+    one-time secret must use :meth:`GmailWorker.fetch_verification`, which REQUIRES
+    the sender, recipient, and freshness bindings instead of merely preferring them.
     """
 
     valid = [message for message in messages if isinstance(message, Mapping)]
-    by_recency = sorted(valid, key=_message_timestamp, reverse=True)
+    by_recency = sorted(valid, key=_ordering_timestamp, reverse=True)
     trusted = tuple(domain.rstrip(".").casefold() for domain in trusted_domains if domain)
     if not trusted:
         return by_recency
@@ -1032,7 +1309,13 @@ def _order_messages_by_trust(
 
 
 _INBOX_DOMAIN_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
-_INBOX_AGE_RE = re.compile(r"^\d{1,4}[dhmy]$")
+# Gmail's relative age operators accept ONLY d (day), m (month), and y (year).
+# An hour unit does not exist, and "m" is months rather than minutes, so a query
+# like "newer_than:1h" is not a one-hour bound and "newer_than:30m" would mean
+# thirty MONTHS. Accepting "h" here silently produced an unbounded freshness
+# window for one-time codes, so it is rejected; sub-day bounds must be enforced
+# against each message's own timestamp (see ops.email_verification).
+_INBOX_AGE_RE = re.compile(r"^\d{1,4}[dmy]$")
 
 
 def build_inbox_query(
@@ -1048,6 +1331,11 @@ def build_inbox_query(
     Every part is validated and stripped of newlines/quotes so neither a caller
     nor untrusted upstream text can inject extra operators into the provider
     query. Returns ``in:anywhere`` when no part is supplied.
+
+    ``newer_than`` accepts only the units Gmail actually supports: ``d`` (days),
+    ``m`` (**months**) and ``y`` (years). Hours are not expressible, so a
+    short-lived freshness bound must be enforced against each message's own
+    receive timestamp rather than through this query.
     """
 
     parts: list[str] = []
@@ -1063,7 +1351,7 @@ def build_inbox_query(
     if newer_than:
         age = newer_than.strip().casefold()
         if not _INBOX_AGE_RE.match(age):
-            raise ValueError("newer_than must look like 7d, 24h, 30m, or 1y")
+            raise ValueError("newer_than must look like 7d, 6m (months), or 1y")
         parts.append(f"newer_than:{age}")
     if unread:
         parts.append("is:unread")
@@ -1105,122 +1393,12 @@ def _has_attachments(message: Mapping[str, object]) -> bool:
     return False
 
 
-# A sign-in email is one whose subject/body is about confirming a login/device.
-_LOGIN_EMAIL_KEYWORDS = (
-    "verify",
-    "verification",
-    "confirm",
-    "sign in",
-    "sign-in",
-    "log in",
-    "login",
-    "new device",
-    "new login",
-    "activate",
-    "authenticate",
-    "secure your account",
-    "it's you",
-    "it is you",
-)
-# URL tokens that mark the actual sign-in/verification link (not a footer/help link).
-_LOGIN_LINK_HINTS = (
-    "notification-station",
-    "notifications/cta",
-    "/cta/",
-    "deliverymethod",
-    "login-verify",
-    "login_verify",
-    "verify-email",
-    "verify_email",
-    "email-verification",
-    "verification",
-    "verify",
-    "confirm",
-    "secure-login",
-    "signin",
-    "sign-in",
-    "one-time",
-    "onetime",
-    "magiclink",
-    "magic-link",
-    "activate",
-    "sso",
-    "auth",
-    "token",
-)
-_URL_RE = re.compile(r"https?://[^\s\"'<>)\]}]+", re.IGNORECASE)
-# Footer/marketing links to ignore when several URLs are present.
-_LINK_STOPWORDS = (
-    "unsubscribe",
-    "privacy",
-    "/legal",
-    "terms",
-    "help.",
-    "/help",
-    "support.",
-    "cookie",
-    "preferences",
-    "manage-preferences",
-)
-# Static assets and open/click tracking that are never the sign-in link.
-_LINK_ASSET_MARKERS = (
-    "hsappstatic.net",
-    "/emailimages/",
-    "hubspotlinks.com",
-    "/cto/",
-    "sib.googleusercontent",
-    "list-manage",
-    "/track",
-    "/open?",
-    "pixel",
-)
-_ASSET_SUFFIXES = (
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".svg",
-    ".css",
-    ".ico",
-    ".woff",
-    ".woff2",
-    ".webp",
-)
-
-
-def _extract_login_link(subject: str, body: str) -> str | None:
-    """Extract a sign-in/verification magic link from a login email.
-
-    Returns the most likely verification URL and never a static asset, tracking
-    pixel, or marketing/footer link. Only emails that read like a sign-in
-    confirmation are considered, so ordinary mail is ignored.
-    """
-
-    text = f"{subject}\n{body}"
-    lowered_text = text.casefold()
-    if not any(keyword in lowered_text for keyword in _LOGIN_EMAIL_KEYWORDS):
-        return None
-    # HTML bodies may still be entity-encoded; normalize the common ampersand.
-    normalized = body.replace("&amp;", "&")
-    candidates: list[str] = []
-    for match in _URL_RE.finditer(normalized):
-        url = match.group(0).rstrip(".,);]}'\"")
-        low = url.casefold()
-        if any(stop in low for stop in _LINK_STOPWORDS):
-            continue
-        if any(marker in low for marker in _LINK_ASSET_MARKERS):
-            continue
-        if low.split("?", 1)[0].endswith(_ASSET_SUFFIXES):
-            continue
-        candidates.append(url)
-    if not candidates:
-        return None
-    # Prefer a URL whose path/query clearly marks it as the sign-in link.
-    for url in candidates:
-        if any(hint in url.casefold() for hint in _LOGIN_LINK_HINTS):
-            return url
-    # Otherwise fall back to the first real (non-asset, non-footer) link.
-    return candidates[0]
+# Verification-link discovery is shared with the hardened path in
+# ``ops.email_verification``. This alias keeps the historical permissive
+# behaviour (no host allowlist) available to existing callers, while anything
+# that consumes the link for an autonomous action must instead go through
+# ``GmailWorker.fetch_verification``, which requires a reviewed host.
+_extract_login_link = extract_verification_link
 
 
 def _validate_email(value: str) -> str:
@@ -1277,5 +1455,8 @@ __all__ = [
     "PhaseUnavailableError",
     "SanitizedGmailMessage",
     "SanitizedGmailThread",
+    "VerificationDecision",
+    "VerificationEvidence",
+    "VerificationPurpose",
     "build_inbox_query",
 ]

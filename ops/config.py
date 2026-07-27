@@ -259,6 +259,21 @@ class Settings(BaseModel):
     # grows exponentially from the base; set the base to 0 to disable waiting.
     gmail_retry_max_attempts: int = Field(default=3, ge=1, le=6)
     gmail_retry_base_delay_seconds: float = Field(default=0.5, ge=0.0, le=10.0)
+    # Emailed verification (signup confirmation / login code or magic link). The
+    # freshness window is enforced in code against each message's own receive
+    # timestamp because Gmail's relative age operators have no hour unit, so a
+    # short-lived one-time secret cannot be bounded by the search query alone.
+    gmail_verification_max_age_seconds: int = Field(default=900, ge=60, le=3_600)
+    # How many times a single run may poll the inbox for one verification before it
+    # settles into a truthful human gate. Bounded so a provider that never sends
+    # cannot spin forever.
+    gmail_verification_max_attempts: int = Field(default=3, ge=1, le=10)
+    gmail_verification_poll_seconds: float = Field(default=5.0, ge=0.0, le=60.0)
+    # When true, a verification secret may be consumed ONLY when the message can be
+    # bound to this run's exact signup/login recipient and a reviewed sender. The
+    # default preserves existing deployments (which may hold no remembered login
+    # email yet) while still restricting magic-link hosts to the reviewed set.
+    gmail_verification_require_binding: bool = False
 
     ops_db_path: Path = Path("./private/ops.db")
     checkpoint_db_path: Path = Path("./private/checkpoints.db")
@@ -397,6 +412,18 @@ class Settings(BaseModel):
             "gmail_retry_max_attempts": _integer(source.get("GMAIL_RETRY_MAX_ATTEMPTS"), default=3),
             "gmail_retry_base_delay_seconds": _float(
                 source.get("GMAIL_RETRY_BASE_DELAY_SECONDS"), default=0.5
+            ),
+            "gmail_verification_max_age_seconds": _integer(
+                source.get("GMAIL_VERIFICATION_MAX_AGE_SECONDS"), default=900
+            ),
+            "gmail_verification_max_attempts": _integer(
+                source.get("GMAIL_VERIFICATION_MAX_ATTEMPTS"), default=3
+            ),
+            "gmail_verification_poll_seconds": _float(
+                source.get("GMAIL_VERIFICATION_POLL_SECONDS"), default=5.0
+            ),
+            "gmail_verification_require_binding": _boolean(
+                source.get("GMAIL_VERIFICATION_REQUIRE_BINDING"), default=False
             ),
             "ops_db_path": Path(source.get("OPS_DB_PATH", "./private/ops.db")),
             "checkpoint_db_path": Path(
