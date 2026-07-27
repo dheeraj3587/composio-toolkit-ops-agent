@@ -11,8 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
-import json
 import logging
 import random
 import re
@@ -87,7 +85,7 @@ from ops.provider_errors import (
     ProviderContractError,
     ProviderOperationError,
 )
-from ops.redaction import redact_data, redact_text
+from ops.redaction import redact_data
 from ops.research_cache import SqliteResearchCache
 from ops.routing import RoutingDecision, decide_access
 
@@ -98,6 +96,13 @@ from ops.run_errors import CredentialSubmissionError as CredentialSubmissionErro
 from ops.run_errors import IdempotencyConflictError as IdempotencyConflictError
 from ops.run_errors import InvalidIdempotencyKeyError as InvalidIdempotencyKeyError
 from ops.run_errors import RunConflictError as RunConflictError
+from ops.run_idempotency import (  # noqa: F401
+    IDEMPOTENCY_KEY_PATTERN,
+    _legacy_request_fingerprint,
+    _legacy_request_fingerprints,
+    _request_fingerprint,
+)
+from ops.run_idempotency import validate_idempotency_key as validate_idempotency_key
 
 # Imported for use below AND deliberately re-exported: tests and debugging
 # surfaces import these internals from ``ops.run_service``, which stays their
@@ -142,8 +147,6 @@ from ops.you_research import (
 )
 
 LOGGER = logging.getLogger("composio_ops.run_service")
-
-IDEMPOTENCY_KEY_PATTERN = re.compile(r"^idem_[0-9a-f]{32}$")
 
 # Human gates the agent may retry on its own. Only a login form backed by
 # already-authorized reusable credentials may advance without a human. Everything
@@ -191,16 +194,6 @@ def _verification_backoff(base_delay: float, attempt: int) -> float:
         return 0.0
     delay = min(base_delay * (2**attempt), 30.0)
     return float(delay * (0.8 + 0.4 * random.random()))
-
-
-def validate_idempotency_key(value: str | None) -> str | None:
-    """Validate a short opaque replay key without accepting secret material."""
-
-    if value is None:
-        return None
-    if IDEMPOTENCY_KEY_PATTERN.fullmatch(value) is None or redact_text(value) != value:
-        raise InvalidIdempotencyKeyError("idempotency key is invalid")
-    return value
 
 
 # create_run collapses several legal graph transitions into one initial
@@ -252,52 +245,6 @@ def _validate_created_projection(final_status: str) -> None:
     for nxt in chain:
         validate_status_transition(previous, nxt, "create")
         previous = nxt
-
-
-def _request_fingerprint(request: OperationsRequest, execution_mode: str) -> str:
-    canonical = json.dumps(
-        {"execution_mode": execution_mode, "request": request.model_dump(mode="json")},
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
-
-
-def _legacy_request_fingerprints(request: OperationsRequest, execution_mode: str) -> set[str]:
-    """Accepted historical fingerprint shapes for compatibility replays."""
-
-    if request.credential_creation_policy != "reuse_only":
-        return set()
-    fingerprints: set[str] = set()
-    excluded_sets = [{"credential_creation_policy"}]
-    if request.browser_provider == "browser_use":
-        excluded_sets.append({"browser_provider", "credential_creation_policy"})
-    for excluded in excluded_sets:
-        legacy_request = request.model_dump(mode="json", exclude=excluded)
-        canonical = json.dumps(
-            {"execution_mode": execution_mode, "request": legacy_request},
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        fingerprints.add(hashlib.sha256(canonical).hexdigest())
-    return fingerprints
-
-
-def _legacy_request_fingerprint(request: OperationsRequest, execution_mode: str) -> str:
-    """Return the oldest Browser Use fingerprint shape kept for test/client compatibility."""
-
-    legacy_request = request.model_dump(
-        mode="json", exclude={"browser_provider", "credential_creation_policy"}
-    )
-    canonical = json.dumps(
-        {"execution_mode": execution_mode, "request": legacy_request},
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
 
 
 class RunService:
