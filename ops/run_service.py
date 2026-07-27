@@ -91,6 +91,14 @@ from ops.redaction import redact_data, redact_text
 from ops.research_cache import SqliteResearchCache
 from ops.routing import RoutingDecision, decide_access
 
+# Explicitly re-exported (the ``X as X`` form): ``api.app`` and ``api.service``
+# import these from ``ops.run_service``, which remains their public home, and the
+# type checker forbids implicit re-export.
+from ops.run_errors import CredentialSubmissionError as CredentialSubmissionError
+from ops.run_errors import IdempotencyConflictError as IdempotencyConflictError
+from ops.run_errors import InvalidIdempotencyKeyError as InvalidIdempotencyKeyError
+from ops.run_errors import RunConflictError as RunConflictError
+
 # Imported for use below AND deliberately re-exported: tests and debugging
 # surfaces import these internals from ``ops.run_service``, which stays their
 # stable home even though the implementations now live in a leaf module. The
@@ -183,31 +191,6 @@ def _verification_backoff(base_delay: float, attempt: int) -> float:
         return 0.0
     delay = min(base_delay * (2**attempt), 30.0)
     return float(delay * (0.8 + 0.4 * random.random()))
-
-
-class InvalidIdempotencyKeyError(ValueError):
-    """Raised without echoing a malformed or credential-shaped key."""
-
-
-class IdempotencyConflictError(ValueError):
-    """Raised when a key is reused for a different canonical request."""
-
-
-class RunConflictError(RuntimeError):
-    """Raised when a competing command mutates the same run concurrently."""
-
-    def __init__(self, run_id: str, action: str) -> None:
-        self.run_id = run_id
-        self.action = action
-        super().__init__("a competing command is already modifying this run")
-
-
-class CredentialSubmissionError(RuntimeError):
-    """Owner credential submission rejected; no partial vault write is kept."""
-
-    def __init__(self, reason_code: str) -> None:
-        self.reason_code = reason_code
-        super().__init__("owner credential submission was rejected")
 
 
 def validate_idempotency_key(value: str | None) -> str | None:
