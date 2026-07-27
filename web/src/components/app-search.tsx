@@ -41,8 +41,9 @@ export function AppSearch() {
             Choose an app to inspect
           </h2>
           <p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">
-            Every app in the immutable P1 snapshot is listed below. Pick one to read its evidence
-            before opening a run. These are backend records, not generated suggestions.
+            Every app in the immutable P1 snapshot is listed below. Open a card to read its
+            evidence, or use <span className="font-medium text-foreground">Run</span> to start a run
+            for that app directly. These are backend records, not generated suggestions.
           </p>
         </div>
         <div className="p-5 lg:p-6">
@@ -118,13 +119,26 @@ export function AppSearch() {
   )
 }
 
+/**
+ * One catalog entry with two distinct destinations.
+ *
+ * The card surface still opens the evidence profile, but every app now also
+ * carries an explicit "Run" action. Previously the only way to start a run was to
+ * open an app's profile first and find the button there, so the catalog looked
+ * like a read-only list. The card body is an overlay link and the run action sits
+ * above it, which keeps a single tap target per destination without nesting one
+ * anchor inside another.
+ */
 function AppCard({ app }: { app: AppSearchItem }) {
   return (
-    <Link
-      href={`/apps/${encodeURIComponent(app.app_slug)}`}
-      className="group flex min-h-32 flex-col justify-between rounded-md border border-border bg-white p-4 transition-colors hover:border-brand-300 hover:bg-brand-50/35"
-    >
-      <div className="flex items-start justify-between gap-3">
+    <div className="group relative flex min-h-32 flex-col justify-between rounded-md border border-border bg-white p-4 transition-colors focus-within:border-brand-300 hover:border-brand-300 hover:bg-brand-50/35">
+      <Link
+        href={`/apps/${encodeURIComponent(app.app_slug)}`}
+        className="absolute inset-0 z-0 rounded-md focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500"
+      >
+        <span className="sr-only">Inspect {app.app_name} evidence</span>
+      </Link>
+      <div className="pointer-events-none flex items-start justify-between gap-3">
         <div>
           <p className="text-sm font-semibold">{app.app_name}</p>
           <p className="mt-1 font-mono text-[9px] uppercase tracking-[0.12em] text-muted-foreground">
@@ -134,10 +148,18 @@ function AppCard({ app }: { app: AppSearchItem }) {
         <StatusBadge status={app.access_route ?? "unknown"} />
       </div>
       <div className="flex items-end justify-between gap-3 text-xs text-muted-foreground">
-        <span>{app.api_type ? humanize(app.api_type) : "API type not reported"}</span>
-        <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" aria-hidden="true" />
+        <span className="pointer-events-none">
+          {app.api_type ? humanize(app.api_type) : "API type not reported"}
+        </span>
+        <Link
+          href={`/runs/new?app=${encodeURIComponent(app.app_name)}`}
+          className="relative z-10 inline-flex items-center gap-1 rounded-md border border-border bg-white px-2 py-1 text-[11px] font-medium text-foreground transition-colors hover:border-brand-300 hover:bg-brand-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500"
+        >
+          Run<span className="sr-only"> {app.app_name}</span>
+          <ArrowRight className="size-3.5 transition-transform group-hover:translate-x-0.5" aria-hidden="true" />
+        </Link>
       </div>
-    </Link>
+    </div>
   )
 }
 

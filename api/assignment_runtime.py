@@ -1,9 +1,12 @@
-"""Assignment-focused live execution bootstrap for the reviewed 10-app matrix.
+"""Assignment-focused live execution bootstrap for the verified app catalog.
 
 This module keeps the existing plan-only path untouched. In
 ``execute_when_configured`` mode it enables a bounded browser inspection for every
-reviewed app that has an official browser surface, while preserving Sherlock's
-verified blocked result.
+app that has an official browser surface: the reviewed matrix below uses its
+hand-verified hosts, and every other self-serve app in the P1 snapshot falls back
+to an allowlist derived from its own verified research hosts (see
+``ops.derived_browser_policy``). Sherlock's verified blocked result is preserved,
+and apps with no self-serve credential path keep their outreach route.
 
 The bootstrap is imported only by ``api.main`` (the production ASGI entry point).
 Tests that import ``api.app`` continue to exercise the conservative core runtime.
@@ -30,7 +33,7 @@ from ops.browser_host_policy import (
     evaluate_navigation,
 )
 from ops.browser_link_log import log_event, url_host
-from ops.browser_target_selection import derive_account_state
+from ops.browser_target_selection import derive_account_state, select_browser_target
 from ops.browser_worker import (
     BrowserObservation,
     BrowserSessionContext,
@@ -45,6 +48,7 @@ from ops.browser_worker import (
     _official_target_url,
     _render_browser_task,
     _string,
+    is_allowed_browser_url,
     sanitize_browser_url,
     to_browser_sensitive_data,
     validate_allowed_domains,
@@ -54,6 +58,7 @@ from ops.composio_capability import (
     ComposioCapabilityReport,
 )
 from ops.config import Settings
+from ops.derived_browser_policy import derive_browser_host_policy
 from ops.graph import DurableOperationsWorkflow
 from ops.models import OperationalResearch, OperationsRequest
 from ops.provider_errors import ProviderContractError, ProviderOperationError
@@ -62,6 +67,12 @@ from ops.routing import decide_access
 _INACTIVITY_WINDOW = timedelta(minutes=15)
 _MAXIMUM_WINDOW = timedelta(hours=4)
 _CORE_ROUTE = DurableOperationsWorkflow._route
+_CORE_AFTER_BROWSER = DurableOperationsWorkflow._after_browser
+
+# Routes that cannot yield a self-serve credential on their own: the browser
+# inspection still runs (it is what a human would do first) and the controlled
+# vendor outreach is sent afterwards.
+_GATED_ROUTES: frozenset[str] = frozenset({"approval_required", "partner_gated"})
 
 # Reviewed apps with a real official browser surface, keyed by canonical slug.
 # The first block is the original live matrix; the self-serve batch below it was
@@ -306,11 +317,34 @@ def _demo_seed_record(normalized_query: str) -> Any | None:
     return P1AppRecord.model_validate(payload)
 
 
-def assignment_allowed_hosts(research: OperationalResearch) -> BrowserAllowedHosts:
-    """Resolve exact reviewed hosts for assignment browser inspection."""
+def resolved_browser_policy(research: OperationalResearch) -> BrowserHostPolicy | None:
+    """Return the reviewed policy for an app, else one derived from its research.
+
+    Precedence is deliberate:
+
+    1. An ACTIVE reviewed policy always wins — the hand-verified hosts and any
+       app-specific quirks (regional data centres, tenant wildcards) stay exactly
+       as reviewed.
+    2. An explicitly INACTIVE reviewed policy is a reviewed "no" (Sherlock) and
+       blocks derivation entirely.
+    3. Otherwise the allowlist is derived from the app's own verified research
+       hosts, so the remaining apps in the P1 snapshot can actually execute
+       instead of dead-ending at ``configuration_required``.
+
+    ``None`` means no browser session may be launched for this app.
+    """
 
     policy = assignment_policy(research.app_slug)
-    if policy is None or not policy.active:
+    if policy is not None:
+        return policy if policy.active else None
+    return derive_browser_host_policy(research)
+
+
+def assignment_allowed_hosts(research: OperationalResearch) -> BrowserAllowedHosts:
+    """Resolve the reviewed (or research-derived) hosts for browser inspection."""
+
+    policy = resolved_browser_policy(research)
+    if policy is None:
         raise ProviderContractError(
             phase=5,
             capability="assignment browser inspection",
@@ -321,6 +355,31 @@ def assignment_allowed_hosts(research: OperationalResearch) -> BrowserAllowedHos
         exact_hosts=policy.exact_hosts,
         vendor_wildcard_domains=policy.vendor_wildcard_domains,
     )
+
+
+def assignment_browser_ready(research: OperationalResearch) -> bool:
+    """True when a browser run for this app has both an allowlist and a target.
+
+    Checked BEFORE the graph commits to a browser route so an app with no usable
+    entry URL falls back to outreach instead of starting a paid session that would
+    immediately fail with ``official_target_url_unavailable``. The account state is
+    irrelevant here: it only reorders the same candidate set.
+    """
+
+    try:
+        allowed = assignment_allowed_hosts(research)
+        patterns = validate_allowed_domains(allowed.patterns())
+        target = select_browser_target(
+            research=research,
+            trace=get_browser_api_trace(research.app_slug),
+            allowed_domains=patterns,
+            account_state="unknown",
+            is_allowed_url=is_allowed_browser_url,
+            fallback_mode="browser_use",
+        )
+    except (ProviderContractError, ValueError):
+        return False
+    return target is not None
 
 
 class AssignmentComposioCapabilityPreflight(ComposioCapabilityPreflight):
@@ -898,10 +957,23 @@ def _assignment_route(
     workflow: DurableOperationsWorkflow,
     state: Mapping[str, object],
 ) -> dict[str, object]:
-    """Allow trace-backed assignment runs without weakening the core route gate."""
+    """Let an executable assignment run proceed without weakening the core gate.
+
+    The core route refuses a browser route whenever the verified research has no
+    reviewed login/credential URL pair (``verified_browser_urls_missing``) or no
+    hand-authored navigation trace (``browser_trace_not_reviewed``). Both are true
+    for most of the P1 snapshot, which left those runs finalizing at
+    ``configuration_required`` without ever executing. Here the run is allowed to
+    continue only when this layer can prove it is actually executable: a resolved
+    host allowlist AND a validated entry target. Every other core refusal, and
+    every non-browser route, is returned untouched.
+    """
 
     result = _CORE_ROUTE(workflow, state)  # type: ignore[arg-type]
-    if result.get("route_reason_code") != "verified_browser_urls_missing":
+    if result.get("route_reason_code") not in {
+        "verified_browser_urls_missing",
+        "browser_trace_not_reviewed",
+    }:
         return result
 
     request = OperationsRequest.model_validate(state["request"])
@@ -909,22 +981,19 @@ def _assignment_route(
         return result
 
     research = OperationalResearch.model_validate(state["operational_research"])
-    policy = assignment_policy(research.app_slug)
-    trace = get_browser_api_trace(research.app_slug)
     decision = decide_access(research)
     if (
-        policy is None
-        or not policy.active
-        or trace is None
-        or not decision.is_final
+        not decision.is_final
         or decision.route not in {"self_serve", "hybrid"}
+        or not assignment_browser_ready(research)
     ):
         return result
 
     audit_events = state.get("audit_events")
     audit_history = list(audit_events) if isinstance(audit_events, list) else []
-    # The strict trace's start_url is validated when the catalog loads and is
-    # checked against this active app policy again by the worker before use.
+    # A reviewed trace's start_url is validated when the catalog loads; a derived
+    # target comes from the app's own verified research. Either way the worker
+    # re-checks the target against this app's allowlist before navigating.
     return {
         "access_route": decision.route,
         "route_reason": decision.explanation,
@@ -938,13 +1007,14 @@ def _assignment_after_route(
     workflow: object,
     state: Mapping[str, object],
 ) -> str:
-    """Use browser inspection for every runnable app in the 10-app matrix."""
+    """Use browser inspection for every app this layer can actually execute."""
 
     del workflow
     request = OperationsRequest.model_validate(state["request"])
     if request.dry_run:
         return "finalize"
-    if state.get("access_route") in {"blocked", "unknown"}:
+    route = state.get("access_route")
+    if route in {"blocked", "unknown"}:
         return "finalize"
     slug = str(state.get("app_slug") or "")
     # Gated live-matrix apps go straight to controlled outreach; the human cannot
@@ -954,6 +1024,46 @@ def _assignment_after_route(
     policy = assignment_policy(slug)
     if policy is not None and policy.active:
         return "browser_start"
+    # No reviewed policy: the app can still be driven in the browser using hosts
+    # derived from its own verified research. This is the same treatment the
+    # reviewed matrix already gives gated apps such as Salesforce and Zendesk; a
+    # gated route additionally sends its vendor outreach after the inspection
+    # (see ``_assignment_after_browser``).
+    raw_research = state.get("operational_research")
+    if isinstance(raw_research, Mapping):
+        research = OperationalResearch.model_validate(raw_research)
+        if assignment_browser_ready(research):
+            log_event(
+                "route.browser_from_derived_policy",
+                app_slug=slug,
+                access_route=str(route),
+            )
+            return "browser_start"
+    return "outreach_send"
+
+
+def _assignment_after_browser(
+    workflow: DurableOperationsWorkflow,
+    state: Mapping[str, object],
+) -> str:
+    """Keep the vendor outreach for gated apps that were browser-inspected first.
+
+    The core rule sends only a ``hybrid`` run from a reached credential page to
+    outreach. Approval- and partner-gated apps now reach the browser too, and for
+    them the inspection alone is not an outcome: production access still needs the
+    vendor, so the controlled Gmail outreach is still sent once.
+    """
+
+    node = _CORE_AFTER_BROWSER(workflow, state)  # type: ignore[arg-type]
+    if node != "finalize" or state.get("gmail_thread_id"):
+        return node
+    if state.get("access_route") not in _GATED_ROUTES:
+        return node
+    observation = state.get("browser_observation")
+    if not isinstance(observation, Mapping):
+        return node
+    if observation.get("status") not in {"credential_page_ready", "developer_console_ready"}:
+        return node
     return "outreach_send"
 
 
@@ -1032,6 +1142,7 @@ def install_assignment_runtime() -> None:
     workflow_type = cast(Any, graph_module).DurableOperationsWorkflow
     workflow_type._route = _assignment_route
     workflow_type._after_route = _assignment_after_route
+    workflow_type._after_browser = _assignment_after_browser
     _INSTALLED = True
 
 
@@ -1039,7 +1150,9 @@ __all__ = [
     "AssignmentBrowserWorker",
     "AssignmentComposioCapabilityPreflight",
     "assignment_allowed_hosts",
+    "assignment_browser_ready",
     "assignment_policy",
     "install_assignment_browser_policies",
     "install_assignment_runtime",
+    "resolved_browser_policy",
 ]
