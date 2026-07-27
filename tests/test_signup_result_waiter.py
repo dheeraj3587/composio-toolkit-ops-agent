@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 from ops.automation_contracts import (
@@ -173,6 +174,59 @@ async def test_blind_spot_resets_the_stability_streak() -> None:
     assert result.outcome == "account_created_authenticated"
     assert calls == 4
     assert responses == []
+
+
+async def test_hung_observation_is_bounded_by_total_deadline() -> None:
+    async def reader(_page, _contract) -> SignupResultCapture:
+        await asyncio.sleep(10)
+        raise AssertionError("deadline cancellation should stop this reader")
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await wait_for_signup_result(
+        FakePage(),
+        contract(),
+        timeout_seconds=0.5,
+        poll_seconds=0.05,
+        stable_observations=2,
+        observation_reader=reader,
+        gate_reader=clear_gates,
+    )
+    elapsed = loop.time() - started
+
+    assert result.status == "outcome_unknown"
+    assert result.reason_code == "signup_result_observation_timeout"
+    assert elapsed < 1.0
+
+
+async def test_hung_gate_inspection_is_bounded_by_total_deadline() -> None:
+    async def reader(_page, _contract) -> SignupResultCapture:
+        return SignupResultCapture(
+            status="captured",
+            reason_code="signup_result_observation_captured",
+            observation=success_observation(),
+        )
+
+    async def hanging_gates(_page, _contract) -> SignupSubmissionGateInspection:
+        await asyncio.sleep(10)
+        raise AssertionError("deadline cancellation should stop this gate reader")
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await wait_for_signup_result(
+        FakePage(),
+        contract(),
+        timeout_seconds=0.5,
+        poll_seconds=0.05,
+        stable_observations=2,
+        observation_reader=reader,
+        gate_reader=hanging_gates,
+    )
+    elapsed = loop.time() - started
+
+    assert result.status == "outcome_unknown"
+    assert result.reason_code == "signup_result_observation_timeout"
+    assert elapsed < 1.0
 
 
 async def test_unproven_timeout_remains_outcome_unknown() -> None:
