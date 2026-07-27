@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ops.approved_run_values import ApprovedRunValuesRegistry
@@ -117,8 +118,7 @@ def result(
     )
 
 
-def test_legacy_signup_database_is_migrated_without_losing_state(tmp_path: Path) -> None:
-    path = tmp_path / "legacy.db"
+def _create_legacy_state_database(path: Path) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute(
             """
@@ -138,12 +138,46 @@ def test_legacy_signup_database_is_migrated_without_losing_state(tmp_path: Path)
         )
         connection.commit()
 
+
+def test_legacy_signup_database_is_migrated_without_losing_state(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    _create_legacy_state_database(path)
+
     snapshot = SQLiteSignupStateStore(path).get_or_create("run_legacy")
 
     assert snapshot.state is SignupState.SIGNUP_SUBMITTED
     assert snapshot.revision == 7
     assert snapshot.reason_code == "signup_state_legacy"
     assert snapshot.outcome is None
+
+
+def test_concurrent_legacy_migration_is_serialized(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-concurrent.db"
+    _create_legacy_state_database(path)
+
+    def initialize() -> None:
+        SQLiteSignupStateStore(path).initialize()
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(initialize) for _ in range(8)]
+        for future in futures:
+            future.result()
+
+    with sqlite3.connect(path) as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(signup_states)").fetchall()
+        }
+        row = connection.execute(
+            """
+            SELECT state, revision, reason_code, outcome
+            FROM signup_states
+            WHERE run_id = 'run_legacy'
+            """
+        ).fetchone()
+
+    assert {"reason_code", "outcome"} <= columns
+    assert row == ("signup_submitted", 7, "signup_state_legacy", None)
 
 
 def test_existing_account_outcome_persists_and_routes_to_login(tmp_path: Path) -> None:
