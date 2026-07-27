@@ -52,17 +52,19 @@ def build_integrator_bundle(
         notes.append(f"Credential validation status: {validation.status}.")
     if readiness == "configuration_required":
         notes.append("One or more external capabilities require operator configuration.")
+    auth_scheme = _auth_scheme(research.auth_methods, refs)
+    oauth_selected = auth_scheme == "oauth2"
     return IntegratorBundle(
         app_name=research.app_name,
         app_slug=research.app_slug,
         readiness=readiness,
         api_type=research.api_type,
         api_base_url=research.api_base_url,
-        auth_scheme=_auth_scheme(research.auth_methods),
-        authorization_url=research.authorization_url,
-        token_url=research.token_url,
-        scopes=[scope.name for scope in research.scopes],
-        callback_urls=list(company.callback_urls),
+        auth_scheme=auth_scheme,
+        authorization_url=research.authorization_url if oauth_selected else None,
+        token_url=research.token_url if oauth_selected else None,
+        scopes=[scope.name for scope in research.scopes] if oauth_selected else [],
+        callback_urls=list(company.callback_urls) if oauth_selected else [],
         credential_refs=refs,
         access_route=research.access_route,
         provider_account_id=provider_account_id,
@@ -112,7 +114,14 @@ def _readiness(
     return "configuration_required"
 
 
-def _auth_scheme(methods: list[str]) -> str:
+def _auth_scheme(methods: list[str], credential_refs: dict[str, str]) -> str:
+    # Concrete captured fields are stronger evidence than a provider's list of all
+    # supported methods. Pipedrive advertises OAuth and personal API tokens; when
+    # this run actually captured ``api_token``, calling the handoff OAuth2 is false.
+    normalized_fields = {field.casefold().replace("-", "_") for field in credential_refs}
+    if normalized_fields & {"api_key", "apikey", "api_token"}:
+        return "api_key"
+
     normalized = " ".join(methods).casefold()
     if "oauth" in normalized:
         return "oauth2"

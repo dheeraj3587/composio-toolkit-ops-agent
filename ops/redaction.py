@@ -127,6 +127,11 @@ def redact_data(value: Any, *, key: str | None = None) -> Any:
 
     if isinstance(value, (SecretStr, SecretBytes)):
         return REDACTED
+    # Absence is not secret material. Preserve it before key-name classification so
+    # an intentionally inapplicable field (for example OAuth URLs in an API-key
+    # handoff) remains null instead of becoming the misleading string "[REDACTED]".
+    if value is None:
+        return None
     if key is not None and _is_sensitive_key(key) and not _is_reference_payload(value, key=key):
         return REDACTED
     if isinstance(value, BaseModel):
@@ -161,7 +166,7 @@ def redact_data(value: Any, *, key: str | None = None) -> Any:
         return value if is_vault_reference(value) else redact_text(value)
     if isinstance(value, BaseException):
         return redact_text(str(value))
-    if value is None or isinstance(value, (bool, int, float)):
+    if isinstance(value, (bool, int, float)):
         return value
     # Persistence and logging accept JSON-safe primitives only. Unknown
     # objects must not reach json.dumps(default=str), where repr/str could

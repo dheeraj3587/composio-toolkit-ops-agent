@@ -65,6 +65,7 @@ from ops.models import (
     validate_vault_reference,
 )
 from ops.network_endpoint_policy import validation_endpoint as network_validation_endpoint
+from ops.operational_baselines import apply_reviewed_operational_baseline
 from ops.operational_research import (
     GeminiStructuredExtractor,
     OfficialEvidenceFetcher,
@@ -151,11 +152,13 @@ def _sanitized_app_list(items: list[dict[str, Any]], *, capability: str) -> list
     return cast("list[dict[str, Any]]", sanitized)
 
 
-# Human gates the agent may retry on its own. Everything omitted here needs a
-# real person in the live browser (captcha, passkey, security key, device
-# approval, account selection, legal acceptance, billing) or has its own
-# autonomous resolver with inbox access (email_otp).
-_AUTO_ADVANCEABLE_GATES: frozenset[str] = frozenset({"login_required", "provider_verification"})
+# Human gates the agent may retry on its own. Only a login form backed by
+# already-authorized reusable credentials may advance without a human. Everything
+# else needs a real person in the live browser. Provider verification is deliberately
+# excluded: it can represent CAPTCHA, device approval, consent, account selection,
+# or another security prompt, and auto-resuming it both defeats HITL and can turn a
+# solvable gate into a failed login before the evaluator can attach.
+_AUTO_ADVANCEABLE_GATES: frozenset[str] = frozenset({"login_required"})
 _GATED_OUTREACH_ROUTES = frozenset({"approval_required", "partner_gated"})
 
 # Persisted reason codes for a gated run whose outreach the Composio capability
@@ -461,14 +464,17 @@ def _missing_operational_fields(research: Mapping[str, object]) -> list[str]:
         "login_url",
         "credential_management_url",
         "production_approval_required",
-        "contact_email",
-        "contact_url",
     )
     missing: list[str] = []
     for name in candidates:
         value = research.get(name)
         if value is None or value == "" or value == [] or value == ():
             missing.append(name)
+    # A provider may intentionally expose a support form instead of publishing an
+    # email address. Either reviewed channel is operationally complete; requiring
+    # both forced unnecessary live enrichment on an otherwise deterministic run.
+    if not research.get("contact_email") and not research.get("contact_url"):
+        missing.append("contact_channel")
     return missing
 
 
@@ -982,14 +988,11 @@ class RunService:
 
         * ``login_required`` — advanced ONLY when reusable credentials for the app
           are stored, so this never becomes a pointless retry loop.
-        * ``provider_verification`` — the generic "needs another look" gate the
-          worker also raises for an ambiguous page. With a decision backend now
-          configured, one bounded retry lets the action loop re-plan instead of
-          parking the run forever.
 
-        A CAPTCHA, passkey, device approval, billing or legal gate is never
-        advanced: those require a real human in the live browser. ``email_otp`` is
-        left to ``resolve_pending_otps``, which has the inbox.
+        Provider verification, CAPTCHA, passkey, device approval, account selection,
+        billing and legal gates are never advanced: they require a real human in the
+        interactive browser. ``email_otp`` is left to ``resolve_pending_otps``, which
+        has the inbox.
 
         Every advance is bounded per run by ``max_autonomous_advances``, so a login
         that keeps failing settles into a truthful human gate.
@@ -1911,8 +1914,10 @@ class RunService:
         enrichment_documents = 0
         enrichment_metrics: dict[str, object] = {}
         enrichment_capability: CapabilityAvailability | None = None
+        reviewed_baseline_version: str | None = None
         if isinstance(lookup, P1LookupFound):
             research = to_operational_research(lookup.record)
+            research, reviewed_baseline_version = apply_reviewed_operational_baseline(research)
             # Plan-only runs are strictly local: no provider or network action is
             # permitted. An explicit execute request may use one bounded,
             # allowlisted official-evidence probe when the baseline is incomplete.
@@ -2023,6 +2028,12 @@ class RunService:
                     "external_actions": False,
                 },
             )
+            if execution_mode == "execute_when_configured":
+                transaction.append_audit_event(
+                    run_id=run_id,
+                    event_type="operational_research_started",
+                    payload={"status": "researching", "external_actions": False},
+                )
 
             if isinstance(lookup, P1LookupFound):
                 if research_payload is None:  # pragma: no cover - narrowing invariant
@@ -2033,6 +2044,18 @@ class RunService:
                     lookup,
                     research_payload,
                 )
+                if reviewed_baseline_version is not None:
+                    transaction.append_audit_event(
+                        run_id=run_id,
+                        event_type="reviewed_operational_baseline_applied",
+                        payload={
+                            "status": "baseline_complete",
+                            "app_slug": lookup.record.slug,
+                            "version": reviewed_baseline_version,
+                            "missing_fields": _missing_operational_fields(research_payload),
+                            "external_actions": False,
+                        },
+                    )
                 if enrichment_capability is not None:
                     transaction.append_audit_event(
                         run_id=run_id,
@@ -2243,7 +2266,18 @@ class RunService:
                                     account_ref=account_ref,
                                     secret_scope=run_id,
                                     use_storage_state=is_playwright,
-                                    live_view_mode="screenshot",
+                                    live_view_mode=(
+                                        "interactive_remote"
+                                        if is_playwright
+                                        and bool(
+                                            getattr(
+                                                self._settings,
+                                                "browser_interactive_hitl_enabled",
+                                                False,
+                                            )
+                                        )
+                                        else "screenshot"
+                                    ),
                                 )
                             )
                         except (TypeError, AttributeError, AssertionError, NameError):
@@ -2597,7 +2631,13 @@ class RunService:
                 run_id=run_id,
                 event_type=decision_event,
                 payload={
-                    "status": persisted_status,
+                    # Route selection is a real completed phase even when this same
+                    # transaction immediately dispatches the browser. Recording the
+                    # later browser status here erased the route_selected hop from
+                    # the evaluator timeline.
+                    "status": (
+                        "route_selected" if decision_event == "route_selected" else persisted_status
+                    ),
                     "route": persisted_route,
                     "reason_code": persisted_reason,
                     "explanation": persisted_explanation,
@@ -2972,7 +3012,19 @@ class RunService:
                     return
                 revision = int(rec.get("state_revision", 0) or 0) + 1
                 if previous != next_status:
-                    validate_status_transition(cast(RunStatus, previous), next_status, "browser")
+                    if next_status == "completed":
+                        # Capture and read-only validation completed the two legal
+                        # domain hops in this one atomic projection. Validate both;
+                        # a direct browser_running -> completed transition is illegal
+                        # and previously stranded successful runs during apply.
+                        validate_status_transition(
+                            cast(RunStatus, previous), "credentials_ready", "browser"
+                        )
+                        validate_status_transition("credentials_ready", "completed", "browser")
+                    else:
+                        validate_status_transition(
+                            cast(RunStatus, previous), next_status, "browser"
+                        )
                 changes: dict[str, object] = {
                     "status": next_status,
                     "state_revision": revision,
@@ -3276,6 +3328,19 @@ class RunService:
             # with a truthful reason while the ambiguous validation status is recorded.
             status = "configuration_required"
             reason_code = "validation_outcome_unknown"
+        if status == "completed":
+            events.extend(
+                [
+                    (
+                        "credentials_ready",
+                        {"status": "credentials_ready", "external_actions": True},
+                    ),
+                    (
+                        "run_completed",
+                        {"status": "completed", "external_actions": True},
+                    ),
+                ]
+            )
         return _CredentialOutcome(
             status=status,
             reason_code=reason_code,
@@ -3369,6 +3434,19 @@ class RunService:
         else:
             status = "configuration_required"
             reason_code = "validation_outcome_unknown"
+        if status == "completed":
+            events.extend(
+                [
+                    (
+                        "credentials_ready",
+                        {"status": "credentials_ready", "external_actions": True},
+                    ),
+                    (
+                        "run_completed",
+                        {"status": "completed", "external_actions": True},
+                    ),
+                ]
+            )
         return _CredentialOutcome(
             status=status,
             reason_code=reason_code,
@@ -3482,18 +3560,21 @@ class RunService:
         if not isinstance(lookup, P1LookupFound):
             return None
         record = lookup.record
+        research, _baseline_version = apply_reviewed_operational_baseline(
+            to_operational_research(record)
+        )
         summary = {
             "app_name": record.app,
             "app_slug": record.slug,
             "category": record.category,
             "api_type": record.api_type,
             "auth_methods": list(record.auth_methods),
-            "access_route": to_operational_research(record).access_route,
+            "access_route": research.access_route,
             "buildability": record.buildability,
             "verification_status": record.verification_status,
             "confidence": record.confidence,
         }
-        return summary, to_operational_research(record)
+        return summary, research
 
     def get_output(self, run_id: str) -> dict[str, Any] | None:
         record = self.storage.get_run(run_id)
@@ -4302,10 +4383,15 @@ class RunService:
                 if isinstance(current_url, str) and current_url:
                     changes["browser_live_url"] = None  # never persist the signed URL
                 updated = transaction.update_run(run_id, **changes)
+                cancelled = signal == "cancelled"
                 transaction.append_audit_event(
                     run_id=run_id,
-                    event_type="hitl_resumed",
-                    payload={"signal": signal, "external_actions": True},
+                    event_type="hitl_cancelled" if cancelled else "hitl_resumed",
+                    payload={
+                        "status": "blocked" if cancelled else "browser_running",
+                        "signal": signal,
+                        "external_actions": True,
+                    },
                 )
                 if injected_login_fields:
                     # Record ONLY the non-secret field names that were injected;
@@ -4494,6 +4580,17 @@ class RunService:
                         "external_actions": True,
                     },
                 )
+                if final_status == "completed":
+                    transaction.append_audit_event(
+                        run_id=run_id,
+                        event_type="credentials_ready",
+                        payload={"status": "credentials_ready", "external_actions": True},
+                    )
+                    transaction.append_audit_event(
+                        run_id=run_id,
+                        event_type="run_completed",
+                        payload={"status": "completed", "external_actions": True},
+                    )
                 projected = _public_run(updated)
                 release_provider = cast(
                     BrowserProvider, current.get("browser_provider", "browser_use")

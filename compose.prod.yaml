@@ -47,6 +47,10 @@ services:
       BROWSER_SERVICE_URL: http://browser-worker:8081
       BROWSER_SERVICE_TOKEN: ${BROWSER_SERVICE_TOKEN:?BROWSER_SERVICE_TOKEN is required}
       BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-production-owner}
+      # The API must project the same interactive capability the isolated browser
+      # service enforces; otherwise a real grant exists but the evaluator UI reports
+      # screenshot-only and never requests it.
+      BROWSER_INTERACTIVE_HITL_ENABLED: ${BROWSER_INTERACTIVE_HITL_ENABLED:-false}
       PLAYWRIGHT_IN_PROCESS_SANDBOX: "false"
       OPS_ENABLE_API_DOCS: "false"
       RUN_LIVE_TESTS: "0"
@@ -106,8 +110,16 @@ services:
       BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-production-owner}
       BROWSER_SESSION_INACTIVITY_SECONDS: ${BROWSER_SESSION_INACTIVITY_SECONDS:-900}
       BROWSER_SESSION_MAX_AGE_SECONDS: ${BROWSER_SESSION_MAX_AGE_SECONDS:-3600}
-      PLAYWRIGHT_MAX_SESSIONS: ${PLAYWRIGHT_MAX_SESSIONS:-2}
+      # Each session leases its OWN X display stack (display_pool), so concurrency
+      # is bounded by host memory rather than by a shared display. The default
+      # stays at one to keep sequential rehearsal behavior deterministic; raise
+      # PLAYWRIGHT_MAX_SESSIONS and BROWSER_DISPLAY_SLOTS together.
+      PLAYWRIGHT_MAX_SESSIONS: ${PLAYWRIGHT_MAX_SESSIONS:-1}
+      BROWSER_DISPLAY_SLOTS: ${PLAYWRIGHT_MAX_SESSIONS:-1}
       PLAYWRIGHT_DISABLE_SANDBOX: ${PLAYWRIGHT_DISABLE_SANDBOX:-true}
+      # Opt-in remains environment controlled, but is no longer hard-disabled by
+      # Compose after the deployment explicitly enables it.
+      BROWSER_INTERACTIVE_HITL_ENABLED: ${BROWSER_INTERACTIVE_HITL_ENABLED:-false}
       # The policy-constrained browser action loop needs at least one JSON
       # inference backend. Values stay inside this private service.
       # Groq is FIRST in build_json_inference's chain and the only strict-schema
@@ -121,7 +133,6 @@ services:
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-nvidia/nemotron-3-ultra-550b-a55b:free}
       GOOGLE_GENAI_API_KEY: ${GOOGLE_GENAI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
-      BROWSER_INTERACTIVE_HITL_ENABLED: "false"
       BROWSER_STORAGE_STATE_KEY: ${BROWSER_STORAGE_STATE_KEY:-}
       BROWSER_STORAGE_STATE_DIR: /browser-data/storage-state
       SECRET_VAULT_KEY: ${SECRET_VAULT_KEY:-}
@@ -214,6 +225,8 @@ services:
       ACME_EMAIL: ${ACME_EMAIL:-admin@example.com}
       OPS_BASIC_AUTH_USER: ${OPS_BASIC_AUTH_USER:?OPS_BASIC_AUTH_USER is required}
       OPS_BASIC_AUTH_HASH: ${OPS_BASIC_AUTH_HASH:?OPS_BASIC_AUTH_HASH is required}
+      # Must match the owner bound into browser-service sessions and live grants.
+      BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-production-owner}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

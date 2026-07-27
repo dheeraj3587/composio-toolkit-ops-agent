@@ -134,9 +134,12 @@ class RunService(Protocol):
 
 _EVENT_SUMMARIES = {
     "dry_run_created": "Local dry-run ledger entry created.",
+    "run_created": "Executable run ledger entry created.",
+    "operational_research_started": "Deterministic operational research started.",
     "p1_snapshot_loaded": "Verified P1 research loaded.",
     "p1_snapshot_not_found": "App was not found in the verified P1 snapshot.",
     "operational_research_built": "Provider-agnostic operational research built.",
+    "reviewed_operational_baseline_applied": "Reviewed versioned provider baseline applied.",
     "route_pending": "Access route remains unknown; one bounded enrichment probe is available.",
     "route_selected": "Access route selected.",
     "composio_capability_evaluated": "Composio toolkit capability evaluated.",
@@ -146,6 +149,7 @@ _EVENT_SUMMARIES = {
     "browser_hitl_required": "Human action required in the live browser.",
     "hitl_requested": "Human action requested.",
     "hitl_resumed": "Human action completed; run resumed.",
+    "hitl_cancelled": "Human action cancelled; run blocked and browser released.",
     "outreach_sent": "Provider outreach sent.",
     "reply_received": "Provider reply received and sanitized.",
     "credential_stored": "Credential material stored behind a vault reference.",
@@ -155,6 +159,8 @@ _EVENT_SUMMARIES = {
     "credential_validation_started": "Read-only credential validation started.",
     "credentials_validated": "Credential validation completed.",
     "integrator_bundle_generated": "Reference-only IntegratorBundle generated.",
+    "credentials_ready": "Validated credential references are ready.",
+    "run_completed": "Run completed.",
     "completed": "Run completed.",
 }
 

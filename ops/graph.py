@@ -28,6 +28,7 @@ from ops.models import (
     OperationalResearch,
     OperationsRequest,
 )
+from ops.operational_baselines import apply_reviewed_operational_baseline
 from ops.p1_adapter import P1LookupFound, P1OperationalAdapter, to_operational_research
 from ops.private_files import finalize_private_database, prepare_private_database
 from ops.provider_errors import (
@@ -859,7 +860,10 @@ def _load_verified_baseline(app_name: str) -> OperationalResearch:
     lookup = P1OperationalAdapter().lookup(app_name)
     if not isinstance(lookup, P1LookupFound):
         raise LookupError("app is not present in the verified P1 snapshot")
-    return to_operational_research(lookup.record)
+    research, _baseline_version = apply_reviewed_operational_baseline(
+        to_operational_research(lookup.record)
+    )
+    return research
 
 
 def _browser_context(state: OperationsState) -> BrowserSessionContext:

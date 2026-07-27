@@ -52,7 +52,9 @@ PIPEDRIVE_START_URL = "https://developers.pipedrive.com/"
 class _ReplayBrowser:
     """Replays the real browser proof already obtained; creates no new session."""
 
-    async def start(self, profile_id: str | None) -> BrowserSessionContext:
+    provider_name = "browser_use"
+
+    async def start(self, profile_id: str | None, **_kwargs: object) -> BrowserSessionContext:
         return BrowserSessionContext(
             profile_id=profile_id or "pipedrive-demo",
             session_id=REAL_SESSION_ID,
@@ -63,15 +65,35 @@ class _ReplayBrowser:
             maximum_expires_at="2026-07-23T10:03:07Z",
         )
 
-    async def navigate_onboarding(self, context: object, research: object) -> BrowserObservation:
-        del context, research
+    async def navigate_onboarding(
+        self,
+        context: object,
+        research: object,
+        *,
+        sensitive_data: object = None,
+        account_creation_requested: bool = False,
+        credential_creation_policy: str = "reuse_only",
+    ) -> BrowserObservation:
+        del context, research, sensitive_data, account_creation_requested
+        del credential_creation_policy
         return BrowserObservation(
             status="credential_page_ready",
             current_url=PIPEDRIVE_START_URL,
             page_title="Pipedrive Developers Corner (official developer portal)",
         )
 
-    async def resume_after_hitl(self, context: object, signal: object) -> BrowserObservation:
+    async def resume_after_hitl(
+        self,
+        context: object,
+        signal: object,
+        research: object = None,
+        *,
+        sensitive_data: object = None,
+        credential_creation_policy: str = "reuse_only",
+        provider_session_id: object = None,
+    ) -> BrowserObservation:
+        del context, signal, research, sensitive_data, credential_creation_policy
+        del provider_session_id
         raise AssertionError("resume is out of scope for this demo")
 
 
@@ -154,13 +176,15 @@ def main() -> None:
         }
     )
 
-    token = os.environ.get("PIPEDRIVE_API_TOKEN")
-    live = token is not None and token.strip() != ""
+    configured_token = os.environ.get("PIPEDRIVE_API_TOKEN")
+    live = configured_token is not None and bool(configured_token.strip())
     if live:
+        assert configured_token is not None  # narrowed by the condition above
+        token_value = configured_token.strip()
         client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0), follow_redirects=False)
         mode = "LIVE (real request to api.pipedrive.com)"
     else:
-        token = "fixture-pipedrive-token"  # noqa: S105 - clearly labeled fixture
+        token_value = "fixture-pipedrive-token"  # noqa: S105 - clearly labeled fixture
         client = httpx.AsyncClient(transport=_pipedrive_fixture_transport())
         mode = "FIXTURE (no real Pipedrive call; pipeline proof only)"
 
@@ -184,7 +208,7 @@ def main() -> None:
 
     workflow = build_graph(
         checkpoint_path=tmp / "checkpoints.db",
-        encryption_key=settings.langgraph_aes_key,  # type: ignore[arg-type]
+        encryption_key=settings.langgraph_aes_key,
         dependencies=WorkflowDependencies(
             browser=_ReplayBrowser(),  # type: ignore[arg-type]
             effect_store=SQLiteEffectStore(tmp / "effects.db"),
@@ -195,16 +219,20 @@ def main() -> None:
         settings=settings,
         workflow=workflow,
         capability_preflight=_StubPreflight(),  # type: ignore[arg-type]
-        research_enricher=_StubEnricher(),  # type: ignore[arg-type]
+        research_enricher=_StubEnricher(),
     )
     core._secret_store = vault
-    core._credential_validator = validator  # type: ignore[assignment]
+    core._credential_validator = validator
 
     local = LocalRunService(core_service=core, settings=settings)
     app = create_app(service=local)
 
     print(f"Pipedrive end-to-end API demo -- validation mode: {mode}\n")
     with TestClient(app) as http:
+        if settings.ops_internal_api_token is not None:
+            http.headers["X-Ops-Internal-Token"] = (
+                settings.ops_internal_api_token.get_secret_value()
+            )
         created = http.post(
             "/api/runs",
             json={
@@ -214,13 +242,18 @@ def main() -> None:
             },
         )
         detail = created.json()
+        if created.status_code != 201 or "run" not in detail:
+            raise RuntimeError(
+                f"fixture run creation failed: http={created.status_code} "
+                f"error={detail.get('error', detail.get('detail', 'unknown'))}"
+            )
         run_id = detail["run"]["run_id"]
         print(f"1) create run   -> HTTP {created.status_code} run_id={run_id}")
         print(f"   status={detail['run']['status']} route={detail['run'].get('access_route')}")
 
         submitted = http.post(
             f"/api/runs/{run_id}/credentials",
-            json={"company": _company_payload(), "credentials": {"api_token": token}},
+            json={"company": _company_payload(), "credentials": {"api_token": token_value}},
         )
         sub = submitted.json()
         print(f"2) submit creds -> HTTP {submitted.status_code} status={sub['run']['status']}")
@@ -239,11 +272,13 @@ def main() -> None:
         print(json.dumps(body, indent=2))
 
         raw_haystack = created.text + submitted.text + got.text + timeline.text + output.text
-        leaked = token in raw_haystack and not live
+        leaked = token_value in raw_haystack and not live
         print(
             f"\nvault reference names only: {list(body.get('integrator_bundle', {}).get('credential_refs', {}))}"
         )
-        print(f"raw token present in any API response: {token in raw_haystack} (expected False)")
+        print(
+            f"raw token present in any API response: {token_value in raw_haystack} (expected False)"
+        )
         assert not leaked, "raw fixture token leaked into an API response"
 
 
