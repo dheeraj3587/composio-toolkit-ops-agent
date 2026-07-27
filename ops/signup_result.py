@@ -102,6 +102,15 @@ _GENERIC_FAILURE_MARKERS = (
     "try again later",
     "temporarily unavailable",
 )
+_LEGAL_MARKERS = ("agree", "terms", "privacy", "consent", "legal")
+_BILLING_MARKERS = (
+    "billing",
+    "payment",
+    "card",
+    "purchase",
+    "subscribe",
+    "upgrade",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,8 +118,9 @@ class SignupResultObservation:
     """Ephemeral browser facts used by the classifier.
 
     Text fields may contain ordinary page content and therefore must never be
-    logged or persisted. They are excluded from repr and are normalized and
-    bounded at construction time.
+    logged or persisted. They are excluded from repr and normalized and bounded
+    at construction time. ``visible_alert_present`` means a visible browser
+    feedback surface (alert, status, or dialog), not arbitrary page prose.
     """
 
     page_url: str = field(repr=False)
@@ -208,6 +218,20 @@ class SignupResultClassification(BaseModel):
         return self.model_dump(mode="json", exclude_none=True)
 
 
+@dataclass(frozen=True, slots=True)
+class _ContractEvidence:
+    success: bool = False
+    authenticated: bool = False
+    account_exists: bool = False
+    verification: bool = False
+    captcha: bool = False
+    phone: bool = False
+    legal: bool = False
+    billing: bool = False
+    authentication_failure: bool = False
+    invalid_predicate: bool = False
+
+
 def classify_signup_result(
     observation: SignupResultObservation,
     contract: BrowserAutomationContract,
@@ -236,8 +260,8 @@ def classify_signup_result(
             reason_code=gates.reason_code,
         )
 
-    evaluated = _evaluate_contract_groups(observation, contract)
-    if evaluated.invalid_predicate:
+    evidence = _evaluate_contract_evidence(observation, contract)
+    if evidence.invalid_predicate:
         return _unresolved(
             contract,
             status="safe_stop",
@@ -255,7 +279,7 @@ def classify_signup_result(
         )
 
     for gate in gates.present_gates:
-        outcome = {
+        outcome: SignupResultOutcome = {
             "captcha": "captcha_required",
             "phone_verification": "phone_verification_required",
             "billing": "billing_required",
@@ -264,20 +288,15 @@ def classify_signup_result(
         candidates.add(outcome)
         groups[outcome] = "signup.live_gate"
 
-    if evaluated.captcha:
-        candidates.add("captcha_required")
-        groups["captcha_required"] = "signup.captcha"
-    if evaluated.phone:
-        candidates.add("phone_verification_required")
-        groups["phone_verification_required"] = "signup.phone_verification"
+    _add_contract_gate_candidates(candidates, groups, evidence)
 
-    if evaluated.account_exists:
+    if evidence.account_exists:
         candidates.add("account_already_exists")
         groups["account_already_exists"] = "signup.existing_account"
 
     verification_outcome, verification_ambiguous = _verification_outcome(
         observation,
-        evaluated.verification,
+        evidence.verification,
     )
     if verification_ambiguous:
         return _unresolved(
@@ -303,25 +322,31 @@ def classify_signup_result(
         candidates.add("provider_approval_required")
         groups["provider_approval_required"] = "routing.production_approval"
 
-    if evaluated.success and evaluated.authenticated:
+    if evidence.success and evidence.authenticated:
         candidates.add("account_created_authenticated")
         groups["account_created_authenticated"] = (
             "signup.success+login.authentication_success"
         )
 
-    if evaluated.authentication_failure or (
+    if evidence.authentication_failure or (
         observation.visible_alert_present
         and _contains_any(observation.status_text, _GENERIC_FAILURE_MARKERS)
     ):
         candidates.add("generic_failure")
         groups["generic_failure"] = (
             "login.authentication_failure"
-            if evaluated.authentication_failure
+            if evidence.authentication_failure
             else "browser.error_surface"
         )
 
-    # A generic failure is subordinate to a more precise failure or gate.
-    if "generic_failure" in candidates and len(candidates) > 1:
+    # Generic failure is subordinate to a more precise negative/gated result, but
+    # never to success. Success plus an error surface is contradictory and must
+    # safe-stop rather than silently claiming account creation.
+    specific_non_success = candidates - {
+        "generic_failure",
+        "account_created_authenticated",
+    }
+    if "generic_failure" in candidates and specific_non_success:
         candidates.discard("generic_failure")
         groups.pop("generic_failure", None)
 
@@ -339,7 +364,7 @@ def classify_signup_result(
             matched_contract_group=groups.get(outcome),
         )
 
-    if evaluated.success and not evaluated.authenticated:
+    if evidence.success and not evidence.authenticated:
         return _unresolved(
             contract,
             status="outcome_unknown",
@@ -352,22 +377,26 @@ def classify_signup_result(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _ContractGroupEvaluation:
-    success: bool = False
-    authenticated: bool = False
-    account_exists: bool = False
-    verification: bool = False
-    captcha: bool = False
-    phone: bool = False
-    authentication_failure: bool = False
-    invalid_predicate: bool = False
+def _add_contract_gate_candidates(
+    candidates: set[SignupResultOutcome],
+    groups: dict[SignupResultOutcome, str],
+    evidence: _ContractEvidence,
+) -> None:
+    for present, outcome, group in (
+        (evidence.captcha, "captcha_required", "signup.captcha"),
+        (evidence.phone, "phone_verification_required", "signup.phone_verification"),
+        (evidence.legal, "legal_acceptance_required", "signup.legal_billing"),
+        (evidence.billing, "billing_required", "signup.legal_billing"),
+    ):
+        if present:
+            candidates.add(outcome)
+            groups[outcome] = group
 
 
-def _evaluate_contract_groups(
+def _evaluate_contract_evidence(
     observation: SignupResultObservation,
     contract: BrowserAutomationContract,
-) -> _ContractGroupEvaluation:
+) -> _ContractEvidence:
     groups = (
         ("success", contract.signup.success_predicates),
         ("authenticated", contract.login.authentication_success_predicates),
@@ -383,16 +412,51 @@ def _evaluate_contract_groups(
         matched, malformed = _matches_any_contract_predicate(observation, predicates)
         values[name] = matched
         invalid = invalid or malformed
-    return _ContractGroupEvaluation(
+
+    legal, billing, malformed = _evaluate_legal_billing_predicates(
+        observation,
+        contract.signup.legal_billing_predicates,
+    )
+    return _ContractEvidence(
         success=values["success"],
         authenticated=values["authenticated"],
         account_exists=values["account_exists"],
         verification=values["verification"],
         captcha=values["captcha"],
         phone=values["phone"],
+        legal=legal,
+        billing=billing,
         authentication_failure=values["authentication_failure"],
-        invalid_predicate=invalid,
+        invalid_predicate=invalid or malformed,
     )
+
+
+def _evaluate_legal_billing_predicates(
+    observation: SignupResultObservation,
+    predicates: tuple[str, ...],
+) -> tuple[bool, bool, bool]:
+    legal = False
+    billing = False
+    malformed = False
+    for raw in predicates:
+        parsed = _parse_predicate(raw)
+        if parsed is None:
+            malformed = True
+            continue
+        if not _predicate_matches(observation, parsed):
+            continue
+        descriptor = _normalize(raw)
+        legal_hint = _contains_any(descriptor, _LEGAL_MARKERS)
+        billing_hint = _contains_any(descriptor, _BILLING_MARKERS)
+        if not legal_hint and not billing_hint:
+            # The legacy combined field does not say which side an arbitrary
+            # predicate represents. Treating it as both yields a safe ambiguity
+            # instead of guessing a consequential route.
+            legal = billing = True
+        else:
+            legal = legal or legal_hint
+            billing = billing or billing_hint
+    return legal, billing, malformed
 
 
 def _matches_any_contract_predicate(
@@ -400,22 +464,29 @@ def _matches_any_contract_predicate(
     predicates: tuple[str, ...],
 ) -> tuple[bool, bool]:
     malformed = False
+    matched = False
     for raw in predicates:
         parsed = _parse_predicate(raw)
         if parsed is None:
             malformed = True
             continue
-        kind, needle = parsed
-        haystack = {
-            "url_path": observation.url_path,
-            "title": observation.title,
-            "text": observation.visible_text,
-            "accessible_name": " ".join(observation.accessible_names),
-            "status": observation.status_text,
-        }[kind]
-        if needle in haystack:
-            return True, malformed
-    return False, malformed
+        matched = matched or _predicate_matches(observation, parsed)
+    return matched, malformed
+
+
+def _predicate_matches(
+    observation: SignupResultObservation,
+    parsed: tuple[str, str],
+) -> bool:
+    kind, needle = parsed
+    haystack = {
+        "url_path": observation.url_path,
+        "title": observation.title,
+        "text": observation.visible_text,
+        "accessible_name": " ".join(observation.accessible_names),
+        "status": observation.status_text,
+    }[kind]
+    return needle in haystack
 
 
 def _parse_predicate(raw: str) -> tuple[str, str] | None:
