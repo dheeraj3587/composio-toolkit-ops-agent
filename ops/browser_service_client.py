@@ -29,6 +29,11 @@ from pydantic import SecretStr
 
 from ops.browser_worker import BrowserObservation, BrowserSessionContext
 from ops.models import validate_vault_reference
+from ops.policies import (
+    validate_account_policy,
+    validate_credential_policy,
+    validate_developer_app_policy,
+)
 from ops.provider_errors import ConfigurationRequiredError, ProviderOperationError
 from ops.secret_store import parse_vault_reference
 
@@ -211,17 +216,29 @@ class BrowserServiceClient:
         research: Any,
         *,
         sensitive_data: Mapping[str, str] | None = None,
-        account_creation_requested: bool = False,
-        credential_creation_policy: str = "reuse_only",
+        account_policy: str | None = None,
+        developer_app_policy: str | None = None,
+        credential_policy: str | None = None,
+        account_creation_requested: bool | None = None,
+        credential_creation_policy: str | None = None,
     ) -> BrowserObservation:
+        resolved_account = validate_account_policy(
+            account_policy
+            or ("create_if_missing" if account_creation_requested else "reuse_existing")
+        )
+        resolved_credential = validate_credential_policy(
+            credential_policy
+            or ("create_if_missing" if credential_creation_policy == "create_if_missing" else None)
+        )
         return await self._drive(
             context,
             research,
             path="navigate",
             credential_refs=sensitive_data,
             signal=None,
-            account_creation_requested=account_creation_requested,
-            credential_creation_policy=credential_creation_policy,
+            account_policy=resolved_account,
+            developer_app_policy=validate_developer_app_policy(developer_app_policy),
+            credential_policy=resolved_credential,
         )
 
     async def resume_after_hitl(
@@ -231,17 +248,26 @@ class BrowserServiceClient:
         research: Any = None,
         *,
         sensitive_data: Mapping[str, str] | None = None,
-        credential_creation_policy: str = "reuse_only",
+        account_policy: str | None = None,
+        developer_app_policy: str | None = None,
+        credential_policy: str | None = None,
+        credential_creation_policy: str | None = None,
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
         del provider_session_id  # the service session id IS the provider id here
+        resolved_credential = validate_credential_policy(
+            credential_policy
+            or ("create_if_missing" if credential_creation_policy == "create_if_missing" else None)
+        )
         return await self._drive(
             context,
             research,
             path="resume",
             credential_refs=sensitive_data,
             signal=signal,
-            credential_creation_policy=credential_creation_policy,
+            account_policy=validate_account_policy(account_policy),
+            developer_app_policy=validate_developer_app_policy(developer_app_policy),
+            credential_policy=resolved_credential,
         )
 
     async def _drive(
@@ -252,14 +278,17 @@ class BrowserServiceClient:
         path: str,
         credential_refs: Mapping[str, str] | None,
         signal: str | None,
-        account_creation_requested: bool = False,
-        credential_creation_policy: str = "reuse_only",
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
     ) -> BrowserObservation:
         refs = _vault_references_only(credential_refs)
-        body: dict[str, object] = {"credential_refs": refs}
-        if account_creation_requested:
-            body["account_creation_requested"] = True
-        body["credential_creation_policy"] = credential_creation_policy
+        body: dict[str, object] = {
+            "credential_refs": refs,
+            "account_policy": account_policy,
+            "developer_app_policy": developer_app_policy,
+            "credential_policy": credential_policy,
+        }
         if research is not None:
             body["research"] = (
                 research.model_dump(mode="json") if hasattr(research, "model_dump") else research

@@ -40,7 +40,9 @@ function validForm(executionMode: string): FormData {
   form.set("requested_scope_policy", "minimum")
   form.set("execution_mode", executionMode)
   form.set("browser_provider", "playwright")
-  form.set("credential_creation_policy", "create_if_missing")
+  form.set("account_policy", "create_if_missing")
+  form.set("developer_app_policy", "create_if_missing")
+  form.set("credential_policy", "create_if_missing")
   return form
 }
 
@@ -54,7 +56,7 @@ describe("createRunAction", () => {
     })
   })
 
-  it("submits the selected execution mode without the legacy dry-run alias", async () => {
+  it("submits the selected execution mode and independent creation policies", async () => {
     await expect(createRunAction(initialState, validForm("execute_when_configured"))).rejects.toThrow("NEXT_REDIRECT")
 
     expect(mocks.createRun).toHaveBeenCalledOnce()
@@ -63,7 +65,9 @@ describe("createRunAction", () => {
       app_name: "Linear",
       execution_mode: "execute_when_configured",
       browser_provider: "playwright",
-      credential_creation_policy: "create_if_missing",
+      account_policy: "create_if_missing",
+      developer_app_policy: "create_if_missing",
+      credential_policy: "create_if_missing",
       company: {
         legal_name: "Example Labs, Inc.",
         website: "https://example.com",
@@ -71,6 +75,7 @@ describe("createRunAction", () => {
       },
     })
     expect(request).not.toHaveProperty("dry_run")
+    expect(request).not.toHaveProperty("credential_creation_policy")
   })
 
   it("fails closed to plan_only when the submitted mode is not supported", async () => {
@@ -113,13 +118,17 @@ describe("createRunAction", () => {
     expect(state.fields).toEqual(["browser_provider"])
   })
 
-  it("rejects an invalid credential creation policy before calling the API", async () => {
+  it.each([
+    ["account_policy", "always_create"],
+    ["developer_app_policy", "replace_existing"],
+    ["credential_policy", "rotate_if_missing"],
+  ])("rejects an invalid %s before calling the API", async (field, invalidValue) => {
     const form = validForm("execute_when_configured")
-    form.set("credential_creation_policy", "always_create")
+    form.set(field, invalidValue)
 
     const state = await createRunAction(initialState, form)
 
     expect(mocks.createRun).not.toHaveBeenCalled()
-    expect(state.fields).toEqual(["credential_creation_policy"])
+    expect(state.fields).toEqual([field])
   })
 })

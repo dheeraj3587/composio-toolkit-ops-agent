@@ -25,6 +25,14 @@ _REFERENCE = re.compile(
 )
 
 
+def validate_app_slug(value: str) -> str:
+    """Validate the canonical app-slug grammar shared by vault clients."""
+
+    if _APP_SLUG.fullmatch(value) is None:
+        raise ValueError("app_slug must contain lowercase letters, digits, or hyphens")
+    return value
+
+
 class SecretStoreError(RuntimeError):
     """Base class for non-sensitive vault errors."""
 
