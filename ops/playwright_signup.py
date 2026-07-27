@@ -1,9 +1,9 @@
-"""Playwright adapter for deterministic signup inspection and filling.
+"""Deterministic Playwright signup inspection and pre-submit filling.
 
 The adapter extracts only value-free control metadata. Secret values are resolved
-inside the trusted browser process, screenshots are disabled before injection,
-and every filled control is verified without returning its value. Submit is never
-clicked in Parts 12-13.
+inside the trusted browser process, screenshots and browser capture are disabled
+before injection, and every filled control is verified without returning its
+value. Submit is never clicked in Parts 12-13.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
 from ops.approved_run_values import ApprovedRunValues
@@ -33,6 +33,7 @@ from ops.signup_forms import (
     SignupFormInspection,
     detect_signup_form,
 )
+from ops.signup_submission_fields import SecretCaptureGuard
 
 _CONTROL_SELECTOR = (
     "input:not([type='hidden']), textarea, select, button, "
@@ -46,6 +47,7 @@ _ARIA_LINE = re.compile(
 )
 _MAX_CONTROLS = 80
 _ACTION_TIMEOUT_MS = 10_000
+_SECRET_FIELDS = frozenset({"email", "password", "password_confirmation"})
 
 _METADATA_SCRIPT = r"""
 (el, token) => {
@@ -80,6 +82,8 @@ _METADATA_SCRIPT = r"""
     }
     node = node.parentElement;
   }
+  // This page-observable token is code-generated and contains no secret. Every
+  // later lookup requires exactly one match; duplication or mutation safe-stops.
   el.setAttribute("data-ops-signup-ref", token);
   return {
     tag: (el.tagName || "").toLowerCase(),
@@ -111,21 +115,22 @@ class SignupSecretStore(Protocol):
 @dataclass(frozen=True, slots=True)
 class _PlannedField:
     match: SignupFieldMatch
-    value: str
+    value: str | None
     select_option: ContractSelectOption | None
     secret: bool
+
+    def __post_init__(self) -> None:
+        if self.secret and self.value is not None:
+            raise ValueError("secret signup fields cannot carry planned plaintext")
+        if not self.secret and (self.value is None or not self.value.strip()):
+            raise ValueError("non-secret signup fields require a planned value")
 
 
 async def inspect_signup_form(
     page: PageLike,
     contract: BrowserAutomationContract,
 ) -> SignupFormInspection:
-    """Inspect a live page through Playwright's accessibility metadata.
-
-    ``Locator.all()`` returns concrete locator objects, so this implementation does
-    not enumerate an ambiguous locator with ``nth()``. Each visible element receives
-    a random, code-owned token that later filling resolves strictly.
-    """
+    """Inspect one bounded live form through accessibility-facing metadata."""
 
     contract.assert_usable()
     controls = page.locator(_CONTROL_SELECTOR)
@@ -138,7 +143,6 @@ async def inspect_signup_form(
         )
 
     candidates: list[SignupControlCandidate] = []
-    inspection_failed = False
     for locator in locators:
         try:
             if not await locator.is_visible():
@@ -146,8 +150,7 @@ async def inspect_signup_form(
             token = f"sf_{uuid4().hex}"
             metadata = await locator.evaluate(_METADATA_SCRIPT, token)
             if not isinstance(metadata, Mapping):
-                inspection_failed = True
-                break
+                raise TypeError("signup control metadata is invalid")
             aria_snapshot = await locator.aria_snapshot(timeout=2_000)
             role, accessible_name = _parse_aria_snapshot(aria_snapshot)
             kind = _control_kind(
@@ -183,16 +186,11 @@ async def inspect_signup_form(
             )
         except Exception:
             # Dropping one control could turn a duplicate into a false unique match.
-            # Fail closed and let the caller retry after the DOM stabilizes.
-            inspection_failed = True
-            break
-
-    if inspection_failed:
-        return SignupFormInspection(
-            status="safe_stop",
-            reason_code="signup_control_inspection_failed",
-            contract_version=contract.contract_version,
-        )
+            return SignupFormInspection(
+                status="safe_stop",
+                reason_code="signup_control_inspection_failed",
+                contract_version=contract.contract_version,
+            )
     return detect_signup_form(candidates, contract.signup, contract.contract_version)
 
 
@@ -208,37 +206,38 @@ async def fill_signup_form(
     credential_manager: SignupCredentialManager,
     account_binding: SignupAccountBinding,
     disable_screenshots: Callable[[], None],
+    assert_secret_capture_disabled: SecretCaptureGuard | None = None,
 ) -> SignupFillResult:
     """Fill and verify the detected form without clicking its submit control."""
 
     contract.assert_usable()
     approved_values.assert_binding(run_id=run_id, session_id=session_id)
     if inspection.status != "detected":
-        return SignupFillResult(
-            status="failed",
-            reason_code="signup_form_not_detected",
-            contract_version=contract.contract_version,
-            screenshots_disabled=False,
+        return _fill_result(
+            "failed",
+            "signup_form_not_detected",
+            contract,
         )
     if inspection.contract_version != contract.contract_version:
-        return SignupFillResult(
-            status="failed",
-            reason_code="signup_contract_version_changed",
-            contract_version=contract.contract_version,
-            screenshots_disabled=False,
+        return _fill_result(
+            "failed",
+            "signup_contract_version_changed",
+            contract,
         )
     if inspection.match_for("signup_submit") is None:
-        return SignupFillResult(
-            status="failed",
-            reason_code="signup_submit_control_missing",
-            contract_version=contract.contract_version,
-            screenshots_disabled=False,
+        return _fill_result(
+            "failed",
+            "signup_submit_control_missing",
+            contract,
         )
 
-    required = set(contract.signup.required_semantic_fields)
-    required.update(
-        field.semantic_field for field in inspection.fields if field.required
+    required = set(
+        cast(
+            tuple[SignupSemanticField, ...],
+            contract.signup.required_semantic_fields,
+        )
     )
+    required.update(field.semantic_field for field in inspection.fields if field.required)
     planned, missing_values, reason = _build_fill_plan(
         inspection=inspection,
         signup=contract.signup,
@@ -255,9 +254,7 @@ async def fill_signup_form(
         )
 
     secret_fields = {
-        item.match.semantic_field
-        for item in planned
-        if item.match.semantic_field in {"email", "password", "password_confirmation"}
+        item.match.semantic_field for item in planned if item.secret
     }
     screenshots_disabled = False
     email = ""
@@ -268,10 +265,26 @@ async def fill_signup_form(
 
     try:
         if secret_fields:
-            # Masking is defence-in-depth, not the authorization boundary. Once a
-            # secret can enter the DOM, capture is disabled for the session.
+            # Screenshot masking alone is insufficient: evaluate arguments may be
+            # retained by Playwright tracing, HAR, or video tooling.
             disable_screenshots()
             screenshots_disabled = True
+            if assert_secret_capture_disabled is None:
+                return _fill_result(
+                    "configuration_required",
+                    "signup_secret_capture_guard_missing",
+                    contract,
+                    screenshots_disabled=True,
+                )
+            try:
+                assert_secret_capture_disabled()
+            except Exception:
+                return _fill_result(
+                    "configuration_required",
+                    "signup_secret_capture_guard_failed",
+                    contract,
+                    screenshots_disabled=True,
+                )
 
         if "email" in secret_fields:
             email = secret_store.get(approved_values.signup_email_ref)
@@ -285,7 +298,9 @@ async def fill_signup_form(
                 )
 
         if secret_fields & {"password", "password_confirmation"}:
-            registered_ref = credential_manager.get_account_password_reference(account_binding)
+            registered_ref = credential_manager.get_account_password_reference(
+                account_binding
+            )
             if registered_ref != approved_values.account_password_ref:
                 return SignupFillResult(
                     status="configuration_required",
@@ -304,7 +319,6 @@ async def fill_signup_form(
                     screenshots_disabled=screenshots_disabled,
                 )
 
-        # Non-secret fields first, then email, then password/confirmation last.
         ordered = sorted(
             planned,
             key=lambda item: (
@@ -315,13 +329,21 @@ async def fill_signup_form(
         )
         for item in ordered:
             semantic = item.match.semantic_field
-            value = (
-                email
-                if semantic == "email"
-                else password
-                if semantic in {"password", "password_confirmation"}
-                else item.value
+            value = _planned_value(
+                item,
+                email=email,
+                password=password,
             )
+            if value is None:
+                await _clear_secret_controls(page, secret_tokens_filled)
+                return SignupFillResult(
+                    status="failed",
+                    reason_code="signup_planned_value_invalid",
+                    contract_version=contract.contract_version,
+                    filled_fields=tuple(filled),
+                    verified_fields=tuple(verified),
+                    screenshots_disabled=screenshots_disabled,
+                )
             locator = await _strict_token_locator(page, item.match.token)
             if locator is None:
                 await _clear_secret_controls(page, secret_tokens_filled)
@@ -334,47 +356,7 @@ async def fill_signup_form(
                     screenshots_disabled=screenshots_disabled,
                 )
             try:
-                if item.match.control_kind == "select":
-                    target, by_label = _resolved_select_target(item.select_option, value)
-                    if by_label:
-                        await locator.select_option(
-                            label=target,
-                            timeout=_ACTION_TIMEOUT_MS,
-                        )
-                    else:
-                        await locator.select_option(
-                            value=target,
-                            timeout=_ACTION_TIMEOUT_MS,
-                        )
-                    ok = await locator.evaluate(
-                        """(el, args) => {
-                          const option = el.options && el.selectedIndex >= 0
-                            ? el.options[el.selectedIndex]
-                            : null;
-                          if (!option) return false;
-                          return args.byLabel
-                            ? option.label === args.expected
-                            : option.value === args.expected;
-                        }""",
-                        {"expected": target, "byLabel": by_label},
-                    )
-                elif item.match.control_kind == "combobox":
-                    await _clear_secret_controls(page, secret_tokens_filled)
-                    return SignupFillResult(
-                        status="configuration_required",
-                        reason_code="custom_combobox_requires_review",
-                        contract_version=contract.contract_version,
-                        filled_fields=tuple(filled),
-                        verified_fields=tuple(verified),
-                        screenshots_disabled=screenshots_disabled,
-                    )
-                else:
-                    await locator.fill(value, timeout=_ACTION_TIMEOUT_MS)
-                    ok = await locator.evaluate(
-                        "(el, expected) => "
-                        "typeof el.value === 'string' && el.value === expected",
-                        value,
-                    )
+                ok = await _fill_and_verify(locator, item, value)
             except Exception:
                 await _clear_secret_controls(page, secret_tokens_filled)
                 return SignupFillResult(
@@ -385,7 +367,7 @@ async def fill_signup_form(
                     verified_fields=tuple(verified),
                     screenshots_disabled=screenshots_disabled,
                 )
-            if semantic in {"email", "password", "password_confirmation"}:
+            if item.secret:
                 secret_tokens_filled.append(item.match.token)
             filled.append(semantic)
             if ok is not True:
@@ -420,10 +402,23 @@ async def fill_signup_form(
             screenshots_disabled=screenshots_disabled,
         )
     finally:
-        # Drop the only local plaintext bindings immediately. Python cannot promise
-        # zeroization, but no plaintext is retained on a model, result, log, or ledger.
         email = ""
         password = ""
+
+
+def _fill_result(
+    status: str,
+    reason_code: str,
+    contract: BrowserAutomationContract,
+    *,
+    screenshots_disabled: bool = False,
+) -> SignupFillResult:
+    return SignupFillResult(
+        status=cast(Any, status),
+        reason_code=reason_code,
+        contract_version=contract.contract_version,
+        screenshots_disabled=screenshots_disabled,
+    )
 
 
 def _build_fill_plan(
@@ -431,12 +426,12 @@ def _build_fill_plan(
     inspection: SignupFormInspection,
     signup: ContractSignup,
     approved_values: ApprovedRunValues,
-    required: set[str],
+    required: set[SignupSemanticField],
 ) -> tuple[list[_PlannedField], list[SignupSemanticField], str | None]:
     values: dict[SignupSemanticField, str | None] = {
-        "email": "__secret_email__",
-        "password": "__secret_password__",
-        "password_confirmation": "__secret_password__",
+        "email": None,
+        "password": None,
+        "password_confirmation": None,
         "first_name": approved_values.first_name,
         "last_name": approved_values.last_name,
         "full_name": _full_name(approved_values),
@@ -453,8 +448,9 @@ def _build_fill_plan(
         semantic = match.semantic_field
         if semantic == "signup_submit":
             continue
+        secret = semantic in _SECRET_FIELDS
         value = values[semantic]
-        if value is None or not str(value).strip():
+        if not secret and (value is None or not value.strip()):
             if semantic in required:
                 missing.append(semantic)
             continue
@@ -467,12 +463,54 @@ def _build_fill_plan(
         planned.append(
             _PlannedField(
                 match=match,
-                value=str(value),
+                value=None if secret else value,
                 select_option=select_rule,
-                secret=semantic in {"email", "password", "password_confirmation"},
+                secret=secret,
             )
         )
     return planned, missing, None
+
+
+def _planned_value(
+    item: _PlannedField,
+    *,
+    email: str,
+    password: str,
+) -> str | None:
+    semantic = item.match.semantic_field
+    if semantic == "email":
+        return email or None
+    if semantic in {"password", "password_confirmation"}:
+        return password or None
+    return item.value
+
+
+async def _fill_and_verify(locator: Any, item: _PlannedField, value: str) -> object:
+    if item.match.control_kind == "select":
+        target, by_label = _resolved_select_target(item.select_option, value)
+        if by_label:
+            await locator.select_option(label=target, timeout=_ACTION_TIMEOUT_MS)
+        else:
+            await locator.select_option(value=target, timeout=_ACTION_TIMEOUT_MS)
+        return await locator.evaluate(
+            """(el, args) => {
+              const option = el.options && el.selectedIndex >= 0
+                ? el.options[el.selectedIndex]
+                : null;
+              if (!option) return false;
+              return args.byLabel
+                ? option.label === args.expected
+                : option.value === args.expected;
+            }""",
+            {"expected": target, "byLabel": by_label},
+        )
+    if item.match.control_kind == "combobox":
+        raise ValueError("custom combobox requires reviewed automation")
+    await locator.fill(value, timeout=_ACTION_TIMEOUT_MS)
+    return await locator.evaluate(
+        "(el, expected) => typeof el.value === 'string' && el.value === expected",
+        value,
+    )
 
 
 def _resolved_select_target(
@@ -496,9 +534,7 @@ async def _strict_token_locator(page: PageLike, token: str) -> Any | None:
     locator = page.locator(f'[data-ops-signup-ref="{token}"]')
     if await locator.count() != 1:
         return None
-    if not await locator.is_visible():
-        return None
-    if await locator.is_disabled():
+    if not await locator.is_visible() or await locator.is_disabled():
         return None
     return locator
 
