@@ -8,16 +8,24 @@ from __future__ import annotations
 
 from typing import Literal, TypedDict
 
+from ops.policies import (
+    AccountPolicy,
+    CredentialCreationPolicy,
+    CredentialPolicy,
+    DeveloperAppPolicy,
+)
+
 AccessRoute = Literal[
     "self_serve",
+    "self_serve_with_hitl",
     "approval_required",
     "partner_gated",
     "hybrid",
     "blocked",
+    "unsupported",
     "unknown",
 ]
 BrowserProvider = Literal["browser_use", "playwright"]
-CredentialCreationPolicy = Literal["reuse_only", "create_if_missing"]
 
 RunStatus = Literal[
     "created",
@@ -143,9 +151,21 @@ class OperationsState(TypedDict, total=False):
     route_reason_code: str
     status: RunStatus
     browser_provider: BrowserProvider
+    account_policy: AccountPolicy
+    developer_app_policy: DeveloperAppPolicy
+    credential_policy: CredentialPolicy
+    # Historical top-level checkpoint field retained for readers of old state.
     credential_creation_policy: CredentialCreationPolicy
     state_revision: int
     last_projected_revision: int
+
+    # Phase B/C foundation. These dictionaries are strict-model projections and
+    # contain opaque vault references only; raw email/password values are forbidden.
+    approved_run_values: dict[str, object]
+    automation_contract: dict[str, object]
+    automation_contract_version: str
+    signup_state: str
+    signup_state_revision: int
 
     browser_profile_id: str
     browser_session_id: str

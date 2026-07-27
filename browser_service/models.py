@@ -11,9 +11,17 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ops.approved_run_values import ApprovedRunValues
+from ops.automation_contracts import BrowserAutomationContract
 from ops.models import validate_vault_reference
+from ops.policies import (
+    AccountPolicy,
+    CredentialPolicy,
+    DeveloperAppPolicy,
+    normalize_legacy_policy_payload,
+)
 
 SessionLifecycle = Literal["ACTIVE", "CLOSING", "CLOSED"]
 LiveViewMode = Literal["screenshot", "interactive_remote"]
@@ -40,6 +48,9 @@ class CreateSessionRequest(_Strict):
 
     # Reviewed app slug; the service resolves its own host policy from this.
     app_slug: str = Field(min_length=1, max_length=120)
+    # Explicit run binding for per-run approved values. Kept optional during the
+    # compatibility window for sessions created by older API workers.
+    run_id: str = Field(default="", max_length=180, pattern=r"^[A-Za-z0-9_-]*$")
     # Opaque profile identifier (never a filesystem path from the caller).
     profile_id: str | None = Field(default=None, max_length=200)
     live_view_mode: LiveViewMode = "screenshot"
@@ -53,6 +64,20 @@ class CreateSessionRequest(_Strict):
     # references may be consumed only for the matching scope, so a reference minted
     # for one run cannot be replayed by another.
     secret_scope: str = Field(default="", max_length=200, pattern=r"^[A-Za-z0-9_-]*$")
+    # Strict Phase B inputs. Values contain secret references only and are immutable.
+    approved_values: ApprovedRunValues | None = None
+    automation_contract: BrowserAutomationContract | None = None
+
+    @model_validator(mode="after")
+    def _phase_b_bindings_match(self) -> CreateSessionRequest:
+        if self.approved_values is not None:
+            if self.run_id and self.approved_values.run_id != self.run_id:
+                raise ValueError("approved values belong to another run")
+            if self.approved_values.session_id is not None:
+                raise ValueError("approved values must be unbound before session creation")
+        if self.automation_contract is not None and self.automation_contract.app_slug != self.app_slug:
+            raise ValueError("automation contract belongs to another app")
+        return self
 
 
 class SessionSummary(_Strict):
@@ -82,16 +107,27 @@ class SessionSummary(_Strict):
 
 
 class NavigateRequest(_Strict):
-    """Drive the reviewed onboarding trace toward the credential page."""
+    """Drive verified onboarding toward the next contract-authorized phase."""
 
     # The verified OperationalResearch payload (non-secret, strict upstream).
     research: dict[str, object]
     # Vault REFERENCES only — never raw credential values.
     credential_refs: dict[str, str] = Field(default_factory=dict)
-    # Explicit local intent. The service never infers account existence from a
-    # page, research content, or a model response.
-    account_creation_requested: bool = False
-    credential_creation_policy: Literal["reuse_only", "create_if_missing"] = "reuse_only"
+    account_policy: AccountPolicy = "reuse_existing"
+    developer_app_policy: DeveloperAppPolicy = "reuse_existing"
+    credential_policy: CredentialPolicy = "reuse_existing"
+    approved_values: ApprovedRunValues | None = None
+    automation_contract: BrowserAutomationContract | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_historical_policies(cls, value: object) -> object:
+        return normalize_legacy_policy_payload(value)
+
+    @model_validator(mode="after")
+    def _contract_matches_values(self) -> NavigateRequest:
+        _validate_phase_b_payload(self.approved_values, self.automation_contract)
+        return self
 
 
 class ResumeRequest(_Strict):
@@ -100,7 +136,21 @@ class ResumeRequest(_Strict):
     signal: str = Field(min_length=1, max_length=64)
     research: dict[str, object] | None = None
     credential_refs: dict[str, str] = Field(default_factory=dict)
-    credential_creation_policy: Literal["reuse_only", "create_if_missing"] = "reuse_only"
+    account_policy: AccountPolicy = "reuse_existing"
+    developer_app_policy: DeveloperAppPolicy = "reuse_existing"
+    credential_policy: CredentialPolicy = "reuse_existing"
+    approved_values: ApprovedRunValues | None = None
+    automation_contract: BrowserAutomationContract | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_historical_policies(cls, value: object) -> object:
+        return normalize_legacy_policy_payload(value)
+
+    @model_validator(mode="after")
+    def _contract_matches_values(self) -> ResumeRequest:
+        _validate_phase_b_payload(self.approved_values, self.automation_contract)
+        return self
 
 
 class ObservationResponse(_Strict):
@@ -173,6 +223,16 @@ class ErrorResponse(_Strict):
 
     reason_code: str
     detail: str = ""
+
+
+def _validate_phase_b_payload(
+    approved_values: ApprovedRunValues | None,
+    automation_contract: BrowserAutomationContract | None,
+) -> None:
+    if approved_values is not None and approved_values.session_id is None:
+        raise ValueError("approved values must be bound before navigation")
+    if automation_contract is not None:
+        automation_contract.assert_usable()
 
 
 __all__ = [

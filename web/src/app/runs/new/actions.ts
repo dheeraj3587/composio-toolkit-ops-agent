@@ -73,12 +73,19 @@ export async function createRunAction(
   const browserProvider = ["browser_use", "playwright"].includes(requestedBrowserProvider)
     ? (requestedBrowserProvider as OperationsRequestInput["browser_provider"])
     : null
-  const requestedCreationPolicy = value(formData, "credential_creation_policy", 40)
-  const creationPolicy = ["reuse_only", "create_if_missing"].includes(
-    requestedCreationPolicy,
-  )
-    ? (requestedCreationPolicy as OperationsRequestInput["credential_creation_policy"])
-    : null
+  const canonicalPolicy = (name: string) => {
+    const candidate = value(formData, name, 40)
+    return ["reuse_existing", "create_if_missing"].includes(candidate) ? candidate : null
+  }
+  const accountPolicy = canonicalPolicy("account_policy") as
+    | OperationsRequestInput["account_policy"]
+    | null
+  const developerAppPolicy = canonicalPolicy("developer_app_policy") as
+    | OperationsRequestInput["developer_app_policy"]
+    | null
+  const credentialPolicy = canonicalPolicy("credential_policy") as
+    | OperationsRequestInput["credential_policy"]
+    | null
 
   const invalid: string[] = []
   if (appName.length < 2) invalid.push("app_name")
@@ -98,7 +105,9 @@ export async function createRunAction(
   // truncate (which would submit a wrong secret).
   if (appLoginPassword.length > 512) invalid.push("app_login_password")
   if (browserProvider === null) invalid.push("browser_provider")
-  if (creationPolicy === null) invalid.push("credential_creation_policy")
+  if (accountPolicy === null) invalid.push("account_policy")
+  if (developerAppPolicy === null) invalid.push("developer_app_policy")
+  if (credentialPolicy === null) invalid.push("credential_policy")
 
   if (invalid.length > 0) {
     return {
@@ -122,7 +131,9 @@ export async function createRunAction(
     requested_scope_policy: policy,
     execution_mode: executionMode,
     browser_provider: browserProvider ?? "browser_use",
-    credential_creation_policy: creationPolicy ?? "reuse_only",
+    account_policy: accountPolicy ?? "reuse_existing",
+    developer_app_policy: developerAppPolicy ?? "reuse_existing",
+    credential_policy: credentialPolicy ?? "reuse_existing",
     outreach_recipient_override: outreachOverride || null,
     browser_login:
       appLoginEmail && appLoginPassword

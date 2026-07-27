@@ -33,6 +33,7 @@ _SAFE_CREDENTIAL_METADATA_KEYS = frozenset(
     {
         "credential_creation_policy",
         "credential_management_url",
+        "credential_policy",
     }
 )
 

@@ -1,0 +1,225 @@
+name: PR11 verified autofix v2
+
+on:
+  push:
+    branches:
+      - agent/autonomous-signup-foundation-complete
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: python -m pip install --requirement requirements-dev.txt
+      - name: Apply unique verified replacements
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected one exact snippet, found {count}')
+              target.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          for path in (
+              'tests/test_credential_capture_bundle.py',
+              'tests/test_owner_credential_submission.py',
+              'tests/test_self_serve_browser.py',
+          ):
+              replace_once(
+                  path,
+                  '''        sensitive_data: object = None,
+        credential_creation_policy: str = "reuse_only",
+    ) -> BrowserObservation:
+        del context, research, sensitive_data, credential_creation_policy''',
+                  '''        sensitive_data: object = None,
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
+    ) -> BrowserObservation:
+        del context, research, sensitive_data, account_policy
+        del developer_app_policy, credential_policy''',
+              )
+
+          replace_once(
+              'tests/test_credential_capture_bundle.py',
+              '''        sensitive_data: object = None,
+        credential_creation_policy: str = "reuse_only",
+        provider_session_id: object = None,
+    ) -> BrowserObservation:
+        del context, signal, research, sensitive_data, credential_creation_policy
+        del provider_session_id''',
+              '''        sensitive_data: object = None,
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
+        provider_session_id: object = None,
+    ) -> BrowserObservation:
+        del context, signal, research, sensitive_data, account_policy
+        del developer_app_policy, credential_policy, provider_session_id''',
+          )
+
+          for path in (
+              'tests/test_owner_credential_submission.py',
+              'tests/test_self_serve_browser.py',
+          ):
+              replace_once(
+                  path,
+                  '''        sensitive_data: object = None,
+        credential_creation_policy: str = "reuse_only",
+        provider_session_id: object = None,
+    ) -> BrowserObservation:
+        raise AssertionError(''',
+                  '''        sensitive_data: object = None,
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
+        provider_session_id: object = None,
+    ) -> BrowserObservation:
+        del context, signal, research, sensitive_data, account_policy
+        del developer_app_policy, credential_policy, provider_session_id
+        raise AssertionError(''',
+              )
+
+          replace_once(
+              'tests/test_browser_service_phase3.py',
+              '''        sensitive_data: Any = None,
+        credential_creation_policy: str = "reuse_only",
+    ) -> BrowserObservation:
+        del research, credential_creation_policy''',
+              '''        sensitive_data: Any = None,
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
+    ) -> BrowserObservation:
+        del research, account_policy, developer_app_policy, credential_policy''',
+          )
+          replace_once(
+              'tests/test_browser_service_phase3.py',
+              '''        sensitive_data: Any = None,
+        credential_creation_policy: str = "reuse_only",
+        provider_session_id: str | None = None,
+    ) -> BrowserObservation:
+        del context, signal, research, credential_creation_policy, provider_session_id''',
+              '''        sensitive_data: Any = None,
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
+        provider_session_id: str | None = None,
+    ) -> BrowserObservation:
+        del context, signal, research, account_policy, developer_app_policy
+        del credential_policy, provider_session_id''',
+          )
+
+          replace_once(
+              'tests/test_run_service.py',
+              'def test_idempotency_fingerprint_freezes_credential_creation_policy(',
+              'def test_idempotency_fingerprint_freezes_credential_policy(',
+          )
+          replace_once(
+              'tests/test_run_service.py',
+              'create = reuse.model_copy(update={"credential_creation_policy": "create_if_missing"})',
+              'create = reuse.model_copy(update={"credential_policy": "create_if_missing"})',
+          )
+          replace_once(
+              'tests/test_signup_submission.py',
+              '''    page, submit = page_for(inspection)
+
+    result = await dispatch(
+        tmp_path,
+        page,
+        inspection,
+        fill_result,
+        capture_guard=False,''',
+              '''    page, submit = page_for(inspection)
+    page.gate_locators = []
+
+    result = await dispatch(
+        tmp_path,
+        page,
+        inspection,
+        fill_result,
+        capture_guard=False,''',
+          )
+          replace_once(
+              'ops/signup_result.py',
+              '    if observation.native_password_invalid or (',
+              '    if observation.native_password_invalid or (  # pragma: allowlist secret',
+          )
+          replace_once(
+              'ops/signup_result.py',
+              '''    if len(candidates) == 1:
+        outcome = next(iter(candidates))
+        return _classified(
+            contract,
+            outcome=outcome,
+            matched_contract_group=groups.get(outcome),
+        )''',
+              '''    if len(candidates) == 1:
+        sole_outcome = next(iter(candidates))
+        return _classified(
+            contract,
+            outcome=sole_outcome,
+            matched_contract_group=groups.get(sole_outcome),
+        )''',
+          )
+          replace_once(
+              'tests/test_signup_result_state.py',
+              '        account_password_ref="vault://example/account_password/password_1",',
+              '        account_password_ref=(  # pragma: allowlist secret\n            "vault://example/account_password/password_1"\n        ),',
+          )
+          replace_once(
+              'ops/signup_submission_fields.py',
+              'from typing import Any, Protocol, cast',
+              'from typing import Any, Protocol',
+          )
+          replace_once(
+              'ops/signup_submission_fields.py',
+              '''    required = set(
+        cast(
+            tuple[SignupSemanticField, ...],
+            contract.signup.required_semantic_fields,
+        )
+    )''',
+              '    required = set(contract.signup.required_semantic_fields)',
+          )
+          replace_once(
+              'ops/playwright_signup.py',
+              '''    required = set(
+        cast(
+            tuple[SignupSemanticField, ...],
+            contract.signup.required_semantic_fields,
+        )
+    )''',
+              '    required = set(contract.signup.required_semantic_fields)',
+          )
+          PY
+      - name: Apply repository formatter
+        run: |
+          ruff check --fix .
+          ruff format .
+      - name: Commit exact mechanical fixes
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git diff --check
+          git add --all
+          git diff --cached --quiet && exit 0
+          git commit -m 'fix: apply verified PR11 compatibility and formatting corrections'
+          git push origin HEAD:agent/autonomous-signup-foundation-complete

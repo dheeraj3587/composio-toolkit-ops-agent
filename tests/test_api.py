@@ -152,6 +152,9 @@ def test_create_and_detail_expose_verified_phase_two_contract(harness: ApiHarnes
         "access_route",
         "execution_mode",
         "browser_provider",
+        "account_policy",
+        "developer_app_policy",
+        "credential_policy",
         "credential_creation_policy",
         "external_actions",
         "created_at",
@@ -159,6 +162,10 @@ def test_create_and_detail_expose_verified_phase_two_contract(harness: ApiHarnes
     }
     assert run["status"] == "route_selected"
     assert run["access_route"] == "self_serve"
+    assert run["account_policy"] == "reuse_existing"
+    assert run["developer_app_policy"] == "reuse_existing"
+    assert run["credential_policy"] == "reuse_existing"
+    assert run["credential_creation_policy"] == "reuse_only"
     assert run["external_actions"] is False
     assert str(run["thread_id"]).startswith("local_")
 

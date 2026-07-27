@@ -37,7 +37,7 @@ vi.mock("@/lib/app-catalog", async (importOriginal) => {
 })
 
 describe("NewRunForm", () => {
-  it("shows the required company fields and makes execute-mode boundaries explicit", () => {
+  it("shows required company fields and independent creation boundaries", () => {
     render(
       <NewRunForm
         defaultAppName="Pipedrive"
@@ -60,7 +60,13 @@ describe("NewRunForm", () => {
     expect(screen.getByText(/may perform approved provider actions only when backend policy/i)).toBeInTheDocument()
     expect(screen.getByText(/execution can proceed only when backend policy and provider configuration permit each action/i)).toBeInTheDocument()
     expect(screen.getByRole("radio", { name: /playwright/i })).toBeChecked()
-    expect(screen.getByRole("combobox", { name: "Credential creation" })).toHaveTextContent(
+    expect(screen.getByRole("combobox", { name: "Account handling" })).toHaveTextContent(
+      "Create if missing",
+    )
+    expect(screen.getByRole("combobox", { name: "Developer application" })).toHaveTextContent(
+      "Create if missing",
+    )
+    expect(screen.getByRole("combobox", { name: "Credential handling" })).toHaveTextContent(
       "Create if missing",
     )
   })
