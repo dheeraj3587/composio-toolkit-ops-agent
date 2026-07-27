@@ -1,4 +1,4 @@
-name: Capture PR11 fast merge gate
+name: Capture PR11 pytest gate
 
 on:
   pull_request:
@@ -11,7 +11,12 @@ jobs:
   capture:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 18
+    env:
+      ALLOW_LIVE_BROWSER: "false"
+      ALLOW_LIVE_VENDOR_EMAIL: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+      RUN_LIVE_TESTS: "0"
     steps:
       - name: Check out report branch
         uses: actions/checkout@v4
@@ -21,10 +26,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Check out exact PR11 merge commit
+      - name: Check out exact final PR11 merge commit
         uses: actions/checkout@v4
         with:
-          ref: 2d8634b8a1d42ce01cba40a5ad4ae7f43ca1a68c
+          ref: 8f5277aeb910a534eab82d2e1ef0e0f3eef87a22
           path: target
           persist-credentials: false
 
@@ -33,55 +38,38 @@ jobs:
           python-version: "3.11"
 
       - run: python -m pip install --requirement target/requirements-dev.txt
+      - run: python -m playwright install --with-deps chromium
 
-      - name: Capture secret and Ruff checks
+      - name: Capture pytest and remaining backend components
         run: |
-          rm -rf report/pr11-fast-diagnostics
-          mkdir -p report/pr11-fast-diagnostics
+          rm -rf report/pr11-pytest-diagnostics
+          mkdir -p report/pr11-pytest-diagnostics
           cd target
           set +e
 
-          files=()
-          while IFS= read -r -d '' candidate; do
-            case "$candidate" in
-              .secrets.baseline | PLAN.md | data/p1/SNAPSHOT.json) continue ;;
-            esac
-            [[ -f "$candidate" ]] && files+=("$candidate")
-          done < <(git ls-files -z --cached --others --exclude-standard)
+          timeout 720s pytest -vv --maxfail=1 \
+            > ../report/pr11-pytest-diagnostics/pytest.txt 2>&1
+          pytest_status=$?
+          mypy ops api streamlit_app.py \
+            > ../report/pr11-pytest-diagnostics/mypy.txt 2>&1
+          mypy_status=$?
+          python -m compileall -q ops api streamlit_app.py \
+            > ../report/pr11-pytest-diagnostics/compileall.txt 2>&1
+          compile_status=$?
+          pip-audit -r requirements-dev.txt \
+            > ../report/pr11-pytest-diagnostics/pip-audit.txt 2>&1
+          audit_status=$?
 
-          excludes=(
-            '"secret_scope"\s*:\s*"production-classifier-smoke"'
-            'secret\s*=\s*"signed-live-view-secret"'
-            '"login_password"\s*:\s*"pw"'
-          )
-          hook_args=(--baseline .secrets.baseline)
-          scan_args=(scan --all-files)
-          for pattern in "${excludes[@]}"; do
-            hook_args+=(--exclude-lines "$pattern")
-            scan_args+=(--exclude-lines "$pattern")
-          done
-          scan_args+=(--exclude-files '(?:^|/)(?:\.git|\.venv|web/node_modules|web/\.next|private)(?:/|$)')
-
-          detect-secrets-hook "${hook_args[@]}" "${files[@]}" > ../report/pr11-fast-diagnostics/detect-hook.txt 2>&1
-          detect_hook=$?
-          detect-secrets "${scan_args[@]}" > ../report/pr11-fast-diagnostics/detect-scan.txt 2>&1
-          detect_scan=$?
-          git diff -- .secrets.baseline > ../report/pr11-fast-diagnostics/baseline.diff
-          ruff check . > ../report/pr11-fast-diagnostics/ruff-check.txt 2>&1
-          ruff_check=$?
-          ruff format --check . > ../report/pr11-fast-diagnostics/ruff-format.txt 2>&1
-          ruff_format=$?
-
-          printf 'detect_hook=%s\ndetect_scan=%s\nruff_check=%s\nruff_format=%s\n' \
-            "$detect_hook" "$detect_scan" "$ruff_check" "$ruff_format" \
-            > ../report/pr11-fast-diagnostics/status.txt
+          printf 'pytest=%s\nmypy=%s\ncompileall=%s\npip_audit=%s\n' \
+            "$pytest_status" "$mypy_status" "$compile_status" "$audit_status" \
+            > ../report/pr11-pytest-diagnostics/status.txt
           set -e
 
-      - name: Commit fast diagnostics
+      - name: Commit pytest diagnostics
         working-directory: report
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pr11-fast-diagnostics
-          git commit -m "chore: capture PR11 fast merge diagnostics"
+          git add pr11-pytest-diagnostics
+          git commit -m "chore: capture PR11 pytest diagnostics"
           git push origin HEAD:agent/signup-foundation-ci-diagnostics
