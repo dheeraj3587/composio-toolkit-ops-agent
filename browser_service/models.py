@@ -11,9 +11,15 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ops.models import validate_vault_reference
+from ops.policies import (
+    AccountPolicy,
+    CredentialPolicy,
+    DeveloperAppPolicy,
+    normalize_legacy_policy_payload,
+)
 
 SessionLifecycle = Literal["ACTIVE", "CLOSING", "CLOSED"]
 LiveViewMode = Literal["screenshot", "interactive_remote"]
@@ -88,10 +94,14 @@ class NavigateRequest(_Strict):
     research: dict[str, object]
     # Vault REFERENCES only — never raw credential values.
     credential_refs: dict[str, str] = Field(default_factory=dict)
-    # Explicit local intent. The service never infers account existence from a
-    # page, research content, or a model response.
-    account_creation_requested: bool = False
-    credential_creation_policy: Literal["reuse_only", "create_if_missing"] = "reuse_only"
+    account_policy: AccountPolicy = "reuse_existing"
+    developer_app_policy: DeveloperAppPolicy = "reuse_existing"
+    credential_policy: CredentialPolicy = "reuse_existing"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_historical_policies(cls, value: object) -> object:
+        return normalize_legacy_policy_payload(value)
 
 
 class ResumeRequest(_Strict):
@@ -100,7 +110,14 @@ class ResumeRequest(_Strict):
     signal: str = Field(min_length=1, max_length=64)
     research: dict[str, object] | None = None
     credential_refs: dict[str, str] = Field(default_factory=dict)
-    credential_creation_policy: Literal["reuse_only", "create_if_missing"] = "reuse_only"
+    account_policy: AccountPolicy = "reuse_existing"
+    developer_app_policy: DeveloperAppPolicy = "reuse_existing"
+    credential_policy: CredentialPolicy = "reuse_existing"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_historical_policies(cls, value: object) -> object:
+        return normalize_legacy_policy_payload(value)
 
 
 class ObservationResponse(_Strict):

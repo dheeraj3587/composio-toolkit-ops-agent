@@ -435,8 +435,9 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                     payload.credential_refs,
                     resolved,
                     resume_signal=None,
-                    account_creation_requested=payload.account_creation_requested,
-                    credential_creation_policy=payload.credential_creation_policy,
+                    account_policy=payload.account_policy,
+                    developer_app_policy=payload.developer_app_policy,
+                    credential_policy=payload.credential_policy,
                 )
         except SessionUnavailable as exc:
             raise _sanitized_error(exc) from None
@@ -473,7 +474,9 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                     payload.credential_refs,
                     resolved,
                     resume_signal=payload.signal,
-                    credential_creation_policy=payload.credential_creation_policy,
+                    account_policy=payload.account_policy,
+                    developer_app_policy=payload.developer_app_policy,
+                    credential_policy=payload.credential_policy,
                 )
         except SessionUnavailable as exc:
             raise _sanitized_error(exc) from None
@@ -835,8 +838,9 @@ async def _drive(
     settings: BrowserServiceSettings,
     *,
     resume_signal: str | None,
-    account_creation_requested: bool = False,
-    credential_creation_policy: str = "reuse_only",
+    account_policy: str = "reuse_existing",
+    developer_app_policy: str = "reuse_existing",
+    credential_policy: str = "reuse_existing",
 ) -> ObservationResponse:
     """Run one navigate/resume operation and project a sanitized observation.
 
@@ -880,10 +884,10 @@ async def _drive(
         if resume_signal is None:
             navigate_kwargs: dict[str, object] = {
                 "sensitive_data": sensitive,
-                "credential_creation_policy": credential_creation_policy,
+                "account_policy": account_policy,
+                "developer_app_policy": developer_app_policy,
+                "credential_policy": credential_policy,
             }
-            if account_creation_requested:
-                navigate_kwargs["account_creation_requested"] = True
             observation = await asyncio.wait_for(
                 worker.navigate_onboarding(context, research, **navigate_kwargs),
                 timeout=settings.operation_timeout_seconds,
@@ -895,7 +899,9 @@ async def _drive(
                     resume_signal,
                     research,
                     sensitive_data=sensitive,
-                    credential_creation_policy=credential_creation_policy,
+                    account_policy=account_policy,
+                    developer_app_policy=developer_app_policy,
+                    credential_policy=credential_policy,
                 ),
                 timeout=settings.operation_timeout_seconds,
             )

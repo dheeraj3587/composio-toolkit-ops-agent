@@ -53,6 +53,9 @@ const runStatus = z.enum([
 // The wired browser backend and the view it can offer. Declared here because both
 // the run-detail projection (BrowserUiState) and the live-view response use them.
 export const browserProviderSchema = z.enum(["browser_use", "playwright"])
+export const accountPolicySchema = z.enum(["reuse_existing", "create_if_missing"])
+export const developerAppPolicySchema = z.enum(["reuse_existing", "create_if_missing"])
+export const credentialPolicySchema = z.enum(["reuse_existing", "create_if_missing"])
 export const credentialCreationPolicySchema = z.enum(["reuse_only", "create_if_missing"])
 export const liveViewModeSchema = z.enum([
   "hosted_url",
@@ -138,6 +141,9 @@ export const runSummarySchema = z.strictObject({
   updated_at: isoTimestamp,
   execution_mode: z.enum(["plan_only", "execute_when_configured"]),
   browser_provider: z.enum(["browser_use", "playwright"]),
+  account_policy: accountPolicySchema.default("reuse_existing"),
+  developer_app_policy: developerAppPolicySchema.default("reuse_existing"),
+  credential_policy: credentialPolicySchema.default("reuse_existing"),
   credential_creation_policy: credentialCreationPolicySchema.default("reuse_only"),
   external_actions: z.boolean(),
 })

@@ -53,14 +53,33 @@ if [[ "${gate_scope}" == "all" || "${gate_scope}" == "backend" ]]; then
     fi
   done < <(git ls-files -z --cached --others --exclude-standard)
 
+  # These are reviewed, non-secret smoke/test literals. Keep the allowlist scoped to
+  # the exact line content instead of excluding whole files from secret scanning.
+  # detect-secrets applies exclude-lines with re.match(), so account for indentation.
+  secret_fixture_line_excludes=(
+    '.*"secret_scope"\s*:\s*"production-classifier-smoke"'
+    '.*secret\s*=\s*"signed-live-view-secret"'
+    '.*"login_password"\s*:\s*"pw"'
+  )
+  detect_secrets_hook_args=(--baseline .secrets.baseline)
+  for fixture_pattern in "${secret_fixture_line_excludes[@]}"; do
+    detect_secrets_hook_args+=(--exclude-lines "${fixture_pattern}")
+  done
+
   if (( ${#secret_scan_files[@]} > 0 )); then
-    detect-secrets-hook --baseline .secrets.baseline "${secret_scan_files[@]}"
+    detect-secrets-hook "${detect_secrets_hook_args[@]}" "${secret_scan_files[@]}"
   fi
   # Run the required recursive scanner without printing candidate material. The audited
   # baseline hook above is the enforcing comparison for source-controlled files.
-  detect-secrets scan --all-files \
-    --exclude-files '(?:^|/)(?:\.git|\.venv|web/node_modules|web/\.next|private)(?:/|$)' \
-    >"${scan_output}"
+  detect_secrets_scan_args=(scan --all-files)
+  for fixture_pattern in "${secret_fixture_line_excludes[@]}"; do
+    detect_secrets_scan_args+=(--exclude-lines "${fixture_pattern}")
+  done
+  detect_secrets_scan_args+=(
+    --exclude-files
+    '(?:^|/)(?:\.git|\.venv|web/node_modules|web/\.next|private)(?:/|$)'
+  )
+  detect-secrets "${detect_secrets_scan_args[@]}" >"${scan_output}"
 
   ruff check .
   ruff format --check .
@@ -105,6 +124,11 @@ provider_key = re.compile(
     r")(?![A-Za-z0-9])"
 )
 safe_prefixes = ("vault://", "[REDACTED", "${", "{")
+reviewed_fixture_fragments = {
+    "deploy/kiro-smoke.py": ('"secret_scope": "production-classifier-smoke"',),
+    "tests/test_browser_service_phase3.py": ('secret = "signed-live-view-secret"',),
+    "tests/test_playwright_action_loop.py": ('"login_password": "pw"',),
+}
 suspicious: set[str] = set()
 
 with open(sys.argv[1], encoding="utf-8") as handle:
@@ -115,6 +139,11 @@ with open(sys.argv[1], encoding="utf-8") as handle:
         if "pragma: allowlist secret" in parts[2]:
             continue
         content = parts[2]
+        if any(
+            fragment in content
+            for fragment in reviewed_fixture_fragments.get(parts[0], ())
+        ):
+            continue
         location = f"{parts[0]}:{parts[1]}"
         quoted_match = quoted_assignment.search(content)
         shell_match = shell_assignment.search(content)

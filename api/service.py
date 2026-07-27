@@ -202,6 +202,9 @@ class LocalRunService:
             updated_at=str(record["updated_at"]),
             execution_mode=record.get("execution_mode", "plan_only"),  # type: ignore[arg-type]
             browser_provider=record.get("browser_provider", "browser_use"),  # type: ignore[arg-type]
+            account_policy=record.get("account_policy", "reuse_existing"),  # type: ignore[arg-type]
+            developer_app_policy=record.get("developer_app_policy", "reuse_existing"),  # type: ignore[arg-type]
+            credential_policy=record.get("credential_policy", "reuse_existing"),  # type: ignore[arg-type]
             credential_creation_policy=record.get("credential_creation_policy", "reuse_only"),  # type: ignore[arg-type]
             external_actions=bool(record.get("external_actions", False)),
         )
@@ -698,7 +701,9 @@ class LocalRunService:
             company=company,
             requested_scope_policy=request.requested_scope_policy,
             browser_provider=request.browser_provider,
-            credential_creation_policy=request.credential_creation_policy,
+            account_policy=request.account_policy,
+            developer_app_policy=request.developer_app_policy,
+            credential_policy=request.credential_policy,
             dry_run=True,
             outreach_recipient_override=request.outreach_recipient_override,
         )

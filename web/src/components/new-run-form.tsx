@@ -28,7 +28,9 @@ const runFormSchema = z.object({
   browser_provider: z.enum(["playwright", "browser_use"], {
     error: "Choose an available browser engine.",
   }),
-  credential_creation_policy: z.enum(["reuse_only", "create_if_missing"]),
+  account_policy: z.enum(["reuse_existing", "create_if_missing"]),
+  developer_app_policy: z.enum(["reuse_existing", "create_if_missing"]),
+  credential_policy: z.enum(["reuse_existing", "create_if_missing"]),
   callback_urls: z.string().max(2_000).refine((value) => {
     const urls = value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean)
     return urls.length <= 10 && urls.every((url) => safeUrl.safeParse(url).success)
@@ -80,7 +82,9 @@ export function NewRunForm({
       requested_scope_policy: "maximum",
       execution_mode: "execute_when_configured",
       browser_provider: defaultProvider,
-      credential_creation_policy: "create_if_missing",
+      account_policy: "create_if_missing",
+      developer_app_policy: "create_if_missing",
+      credential_policy: "create_if_missing",
       callback_urls: "",
       outreach_recipient_override: "",
       legal_name: "",
@@ -105,7 +109,9 @@ export function NewRunForm({
     data.set("requested_scope_policy", values.requested_scope_policy)
     data.set("execution_mode", values.execution_mode)
     data.set("browser_provider", values.browser_provider)
-    data.set("credential_creation_policy", values.credential_creation_policy)
+    data.set("account_policy", values.account_policy)
+    data.set("developer_app_policy", values.developer_app_policy)
+    data.set("credential_policy", values.credential_policy)
     data.set("callback_urls", values.callback_urls)
     data.set("outreach_recipient_override", values.outreach_recipient_override)
     data.set("legal_name", values.legal_name)
@@ -164,27 +170,24 @@ export function NewRunForm({
               )}
             />
           </Field>
-          <Field
-            label="Credential creation"
-            htmlFor="credential_creation_policy"
-            hint="The agent always searches for the exact integration name first. Human-only, billing, legal, verification, and ambiguous steps still pause."
-          >
-            <Controller
-              name="credential_creation_policy"
-              control={control}
-              render={({ field }) => (
-                <Select name={field.name} value={field.value} onValueChange={field.onChange}>
-                  <SelectTrigger id="credential_creation_policy" className="w-full rounded-md bg-white">
-                    <SelectValue placeholder="Choose creation behavior" />
-                  </SelectTrigger>
-                  <SelectContent className="rounded-md">
-                    <SelectItem value="create_if_missing">Create if missing — reviewed routes only</SelectItem>
-                    <SelectItem value="reuse_only">Reuse only — never create</SelectItem>
-                  </SelectContent>
-                </Select>
-              )}
-            />
-          </Field>
+          <PolicyField
+            control={control}
+            name="account_policy"
+            label="Account handling"
+            hint="Use an existing account, or authorize signup when a verified self-service route is available."
+          />
+          <PolicyField
+            control={control}
+            name="developer_app_policy"
+            label="Developer application"
+            hint="Search first; create a developer application only when this policy explicitly allows it."
+          />
+          <PolicyField
+            control={control}
+            name="credential_policy"
+            label="Credential handling"
+            hint="Search first; generate a credential only when this policy explicitly allows it."
+          />
           <Field
             label="Execution mode"
             htmlFor="execution_mode"
@@ -282,6 +285,38 @@ export function NewRunForm({
 
 function fieldError(message: string | undefined, serverInvalid: boolean): string | undefined {
   return message ?? (serverInvalid ? "The backend rejected this field." : undefined)
+}
+
+function PolicyField({
+  control,
+  name,
+  label,
+  hint,
+}: {
+  control: ReturnType<typeof useForm<RunFormValues>>["control"]
+  name: "account_policy" | "developer_app_policy" | "credential_policy"
+  label: string
+  hint: string
+}) {
+  return (
+    <Field label={label} htmlFor={name} hint={hint}>
+      <Controller
+        name={name}
+        control={control}
+        render={({ field }) => (
+          <Select name={field.name} value={field.value} onValueChange={field.onChange}>
+            <SelectTrigger id={name} className="w-full rounded-md bg-white">
+              <SelectValue placeholder="Choose policy" />
+            </SelectTrigger>
+            <SelectContent className="rounded-md">
+              <SelectItem value="create_if_missing">Create if missing — verified routes only</SelectItem>
+              <SelectItem value="reuse_existing">Reuse existing — never create</SelectItem>
+            </SelectContent>
+          </Select>
+        )}
+      />
+    </Field>
+  )
 }
 
 function Field({
