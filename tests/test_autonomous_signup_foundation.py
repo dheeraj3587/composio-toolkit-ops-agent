@@ -16,7 +16,11 @@ from ops.automation_contracts import (
 )
 from ops.autonomous_signup_foundation import AutonomousSignupFoundation
 from ops.models import CompanyProfile, OperationsRequest
-from ops.signup_state_machine import SQLiteSignupStateStore, SignupState, SignupStateMachine
+from ops.signup_state_machine import (
+    SQLiteSignupStateStore,
+    SignupState,
+    SignupStateMachine,
+)
 
 _SOURCE = "https://docs.example.com/automation"
 
@@ -81,7 +85,9 @@ def test_foundation_models_create_then_bind_rpc_flow(tmp_path) -> None:
         app_slug="example",
         request=request,
         signup_email_ref="vault://gmail/signup_email/run_alpha",
-        account_password_ref="vault://example/account_password/run_alpha",
+        account_password_ref=(  # pragma: allowlist secret
+            "vault://example/account_password/run_alpha"
+        ),
     )
 
     create_payload = CreateSessionRequest.model_validate(prepared.create_session_payload())
@@ -110,14 +116,18 @@ def test_foundation_keeps_two_bound_sessions_isolated(tmp_path) -> None:
         app_slug="example",
         request=_request("Alpha Labs"),
         signup_email_ref="vault://gmail/signup_email/run_alpha",
-        account_password_ref="vault://example/account_password/run_alpha",
+        account_password_ref=(  # pragma: allowlist secret
+            "vault://example/account_password/run_alpha"
+        ),
     )
     beta = foundation.prepare_run(
         run_id="run_beta",
         app_slug="example",
         request=_request("Beta Labs"),
         signup_email_ref="vault://gmail/signup_email/run_beta",
-        account_password_ref="vault://example/account_password/run_beta",
+        account_password_ref=(  # pragma: allowlist secret
+            "vault://example/account_password/run_beta"
+        ),
     )
     foundation.bind_session(alpha, session_id="session_alpha", account_exists=False)
     foundation.bind_session(beta, session_id="session_beta", account_exists=False)
@@ -139,7 +149,9 @@ def test_reuse_existing_policy_skips_signup_creation(tmp_path) -> None:
         app_slug="example",
         request=_request("Existing Company", account_policy="reuse_existing"),
         signup_email_ref="vault://gmail/signup_email/run_existing",
-        account_password_ref="vault://example/account_password/run_existing",
+        account_password_ref=(  # pragma: allowlist secret
+            "vault://example/account_password/run_existing"
+        ),
     )
     bound = foundation.bind_session(
         prepared,
