@@ -37,9 +37,10 @@ def main() -> None:
             "credential_management_url": "https://app.pipedrive.com/settings/api",
         }
     )
+    secret_scope = "production-classifier-smoke"  # pragma: allowlist secret
     created = call(
         "/internal/browser/sessions",
-        {"app_slug": "pipedrive", "secret_scope": "production-classifier-smoke"},
+        {"app_slug": "pipedrive", "secret_scope": secret_scope},
     )
     session_id = str(created["session_id"])
     print("session_created", flush=True)

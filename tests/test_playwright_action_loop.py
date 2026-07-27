@@ -389,11 +389,15 @@ def test_login_bound_navigation_enters_authentication_stage_before_first_documen
         },
     )
 
+    login_password = "pw"  # pragma: allowlist secret
     asyncio.run(
         worker.navigate_onboarding(
             context,  # type: ignore[arg-type]
             _research(),
-            sensitive_data={"login_email": "ops@example.test", "login_password": "pw"},
+            sensitive_data={
+                "login_email": "ops@example.test",
+                "login_password": login_password,
+            },
         )
     )
     asyncio.run(worker.stop(context))  # type: ignore[arg-type]

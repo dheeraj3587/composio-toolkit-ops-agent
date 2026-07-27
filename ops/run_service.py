@@ -188,6 +188,9 @@ _PUBLIC_RUN_FIELDS = (
     "created_at",
     "updated_at",
     "browser_provider",
+    "account_policy",
+    "developer_app_policy",
+    "credential_policy",
     "credential_creation_policy",
 )
 
@@ -288,17 +291,37 @@ def _request_fingerprint(request: OperationsRequest, execution_mode: str) -> str
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _historical_request_payload(request: OperationsRequest) -> dict[str, object]:
+    """Reconstruct the pre-canonical request shape for idempotency replays."""
+
+    payload = request.model_dump(
+        mode="json",
+        exclude={"account_policy", "developer_app_policy", "credential_policy"},
+    )
+    payload["account_creation_requested"] = request.account_creation_requested
+    payload["credential_creation_policy"] = request.credential_creation_policy
+    return payload
+
+
 def _legacy_request_fingerprints(request: OperationsRequest, execution_mode: str) -> set[str]:
     """Accepted historical fingerprint shapes for compatibility replays."""
 
-    if request.credential_creation_policy != "reuse_only":
+    # A developer-app policy never existed historically, so a non-default value
+    # cannot legitimately match an old fingerprint.
+    if request.developer_app_policy != "reuse_existing":
         return set()
     fingerprints: set[str] = set()
-    excluded_sets = [{"credential_creation_policy"}]
-    if request.browser_provider == "browser_use":
-        excluded_sets.append({"browser_provider", "credential_creation_policy"})
-    for excluded in excluded_sets:
-        legacy_request = request.model_dump(mode="json", exclude=excluded)
+    full = _historical_request_payload(request)
+    candidates = [full]
+    if request.credential_creation_policy == "reuse_only":
+        without_creation = dict(full)
+        without_creation.pop("credential_creation_policy", None)
+        candidates.append(without_creation)
+        if request.browser_provider == "browser_use":
+            oldest = dict(without_creation)
+            oldest.pop("browser_provider", None)
+            candidates.append(oldest)
+    for legacy_request in candidates:
         canonical = json.dumps(
             {"execution_mode": execution_mode, "request": legacy_request},
             ensure_ascii=False,
@@ -310,11 +333,11 @@ def _legacy_request_fingerprints(request: OperationsRequest, execution_mode: str
 
 
 def _legacy_request_fingerprint(request: OperationsRequest, execution_mode: str) -> str:
-    """Return the oldest Browser Use fingerprint shape kept for test/client compatibility."""
+    """Return the oldest Browser Use fingerprint shape kept for test compatibility."""
 
-    legacy_request = request.model_dump(
-        mode="json", exclude={"browser_provider", "credential_creation_policy"}
-    )
+    legacy_request = _historical_request_payload(request)
+    legacy_request.pop("browser_provider", None)
+    legacy_request.pop("credential_creation_policy", None)
     canonical = json.dumps(
         {"execution_mode": execution_mode, "request": legacy_request},
         ensure_ascii=False,
@@ -1679,6 +1702,9 @@ class RunService:
                 scope_policy=request.requested_scope_policy,
                 execution_mode=persisted_execution_mode,
                 browser_provider=request.browser_provider,
+                account_policy=request.account_policy,
+                developer_app_policy=request.developer_app_policy,
+                credential_policy=request.credential_policy,
                 credential_creation_policy=request.credential_creation_policy,
                 external_actions=False,
                 idempotency_key=validated_idempotency_key,
@@ -1692,6 +1718,9 @@ class RunService:
                     "scope_policy": request.requested_scope_policy,
                     "execution_mode": persisted_execution_mode,
                     "browser_provider": request.browser_provider,
+                    "account_policy": request.account_policy,
+                    "developer_app_policy": request.developer_app_policy,
+                    "credential_policy": request.credential_policy,
                     "credential_creation_policy": request.credential_creation_policy,
                     "external_actions": False,
                 },

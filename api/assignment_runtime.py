@@ -56,6 +56,7 @@ from ops.composio_capability import (
 from ops.config import Settings
 from ops.graph import DurableOperationsWorkflow
 from ops.models import OperationalResearch, OperationsRequest
+from ops.policies import resolve_automation_policies
 from ops.provider_errors import ProviderContractError, ProviderOperationError
 from ops.routing import decide_access
 
@@ -506,17 +507,27 @@ class AssignmentBrowserWorker(BrowserWorker):
         research: OperationalResearch,
         *,
         sensitive_data: Mapping[str, str] | None = None,
-        account_creation_requested: bool = False,
-        credential_creation_policy: str = "reuse_only",
+        account_policy: str | None = None,
+        developer_app_policy: str | None = None,
+        credential_policy: str | None = None,
+        account_creation_requested: bool | None = None,
+        credential_creation_policy: str | None = None,
     ) -> BrowserObservation:
+        policies = resolve_automation_policies(
+            account_policy=account_policy,
+            developer_app_policy=developer_app_policy,
+            credential_policy=credential_policy,
+            account_creation_requested=account_creation_requested,
+            credential_creation_policy=credential_creation_policy,
+        )
         self._assignment_research[context.session_id] = research
         return await self._run_assignment_task(
             context=context,
             research=research,
             resume_signal=None,
             sensitive_data=sensitive_data,
-            account_creation_requested=account_creation_requested,
-            credential_creation_policy=credential_creation_policy,
+            account_creation_requested=policies.account_creation_requested,
+            credential_creation_policy=policies.credential_creation_policy,
         )
 
     async def resume_after_hitl(
@@ -526,9 +537,18 @@ class AssignmentBrowserWorker(BrowserWorker):
         research: OperationalResearch | None = None,
         *,
         sensitive_data: Mapping[str, str] | None = None,
-        credential_creation_policy: str = "reuse_only",
+        account_policy: str | None = None,
+        developer_app_policy: str | None = None,
+        credential_policy: str | None = None,
+        credential_creation_policy: str | None = None,
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
+        policies = resolve_automation_policies(
+            account_policy=account_policy,
+            developer_app_policy=developer_app_policy,
+            credential_policy=credential_policy,
+            credential_creation_policy=credential_creation_policy,
+        )
         log_event(
             "browser.resume.begin",
             handle=context.session_id,
@@ -570,7 +590,7 @@ class AssignmentBrowserWorker(BrowserWorker):
             research=resolved,
             resume_signal=signal,
             sensitive_data=sensitive_data,
-            credential_creation_policy=credential_creation_policy,
+            credential_creation_policy=policies.credential_creation_policy,
         )
 
     def provider_session_id(self, handle: str) -> str | None:

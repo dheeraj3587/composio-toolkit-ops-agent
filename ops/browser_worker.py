@@ -33,6 +33,14 @@ from ops.browser_target_selection import (
 )
 from ops.config import Settings
 from ops.models import OperationalResearch
+from ops.policies import (
+    account_creation_requested as should_create_account,
+)
+from ops.policies import (
+    validate_account_policy,
+    validate_credential_policy,
+    validate_developer_app_policy,
+)
 from ops.provider_errors import (
     ConfigurationRequiredError,
     PhaseUnavailableError,
@@ -285,10 +293,22 @@ class BrowserWorker:
         research: OperationalResearch,
         *,
         sensitive_data: Mapping[str, str] | None = None,
-        account_creation_requested: bool = False,
-        credential_creation_policy: str = "reuse_only",
+        account_policy: str | None = None,
+        developer_app_policy: str | None = None,
+        credential_policy: str | None = None,
+        account_creation_requested: bool | None = None,
+        credential_creation_policy: str | None = None,
     ) -> BrowserObservation:
         self._require_configuration()
+        resolved_account = validate_account_policy(
+            account_policy
+            or ("create_if_missing" if account_creation_requested else "reuse_existing")
+        )
+        resolved_developer = validate_developer_app_policy(developer_app_policy)
+        resolved_credential = validate_credential_policy(
+            credential_policy
+            or ("create_if_missing" if credential_creation_policy == "create_if_missing" else None)
+        )
         if context.session_id:
             self._research[context.session_id] = research
         return await self._run_bounded_task(
@@ -296,8 +316,9 @@ class BrowserWorker:
             research=research,
             resume_signal=None,
             sensitive_data=sensitive_data,
-            account_creation_requested=account_creation_requested,
-            credential_creation_policy=credential_creation_policy,
+            account_policy=resolved_account,
+            developer_app_policy=resolved_developer,
+            credential_policy=resolved_credential,
         )
 
     async def resume_after_hitl(
@@ -307,10 +328,17 @@ class BrowserWorker:
         research: OperationalResearch | None = None,
         *,
         sensitive_data: Mapping[str, str] | None = None,
-        credential_creation_policy: str = "reuse_only",
+        account_policy: str | None = None,
+        developer_app_policy: str | None = None,
+        credential_policy: str | None = None,
+        credential_creation_policy: str | None = None,
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
         self._require_configuration()
+        resolved_credential = validate_credential_policy(
+            credential_policy
+            or ("create_if_missing" if credential_creation_policy == "create_if_missing" else None)
+        )
         resolved = research or self._research.get(context.session_id)
         if resolved is None:
             raise ProviderOperationError(
@@ -327,7 +355,9 @@ class BrowserWorker:
             research=resolved,
             resume_signal=signal,
             sensitive_data=sensitive_data,
-            credential_creation_policy=credential_creation_policy,
+            account_policy=validate_account_policy(account_policy),
+            developer_app_policy=validate_developer_app_policy(developer_app_policy),
+            credential_policy=resolved_credential,
         )
 
     def provider_session_id(self, handle: str) -> str | None:
@@ -376,10 +406,14 @@ class BrowserWorker:
         research: OperationalResearch,
         resume_signal: str | None,
         sensitive_data: Mapping[str, str] | None = None,
-        account_creation_requested: bool = False,
-        credential_creation_policy: str = "reuse_only",
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
     ) -> BrowserObservation:
-        del credential_creation_policy
+        # Browser Use currently consumes only target-selection intent. The other
+        # independently validated policies are carried for provider parity and the
+        # later developer-app/credential phases.
+        del developer_app_policy, credential_policy
         try:
             allowed = build_browser_allowed_hosts(
                 research.app_slug,
@@ -396,7 +430,9 @@ class BrowserWorker:
         patterns = validate_allowed_domains(allowed.patterns())
         account_state = derive_account_state(
             sensitive_data=sensitive_data,
-            account_creation_requested=account_creation_requested,
+            account_creation_requested=should_create_account(
+                validate_account_policy(account_policy)
+            ),
         )
         target_url = _official_target_url(
             research,
