@@ -72,7 +72,9 @@ def ready_foundation(tmp_path: Path):
         app_slug="example",
         request=request,
         signup_email_ref="vault://example/signup_email/email_1",
-        account_password_ref="vault://example/account_password/password_1",
+        account_password_ref=(  # pragma: allowlist secret
+            "vault://example/account_password/password_1"
+        ),
     )
     bound = foundation.bind_session(
         prepared,
