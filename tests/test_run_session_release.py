@@ -15,6 +15,7 @@ from ops.browser_worker import BrowserSessionContext
 from ops.config import Settings
 from ops.run_reconciliation import RunReconciliationService
 from ops.run_service import _TERMINAL_BROWSER_STATUSES, RunService
+from ops.run_state_projection import RunProjectionService
 
 
 class _RecordingWorker:
@@ -127,8 +128,8 @@ def test_reconcile_projection_and_credentials_release_terminal_sessions() -> Non
     # implementation rather than the historical location; the property being
     # guarded is unchanged (every terminal path must release the session).
     reconcile = inspect.getsource(RunReconciliationService.reconcile_one_stranded)
-    projection = inspect.getsource(RunService.project)
-    guarded = inspect.getsource(RunService.guarded_status_update)
+    projection = inspect.getsource(RunProjectionService.project)
+    guarded = inspect.getsource(RunProjectionService.guarded_status_update)
     credentials = inspect.getsource(RunService.submit_owner_credentials)
 
     assert "_release_browser_session" in reconcile
