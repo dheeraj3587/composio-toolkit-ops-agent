@@ -1,11 +1,13 @@
-"""Durable signup state-machine skeleton.
+"""Durable, revision-checked signup state and outcome persistence.
 
-This milestone models policy branching and restart-safe transitions only. It does
-not inspect, fill, or submit a browser form.
+The state store is the single source of truth for signup progress. Part 15 adds
+stable reason codes and exact outcome metadata through an additive SQLite
+migration, preserving existing rows and callers.
 """
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,6 +33,8 @@ class SignupState(StrEnum):
     EMAIL_VERIFICATION_REQUIRED = "email_verification_required"
     EMAIL_VERIFICATION_PENDING = "email_verification_pending"
     EMAIL_VERIFICATION_APPLYING = "email_verification_applying"
+    SIGNUP_HITL_REQUIRED = "signup_hitl_required"
+    PROVIDER_APPROVAL_REQUIRED = "provider_approval_required"
     ACCOUNT_CREATED = "account_created"
     SIGNUP_FAILED = "signup_failed"
 
@@ -70,6 +74,9 @@ _LEGAL_TRANSITIONS: dict[SignupState, frozenset[SignupState]] = {
     SignupState.SIGNUP_SUBMITTED: frozenset(
         {
             SignupState.EMAIL_VERIFICATION_REQUIRED,
+            SignupState.ACCOUNT_EXISTS_DETECTED,
+            SignupState.SIGNUP_HITL_REQUIRED,
+            SignupState.PROVIDER_APPROVAL_REQUIRED,
             SignupState.ACCOUNT_CREATED,
             SignupState.SIGNUP_FAILED,
         }
@@ -83,6 +90,10 @@ _LEGAL_TRANSITIONS: dict[SignupState, frozenset[SignupState]] = {
     SignupState.EMAIL_VERIFICATION_APPLYING: frozenset(
         {SignupState.ACCOUNT_CREATED, SignupState.SIGNUP_FAILED}
     ),
+    SignupState.SIGNUP_HITL_REQUIRED: frozenset(
+        {SignupState.SIGNUP_SUBMITTED, SignupState.SIGNUP_FAILED}
+    ),
+    SignupState.PROVIDER_APPROVAL_REQUIRED: frozenset(),
     SignupState.ACCOUNT_CREATED: frozenset(),
     SignupState.SIGNUP_FAILED: frozenset({SignupState.SIGNUP_PAGE_LOADING}),
 }
@@ -99,6 +110,16 @@ class SignupStateSnapshot(BaseModel):
     state: SignupState
     revision: int = Field(ge=0)
     updated_at: str
+    reason_code: str = Field(
+        default="signup_state_unspecified",
+        pattern=r"^[a-z0-9_:-]+$",
+        max_length=120,
+    )
+    outcome: str | None = Field(
+        default=None,
+        pattern=r"^[a-z0-9_:-]+$",
+        max_length=120,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,10 +148,30 @@ class SQLiteSignupStateStore:
                     run_id TEXT PRIMARY KEY,
                     state TEXT NOT NULL,
                     revision INTEGER NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    reason_code TEXT NOT NULL DEFAULT 'signup_state_unspecified',
+                    outcome TEXT
                 )
                 """
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(signup_states)"
+                ).fetchall()
+            }
+            if "reason_code" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE signup_states
+                    ADD COLUMN reason_code TEXT NOT NULL
+                    DEFAULT 'signup_state_legacy'
+                    """
+                )
+            if "outcome" not in columns:
+                connection.execute(
+                    "ALTER TABLE signup_states ADD COLUMN outcome TEXT"
+                )
             connection.commit()
         finally:
             connection.close()
@@ -141,13 +182,23 @@ class SQLiteSignupStateStore:
         with sqlite3.connect(self.db_path, timeout=10) as connection:
             connection.execute(
                 """
-                INSERT OR IGNORE INTO signup_states(run_id, state, revision, updated_at)
-                VALUES (?, ?, 0, ?)
+                INSERT OR IGNORE INTO signup_states(
+                    run_id, state, revision, updated_at, reason_code, outcome
+                ) VALUES (?, ?, 0, ?, ?, NULL)
                 """,
-                (run_id, SignupState.SIGNUP_NOT_STARTED.value, now),
+                (
+                    run_id,
+                    SignupState.SIGNUP_NOT_STARTED.value,
+                    now,
+                    "signup_not_started",
+                ),
             )
             row = connection.execute(
-                "SELECT run_id, state, revision, updated_at FROM signup_states WHERE run_id = ?",
+                """
+                SELECT run_id, state, revision, updated_at, reason_code, outcome
+                FROM signup_states
+                WHERE run_id = ?
+                """,
                 (run_id,),
             ).fetchone()
             connection.commit()
@@ -161,12 +212,18 @@ class SQLiteSignupStateStore:
         next_state: SignupState,
         *,
         expected_revision: int | None = None,
+        reason_code: str | None = None,
+        outcome: str | None = None,
     ) -> SignupStateSnapshot:
         self.initialize()
         with sqlite3.connect(self.db_path, timeout=10) as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT run_id, state, revision, updated_at FROM signup_states WHERE run_id = ?",
+                """
+                SELECT run_id, state, revision, updated_at, reason_code, outcome
+                FROM signup_states
+                WHERE run_id = ?
+                """,
                 (run_id,),
             ).fetchone()
             if row is None:
@@ -176,22 +233,45 @@ class SQLiteSignupStateStore:
             if expected_revision is not None and current.revision != expected_revision:
                 connection.rollback()
                 raise SignupStateConflict("signup state revision changed")
-            if current.state == next_state:
+
+            target_reason = reason_code or next_state.value
+            _validate_metadata(target_reason, "reason code")
+            if outcome is not None:
+                _validate_metadata(outcome, "signup outcome")
+
+            if (
+                current.state == next_state
+                and current.reason_code == target_reason
+                and current.outcome == outcome
+            ):
                 connection.commit()
                 return current
-            if next_state not in _LEGAL_TRANSITIONS[current.state]:
+            if (
+                current.state != next_state
+                and next_state not in _LEGAL_TRANSITIONS[current.state]
+            ):
                 connection.rollback()
                 raise SignupStateConflict(
                     f"illegal signup transition {current.state.value} -> {next_state.value}"
                 )
+
             now = _utc_now()
             cursor = connection.execute(
                 """
                 UPDATE signup_states
-                SET state = ?, revision = ?, updated_at = ?
+                SET state = ?, revision = ?, updated_at = ?,
+                    reason_code = ?, outcome = ?
                 WHERE run_id = ? AND revision = ?
                 """,
-                (next_state.value, current.revision + 1, now, run_id, current.revision),
+                (
+                    next_state.value,
+                    current.revision + 1,
+                    now,
+                    target_reason,
+                    outcome,
+                    run_id,
+                    current.revision,
+                ),
             )
             if cursor.rowcount != 1:
                 connection.rollback()
@@ -202,6 +282,8 @@ class SQLiteSignupStateStore:
             state=next_state,
             revision=current.revision + 1,
             updated_at=now,
+            reason_code=target_reason,
+            outcome=outcome,
         )
 
 
@@ -224,26 +306,30 @@ class SignupStateMachine:
         current = self._store.get_or_create(run_id)
         if account_policy == "reuse_existing" or account_exists:
             target = SignupState.ACCOUNT_EXISTS_DETECTED
+            reason = (
+                "account_policy_reuses_existing"
+                if account_policy == "reuse_existing"
+                else "existing_account_detected"
+            )
             updated = self._store.transition(
                 run_id,
                 target,
                 expected_revision=current.revision,
+                reason_code=reason,
+                outcome="account_already_exists" if account_exists else None,
             )
             return SignupPolicyDecision(
                 state=updated.state,
                 next_phase="login_account_detection",
                 account_creation_authorized=False,
-                reason_code=(
-                    "account_policy_reuses_existing"
-                    if account_policy == "reuse_existing"
-                    else "existing_account_detected"
-                ),
+                reason_code=reason,
             )
 
         updated = self._store.transition(
             run_id,
             SignupState.SIGNUP_PAGE_LOADING,
             expected_revision=current.revision,
+            reason_code="account_missing_and_creation_authorized",
         )
         return SignupPolicyDecision(
             state=updated.state,
@@ -258,11 +344,15 @@ class SignupStateMachine:
         next_state: SignupState,
         *,
         expected_revision: int | None = None,
+        reason_code: str | None = None,
+        outcome: str | None = None,
     ) -> SignupStateSnapshot:
         return self._store.transition(
             run_id,
             next_state,
             expected_revision=expected_revision,
+            reason_code=reason_code,
+            outcome=outcome,
         )
 
 
@@ -272,7 +362,18 @@ def _snapshot(row: tuple[object, ...]) -> SignupStateSnapshot:
         state=SignupState(str(row[1])),
         revision=int(row[2]),
         updated_at=str(row[3]),
+        reason_code=str(row[4] or "signup_state_legacy"),
+        outcome=str(row[5]) if row[5] is not None else None,
     )
+
+
+def _validate_metadata(value: str, label: str) -> None:
+    if (
+        not value
+        or len(value) > 120
+        or re.fullmatch(r"[a-z0-9_:-]+", value) is None
+    ):
+        raise ValueError(f"{label} is invalid")
 
 
 def _utc_now() -> str:
