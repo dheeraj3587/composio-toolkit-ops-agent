@@ -113,6 +113,15 @@ from ops.model_input_dlp import (
     sanitize_url,
 )
 from ops.models import OperationalResearch, validate_vault_reference
+from ops.policies import (
+    account_creation_requested as should_create_account,
+)
+from ops.policies import (
+    legacy_credential_creation_policy,
+    validate_account_policy,
+    validate_credential_policy,
+    validate_developer_app_policy,
+)
 from ops.provider_errors import ConfigurationRequiredError, ProviderOperationError
 from ops.secret_store import SecretStore
 
@@ -990,10 +999,22 @@ class PlaywrightBrowserWorker:
         research: OperationalResearch,
         *,
         sensitive_data: Mapping[str, str] | None = None,
-        account_creation_requested: bool = False,
-        credential_creation_policy: str = "reuse_only",
+        account_policy: str | None = None,
+        developer_app_policy: str | None = None,
+        credential_policy: str | None = None,
+        account_creation_requested: bool | None = None,
+        credential_creation_policy: str | None = None,
     ) -> BrowserObservation:
         self._require_configuration()
+        resolved_account = validate_account_policy(
+            account_policy
+            or ("create_if_missing" if account_creation_requested else "reuse_existing")
+        )
+        resolved_developer = validate_developer_app_policy(developer_app_policy)
+        resolved_credential = validate_credential_policy(
+            credential_policy
+            or ("create_if_missing" if credential_creation_policy == "create_if_missing" else None)
+        )
         session = self._sessions.get(context.session_id)
         if session is None:
             raise ProviderOperationError(
@@ -1008,7 +1029,7 @@ class PlaywrightBrowserWorker:
         account_state = derive_account_state(
             restored_storage_state=session.restored_storage_state,
             sensitive_data=sensitive_data,
-            account_creation_requested=account_creation_requested,
+            account_creation_requested=should_create_account(resolved_account),
         )
         target = select_initial_target(research, trace, patterns, account_state=account_state)
         if not target or not navigation_allowed(target, patterns):
@@ -1056,7 +1077,8 @@ class PlaywrightBrowserWorker:
             session,
             research,
             sensitive_data=sensitive_data,
-            credential_creation_policy=credential_creation_policy,
+            credential_creation_policy=legacy_credential_creation_policy(resolved_credential),
+            developer_app_policy=resolved_developer,
         )
 
     async def resume_after_hitl(
@@ -1066,10 +1088,17 @@ class PlaywrightBrowserWorker:
         research: OperationalResearch | None = None,
         *,
         sensitive_data: Mapping[str, str] | None = None,
-        credential_creation_policy: str = "reuse_only",
+        account_policy: str | None = None,
+        developer_app_policy: str | None = None,
+        credential_policy: str | None = None,
+        credential_creation_policy: str | None = None,
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
         del provider_session_id
+        resolved_credential = validate_credential_policy(
+            credential_policy
+            or ("create_if_missing" if credential_creation_policy == "create_if_missing" else None)
+        )
         self._require_configuration()
         # The resume signal is no longer discarded: only a recognized signal
         # resumes the run; an unknown signal fails closed with a typed reason.
@@ -1095,7 +1124,8 @@ class PlaywrightBrowserWorker:
             session,
             resolved,
             sensitive_data=sensitive_data,
-            credential_creation_policy=credential_creation_policy,
+            credential_creation_policy=legacy_credential_creation_policy(resolved_credential),
+            developer_app_policy=validate_developer_app_policy(developer_app_policy),
             resume_signal=normalized_signal,
         )
 
@@ -1106,6 +1136,7 @@ class PlaywrightBrowserWorker:
         *,
         sensitive_data: Mapping[str, str] | None,
         credential_creation_policy: str = "reuse_only",
+        developer_app_policy: str = "reuse_existing",
         resume_signal: str | None = None,
     ) -> BrowserObservation:
         """Drive the page toward the credential page under strict bounds.
@@ -1119,6 +1150,10 @@ class PlaywrightBrowserWorker:
         signals actually visible on the page — never because a model said so.
         """
 
+        # Carried durably now so later developer-application creation can be
+        # authorized independently of API-key creation. Phase 1-5 does not execute
+        # that side effect yet.
+        validate_developer_app_policy(developer_app_policy)
         trace = get_browser_api_trace(research.app_slug)
         if trace is None:
             return self._human_required(session, "No reviewed navigation trace is available.")

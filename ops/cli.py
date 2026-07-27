@@ -565,7 +565,11 @@ def main(argv: list[str] | None = None) -> int:
                 company=_default_company(args),
                 requested_scope_policy=args.scope_policy,
                 browser_provider=args.browser_provider,
-                credential_creation_policy=args.credential_creation_policy,
+                credential_policy=(
+                    "create_if_missing"
+                    if args.credential_creation_policy == "create_if_missing"
+                    else "reuse_existing"
+                ),
                 dry_run=True,
             )
             _emit({"run": create_dry_run(request, db_path=args.db_path)})

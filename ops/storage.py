@@ -37,6 +37,9 @@ _RUN_COLUMNS = (
     "scope_policy",
     "execution_mode",
     "browser_provider",
+    "account_policy",
+    "developer_app_policy",
+    "credential_policy",
     "credential_creation_policy",
     "external_actions",
     "state_revision",
@@ -140,6 +143,9 @@ class OperationsUnitOfWork:
         scope_policy: str = "maximum",
         execution_mode: str = "local_dry_run",
         browser_provider: str = "browser_use",
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
         credential_creation_policy: str = "reuse_only",
         external_actions: bool = False,
         idempotency_key: str | None = None,
@@ -169,6 +175,9 @@ class OperationsUnitOfWork:
             scope_policy=scope_policy,
             execution_mode=execution_mode,
             browser_provider=browser_provider,
+            account_policy=account_policy,
+            developer_app_policy=developer_app_policy,
+            credential_policy=credential_policy,
             credential_creation_policy=credential_creation_policy,
             external_actions=external_actions,
             idempotency_key=idempotency_key,
@@ -266,6 +275,9 @@ class OperationsStorage:
                     scope_policy TEXT NOT NULL DEFAULT 'maximum',
                     execution_mode TEXT NOT NULL DEFAULT 'local_dry_run',
                     browser_provider TEXT NOT NULL DEFAULT 'browser_use',
+                    account_policy TEXT NOT NULL DEFAULT 'reuse_existing',
+                    developer_app_policy TEXT NOT NULL DEFAULT 'reuse_existing',
+                    credential_policy TEXT NOT NULL DEFAULT 'reuse_existing',
                     credential_creation_policy TEXT NOT NULL DEFAULT 'reuse_only',
                     external_actions INTEGER NOT NULL DEFAULT 0,
                     state_revision INTEGER NOT NULL DEFAULT 0,
@@ -319,6 +331,9 @@ class OperationsStorage:
                 "scope_policy": "TEXT NOT NULL DEFAULT 'maximum'",
                 "execution_mode": "TEXT NOT NULL DEFAULT 'local_dry_run'",
                 "browser_provider": "TEXT NOT NULL DEFAULT 'browser_use'",
+                "account_policy": "TEXT NOT NULL DEFAULT 'reuse_existing'",
+                "developer_app_policy": "TEXT NOT NULL DEFAULT 'reuse_existing'",
+                "credential_policy": "TEXT NOT NULL DEFAULT 'reuse_existing'",
                 "credential_creation_policy": "TEXT NOT NULL DEFAULT 'reuse_only'",
                 "external_actions": "INTEGER NOT NULL DEFAULT 0",
                 "state_revision": "INTEGER NOT NULL DEFAULT 0",
@@ -327,6 +342,17 @@ class OperationsStorage:
             for column_name, declaration in migration_columns.items():
                 if column_name not in existing_columns:
                     connection.execute(f"ALTER TABLE runs ADD COLUMN {column_name} {declaration}")
+            # Preserve the only historical non-default creation intent. New rows write
+            # both canonical and deprecated columns consistently; existing rows that
+            # opted into creation are upgraded once without changing read-only rows.
+            connection.execute(
+                """
+                UPDATE runs
+                SET credential_policy = 'create_if_missing'
+                WHERE credential_creation_policy = 'create_if_missing'
+                  AND credential_policy = 'reuse_existing'
+                """
+            )
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_idempotency_key
@@ -372,6 +398,9 @@ class OperationsStorage:
         scope_policy: str = "maximum",
         execution_mode: str = "local_dry_run",
         browser_provider: str = "browser_use",
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
         credential_creation_policy: str = "reuse_only",
         external_actions: bool = False,
         idempotency_key: str | None = None,
@@ -403,6 +432,9 @@ class OperationsStorage:
                 scope_policy=scope_policy,
                 execution_mode=execution_mode,
                 browser_provider=browser_provider,
+                account_policy=account_policy,
+                developer_app_policy=developer_app_policy,
+                credential_policy=credential_policy,
                 credential_creation_policy=credential_creation_policy,
                 external_actions=external_actions,
                 idempotency_key=idempotency_key,
@@ -435,6 +467,9 @@ class OperationsStorage:
         scope_policy: str = "maximum",
         execution_mode: str = "local_dry_run",
         browser_provider: str = "browser_use",
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
         credential_creation_policy: str = "reuse_only",
         external_actions: bool = False,
         idempotency_key: str | None = None,
@@ -468,6 +503,9 @@ class OperationsStorage:
             _safe_text(scope_policy),
             _safe_text(execution_mode),
             _safe_text(browser_provider),
+            _safe_text(account_policy),
+            _safe_text(developer_app_policy),
+            _safe_text(credential_policy),
             _safe_text(credential_creation_policy),
             int(external_actions),
             _safe_text(idempotency_key),
@@ -484,10 +522,11 @@ class OperationsStorage:
                 p1_summary_json, operational_research_json, route_reason_code,
                 route_explanation, missing_fields_json, provider_status_json,
                 hitl_request_json, validation_json, scope_policy, execution_mode,
-                browser_provider, credential_creation_policy, external_actions,
+                browser_provider, account_policy, developer_app_policy,
+                credential_policy, credential_creation_policy, external_actions,
                 idempotency_key, request_fingerprint,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             values,
         )
@@ -562,6 +601,9 @@ class OperationsStorage:
             "validation",
             "scope_policy",
             "execution_mode",
+            "account_policy",
+            "developer_app_policy",
+            "credential_policy",
             "external_actions",
             "state_revision",
             "last_projected_revision",
