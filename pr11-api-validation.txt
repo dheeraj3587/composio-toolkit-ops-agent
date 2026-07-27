@@ -1,0 +1,2 @@
+VALIDATION_ERROR
+{'type': 'literal_error', 'loc': ('credential_policy',), 'msg': "Input should be 'reuse_existing' or 'create_if_missing'", 'ctx': {'expected': "'reuse_existing' or 'create_if_missing'"}}
