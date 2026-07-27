@@ -75,7 +75,9 @@ def bound_foundation(tmp_path: Path):
         app_slug="pipedrive",
         request=request,
         signup_email_ref="vault://pipedrive/signup_email/email_1",
-        account_password_ref="vault://pipedrive/account_password/password_1",
+        account_password_ref=(  # pragma: allowlist secret
+            "vault://pipedrive/account_password/password_1"
+        ),
     )
     return foundation, foundation.bind_session(
         prepared,
