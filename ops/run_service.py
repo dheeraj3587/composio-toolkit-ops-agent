@@ -20,7 +20,7 @@ import threading
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
@@ -385,6 +385,24 @@ def _clean_credential_value(value: str) -> str:
 
     without_format = "".join(ch for ch in value if unicodedata.category(ch) != "Cf")
     return without_format.strip()
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    """Parse a stored ISO-8601 timestamp into an aware UTC datetime, or ``None``.
+
+    A value that cannot be parsed returns ``None`` so callers skip the row rather
+    than treating an unreadable timestamp as "infinitely idle" and tearing down a
+    run that may still be working.
+    """
+
+    if not isinstance(value, str) or not value:
+        return None
+    candidate = value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _browser_result_reason(state: Mapping[str, object], default: str) -> str:
@@ -901,6 +919,61 @@ class RunService:
                 self.advance_autonomous_runs()
             except Exception:  # pragma: no cover - the loop must never die
                 pass
+            try:
+                self.reconcile_idle_browser_runs()
+            except Exception:  # pragma: no cover - the loop must never die
+                pass
+
+    def reconcile_idle_browser_runs(self, *, limit: int = 100) -> int:
+        """Recover runs stuck at ``browser_running`` with nothing driving them.
+
+        A ``browser_running`` run is normally short-lived: either the navigation
+        completes, or it stops at a human gate. Nothing sweeps this status, so a run
+        whose projection landed here without a live operation used to sit forever and
+        keep holding a browser slot — fatal where capacity is one session.
+
+        This is the periodic counterpart to :meth:`_reconcile_stranded_runs`, which
+        only runs at startup. A run is touched ONLY when it has been idle far longer
+        than any legitimate browser operation could take, so an in-flight navigation
+        is never torn down: the threshold is derived from the provider operation
+        timeout with a wide safety factor. The outcome is the same recoverable
+        ``configuration_required`` state the startup path already produces, and the
+        browser session is released.
+        """
+
+        settings = self._settings or Settings.from_env()
+        idle_seconds = max(600, int(getattr(settings, "browser_use_task_timeout_seconds", 180)) * 4)
+        cutoff = datetime.now(UTC) - timedelta(seconds=idle_seconds)
+        reconciled = 0
+        for record in self.storage.list_runs(limit=limit, offset=0):
+            if record.get("status") != "browser_running":
+                continue
+            run_id = str(record.get("run_id") or "")
+            if not run_id:
+                continue
+            updated_at = _parse_timestamp(record.get("updated_at"))
+            if updated_at is None or updated_at > cutoff:
+                continue
+            before = self.storage.get_run(run_id)
+            self._reconcile_one_stranded(
+                run_id,
+                stranded_statuses=("browser_running",),
+                reason="idle_browser_run_reconciled",
+            )
+            after = self.storage.get_run(run_id)
+            if (
+                isinstance(before, Mapping)
+                and isinstance(after, Mapping)
+                and before.get("status") != after.get("status")
+            ):
+                reconciled += 1
+                log_event(
+                    "browser.idle_run.reconciled",
+                    run_id=run_id,
+                    app_slug=record.get("app_slug"),
+                    idle_seconds=idle_seconds,
+                )
+        return reconciled
 
     def advance_autonomous_runs(self, *, limit: int = 100) -> int:
         """Resume every waiting run whose human gate the agent can resolve itself.
@@ -4166,7 +4239,31 @@ class RunService:
                         if outcome.bundle is not None:
                             capture_updates["integrator_bundle"] = outcome.bundle
                         capture_events.extend(outcome.events)
+            elif observation_status in {"blocked", "failed"}:
+                # A resume that ends blocked/failed must say so. Projecting these as
+                # ``browser_running`` parked the run permanently: nothing drives a
+                # browser_running run (the advancer only sweeps waiting_for_hitl,
+                # retry records no action, and the UI offers no resume), so the run
+                # held the single browser slot until the next API restart.
+                next_status = "blocked" if observation_status == "blocked" else "failed"
+                provider_browser = next_status
+                capture_updates["route_reason_code"] = _browser_result_reason(
+                    state, f"browser_resume_{observation_status}"
+                )
+                capture_events.append(
+                    (
+                        "browser_resume_terminal",
+                        {
+                            "status": next_status,
+                            "reason_code": capture_updates["route_reason_code"],
+                            "external_actions": True,
+                        },
+                    )
+                )
+                # The shared terminal-release block at the end of this method hands
+                # the browser session back for these statuses.
             else:
+                # "navigating" (or an absent status) is genuinely still in progress.
                 next_status = "browser_running"
 
             with self.storage.unit_of_work() as transaction:
