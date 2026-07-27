@@ -1,9 +1,11 @@
 export type AccessRoute =
   | "self_serve"
+  | "self_serve_with_hitl"
   | "approval_required"
   | "partner_gated"
   | "hybrid"
   | "blocked"
+  | "unsupported"
   | "unknown"
 
 export type RunStatus =
@@ -274,12 +276,12 @@ export interface IntegratorOutput {
   app_name: string
   app_slug: string
   readiness:
-  | "credentials_ready"
-  | "awaiting_provider"
-  | "human_action_required"
-  | "configuration_required"
-  | "blocked"
-  | "failed"
+    | "credentials_ready"
+    | "awaiting_provider"
+    | "human_action_required"
+    | "configuration_required"
+    | "blocked"
+    | "failed"
   api_type: string
   api_base_url?: string | null
   auth_scheme: string
