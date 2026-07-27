@@ -323,7 +323,7 @@ async def wait_for_signup_result(
             return classified.with_stable_observations(stable_count)
         await _sleep_before_deadline(deadline=deadline, seconds=poll_seconds)
 
-    if last_unknown is not None and last_unknown.reason_code != "signup_result_not_yet_proven":
+    if last_unknown and last_unknown.reason_code != "signup_result_not_yet_proven":
         return last_unknown.model_copy(update={"stable_observations": 0})
     return _unresolved_result(
         contract,
