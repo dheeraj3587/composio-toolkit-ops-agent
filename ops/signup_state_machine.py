@@ -142,6 +142,10 @@ class SQLiteSignupStateStore:
         try:
             finalize_private_database(self.db_path, existed=existed)
             connection.execute("PRAGMA secure_delete = ON")
+            # Serialize schema discovery and additive migration across processes.
+            # Without a write reservation, two cold starts can both observe a
+            # missing column and race on ALTER TABLE.
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS signup_states (
@@ -173,6 +177,9 @@ class SQLiteSignupStateStore:
                     "ALTER TABLE signup_states ADD COLUMN outcome TEXT"
                 )
             connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
