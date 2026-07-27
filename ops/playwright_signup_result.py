@@ -237,7 +237,7 @@ async def wait_for_signup_result(
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
-    previous_key: tuple[str, str] | None = None
+    previous_key: tuple[str, str, str] | None = None
     stable_count = 0
     last_unknown: SignupResultClassification | None = None
     last_retry_reason = "signup_result_not_yet_proven"
@@ -252,6 +252,8 @@ async def wait_for_signup_result(
             )
         if capture.status == "retryable" or capture.observation is None:
             last_retry_reason = capture.reason_code
+            previous_key = None
+            stable_count = 0
             await asyncio.sleep(poll_seconds)
             continue
 
@@ -262,6 +264,8 @@ async def wait_for_signup_result(
                 "signup_gate_inspection_failed",
             }:
                 last_retry_reason = gates.reason_code
+                previous_key = None
+                stable_count = 0
                 await asyncio.sleep(poll_seconds)
                 continue
             return _unresolved_result(
@@ -280,7 +284,11 @@ async def wait_for_signup_result(
             await asyncio.sleep(poll_seconds)
             continue
 
-        key = (classified.outcome, classified.reason_code)
+        key = (
+            classified.outcome,
+            classified.reason_code,
+            classified.matched_contract_group or "",
+        )
         if key == previous_key:
             stable_count += 1
         else:
