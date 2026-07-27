@@ -15,6 +15,7 @@ from ops.browser_worker import BrowserSessionContext
 from ops.config import Settings
 from ops.run_browser_execution import RunBrowserExecutionService
 from ops.run_credentials import RunCredentialService
+from ops.run_resume import RunResumeService
 from ops.run_reconciliation import RunReconciliationService
 from ops.run_service import _TERMINAL_BROWSER_STATUSES, RunService
 from ops.run_state_projection import RunProjectionService
@@ -121,7 +122,7 @@ def test_async_workflow_and_apply_errors_release_the_session() -> None:
 
 
 def test_a_terminal_resume_releases_the_session() -> None:
-    source = inspect.getsource(RunService.resume_run)
+    source = inspect.getsource(RunResumeService.resume_run)
     assert "_release_browser_session" in source
     assert "_TERMINAL_BROWSER_STATUSES" in source
 
