@@ -29,9 +29,7 @@ class _StubTransaction:
         self._store[run_id].update(changes)
         return self._store[run_id]
 
-    def append_audit_event(
-        self, *, run_id: str, event_type: str, payload: dict[str, Any]
-    ) -> None:
+    def append_audit_event(self, *, run_id: str, event_type: str, payload: dict[str, Any]) -> None:
         self.events.append((run_id, event_type, payload))
 
 

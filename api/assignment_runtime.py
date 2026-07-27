@@ -59,15 +59,34 @@ from ops.composio_capability import (
 )
 from ops.config import Settings
 from ops.derived_browser_policy import derive_browser_host_policy
-from ops.graph import DurableOperationsWorkflow
 from ops.models import OperationalResearch, OperationsRequest
 from ops.provider_errors import ProviderContractError, ProviderOperationError
 from ops.routing import decide_access
 
 _INACTIVITY_WINDOW = timedelta(minutes=15)
 _MAXIMUM_WINDOW = timedelta(hours=4)
-_CORE_ROUTE = DurableOperationsWorkflow._route
-_CORE_AFTER_BROWSER = DurableOperationsWorkflow._after_browser
+# The unpatched core graph nodes this layer wraps. ``api`` must not import
+# ``ops.graph`` (the workflow is reached only through the application service), so
+# the type is resolved through the module registry instead of an import.
+#
+# Resolution is cached and MUST happen before the node is replaced: resolving a
+# node after patching would return this module's own wrapper and recurse forever.
+# ``install_assignment_runtime`` therefore primes the cache before it assigns, and
+# a direct call before installation still resolves the genuine core node.
+_CORE_NODES: dict[str, Any] = {}
+
+
+def _core_workflow_type() -> Any:
+    return cast(Any, importlib.import_module("ops.graph")).DurableOperationsWorkflow
+
+
+def _core_node(name: str) -> Any:
+    """Return the original core graph node, resolved once on first use."""
+
+    if name not in _CORE_NODES:
+        _CORE_NODES[name] = getattr(_core_workflow_type(), name)
+    return _CORE_NODES[name]
+
 
 # Routes that cannot yield a self-serve credential on their own: the browser
 # inspection still runs (it is what a human would do first) and the controlled
@@ -954,7 +973,7 @@ class AssignmentBrowserWorker(BrowserWorker):
 
 
 def _assignment_route(
-    workflow: DurableOperationsWorkflow,
+    workflow: Any,
     state: Mapping[str, object],
 ) -> dict[str, object]:
     """Let an executable assignment run proceed without weakening the core gate.
@@ -969,7 +988,7 @@ def _assignment_route(
     every non-browser route, is returned untouched.
     """
 
-    result = _CORE_ROUTE(workflow, state)  # type: ignore[arg-type]
+    result = cast("dict[str, object]", _core_node("_route")(workflow, state))
     if result.get("route_reason_code") not in {
         "verified_browser_urls_missing",
         "browser_trace_not_reviewed",
@@ -1043,7 +1062,7 @@ def _assignment_after_route(
 
 
 def _assignment_after_browser(
-    workflow: DurableOperationsWorkflow,
+    workflow: Any,
     state: Mapping[str, object],
 ) -> str:
     """Keep the vendor outreach for gated apps that were browser-inspected first.
@@ -1054,7 +1073,7 @@ def _assignment_after_browser(
     vendor, so the controlled Gmail outreach is still sent once.
     """
 
-    node = _CORE_AFTER_BROWSER(workflow, state)  # type: ignore[arg-type]
+    node = cast("str", _core_node("_after_browser")(workflow, state))
     if node != "finalize" or state.get("gmail_thread_id"):
         return node
     if state.get("access_route") not in _GATED_ROUTES:
@@ -1138,8 +1157,11 @@ def install_assignment_runtime() -> None:
     run_service_module.BrowserWorker = AssignmentBrowserWorker
     run_service_module.ComposioCapabilityPreflight = AssignmentComposioCapabilityPreflight
 
-    graph_module = importlib.import_module("ops.graph")
-    workflow_type = cast(Any, graph_module).DurableOperationsWorkflow
+    workflow_type = _core_workflow_type()
+    # Capture the originals BEFORE replacing them, so the wrappers can never
+    # resolve themselves and recurse.
+    _core_node("_route")
+    _core_node("_after_browser")
     workflow_type._route = _assignment_route
     workflow_type._after_route = _assignment_after_route
     workflow_type._after_browser = _assignment_after_browser
