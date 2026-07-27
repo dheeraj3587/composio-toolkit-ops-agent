@@ -538,11 +538,9 @@ def _evaluate_contract_evidence(
         observation,
         contract.signup.phone_verification_predicates,
     )
-    authentication_failure, authentication_failure_invalid = (
-        _matches_any_contract_predicate(
-            observation,
-            contract.login.authentication_failure_predicates,
-        )
+    authentication_failure, authentication_failure_invalid = _matches_any_contract_predicate(
+        observation,
+        contract.login.authentication_failure_predicates,
     )
     legal, billing, legal_billing_invalid = _evaluate_legal_billing_predicates(
         observation,
