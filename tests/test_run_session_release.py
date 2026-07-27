@@ -13,6 +13,7 @@ from typing import Any
 
 from ops.browser_worker import BrowserSessionContext
 from ops.config import Settings
+from ops.run_reconciliation import RunReconciliationService
 from ops.run_service import _TERMINAL_BROWSER_STATUSES, RunService
 
 
@@ -121,7 +122,11 @@ def test_a_terminal_resume_releases_the_session() -> None:
 
 
 def test_reconcile_projection_and_credentials_release_terminal_sessions() -> None:
-    reconcile = inspect.getsource(RunService._reconcile_one_stranded)
+    # Each assertion targets whichever object OWNS the terminal path today. The
+    # reconciliation sweeps moved to their own module, so the guard follows the
+    # implementation rather than the historical location; the property being
+    # guarded is unchanged (every terminal path must release the session).
+    reconcile = inspect.getsource(RunReconciliationService.reconcile_one_stranded)
     projection = inspect.getsource(RunService.project)
     guarded = inspect.getsource(RunService.guarded_status_update)
     credentials = inspect.getsource(RunService.submit_owner_credentials)
