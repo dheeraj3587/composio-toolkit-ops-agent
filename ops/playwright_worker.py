@@ -82,7 +82,6 @@ from ops.browser_pages import (
     DialogRecord,
     DownloadPolicy,
     DownloadRecord,
-    frame_path_is_reviewed,
     install_dialog_handler,
     install_download_guard,
 )
@@ -123,6 +122,14 @@ from ops.playwright_gates import (  # noqa: F401
 )
 from ops.playwright_gates import classify_structural_gate as classify_structural_gate
 from ops.playwright_gates import detect_human_gate as detect_human_gate
+from ops.playwright_login_dom import (  # noqa: F401
+    _has_password_field,
+    _inject_login,
+    _login_frames_are_reviewed,
+    _login_origin_is_safe,
+    _submit_login,
+    _try_fill,
+)
 
 # Imported for use below AND re-exported: ``ops.playwright_worker`` stays the
 # import home these names already have across ops, api and the tests.
@@ -2233,39 +2240,6 @@ class PlaywrightBrowserWorker:
             self._release_capacity(session)
 
 
-async def _login_origin_is_safe(page: Any, patterns: tuple[str, ...]) -> bool:
-    """Verify the main frame is on a reviewed origin and the form is unambiguous.
-
-    Credentials are only ever typed when: the page URL is inside the reviewed host
-    allowlist, exactly one visible+enabled password input exists, and the enclosing
-    form does not post to an off-allowlist host.
-    """
-
-    if not navigation_allowed(_page_url(page), patterns):
-        return False
-    try:
-        passwords = page.locator("input[type='password']")
-        visible = 0
-        for index in range(min(int(await passwords.count()), 5)):
-            field = passwords.nth(index)
-            if await field.is_visible() and await field.is_enabled():
-                visible += 1
-        if visible != 1:
-            return False  # zero, or an ambiguous/hidden multi-form page
-    except Exception:
-        return False
-    try:
-        action = await page.locator("form:has(input[type='password'])").first.get_attribute(
-            "action", timeout=2_000
-        )
-    except Exception:
-        action = None
-    if isinstance(action, str) and action.casefold().startswith(("http://", "https://")):
-        if not navigation_allowed(action, patterns):
-            return False  # the form would post credentials off-allowlist
-    return True
-
-
 _CREDENTIAL_SURFACE_SELECTOR = (
     "input[type='password'], input[name*='token' i], input[name*='secret' i], "
     "input[name*='key' i], input[name*='otp' i], code, pre, samp, kbd, textarea, "
@@ -2393,114 +2367,6 @@ async def _safe(coro_fn: Any) -> None:
             await result
     except Exception:
         pass
-
-
-async def _login_frames_are_reviewed(page: Any, patterns: tuple[str, ...]) -> bool:
-    """True when every frame hosting a password field is on a reviewed origin.
-
-    A credential field inside an UNREVIEWED (e.g. third-party) iframe is never
-    filled, even when the top-level page is approved — the main frame being
-    allowlisted says nothing about who owns the nested document.
-    """
-
-    from ops.browser_snapshot import frame_chain, frame_host
-
-    try:
-        frames = list(page.frames)
-    except Exception:
-        return False  # cannot enumerate frames -> fail closed
-    for frame in frames:
-        try:
-            count = int(await frame.locator("input[type='password']").count())
-        except Exception:
-            continue
-        if count <= 0:
-            continue
-        try:
-            is_main = frame is page.main_frame
-        except Exception:
-            is_main = False
-        if is_main:
-            if not navigation_allowed(_page_url(page), patterns):
-                return False
-            continue
-        host = frame_host(frame)
-        if not host or not navigation_allowed(f"https://{host}/", patterns):
-            return False
-        if not frame_path_is_reviewed(frame_chain(frame), patterns):
-            return False
-    return True
-
-
-async def _has_password_field(page: Any) -> bool:
-    try:
-        locator = page.locator("input[type='password']")
-        return bool(await locator.count() > 0)
-    except Exception:
-        return False
-
-
-async def _inject_login(page: Any, sensitive_data: Mapping[str, str]) -> None:
-    """Fill login fields by code from placeholder->value pairs; the value is never
-    logged and never passed to an LLM. Best-effort by common field heuristics."""
-
-    email = sensitive_data.get("login_email") or sensitive_data.get("email")
-    password = sensitive_data.get("login_password") or sensitive_data.get("password")
-    if email:
-        for selector in ("input[type='email']", "input[name='email']", "input[name='username']"):
-            if await _try_fill(page, selector, email):
-                break
-    if password:
-        await _try_fill(page, "input[type='password']", password)
-
-
-async def _submit_login(page: Any) -> bool:
-    """Submit the filled login form and wait for the page to settle.
-
-    Filling inputs alone never advances a login flow. Tries the submit control, then
-    falls back to pressing Enter in the password field. Always waits for the network
-    to go idle (bounded) so the next observation sees the post-submit page.
-    """
-
-    submitted = False
-    for selector in (
-        "button[type='submit']",
-        "input[type='submit']",
-        "button:has-text('Log in')",
-        "button:has-text('Sign in')",
-        "button:has-text('Continue')",
-    ):
-        try:
-            locator = page.locator(selector)
-            if await locator.count() >= 1:
-                await locator.first.click(timeout=5_000)
-                submitted = True
-                break
-        except Exception:
-            continue
-    if not submitted:
-        try:
-            await page.locator("input[type='password']").first.press("Enter", timeout=5_000)
-            submitted = True
-        except Exception:
-            submitted = False
-    if submitted:
-        try:
-            await page.wait_for_load_state("networkidle", timeout=20_000)
-        except Exception:
-            pass
-    return submitted
-
-
-async def _try_fill(page: Any, selector: str, value: str) -> bool:
-    try:
-        locator = page.locator(selector)
-        if await locator.count() >= 1:
-            await locator.first.fill(value, timeout=5_000)
-            return True
-    except Exception:
-        return False
-    return False
 
 
 __all__ = [
