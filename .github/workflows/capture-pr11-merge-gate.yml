@@ -1,88 +1,13 @@
-name: Capture PR11 merge backend gate
+name: Capture PR11 merge backend gate (paused)
 
 on:
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  capture:
-    if: github.actor != 'github-actions[bot]'
+  paused:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    env:
-      ALLOW_LIVE_BROWSER: "false"
-      ALLOW_LIVE_VENDOR_EMAIL: "false"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      PYTHONDONTWRITEBYTECODE: "1"
-      RUN_LIVE_TESTS: "0"
     steps:
-      - name: Check out report branch
-        uses: actions/checkout@v4
-        with:
-          ref: agent/signup-foundation-ci-diagnostics
-          path: report
-          fetch-depth: 0
-          persist-credentials: true
-
-      - name: Check out exact PR11 merge commit
-        uses: actions/checkout@v4
-        with:
-          ref: 2d8634b8a1d42ce01cba40a5ad4ae7f43ca1a68c
-          path: target
-          persist-credentials: false
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: target/requirements-dev.txt
-
-      - run: python -m pip install --requirement target/requirements-dev.txt
-      - run: python -m playwright install --with-deps chromium
-
-      - name: Run and capture every backend component
-        run: |
-          rm -rf report/pr11-merge-diagnostics
-          mkdir -p report/pr11-merge-diagnostics
-          cd target
-          set +e
-
-          ./scripts/security_gate.sh backend > ../report/pr11-merge-diagnostics/security-gate-first.txt 2>&1
-          first_status=$?
-          if [ "$first_status" -eq 3 ] && ! git diff --quiet -- .secrets.baseline; then
-            ./scripts/security_gate.sh backend > ../report/pr11-merge-diagnostics/security-gate-second.txt 2>&1
-            second_status=$?
-          else
-            second_status=-1
-          fi
-
-          ruff check . > ../report/pr11-merge-diagnostics/ruff-check.txt 2>&1
-          ruff_check=$?
-          ruff format --check . > ../report/pr11-merge-diagnostics/ruff-format.txt 2>&1
-          ruff_format=$?
-          RUN_LIVE_TESTS=0 pytest -q > ../report/pr11-merge-diagnostics/pytest.txt 2>&1
-          pytest_status=$?
-          mypy ops api streamlit_app.py > ../report/pr11-merge-diagnostics/mypy.txt 2>&1
-          mypy_status=$?
-          python -m compileall -q ops api streamlit_app.py > ../report/pr11-merge-diagnostics/compileall.txt 2>&1
-          compile_status=$?
-          pip-audit -r requirements-dev.txt > ../report/pr11-merge-diagnostics/pip-audit.txt 2>&1
-          audit_status=$?
-
-          printf 'security_first=%s\nsecurity_second=%s\nruff_check=%s\nruff_format=%s\npytest=%s\nmypy=%s\ncompileall=%s\npip_audit=%s\n' \
-            "$first_status" "$second_status" "$ruff_check" "$ruff_format" \
-            "$pytest_status" "$mypy_status" "$compile_status" "$audit_status" \
-            > ../report/pr11-merge-diagnostics/status.txt
-          set -e
-
-      - name: Commit diagnostic output
-        working-directory: report
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pr11-merge-diagnostics
-          git commit -m "chore: capture PR11 merge gate diagnostics"
-          git push origin HEAD:agent/signup-foundation-ci-diagnostics
+      - run: echo "Long diagnostic already running; no new runs."
