@@ -1,12 +1,9 @@
 """Crash-safe authorization and dispatch for normal signup submission.
 
-Part 14 is deliberately narrow: it may click exactly one already-reviewed signup
-submit control after every required field has been re-verified. It does not
-classify the provider response; Part 15 owns that transition.
-
-The external click is protected by the shared effect ledger. A process restart or
-ambiguous Playwright timeout therefore produces ``outcome_unknown`` and never a
-blind second submission.
+Part 14 may click exactly one reviewed signup submit control after every required
+field has been re-verified. The external click is protected by the shared effect
+ledger, so a restart or ambiguous Playwright timeout produces reconciliation and
+never a blind second account-creation attempt. Part 15 owns result classification.
 """
 
 from __future__ import annotations
@@ -28,6 +25,7 @@ from ops.signup_credentials import SignupAccountBinding, SignupCredentialManager
 from ops.signup_forms import SignupFillResult, SignupFormInspection
 from ops.signup_state_machine import SignupState
 from ops.signup_submission_fields import (
+    SecretCaptureGuard,
     strict_signup_token_locator,
     verify_required_signup_fields,
 )
@@ -41,6 +39,11 @@ SubmissionStatus = Literal[
     "authorization_denied",
     "configuration_required",
     "outcome_unknown",
+    "failed",
+]
+_PreflightFailureStatus = Literal[
+    "authorization_denied",
+    "configuration_required",
     "failed",
 ]
 
@@ -101,12 +104,40 @@ class SignupSubmissionResult(BaseModel):
 
 
 @dataclass(frozen=True, slots=True)
-class _Preflight:
-    status: Literal["authorized", "authorization_denied", "configuration_required", "failed"]
+class _PreflightDecision:
+    """Static/identity decision that deliberately carries no executable locator."""
+
+    status: Literal[
+        "authorized",
+        "authorization_denied",
+        "configuration_required",
+        "failed",
+    ]
     reason_code: str
-    locator: Any | None = None
     verified_fields: tuple[SignupSemanticField, ...] = ()
     present_gates: tuple[SubmissionGate, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthorizedPreflight:
+    """A live authorization result whose executable locator is mandatory."""
+
+    locator: Any
+    verified_fields: tuple[SignupSemanticField, ...]
+    present_gates: tuple[SubmissionGate, ...]
+    status: Literal["authorized"] = "authorized"
+    reason_code: str = "signup_submit_authorized"
+
+
+@dataclass(frozen=True, slots=True)
+class _DeniedPreflight:
+    status: _PreflightFailureStatus
+    reason_code: str
+    verified_fields: tuple[SignupSemanticField, ...] = ()
+    present_gates: tuple[SubmissionGate, ...] = ()
+
+
+_LivePreflight = _AuthorizedPreflight | _DeniedPreflight
 
 
 async def submit_signup_form(
@@ -125,13 +156,9 @@ async def submit_signup_form(
     account_binding: SignupAccountBinding,
     effect_store: EffectStore,
     risk_policy: BrowserActionRiskPolicy | None = None,
+    assert_secret_capture_disabled: SecretCaptureGuard | None = None,
 ) -> SignupSubmissionResult:
-    """Authorize and dispatch one normal signup submit action at most once.
-
-    The durable reservation is acquired after stable identity validation but
-    before DOM-dependent checks. A completed receipt can therefore be replayed
-    after a crash even when the browser has already left the old form.
-    """
+    """Authorize and dispatch one normal signup submit action at most once."""
 
     policy = risk_policy or BrowserActionRiskPolicy()
     identity = _effect_identity_preflight(
@@ -144,13 +171,14 @@ async def submit_signup_form(
         account_binding=account_binding,
     )
     if identity.status != "authorized":
-        return _result_from_preflight(identity, contract.contract_version)
+        return _result_from_decision(identity, contract.contract_version)
 
     provider = contract.app_slug
     action = "signup_submit"
-    idempotency_key = (
-        f"signup-submit:v1:{run_id}:{contract.contract_version}:"
-        f"{account_binding.binding_id}"
+    idempotency_key = _signup_effect_key(
+        run_id=run_id,
+        contract_version=contract.contract_version,
+        account_binding_id=account_binding.binding_id,
     )
     try:
         reservation = effect_store.reserve(
@@ -207,19 +235,19 @@ async def submit_signup_form(
         credential_manager=credential_manager,
         account_binding=account_binding,
         risk_policy=policy,
+        assert_secret_capture_disabled=assert_secret_capture_disabled,
     )
-    if first.status != "authorized":
+    if isinstance(first, _DeniedPreflight):
         _mark_failed_best_effort(
             effect_store,
             provider=provider,
             action=action,
             idempotency_key=idempotency_key,
         )
-        return _result_from_preflight(first, contract.contract_version)
+        return _result_from_decision(first, contract.contract_version)
 
     # Re-run every live check after the first pass. A changed DOM, new gate,
-    # altered field, expired contract, or moved control invalidates the reservation
-    # before the real click.
+    # altered field, expired contract, or moved control invalidates the reservation.
     second = await _submission_preflight(
         page,
         inspection=inspection,
@@ -234,18 +262,21 @@ async def submit_signup_form(
         credential_manager=credential_manager,
         account_binding=account_binding,
         risk_policy=policy,
+        assert_secret_capture_disabled=assert_secret_capture_disabled,
     )
-    if second.status != "authorized":
+    if isinstance(second, _DeniedPreflight):
         _mark_failed_best_effort(
             effect_store,
             provider=provider,
             action=action,
             idempotency_key=idempotency_key,
         )
-        return _result_from_preflight(second, contract.contract_version)
+        return _result_from_decision(second, contract.contract_version)
 
     before_url = _page_url(page)
     try:
+        # `_AuthorizedPreflight` makes a missing locator unrepresentable. The click
+        # can therefore no longer crash through an `Any | None` union.
         await second.locator.click(timeout=_ACTION_TIMEOUT_MS)
     except Exception:
         _mark_unknown_best_effort(
@@ -298,6 +329,20 @@ async def submit_signup_form(
     )
 
 
+def _signup_effect_key(
+    *,
+    run_id: str,
+    contract_version: str,
+    account_binding_id: str,
+) -> str:
+    """Bind at-most-once identity to every stable account-creation component."""
+
+    return (
+        f"signup-submit:v1:{run_id}:{contract_version}:"
+        f"{account_binding_id}"
+    )
+
+
 def _effect_identity_preflight(
     *,
     inspection: SignupFormInspection,
@@ -307,23 +352,21 @@ def _effect_identity_preflight(
     run_id: str,
     session_id: str,
     account_binding: SignupAccountBinding,
-) -> _Preflight:
-    """Validate the stable identity used to look up a prior effect receipt."""
-
+) -> _PreflightDecision:
     try:
         approved_values.assert_binding(run_id=run_id, session_id=session_id)
     except Exception:
-        return _Preflight(
+        return _PreflightDecision(
             status="configuration_required",
             reason_code="signup_submit_binding_invalid",
         )
     if contract.app_slug != account_binding.app_slug:
-        return _Preflight(
+        return _PreflightDecision(
             status="configuration_required",
             reason_code="signup_submit_account_binding_mismatch",
         )
     if inspection.status != "detected" or fill_result.status != "filled":
-        return _Preflight(
+        return _PreflightDecision(
             status="configuration_required",
             reason_code="signup_submit_form_not_prepared",
         )
@@ -331,11 +374,11 @@ def _effect_identity_preflight(
         inspection.contract_version != contract.contract_version
         or fill_result.contract_version != contract.contract_version
     ):
-        return _Preflight(
+        return _PreflightDecision(
             status="configuration_required",
             reason_code="signup_submit_contract_version_changed",
         )
-    return _Preflight(
+    return _PreflightDecision(
         status="authorized",
         reason_code="signup_submit_effect_identity_verified",
         verified_fields=tuple(fill_result.verified_fields),
@@ -353,9 +396,7 @@ def _static_submission_preflight(
     run_id: str,
     session_id: str,
     account_binding: SignupAccountBinding,
-) -> _Preflight:
-    """Validate durable authorization facts before reading the live DOM."""
-
+) -> _PreflightDecision:
     identity = _effect_identity_preflight(
         inspection=inspection,
         fill_result=fill_result,
@@ -370,30 +411,30 @@ def _static_submission_preflight(
     try:
         contract.assert_usable()
     except Exception:
-        return _Preflight(
+        return _PreflightDecision(
             status="configuration_required",
             reason_code="signup_submit_contract_inactive",
             verified_fields=identity.verified_fields,
         )
     if account_policy != "create_if_missing":
-        return _Preflight(
+        return _PreflightDecision(
             status="authorization_denied",
             reason_code="signup_submit_account_policy_blocked",
             verified_fields=identity.verified_fields,
         )
     if not contract.routing.signup_supported:
-        return _Preflight(
+        return _PreflightDecision(
             status="authorization_denied",
             reason_code="signup_submit_not_supported_by_contract",
             verified_fields=identity.verified_fields,
         )
     if current_state != SignupState.SIGNUP_SUBMISSION_READY:
-        return _Preflight(
+        return _PreflightDecision(
             status="authorization_denied",
             reason_code="signup_submit_state_not_ready",
             verified_fields=identity.verified_fields,
         )
-    return _Preflight(
+    return _PreflightDecision(
         status="authorized",
         reason_code="signup_submit_static_authorization_passed",
         verified_fields=identity.verified_fields,
@@ -415,7 +456,8 @@ async def _submission_preflight(
     credential_manager: SignupCredentialManager,
     account_binding: SignupAccountBinding,
     risk_policy: BrowserActionRiskPolicy,
-) -> _Preflight:
+    assert_secret_capture_disabled: SecretCaptureGuard | None,
+) -> _LivePreflight:
     static = _static_submission_preflight(
         inspection=inspection,
         fill_result=fill_result,
@@ -428,9 +470,9 @@ async def _submission_preflight(
         account_binding=account_binding,
     )
     if static.status != "authorized":
-        return static
+        return _denied(static)
     if not _signup_url_allowed(_page_url(page), contract):
-        return _Preflight(
+        return _DeniedPreflight(
             status="configuration_required",
             reason_code="signup_submit_page_origin_blocked",
             verified_fields=static.verified_fields,
@@ -438,7 +480,7 @@ async def _submission_preflight(
 
     gates = await inspect_signup_submission_gates(page, contract)
     if gates.status == "safe_stop":
-        return _Preflight(
+        return _DeniedPreflight(
             status="failed",
             reason_code=gates.reason_code,
             present_gates=gates.present_gates,
@@ -446,14 +488,14 @@ async def _submission_preflight(
 
     submit_match = inspection.match_for("signup_submit")
     if submit_match is None or submit_match.control_kind != "button":
-        return _Preflight(
+        return _DeniedPreflight(
             status="configuration_required",
             reason_code="signup_submit_control_missing",
             present_gates=gates.present_gates,
         )
     submit_locator = await strict_signup_token_locator(page, submit_match.token)
     if submit_locator is None:
-        return _Preflight(
+        return _DeniedPreflight(
             status="failed",
             reason_code="signup_submit_control_stale_or_ambiguous",
             present_gates=gates.present_gates,
@@ -461,7 +503,7 @@ async def _submission_preflight(
     try:
         metadata = await submit_locator.evaluate(_SUBMIT_METADATA_SCRIPT)
     except Exception:
-        return _Preflight(
+        return _DeniedPreflight(
             status="failed",
             reason_code="signup_submit_control_inspection_failed",
             present_gates=gates.present_gates,
@@ -472,7 +514,7 @@ async def _submission_preflight(
         contract=contract,
     )
     if semantic_reason is not None:
-        return _Preflight(
+        return _DeniedPreflight(
             status="configuration_required",
             reason_code=semantic_reason,
             present_gates=gates.present_gates,
@@ -487,6 +529,7 @@ async def _submission_preflight(
         secret_store=secret_store,
         credential_manager=credential_manager,
         account_binding=account_binding,
+        assert_secret_capture_disabled=assert_secret_capture_disabled,
     )
     decision = risk_policy.authorize_purpose(
         ActionAuthorizationContext(
@@ -508,14 +551,14 @@ async def _submission_preflight(
         )
     )
     if not decision.autonomous_allowed:
-        return _Preflight(
+        return _DeniedPreflight(
             status="authorization_denied",
             reason_code=decision.reason_code,
             verified_fields=verified_fields,
             present_gates=gates.present_gates,
         )
     if verification_reason is not None:
-        return _Preflight(
+        return _DeniedPreflight(
             status="configuration_required",
             reason_code=verification_reason,
             verified_fields=verified_fields,
@@ -523,23 +566,30 @@ async def _submission_preflight(
         )
 
     try:
-        # Playwright executes all strictness and actionability checks without
-        # dispatching a click. The real action still re-resolves on the second pass.
         await submit_locator.click(trial=True, timeout=_ACTION_TIMEOUT_MS)
     except Exception:
-        return _Preflight(
+        return _DeniedPreflight(
             status="failed",
             reason_code="signup_submit_not_actionable",
             verified_fields=verified_fields,
             present_gates=gates.present_gates,
         )
 
-    return _Preflight(
-        status="authorized",
-        reason_code="signup_submit_authorized",
+    return _AuthorizedPreflight(
         locator=submit_locator,
         verified_fields=verified_fields,
         present_gates=gates.present_gates,
+    )
+
+
+def _denied(decision: _PreflightDecision) -> _DeniedPreflight:
+    if decision.status == "authorized":
+        raise ValueError("authorized static decision cannot be converted to denial")
+    return _DeniedPreflight(
+        status=decision.status,
+        reason_code=decision.reason_code,
+        verified_fields=decision.verified_fields,
+        present_gates=decision.present_gates,
     )
 
 
@@ -561,12 +611,9 @@ def _validate_submit_semantics(
         and inside_form
     )
     if not native_submit:
-        # SPA buttons are permitted only through the strongest reviewed identity
-        # tier. Accessible text alone cannot authorize arbitrary JavaScript.
         if match_strategy != "reviewed_test_id" or role not in {"button", ""}:
             return "signup_submit_non_native_control_not_reviewed"
         return None
-
     method = str(metadata.get("formMethod") or "get").casefold()
     if method == "get":
         return "signup_submit_get_form_blocked"
@@ -579,10 +626,7 @@ def _validate_submit_semantics(
     return None
 
 
-def _signup_url_allowed(
-    action: str,
-    contract: BrowserAutomationContract,
-) -> bool:
+def _signup_url_allowed(action: str, contract: BrowserAutomationContract) -> bool:
     try:
         parsed = urlsplit(action)
     except ValueError:
@@ -595,10 +639,7 @@ def _signup_url_allowed(
     ):
         return False
     host = parsed.hostname.casefold().rstrip(".")
-    if any(
-        _host_matches(host, pattern)
-        for pattern in contract.hosts.prohibited_hosts
-    ):
+    if any(_host_matches(host, pattern) for pattern in contract.hosts.prohibited_hosts):
         return False
     allowed = list(contract.hosts.vendor_hosts)
     allowed.extend(contract.hosts.authentication_hosts)
@@ -635,19 +676,14 @@ def _completed_receipt_valid(
     return receipt == expected
 
 
-def _result_from_preflight(
-    preflight: _Preflight,
+def _result_from_decision(
+    preflight: _PreflightDecision | _DeniedPreflight,
     contract_version: str,
 ) -> SignupSubmissionResult:
-    status: SubmissionStatus
-    if preflight.status == "authorization_denied":
-        status = "authorization_denied"
-    elif preflight.status == "configuration_required":
-        status = "configuration_required"
-    else:
-        status = "failed"
+    if preflight.status == "authorized":
+        raise ValueError("authorized decision cannot be projected as a failure")
     return SignupSubmissionResult(
-        status=status,
+        status=preflight.status,
         reason_code=preflight.reason_code,
         contract_version=contract_version,
         verified_fields=preflight.verified_fields,
