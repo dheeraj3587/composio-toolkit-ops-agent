@@ -13,6 +13,7 @@ from typing import Any
 
 from ops.browser_worker import BrowserSessionContext
 from ops.config import Settings
+from ops.run_browser_execution import RunBrowserExecutionService
 from ops.run_reconciliation import RunReconciliationService
 from ops.run_service import _TERMINAL_BROWSER_STATUSES, RunService
 from ops.run_state_projection import RunProjectionService
@@ -110,8 +111,10 @@ def test_release_never_stops_a_browser_use_session() -> None:
 
 # --- the terminal paths must actually call the release ------------------------
 def test_async_workflow_and_apply_errors_release_the_session() -> None:
-    source = inspect.getsource(RunService._run_async_browser)
-    assert source.count("_release_browser_session") >= 2
+    source = inspect.getsource(RunBrowserExecutionService.run_async_browser)
+    # Matches both the collaborator's own release_browser_session and a
+    # _release_browser_session call made back through the service.
+    assert source.count("release_browser_session") >= 2
     assert "async_workflow_error" in source
     assert "async_apply_error" in source
 
