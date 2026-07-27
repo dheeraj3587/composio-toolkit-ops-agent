@@ -17,10 +17,12 @@ from ops.policies import (
 
 AccessRoute = Literal[
     "self_serve",
+    "self_serve_with_hitl",
     "approval_required",
     "partner_gated",
     "hybrid",
     "blocked",
+    "unsupported",
     "unknown",
 ]
 BrowserProvider = Literal["browser_use", "playwright"]
@@ -156,6 +158,14 @@ class OperationsState(TypedDict, total=False):
     credential_creation_policy: CredentialCreationPolicy
     state_revision: int
     last_projected_revision: int
+
+    # Phase B/C foundation. These dictionaries are strict-model projections and
+    # contain opaque vault references only; raw email/password values are forbidden.
+    approved_run_values: dict[str, object]
+    automation_contract: dict[str, object]
+    automation_contract_version: str
+    signup_state: str
+    signup_state_revision: int
 
     browser_profile_id: str
     browser_session_id: str
