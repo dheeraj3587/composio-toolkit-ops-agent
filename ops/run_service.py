@@ -90,6 +90,7 @@ from ops.routing import RoutingDecision, decide_access
 # Explicitly re-exported (the ``X as X`` form): ``api.app`` and ``api.service``
 # import these from ``ops.run_service``, which remains their public home, and the
 # type checker forbids implicit re-export.
+from ops.run_advance import _AUTO_ADVANCEABLE_GATES, RunAdvanceService  # noqa: F401
 from ops.run_errors import CredentialSubmissionError as CredentialSubmissionError
 from ops.run_errors import IdempotencyConflictError as IdempotencyConflictError
 from ops.run_errors import InvalidIdempotencyKeyError as InvalidIdempotencyKeyError
@@ -149,13 +150,6 @@ from ops.you_research import (
 
 LOGGER = logging.getLogger("composio_ops.run_service")
 
-# Human gates the agent may retry on its own. Only a login form backed by
-# already-authorized reusable credentials may advance without a human. Everything
-# else needs a real person in the live browser. Provider verification is deliberately
-# excluded: it can represent CAPTCHA, device approval, consent, account selection,
-# or another security prompt, and auto-resuming it both defeats HITL and can turn a
-# solvable gate into a failed login before the evaluator can attach.
-_AUTO_ADVANCEABLE_GATES: frozenset[str] = frozenset({"login_required"})
 _GATED_OUTREACH_ROUTES = frozenset({"approval_required", "partner_gated"})
 
 
@@ -327,15 +321,40 @@ class RunService:
         self._effect_store: SQLiteEffectStore | None = None
         # Sanitized startup wiring audit rows; never contains secrets.
         self._wiring: list[dict[str, object]] = []
-        # Read-only query collaborator. It holds a reference to this service and
-        # resolves storage, the snapshot adapter and the secret store on every
-        # call, so adapters assigned after construction are still honored.
-        self._queries = RunQueryService(self)
-        # Live-view collaborator. Everything it returns is ephemeral and
-        # resolved from the in-memory worker at request time.
-        self._live_view = RunLiveViewService(self)
-        # Startup and periodic recovery of runs holding a dead browser.
-        self._reconciliation = RunReconciliationService(self)
+
+    # --- extracted collaborators -------------------------------------------
+    #
+    # Resolved lazily on access rather than assigned in __init__ for two
+    # reasons. First, each one is stateless: it holds only a reference back to
+    # this service and reads storage, settings and adapters through it on every
+    # call, so constructing one is free and late-assigned adapters are always
+    # honored. Second, several tests build a service with
+    # ``RunService.__new__`` and hand-assign only the attributes they need,
+    # which never runs __init__; a collaborator assigned there would be missing.
+
+    @property
+    def _queries(self) -> RunQueryService:
+        """Read-only run and catalog queries."""
+
+        return RunQueryService(self)
+
+    @property
+    def _live_view(self) -> RunLiveViewService:
+        """Ephemeral screenshot, live-URL and interactive-grant resolution."""
+
+        return RunLiveViewService(self)
+
+    @property
+    def _reconciliation(self) -> RunReconciliationService:
+        """Startup and periodic recovery of runs holding a dead browser."""
+
+        return RunReconciliationService(self)
+
+    @property
+    def _advance(self) -> RunAdvanceService:
+        """Autonomous continuation of machine-resolvable human gates."""
+
+        return RunAdvanceService(self)
 
     @classmethod
     def from_paths(
@@ -554,39 +573,9 @@ class RunService:
         return None
 
     def _start_autonomous_advancer(self) -> None:
-        """Start the sweep that auto-resumes machine-resolvable human gates.
+        """Start the sweep that auto-resumes machine-resolvable human gates."""
 
-        Deliberately independent of the email poller: that thread only starts when
-        Gmail is configured, so autonomous login continuation would never have run
-        on a deployment without an inbox.
-        """
-
-        settings = self._settings or Settings.from_env()
-        if int(getattr(settings, "max_autonomous_advances", 0)) <= 0:
-            return
-        if self._advance_thread is not None and self._advance_thread.is_alive():
-            return
-        interval = max(5, int(getattr(settings, "autonomous_advance_interval_seconds", 20)))
-        self._advance_stop.clear()
-        thread = threading.Thread(
-            target=self._advance_loop,
-            args=(interval,),
-            name="autonomous-advancer",
-            daemon=True,
-        )
-        self._advance_thread = thread
-        thread.start()
-
-    def _advance_loop(self, interval: int) -> None:
-        while not self._advance_stop.wait(interval):
-            try:
-                self.advance_autonomous_runs()
-            except Exception:  # pragma: no cover - the loop must never die
-                pass
-            try:
-                self.reconcile_idle_browser_runs()
-            except Exception:  # pragma: no cover - the loop must never die
-                pass
+        self._advance.start()
 
     def reconcile_idle_browser_runs(self, *, limit: int = 100) -> int:
         """Recover runs stuck at ``browser_running`` with nothing driving them."""
@@ -594,61 +583,9 @@ class RunService:
         return self._reconciliation.reconcile_idle_browser_runs(limit=limit)
 
     def advance_autonomous_runs(self, *, limit: int = 100) -> int:
-        """Resume every waiting run whose human gate the agent can resolve itself.
+        """Resume every waiting run whose human gate the agent can resolve itself."""
 
-        Only gates that are genuinely machine-resolvable are advanced:
-
-        * ``login_required`` — advanced ONLY when reusable credentials for the app
-          are stored, so this never becomes a pointless retry loop.
-
-        Provider verification, CAPTCHA, passkey, device approval, account selection,
-        billing and legal gates are never advanced: they require a real human in the
-        interactive browser. ``email_otp`` is left to ``resolve_pending_otps``, which
-        has the inbox.
-
-        Every advance is bounded per run by ``max_autonomous_advances``, so a login
-        that keeps failing settles into a truthful human gate.
-        """
-
-        settings = self._settings or Settings.from_env()
-        budget = int(getattr(settings, "max_autonomous_advances", 0))
-        if budget <= 0:
-            return 0
-        advanced = 0
-        for record in self.storage.list_runs(limit=limit, offset=0):
-            if record.get("status") != "waiting_for_hitl":
-                continue
-            run_id = str(record.get("run_id") or "")
-            if not run_id:
-                continue
-            action_type = self._hitl_action_type(record)
-            if action_type not in _AUTO_ADVANCEABLE_GATES:
-                continue
-            if self._autonomous_advances.get(run_id, 0) >= budget:
-                continue
-            if action_type == "login_required" and not self._reusable_login_values(
-                str(record.get("app_slug") or "unknown")
-            ):
-                # Nothing to inject: asking the worker again would just re-raise
-                # the same gate. The owner still needs to supply credentials once.
-                continue
-            self._autonomous_advances[run_id] = self._autonomous_advances.get(run_id, 0) + 1
-            try:
-                # resume_run injects the remembered credentials on its own.
-                self.resume_run(run_id, signal="completed")
-            except (RunConflictError, CredentialSubmissionError, KeyError):
-                continue  # another writer owns the run, or it already moved on
-            except Exception:
-                log_event("browser.autonomous_advance.error", level=40, run_id=run_id)
-                continue
-            log_event(
-                "browser.autonomous_advance.resumed",
-                run_id=run_id,
-                gate=action_type,
-                attempt=self._autonomous_advances[run_id],
-            )
-            advanced += 1
-        return advanced
+        return self._advance.advance_autonomous_runs(limit=limit)
 
     def resolve_pending_otps(self, *, limit: int = 100) -> int:
         """Autonomously resolve every run waiting on an emailed login code."""
