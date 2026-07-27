@@ -45,41 +45,77 @@ chmod 700 "${XDG_RUNTIME_DIR}"
 export HOME XDG_CACHE_HOME XDG_CONFIG_HOME XDG_RUNTIME_DIR
 
 if is_enabled "${BROWSER_INTERACTIVE_HITL_ENABLED:-false}"; then
-    echo "browser-service: interactive HITL enabled, starting display stack" >&2
-
-    # Virtual framebuffer: Chromium can then run headful, which is what makes a
-    # human handoff (CAPTCHA, account chooser, MFA) actually solvable.
-    Xvfb ":${DISPLAY_NUM}" -screen 0 "${SCREEN_GEOMETRY}" -nolisten tcp &
-    export DISPLAY=":${DISPLAY_NUM}"
-
-    # Wait for the X socket rather than sleeping blindly.
-    i=0
-    while [ ! -e "/tmp/.X11-unix/X${DISPLAY_NUM}" ]; do
-        i=$((i + 1))
-        if [ "$i" -gt 100 ]; then
-            echo "browser-service: Xvfb failed to start" >&2
+    # ONE display stack per session slot. A single shared display was the reason
+    # interactive HITL was capped at one session: x11vnc exports a WHOLE display,
+    # so two headful browsers on one desktop would let a grant issued for session A
+    # stream session B's window. Slot i therefore gets its own Xvfb, its own window
+    # manager and its own x11vnc:
+    #
+    #   display :(BROWSER_DISPLAY_NUM + i)  <-  x11vnc on (BROWSER_VNC_PORT + i)
+    #
+    # browser_service.display_pool leases slot i to exactly one session and the
+    # relay connects only to that slot's port, so isolation holds by construction.
+    DISPLAY_SLOTS="${BROWSER_DISPLAY_SLOTS:-${PLAYWRIGHT_MAX_SESSIONS:-1}}"
+    case "${DISPLAY_SLOTS}" in
+        '' | *[!0-9]*)
+            echo "browser-service: BROWSER_DISPLAY_SLOTS must be a positive integer" >&2
             exit 1
-        fi
-        sleep 0.1
+            ;;
+    esac
+    if [ "${DISPLAY_SLOTS}" -lt 1 ] || [ "${DISPLAY_SLOTS}" -gt 10 ]; then
+        echo "browser-service: BROWSER_DISPLAY_SLOTS must be between 1 and 10" >&2
+        exit 1
+    fi
+
+    echo "browser-service: interactive HITL enabled, starting ${DISPLAY_SLOTS} display stack(s)" >&2
+
+    slot=0
+    while [ "${slot}" -lt "${DISPLAY_SLOTS}" ]; do
+        slot_display=$((DISPLAY_NUM + slot))
+        slot_vnc_port=$((VNC_PORT + slot))
+
+        # Virtual framebuffer: Chromium can then run headful, which is what makes a
+        # human handoff (CAPTCHA, account chooser, MFA) actually solvable.
+        Xvfb ":${slot_display}" -screen 0 "${SCREEN_GEOMETRY}" -nolisten tcp &
+
+        # Wait for THIS slot's X socket rather than sleeping blindly.
+        i=0
+        while [ ! -e "/tmp/.X11-unix/X${slot_display}" ]; do
+            i=$((i + 1))
+            if [ "$i" -gt 100 ]; then
+                echo "browser-service: Xvfb failed to start on :${slot_display}" >&2
+                exit 1
+            fi
+            sleep 0.1
+        done
+
+        # A minimal window manager so dialogs and popups are placed sanely. Bound
+        # to this slot's display, so each desktop is managed independently.
+        DISPLAY=":${slot_display}" fluxbox >/dev/null 2>&1 &
+
+        # -localhost is the load-bearing flag: x11vnc accepts connections only from
+        # inside this container, so there is no raw public VNC port. -nopw is safe
+        # ONLY because of that binding plus the authenticated relay in front of it;
+        # a VNC password here would be a second secret with no added protection.
+        x11vnc \
+            -display ":${slot_display}" \
+            -rfbport "${slot_vnc_port}" \
+            -localhost \
+            -nopw \
+            -shared \
+            -forever \
+            -noxdamage \
+            -quiet \
+            >/dev/null 2>&1 &
+
+        slot=$((slot + 1))
     done
 
-    # A minimal window manager so dialogs and popups are placed sanely.
-    fluxbox >/dev/null 2>&1 &
-
-    # -localhost is the load-bearing flag: x11vnc accepts connections only from
-    # inside this container, so there is no raw public VNC port. -nopw is safe
-    # ONLY because of that binding plus the authenticated relay in front of it;
-    # a VNC password here would be a second secret with no added protection.
-    x11vnc \
-        -display ":${DISPLAY_NUM}" \
-        -rfbport "${VNC_PORT}" \
-        -localhost \
-        -nopw \
-        -shared \
-        -forever \
-        -noxdamage \
-        -quiet \
-        >/dev/null 2>&1 &
+    # The process-level DISPLAY is the FIRST slot only as a sane default for any
+    # incidental X client. Each browser session is launched with its own leased
+    # DISPLAY (see PlaywrightBrowserWorker._launch_env), so no session relies on
+    # inheriting this value.
+    export DISPLAY=":${DISPLAY_NUM}"
 else
     echo "browser-service: interactive HITL disabled, headless only" >&2
 fi

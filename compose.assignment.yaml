@@ -78,7 +78,11 @@ services:
       BROWSER_SESSION_INACTIVITY_SECONDS: ${BROWSER_SESSION_INACTIVITY_SECONDS:-900}
       BROWSER_SESSION_MAX_AGE_SECONDS: ${BROWSER_SESSION_MAX_AGE_SECONDS:-3600}
 
-      PLAYWRIGHT_MAX_SESSIONS: ${PLAYWRIGHT_MAX_SESSIONS:-1}
+      # Concurrent sessions. With interactive HITL on, each one leases its OWN
+      # Xvfb + x11vnc display stack, so this is now sized by host memory (each
+      # slot is a headful Chromium) rather than by a shared-display limit.
+      PLAYWRIGHT_MAX_SESSIONS: ${PLAYWRIGHT_MAX_SESSIONS:-3}
+      BROWSER_DISPLAY_SLOTS: ${PLAYWRIGHT_MAX_SESSIONS:-3}
       PLAYWRIGHT_DISABLE_SANDBOX: ${PLAYWRIGHT_DISABLE_SANDBOX:-true}
 
       CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}

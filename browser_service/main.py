@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse
 
 from browser_service import __version__
 from browser_service.auth import AuthContext, assert_session_owner, token_dependency
+from browser_service.display_pool import DisplayPool, DisplayUnavailable
 from browser_service.models import (
     CaptureCredentialsResponse,
     CreateSessionRequest,
@@ -212,6 +213,7 @@ def make_session_closer(
     worker_factory: Callable[[], Any],
     *,
     attachment_drainer: Callable[[str], Awaitable[bool]] | None = None,
+    display_pool: DisplayPool | None = None,
 ) -> Callable[[ManagedSession], Awaitable[None]]:
     """Build the manager's unified live-view and browser-session closer.
 
@@ -223,18 +225,33 @@ def make_session_closer(
 
     async def _close(session: ManagedSession) -> None:
         # Revoke grants first, then stop every relay before Chromium is closed or
-        # the single-display capacity can be reused by another run.
+        # this session's display slot can be leased by another run.
         session.hitl_pending = False
         if attachment_drainer is not None and not await attachment_drainer(session.session_id):
             raise RuntimeError("live_attachment_drain_failed")
         context = session.worker_context
         if context is None:
+            # No browser was ever attached, but a display may still have been
+            # leased by a create that failed before launch. Return it or the slot
+            # leaks and interactive capacity shrinks permanently.
+            _release_display(session)
             return
         worker = worker_factory()
         if worker is None:
             raise RuntimeError("browser_worker_missing_during_close")
         await worker.stop(context)
         session.worker_context = None
+        # Released only AFTER Chromium is actually gone. Handing the display to a
+        # new session while the old browser still renders to it would put two
+        # sessions on one desktop, which is exactly the leak per-session displays
+        # exist to prevent.
+        _release_display(session)
+
+    def _release_display(session: ManagedSession) -> None:
+        if display_pool is None:
+            return
+        display_pool.release(session.display_slot)
+        session.display_slot = None
 
     return _close
 
@@ -249,6 +266,13 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         inactivity_seconds=resolved.inactivity_seconds,
         maximum_age_seconds=resolved.maximum_age_seconds,
         drain_seconds=resolved.drain_seconds,
+    )
+    # One private X display per session slot. Inert (zero slots) when interactive
+    # HITL is off, so a headless deployment allocates nothing.
+    display_pool = DisplayPool(
+        slots=resolved.display_slots,
+        display_base=resolved.display_num_base,
+        vnc_port_base=resolved.vnc_port_base,
     )
 
     @contextlib.asynccontextmanager
@@ -278,6 +302,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
     )
     app.state.settings = resolved
     app.state.manager = manager
+    app.state.display_pool = display_pool
     # The worker is created lazily: importing Playwright must not be required for
     # /internal/health to answer "chromium not installed".
     app.state.worker = None
@@ -345,6 +370,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             attachment_drainer=lambda session_id: _drain_live_attachments(
                 session_id, close_reason="session_closed"
             ),
+            display_pool=display_pool,
         )
     )
 
@@ -366,6 +392,17 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         except SessionUnavailable as exc:
             raise _sanitized_error(exc) from None
 
+        # Lease this session's PRIVATE display before anything launches. Recorded
+        # on the session immediately so a failed launch still releases it via the
+        # closer rather than leaking interactive capacity.
+        try:
+            session.display_slot = display_pool.acquire()
+        except DisplayUnavailable as exc:
+            await manager.close(session.session_id, reason_code=exc.reason_code)
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=exc.reason_code
+            ) from None
+
         # Launch the real browser for this session.
         try:
             worker = _worker()
@@ -373,6 +410,9 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             context = await worker.start(
                 payload.profile_id,
                 storage_state=storage_state if payload.use_storage_state else None,
+                # Headful Chromium renders to THIS session's display only. None in a
+                # headless deployment, where the worker inherits the process env.
+                display=session.display_slot.display if session.display_slot else None,
             )
             # EXPLICIT ownership: the manager can now close the real session, and
             # nothing reaches into the worker's private session dictionary.
@@ -387,8 +427,13 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             # launched browser is not the same as a current, non-sensitive frame.
             session.screenshot_available = False
             # Interactive readiness is an explicit deployment capability. It is
-            # never inferred from a screenshot or a run state.
-            session.interactive_ready = resolved.interactive_hitl_enabled
+            # never inferred from a screenshot or a run state. It additionally
+            # requires an actually-leased private display: without one there is no
+            # desktop to relay, and claiming otherwise would hand out a grant that
+            # cannot resolve to a VNC target.
+            session.interactive_ready = (
+                resolved.interactive_hitl_enabled and session.display_slot is not None
+            )
             if payload.use_storage_state:
                 session.storage_binding = _storage_binding(payload, auth.owner)
         except Exception as exc:  # sanitized: never surface provider text
@@ -638,6 +683,19 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=exc.reason_code)
             return
 
+        # Authorization proved WHO may attach; the leased display decides WHERE the
+        # relay may connect. Fail closed when the session holds no display rather
+        # than falling back to a shared or default port.
+        slot = session.display_slot if session else None
+        if slot is None:
+            LOGGER.warning(
+                "live view denied session=%s reason=%s", log_session_id, "display_slot_missing"
+            )
+            await websocket.close(
+                code=status.WS_1008_POLICY_VIOLATION, reason="display_slot_missing"
+            )
+            return
+
         # Reserve the attachment BEFORE the first post-authorization await. Resume
         # can now always see and drain an authorized handshake, even if WebSocket
         # acceptance is slow. This closes the authorize -> accept -> register race
@@ -673,10 +731,14 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
 
             from browser_service.novnc import relay_websocket_to_vnc
 
+            # The target is derived from the session's OWN leased display, never
+            # from a caller-supplied value and never from one global port. This is
+            # what makes the grant's session binding real at the display layer: a
+            # token for session A can only ever reach A's private desktop.
             reason = await relay_websocket_to_vnc(
                 receive=_receive,
                 send=websocket.send_bytes,
-                target=VncTarget(port=resolved.vnc_port),
+                target=VncTarget(port=slot.vnc_port),
             )
         except LiveViewDenied as exc:
             reason = exc.reason_code

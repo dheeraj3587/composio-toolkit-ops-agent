@@ -97,6 +97,8 @@ class _FakeWorker:
         self.navigate_delay = 0.0
         self.stopped: list[str] = []
         self.received_storage_state: dict[str, Any] | None = None
+        # Every DISPLAY the service launched a session with, in order.
+        self.received_displays: list[str | None] = []
         self.storage_state = {"cookies": [{"name": "session", "value": "SUPERSECRETCOOKIEVALUE"}]}
         self.capture_calls: list[tuple[str, str]] = []
 
@@ -116,10 +118,13 @@ class _FakeWorker:
         profile_id: str | None,
         *,
         storage_state: dict[str, Any] | None = None,
+        display: str | None = None,
     ) -> BrowserSessionContext:
         # Mirrors the real worker: the service may hand over previously saved,
-        # already-decrypted authenticated state (never a filesystem path).
+        # already-decrypted authenticated state (never a filesystem path), plus the
+        # PRIVATE X display leased to this session.
         self.received_storage_state = storage_state
+        self.received_displays.append(display)
         self._counter += 1
         handle = f"pw_fake_{self._counter}"
         self._sessions[handle] = _FakePwSession()
@@ -2166,9 +2171,16 @@ class TestNoPrivateWorkerAccess:
         assert "_sessions" not in source.replace("its private ``_sessions`` dict", "")
 
 
-# ------------------------------- P0-7: interactive HITL is single-session only
+# ------------------------- P0-7: one PRIVATE X display per interactive session
 class TestInteractiveHitlSingleSession:
-    """One X display must never be shared by concurrent browser sessions."""
+    """One X display must never be shared by concurrent browser sessions.
+
+    The rule is unchanged; the mechanism is. Concurrency used to be forbidden
+    outright (``PLAYWRIGHT_MAX_SESSIONS=1``) because one Xvfb/x11vnc pair was
+    shared. Now each session leases its own display stack, so what must be proven
+    is that every slot gets a PRIVATE display and that the derived port range
+    cannot collide with the service's own listeners.
+    """
 
     def test_config_allows_one_interactive_session(self) -> None:
         settings = BrowserServiceSettings(
@@ -2178,14 +2190,25 @@ class TestInteractiveHitlSingleSession:
         )
         assert settings.interactive_hitl_enabled is True
 
-    def test_config_rejects_multiple_interactive_sessions(self) -> None:
+    def test_config_allows_multiple_interactive_sessions(self) -> None:
+        settings = BrowserServiceSettings(
+            service_token=SecretStr(TOKEN),
+            interactive_hitl_enabled=True,
+            max_sessions=3,
+        )
+        assert settings.display_slots == 3
+
+    def test_config_rejects_a_colliding_vnc_port_range(self) -> None:
         from pydantic import ValidationError
 
-        with pytest.raises(ValidationError, match="PLAYWRIGHT_MAX_SESSIONS=1"):
+        # 6078 + 3 slots would reach 6080, the noVNC asset port: the relay would
+        # then connect to the wrong listener instead of x11vnc.
+        with pytest.raises(ValidationError, match="collides"):
             BrowserServiceSettings(
                 service_token=SecretStr(TOKEN),
                 interactive_hitl_enabled=True,
-                max_sessions=2,
+                max_sessions=3,
+                vnc_port_base=6_078,
             )
 
     def test_env_true_is_allowed_with_capacity_one(self) -> None:

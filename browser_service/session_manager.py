@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+from browser_service.display_pool import DisplaySlot
 from browser_service.models import LiveViewMode, SessionLifecycle, SessionSummary
 
 
@@ -49,6 +50,11 @@ class ManagedSession:
     # _PwSession and context/browser/playwright stayed None, so the closer had
     # nothing to close and the janitor leaked Chromium).
     worker_context: Any = None
+    # The PRIVATE X display this session's headful Chromium renders to, leased for
+    # the session's whole lifetime. None in a headless deployment. Isolation
+    # depends on this being exclusive: x11vnc serves a whole display, so two
+    # sessions on one display would let a grant for A stream B's browser window.
+    display_slot: DisplaySlot | None = None
     pages: dict[str, Any] = field(default_factory=dict)
     current_page_id: str = ""
     # Live-view availability, tracked from reality rather than assumed.
@@ -290,9 +296,10 @@ class SessionManager:
             try:
                 await self._closer(session)
             except Exception:
-                # Never release a single-display capacity slot while its browser
-                # or live RFB attachment may still exist. The CLOSING session is
-                # retained so teardown can be retried once the dependency clears.
+                # Never release a capacity slot (or its leased display) while the
+                # browser or a live RFB attachment may still exist. The CLOSING
+                # session is retained so teardown can be retried once the
+                # dependency clears.
                 session.reason_code = f"{reason_code}:teardown_failed"
                 return session.reason_code
 

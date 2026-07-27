@@ -7,7 +7,10 @@ services:
   browser-worker:
     environment:
       BROWSER_INTERACTIVE_HITL_ENABLED: "true"
-      PLAYWRIGHT_MAX_SESSIONS: "1"
+      # Concurrent interactive sessions, each with a PRIVATE display stack:
+      # slot i => display :(99 + i) served by x11vnc on (5900 + i).
+      PLAYWRIGHT_MAX_SESSIONS: ${PLAYWRIGHT_MAX_SESSIONS:-3}
+      BROWSER_DISPLAY_SLOTS: ${PLAYWRIGHT_MAX_SESSIONS:-3}
       BROWSER_DISPLAY_NUM: "99"
       BROWSER_SCREEN_GEOMETRY: "1440x900x24"
       BROWSER_VNC_PORT: "5900"

@@ -13,6 +13,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
+from browser_service.display_pool import MAX_DISPLAY_SLOTS
+
 
 class BrowserServiceSettings(BaseModel):
     """Runtime configuration for the isolated browser service."""
@@ -38,13 +40,18 @@ class BrowserServiceSettings(BaseModel):
     max_request_bytes: int = Field(default=256 * 1024, ge=1_024, le=8 * 1024 * 1024)
     operation_timeout_seconds: float = Field(default=120.0, ge=1.0, le=600.0)
 
-    # Interactive HITL (noVNC). OFF by default. The container owns one X display,
-    # so interactive mode is valid only with a one-session service capacity.
+    # Interactive HITL (noVNC). OFF by default. The container runs ONE display
+    # stack per session slot (see browser_service.display_pool), so interactive
+    # mode is no longer restricted to a single session: session i leases display
+    # :(display_num_base + i) served by x11vnc on (vnc_port_base + i).
     interactive_hitl_enabled: bool = False
     novnc_port: int = Field(default=6080, ge=1, le=65_535)
-    # x11vnc's port INSIDE this container. Only ever reached over loopback, so it
-    # is never published and never accepted from a caller.
-    vnc_port: int = Field(default=5900, ge=1, le=65_535)
+    # BASE of the per-slot X display numbers. Slot i uses :(base + i).
+    display_num_base: int = Field(default=99, ge=1, le=1_000)
+    # BASE of x11vnc's ports INSIDE this container. Slot i is served on
+    # (base + i). Only ever reached over loopback, so these are never published
+    # and never accepted from a caller.
+    vnc_port_base: int = Field(default=5900, ge=1, le=65_535)
     live_view_token_seconds: int = Field(default=300, ge=30, le=3_600)
     # Private-network base for the grant URL. Configuration-supplied ONLY — never
     # derived from a request header, page content, or a redirect (a Host-header
@@ -59,15 +66,48 @@ class BrowserServiceSettings(BaseModel):
 
     @model_validator(mode="after")
     def _validate_interactive_hitl(self) -> BrowserServiceSettings:
-        """Allow interactive HITL only for the container's single X display."""
+        """Ensure every session slot can own a PRIVATE display stack.
 
-        if self.interactive_hitl_enabled and self.max_sessions != 1:
-            raise ValueError("interactive HITL requires PLAYWRIGHT_MAX_SESSIONS=1")
+        Interactive HITL used to require ``max_sessions == 1`` because a single
+        Xvfb/x11vnc pair was shared. Concurrency is now allowed, but the invariant
+        that replaces the old cap is stricter and checked here: there must be one
+        display per session, and the derived port range must not collide with the
+        service's own listeners — a collision would silently point the relay at
+        the HTTP server (or at noVNC's asset port) instead of x11vnc.
+        """
+
+        if not self.interactive_hitl_enabled:
+            return self
+        if self.max_sessions > MAX_DISPLAY_SLOTS:
+            raise ValueError(
+                f"interactive HITL supports at most {MAX_DISPLAY_SLOTS} concurrent "
+                "sessions (PLAYWRIGHT_MAX_SESSIONS)"
+            )
+        highest_vnc_port = self.vnc_port_base + self.max_sessions - 1
+        if highest_vnc_port > 65_535:
+            raise ValueError("BROWSER_VNC_PORT is too high for the requested session count")
+        reserved = {self.port, self.novnc_port}
+        collisions = reserved & set(range(self.vnc_port_base, highest_vnc_port + 1))
+        if collisions:
+            raise ValueError(
+                "the per-session VNC port range collides with the service port or "
+                "BROWSER_NOVNC_PORT; move BROWSER_VNC_PORT"
+            )
         return self
 
     @property
     def token_configured(self) -> bool:
         return self.service_token is not None
+
+    @property
+    def display_slots(self) -> int:
+        """How many private display stacks this deployment owns.
+
+        Zero when interactive HITL is off: a headless deployment renders nothing
+        to an X server, so it needs no display and pays for none.
+        """
+
+        return self.max_sessions if self.interactive_hitl_enabled else 0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> BrowserServiceSettings:
@@ -123,7 +163,10 @@ class BrowserServiceSettings(BaseModel):
             operation_timeout_seconds=_float("BROWSER_OPERATION_TIMEOUT_SECONDS", 120.0),
             interactive_hitl_enabled=_bool("BROWSER_INTERACTIVE_HITL_ENABLED", False),
             novnc_port=_int("BROWSER_NOVNC_PORT", 6080),
-            vnc_port=_int("BROWSER_VNC_PORT", 5900),
+            # Both are now the BASE of a per-slot range, keeping the existing env
+            # var names so an existing single-session deployment is unchanged.
+            display_num_base=_int("BROWSER_DISPLAY_NUM", 99),
+            vnc_port_base=_int("BROWSER_VNC_PORT", 5900),
             live_view_token_seconds=_int("BROWSER_LIVE_VIEW_TOKEN_SECONDS", 300),
             novnc_base_url=(_text("BROWSER_NOVNC_BASE_URL") or "http://browser-worker:8081").rstrip(
                 "/"

@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib
+import os
 import re
 import threading
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -825,6 +826,27 @@ class PlaywrightBrowserWorker:
             args.append("--no-sandbox")
         return args
 
+    @staticmethod
+    def _launch_env(display: str | None) -> dict[str, str] | None:
+        """Chromium's environment, pinned to this session's private X display.
+
+        Returns ``None`` when no display was leased, so the launch call omits
+        ``env`` entirely and Chromium inherits the process environment unchanged
+        (the headless and in-process paths).
+
+        The merge with ``os.environ`` is load-bearing: Playwright REPLACES the
+        browser process environment with whatever ``env`` contains rather than
+        merging it. Passing ``{"DISPLAY": ...}`` alone would strip HOME, PATH and
+        the XDG variables that ``docker/browser-entrypoint.sh`` deliberately points
+        at a writable tmpfs — and a headful Chromium without a writable HOME dies
+        instantly with SIGTRAP, which surfaces only as "Target page, context or
+        browser has been closed".
+        """
+
+        if not display:
+            return None
+        return {**os.environ, "DISPLAY": display}
+
     def _reap_expired(self) -> tuple[str, ...]:
         """Drop sessions past their inactivity or maximum lifetime.
 
@@ -879,7 +901,14 @@ class PlaywrightBrowserWorker:
         secret_scope: str | None = None,
         use_storage_state: bool = False,
         live_view_mode: str = "screenshot",
+        display: str | None = None,
     ) -> BrowserSessionContext:
+        # ``display`` is the PRIVATE X display leased to this session by the browser
+        # service (e.g. ":100"). Headful Chromium renders to exactly that display,
+        # which is what keeps concurrent interactive sessions isolated: x11vnc
+        # serves a whole display, so sharing one would let a grant for session A
+        # stream session B's browser window. None means "inherit the process
+        # DISPLAY", which is the headless and in-process case.
         # Accept the provider-neutral session metadata so the graph and the async
         # run-creation path have ONE call site for every provider. In-process
         # Chromium resolves nothing through the service RPC, so these are recorded
@@ -917,11 +946,15 @@ class PlaywrightBrowserWorker:
                 )
             capacity_owned = True
 
+        launch_env = self._launch_env(display)
+
         async def _launch() -> tuple[Any, Any, Any, Any, asyncio.Lock]:
             playwright = await module.async_playwright().start()
             try:
                 browser = await playwright.chromium.launch(
-                    headless=self._headless, args=self._launch_args()
+                    headless=self._headless,
+                    args=self._launch_args(),
+                    **({"env": launch_env} if launch_env is not None else {}),
                 )
                 # Service workers are blocked: during a secret-bearing session a
                 # worker could persist and relay data outside the page lifecycle.
