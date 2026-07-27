@@ -61,7 +61,7 @@ _RESULT_OBSERVATION_SCRIPT = r"""
 
   const names = [];
   const status = [];
-  let visibleAlertPresent = false;
+  let visibleFeedbackPresent = false;
   for (const el of all) {
     if (!visible(el)) continue;
     const role = (el.getAttribute("role") || "").toLowerCase();
@@ -89,7 +89,9 @@ _RESULT_OBSERVATION_SCRIPT = r"""
       const text = clean(el.textContent || el.getAttribute("aria-label") || "", 500);
       if (text) status.push(text);
     }
-    if (role === "alert") visibleAlertPresent = true;
+    if (role === "alert" || role === "status" || role === "dialog") {
+      visibleFeedbackPresent = true;
+    }
   }
 
   const passwordInputs = Array.from(
@@ -110,7 +112,7 @@ _RESULT_OBSERVATION_SCRIPT = r"""
     statusText: clean(status.join(" "), 4000),
     accessibleNames: names.slice(0, 160),
     nativePasswordInvalid,
-    visibleAlertPresent,
+    visibleFeedbackPresent,
   };
 }
 """
@@ -201,7 +203,9 @@ async def capture_signup_result_observation(
             status_text=str(raw.get("statusText") or ""),
             accessible_names=tuple(names_raw),
             native_password_invalid=bool(raw.get("nativePasswordInvalid")),
-            visible_alert_present=bool(raw.get("visibleAlertPresent")),
+            # The public field name remains backward compatible; the captured
+            # signal covers alert, status, and dialog feedback surfaces.
+            visible_alert_present=bool(raw.get("visibleFeedbackPresent")),
             inspected_controls=count,
         ),
     )
