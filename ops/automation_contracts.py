@@ -51,7 +51,7 @@ _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _EVIDENCE_HASH = re.compile(r"^[0-9a-f]{64}$")
 _SEMANTIC_FIELD = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _TEST_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
-_SIGNUP_FIELDS = frozenset(
+_SIGNUP_FIELDS: frozenset[SignupSemanticField] = frozenset(
     {
         "email",
         "password",
@@ -67,10 +67,12 @@ _SIGNUP_FIELDS = frozenset(
         "signup_submit",
     }
 )
-_SIGNUP_FIELD_ALIASES = {
+# Historical field-name aliases only. These strings are schema vocabulary, not
+# credential values; inline allowlisting keeps the secret scanner strict elsewhere.
+_SIGNUP_FIELD_ALIASES: dict[str, SignupSemanticField] = {
     "signup_email": "email",
-    "account_password": "password",
-    "confirm_password": "password_confirmation",
+    "account_password": "password",  # pragma: allowlist secret
+    "confirm_password": "password_confirmation",  # pragma: allowlist secret
     "legal_name": "company_name",
     "company_website": "website",
     "account_name": "workspace_name",
@@ -197,9 +199,16 @@ class ContractSignupFieldHints(_StrictContractModel):
 
 class ContractSignup(_StrictContractModel):
     entrypoints: tuple[str, ...] = Field(default=(), max_length=10)
-    required_semantic_fields: tuple[str, ...] = Field(default=(), max_length=30)
-    optional_semantic_fields: tuple[str, ...] = Field(default=(), max_length=30)
-    field_hints: dict[str, ContractSignupFieldHints] = Field(default_factory=dict, max_length=30)
+    required_semantic_fields: tuple[SignupSemanticField, ...] = Field(
+        default=(), max_length=30
+    )
+    optional_semantic_fields: tuple[SignupSemanticField, ...] = Field(
+        default=(), max_length=30
+    )
+    field_hints: dict[SignupSemanticField, ContractSignupFieldHints] = Field(
+        default_factory=dict,
+        max_length=30,
+    )
     password_policy: ContractPasswordPolicy = Field(default_factory=ContractPasswordPolicy)
     success_predicates: tuple[str, ...] = Field(default=(), max_length=30)
     existing_account_predicates: tuple[str, ...] = Field(default=(), max_length=20)
@@ -222,7 +231,7 @@ class ContractSignup(_StrictContractModel):
                 )
         raw_hints = normalized.get("field_hints")
         if isinstance(raw_hints, dict):
-            hints: dict[str, object] = {}
+            hints: dict[SignupSemanticField, object] = {}
             for raw_key, hint in raw_hints.items():
                 key = _normalize_signup_field(str(raw_key))
                 if key in hints:
@@ -238,7 +247,10 @@ class ContractSignup(_StrictContractModel):
 
     @field_validator("required_semantic_fields", "optional_semantic_fields")
     @classmethod
-    def _semantic_fields_are_supported(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+    def _semantic_fields_are_supported(
+        cls,
+        values: tuple[SignupSemanticField, ...],
+    ) -> tuple[SignupSemanticField, ...]:
         result = tuple(dict.fromkeys(values))
         if any(value not in _SIGNUP_FIELDS for value in result):
             raise ValueError("signup semantic field is unsupported")
@@ -247,8 +259,9 @@ class ContractSignup(_StrictContractModel):
     @field_validator("field_hints")
     @classmethod
     def _field_hint_keys_are_supported(
-        cls, values: dict[str, ContractSignupFieldHints]
-    ) -> dict[str, ContractSignupFieldHints]:
+        cls,
+        values: dict[SignupSemanticField, ContractSignupFieldHints],
+    ) -> dict[SignupSemanticField, ContractSignupFieldHints]:
         if any(key not in _SIGNUP_FIELDS for key in values):
             raise ValueError("signup field hint key is unsupported")
         return values
@@ -327,13 +340,16 @@ class ContractEvidence(_StrictContractModel):
     @field_validator("field_sources")
     @classmethod
     def _field_sources_are_https(
-        cls, values: dict[str, tuple[str, ...]]
+        cls,
+        values: dict[str, tuple[str, ...]],
     ) -> dict[str, tuple[str, ...]]:
         result: dict[str, tuple[str, ...]] = {}
         for key, urls in values.items():
             if _SEMANTIC_FIELD.fullmatch(key) is None:
                 raise ValueError("evidence field name is invalid")
-            result[key] = tuple(dict.fromkeys(_validated_https(value) for value in urls))
+            result[key] = tuple(
+                dict.fromkeys(_validated_https(value) for value in urls)
+            )
         return result
 
 
@@ -463,7 +479,11 @@ class SQLiteAutomationContractRegistry:
             connection.commit()
         return contract
 
-    def get(self, app_slug: str, contract_version: str) -> BrowserAutomationContract | None:
+    def get(
+        self,
+        app_slug: str,
+        contract_version: str,
+    ) -> BrowserAutomationContract | None:
         self.initialize()
         with sqlite3.connect(self.db_path, timeout=10) as connection:
             row = connection.execute(
@@ -473,7 +493,7 @@ class SQLiteAutomationContractRegistry:
                 """,
                 (app_slug, contract_version),
             ).fetchone()
-        return BrowserAutomationContract.model_validate_json(row[0]) if row is not None else None
+        return _contract_from_row(row)
 
     def latest(self, app_slug: str) -> BrowserAutomationContract | None:
         self.initialize()
@@ -487,10 +507,13 @@ class SQLiteAutomationContractRegistry:
                 """,
                 (app_slug,),
             ).fetchone()
-        return BrowserAutomationContract.model_validate_json(row[0]) if row is not None else None
+        return _contract_from_row(row)
 
     def latest_fresh(
-        self, app_slug: str, *, now: datetime | None = None
+        self,
+        app_slug: str,
+        *,
+        now: datetime | None = None,
     ) -> BrowserAutomationContract | None:
         contract = self.latest(app_slug)
         if contract is None or contract.status != "active" or contract.is_expired(now=now):
@@ -499,16 +522,30 @@ class SQLiteAutomationContractRegistry:
 
 
 def evidence_hash_for(source_urls: tuple[str, ...] | list[str]) -> str:
-    canonical = json.dumps(sorted(set(source_urls)), separators=(",", ":")).encode("utf-8")
+    canonical = json.dumps(
+        sorted(set(source_urls)),
+        separators=(",", ":"),
+    ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 
 
-def _normalize_signup_field(value: str) -> str:
+def _contract_from_row(row: tuple[object, ...] | None) -> BrowserAutomationContract | None:
+    if row is None:
+        return None
+    if len(row) != 1 or not isinstance(row[0], (str, bytes, bytearray)):
+        raise RuntimeError("automation contract row is invalid")
+    return BrowserAutomationContract.model_validate_json(row[0])
+
+
+def _normalize_signup_field(value: str) -> SignupSemanticField:
     normalized = value.strip().casefold()
-    normalized = _SIGNUP_FIELD_ALIASES.get(normalized, normalized)
+    alias = _SIGNUP_FIELD_ALIASES.get(normalized)
+    if alias is not None:
+        return alias
     if normalized not in _SIGNUP_FIELDS:
         raise ValueError("signup semantic field is unsupported")
-    return normalized
+    # Membership in the typed finite set is the runtime narrowing proof.
+    return next(field for field in _SIGNUP_FIELDS if field == normalized)
 
 
 def _validated_https(value: str) -> str:
@@ -527,7 +564,9 @@ def _normalize_host_pattern(value: str) -> str:
     wildcard = normalized.startswith("*.")
     host = normalized[2:] if wildcard else normalized
     labels = host.split(".")
-    if len(labels) < 2 or any(_HOST_LABEL.fullmatch(label) is None for label in labels):
+    if len(labels) < 2 or any(
+        _HOST_LABEL.fullmatch(label) is None for label in labels
+    ):
         raise ValueError("contract host pattern is invalid")
     return f"*.{host}" if wildcard else host
 
