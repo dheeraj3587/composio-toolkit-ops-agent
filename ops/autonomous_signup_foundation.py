@@ -1,9 +1,10 @@
-"""RunService-facing bridge for autonomous signup Parts 6-13.
+"""RunService-facing bridge for autonomous signup Parts 6-14.
 
 The browser service chooses the session ID. Values are prepared UNBOUND for
 session creation, then immutably bound after the create response and before
-navigation. Parts 12-13 add durable recording for deterministic form detection
-and verified pre-submit filling. Submission remains a later phase.
+navigation. Parts 12-13 record deterministic form detection and verified
+pre-submit filling. Part 14 records a crash-safe, policy-authorized submission;
+classification of the provider response remains Part 15.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from ops.signup_state_machine import (
     SignupStateMachine,
     SignupStateSnapshot,
 )
+from ops.signup_submission import SignupSubmissionResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,7 +89,7 @@ class BoundSignupSession:
 
 
 class AutonomousSignupFoundation:
-    """Prepare, bind, and durably record pre-submit signup progress."""
+    """Prepare, bind, and durably record deterministic signup progress."""
 
     def __init__(
         self,
@@ -206,7 +208,7 @@ class AutonomousSignupFoundation:
         bound: BoundSignupSession,
         result: SignupFillResult,
     ) -> SignupStateSnapshot:
-        """Apply Part 13's verified result without ever advancing to submission."""
+        """Apply Part 13's verified result without advancing to submission."""
 
         self._assert_bound_session(bound)
         if result.contract_version != bound.automation_contract.contract_version:
@@ -257,6 +259,41 @@ class AutonomousSignupFoundation:
             SignupState.SIGNUP_SUBMISSION_READY,
             expected_revision=current.revision,
         )
+
+    def record_submission(
+        self,
+        bound: BoundSignupSession,
+        result: SignupSubmissionResult,
+    ) -> SignupStateSnapshot:
+        """Record only a completed effect-ledger submission as submitted.
+
+        Authorization denials, configuration gaps, and ambiguous outcomes leave the
+        run at ``signup_submission_ready``. The effect ledger then prevents a blind
+        retry while Part 15 reconciles the browser state.
+        """
+
+        self._assert_bound_session(bound)
+        if result.contract_version != bound.automation_contract.contract_version:
+            raise ValueError("signup submission belongs to another contract version")
+        current = self._signup_state_machine.snapshot(bound.run_id)
+
+        if result.status == "submitted":
+            if current.state == SignupState.SIGNUP_SUBMITTED:
+                return current
+            if current.state != SignupState.SIGNUP_SUBMISSION_READY:
+                raise RuntimeError("signup submission is not expected in the current state")
+            return self._signup_state_machine.advance(
+                bound.run_id,
+                SignupState.SIGNUP_SUBMITTED,
+                expected_revision=current.revision,
+            )
+
+        if current.state not in {
+            SignupState.SIGNUP_SUBMISSION_READY,
+            SignupState.SIGNUP_SUBMITTED,
+        }:
+            raise RuntimeError("signup submission result is not expected in the current state")
+        return current
 
     def get_values(self, *, run_id: str, session_id: str) -> ApprovedRunValues:
         return self._values_registry.get(run_id=run_id, session_id=session_id)
