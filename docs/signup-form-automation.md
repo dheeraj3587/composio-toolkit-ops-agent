@@ -100,8 +100,12 @@ cleared best-effort. On success, the result is
 `signup_form_filled_and_verified`, `submit_clicked` remains false, and the
 durable state advances only to `signup_submission_ready`.
 
-## Next boundary
+## Part 14 boundary
 
-Part 14 may evaluate the reviewed submit control and post-submit outcomes. It
-must not weaken any Part 12-13 ambiguity, secret, screenshot, or contract-version
-checks.
+Part 14 is implemented separately in
+`docs/signup-submission-authorization.md`. It preserves every Part 12-13
+ambiguity, secret, screenshot, binding, and contract-version invariant while
+adding purpose-aware submit authorization, live re-verification, and
+crash-safe effect-ledger dispatch.
+
+Post-submit result classification remains Part 15.
