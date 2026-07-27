@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - agent/autonomous-signup-foundation-complete
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -38,8 +39,14 @@ jobs:
                   raise SystemExit(f'{path}: expected one exact snippet, found {count}')
               target.write_text(text.replace(old, new, 1), encoding='utf-8')
 
-          canonical_object = '''        sensitive_data: object = None,\n        account_policy: str = "reuse_existing",\n        developer_app_policy: str = "reuse_existing",\n        credential_policy: str = "reuse_existing",'''
-          canonical_any = '''        sensitive_data: Any = None,\n        account_policy: str = "reuse_existing",\n        developer_app_policy: str = "reuse_existing",\n        credential_policy: str = "reuse_existing",'''
+          canonical_object = '''        sensitive_data: object = None,
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",'''
+          canonical_any = '''        sensitive_data: Any = None,
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",'''
 
           for path in (
               'tests/test_credential_capture_bundle.py',
@@ -48,7 +55,8 @@ jobs:
           ):
               replace_once(
                   path,
-                  '''        sensitive_data: object = None,\n        credential_creation_policy: str = "reuse_only",''',
+                  '''        sensitive_data: object = None,
+        credential_creation_policy: str = "reuse_only",''',
                   canonical_object,
               )
               replace_once(
@@ -58,7 +66,9 @@ jobs:
               )
               replace_once(
                   path,
-                  '''        sensitive_data: object = None,\n        credential_creation_policy: str = "reuse_only",\n        provider_session_id: object = None,''',
+                  '''        sensitive_data: object = None,
+        credential_creation_policy: str = "reuse_only",
+        provider_session_id: object = None,''',
                   canonical_object + '\n        provider_session_id: object = None,',
               )
 
@@ -72,8 +82,6 @@ jobs:
               'tests/test_owner_credential_submission.py',
               'tests/test_self_serve_browser.py',
           ):
-              # Their resume implementations raise immediately, so explicitly bind
-              # the canonical names without a catch-all and without weakening tests.
               replace_once(
                   path,
                   '    ) -> BrowserObservation:\n        raise AssertionError(',
@@ -82,7 +90,8 @@ jobs:
 
           replace_once(
               'tests/test_browser_service_phase3.py',
-              '''        sensitive_data: Any = None,\n        credential_creation_policy: str = "reuse_only",''',
+              '''        sensitive_data: Any = None,
+        credential_creation_policy: str = "reuse_only",''',
               canonical_any,
           )
           replace_once(
@@ -92,7 +101,9 @@ jobs:
           )
           replace_once(
               'tests/test_browser_service_phase3.py',
-              '''        sensitive_data: Any = None,\n        credential_creation_policy: str = "reuse_only",\n        provider_session_id: str | None = None,''',
+              '''        sensitive_data: Any = None,
+        credential_creation_policy: str = "reuse_only",
+        provider_session_id: str | None = None,''',
               canonical_any + '\n        provider_session_id: str | None = None,',
           )
           replace_once(
@@ -114,8 +125,23 @@ jobs:
 
           replace_once(
               'tests/test_signup_submission.py',
-              '''    page, submit = page_for(inspection)\n\n    result = await dispatch(\n        tmp_path,\n        page,\n        inspection,\n        fill_result,\n        capture_guard=False,''',
-              '''    page, submit = page_for(inspection)\n    page.gate_locators = []\n\n    result = await dispatch(\n        tmp_path,\n        page,\n        inspection,\n        fill_result,\n        capture_guard=False,''',
+              '''    page, submit = page_for(inspection)
+
+    result = await dispatch(
+        tmp_path,
+        page,
+        inspection,
+        fill_result,
+        capture_guard=False,''',
+              '''    page, submit = page_for(inspection)
+    page.gate_locators = []
+
+    result = await dispatch(
+        tmp_path,
+        page,
+        inspection,
+        fill_result,
+        capture_guard=False,''',
           )
 
           replace_once(
@@ -125,8 +151,20 @@ jobs:
           )
           replace_once(
               'ops/signup_result.py',
-              '''    if len(candidates) == 1:\n        outcome = next(iter(candidates))\n        return _classified(\n            contract,\n            outcome=outcome,\n            matched_contract_group=groups.get(outcome),\n        )''',
-              '''    if len(candidates) == 1:\n        sole_outcome = next(iter(candidates))\n        return _classified(\n            contract,\n            outcome=sole_outcome,\n            matched_contract_group=groups.get(sole_outcome),\n        )''',
+              '''    if len(candidates) == 1:
+        outcome = next(iter(candidates))
+        return _classified(
+            contract,
+            outcome=outcome,
+            matched_contract_group=groups.get(outcome),
+        )''',
+              '''    if len(candidates) == 1:
+        sole_outcome = next(iter(candidates))
+        return _classified(
+            contract,
+            outcome=sole_outcome,
+            matched_contract_group=groups.get(sole_outcome),
+        )''',
           )
 
           replace_once(
@@ -142,12 +180,22 @@ jobs:
           )
           replace_once(
               'ops/signup_submission_fields.py',
-              '''    required = set(\n        cast(\n            tuple[SignupSemanticField, ...],\n            contract.signup.required_semantic_fields,\n        )\n    )''',
+              '''    required = set(
+        cast(
+            tuple[SignupSemanticField, ...],
+            contract.signup.required_semantic_fields,
+        )
+    )''',
               '    required = set(contract.signup.required_semantic_fields)',
           )
           replace_once(
               'ops/playwright_signup.py',
-              '''    required = set(\n        cast(\n            tuple[SignupSemanticField, ...],\n            contract.signup.required_semantic_fields,\n        )\n    )''',
+              '''    required = set(
+        cast(
+            tuple[SignupSemanticField, ...],
+            contract.signup.required_semantic_fields,
+        )
+    )''',
               '    required = set(contract.signup.required_semantic_fields)',
           )
           PY
