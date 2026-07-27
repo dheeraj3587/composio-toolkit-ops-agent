@@ -73,8 +73,9 @@ class WorkflowBrowser(Protocol):
         research: OperationalResearch,
         *,
         sensitive_data: Mapping[str, str] | None = None,
-        account_creation_requested: bool = False,
-        credential_creation_policy: str = "reuse_only",
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
     ) -> BrowserObservation: ...
 
     async def resume_after_hitl(
@@ -84,7 +85,9 @@ class WorkflowBrowser(Protocol):
         research: OperationalResearch | None = None,
         *,
         sensitive_data: Mapping[str, str] | None = None,
-        credential_creation_policy: str = "reuse_only",
+        account_policy: str = "reuse_existing",
+        developer_app_policy: str = "reuse_existing",
+        credential_policy: str = "reuse_existing",
         provider_session_id: str | None = None,
     ) -> BrowserObservation: ...
 
@@ -197,7 +200,9 @@ class DurableOperationsWorkflow:
                 "thread_id": stable_thread_id,
                 "app_name": request.app_name,
                 "browser_provider": request.browser_provider,
-                "credential_creation_policy": request.credential_creation_policy,
+                "account_policy": request.account_policy,
+                "developer_app_policy": request.developer_app_policy,
+                "credential_policy": request.credential_policy,
                 "request": request.model_dump(mode="json"),
                 "status": "created",
                 "credential_refs": {},
@@ -516,25 +521,16 @@ class DurableOperationsWorkflow:
         sensitive_data = self._initial_sensitive_data.get(thread_id)
         try:
             request = OperationsRequest.model_validate(state["request"])
-            if request.account_creation_requested:
-                observation = _run_async(
-                    browser.navigate_onboarding(
-                        _browser_context(state),
-                        research,
-                        sensitive_data=sensitive_data,
-                        account_creation_requested=True,
-                        credential_creation_policy=request.credential_creation_policy,
-                    )
+            observation = _run_async(
+                browser.navigate_onboarding(
+                    _browser_context(state),
+                    research,
+                    sensitive_data=sensitive_data,
+                    account_policy=request.account_policy,
+                    developer_app_policy=request.developer_app_policy,
+                    credential_policy=request.credential_policy,
                 )
-            else:
-                observation = _run_async(
-                    browser.navigate_onboarding(
-                        _browser_context(state),
-                        research,
-                        sensitive_data=sensitive_data,
-                        credential_creation_policy=request.credential_creation_policy,
-                    )
-                )
+            )
         except PhaseUnavailableError as exc:
             return _unavailable_update(state, exc)
         except ProviderOperationError as exc:
@@ -581,9 +577,15 @@ class DurableOperationsWorkflow:
                     state.get("resume_signal", "completed"),
                     research,
                     sensitive_data=sensitive_data,
-                    credential_creation_policy=OperationsRequest.model_validate(
+                    account_policy=OperationsRequest.model_validate(
                         state["request"]
-                    ).credential_creation_policy,
+                    ).account_policy,
+                    developer_app_policy=OperationsRequest.model_validate(
+                        state["request"]
+                    ).developer_app_policy,
+                    credential_policy=OperationsRequest.model_validate(
+                        state["request"]
+                    ).credential_policy,
                     provider_session_id=(
                         provider_session if isinstance(provider_session, str) else None
                     ),

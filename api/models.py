@@ -17,7 +17,15 @@ from pydantic import (
 )
 
 from ops.models import OperationalResearch
-from ops.state import AccessRoute, BrowserProvider, CredentialCreationPolicy, RunStatus
+from ops.policies import (
+    AccountPolicy,
+    CredentialCreationPolicy,
+    CredentialPolicy,
+    DeveloperAppPolicy,
+    legacy_credential_creation_policy,
+    normalize_legacy_policy_payload,
+)
+from ops.state import AccessRoute, BrowserProvider, RunStatus
 
 CredentialFieldName = Annotated[
     str,
@@ -137,7 +145,9 @@ class CreateRunRequest(StrictApiModel):
     requested_scope_policy: Literal["minimum", "recommended", "maximum"] = "maximum"
     execution_mode: Literal["plan_only", "execute_when_configured"] = "plan_only"
     browser_provider: BrowserProvider = "browser_use"
-    credential_creation_policy: CredentialCreationPolicy = "reuse_only"
+    account_policy: AccountPolicy = "reuse_existing"
+    developer_app_policy: DeveloperAppPolicy = "reuse_existing"
+    credential_policy: CredentialPolicy = "reuse_existing"
     # Deprecated compatibility alias for execution_mode="plan_only". Only an
     # explicitly supplied dry_run=true carries intent; execution_mode is the single
     # canonical control and dry_run is never rewritten from it.
@@ -148,6 +158,15 @@ class CreateRunRequest(StrictApiModel):
     # creation; they are never persisted to run state, checkpoints, the ledger,
     # logs, or the IntegratorBundle.
     browser_login: BrowserLoginInput | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_historical_policies(cls, value: object) -> object:
+        return normalize_legacy_policy_payload(value)
+
+    @property
+    def credential_creation_policy(self) -> CredentialCreationPolicy:
+        return legacy_credential_creation_policy(self.credential_policy)
 
     @field_validator("outreach_recipient_override")
     @classmethod
@@ -275,7 +294,11 @@ class RunSummary(StrictApiModel):
     updated_at: str
     execution_mode: Literal["plan_only", "execute_when_configured"]
     browser_provider: BrowserProvider
-    credential_creation_policy: CredentialCreationPolicy
+    account_policy: AccountPolicy = "reuse_existing"
+    developer_app_policy: DeveloperAppPolicy = "reuse_existing"
+    credential_policy: CredentialPolicy = "reuse_existing"
+    # Deprecated response field kept during the compatibility window.
+    credential_creation_policy: CredentialCreationPolicy = "reuse_only"
     external_actions: bool
 
 

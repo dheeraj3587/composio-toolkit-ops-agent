@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import re
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NoReturn
@@ -14,6 +15,7 @@ import httpx
 from ops.attachment_extract import AttachmentRef, extract_secret_pairs, is_text_like
 from ops.config import Settings
 from ops.effect_ledger import EffectStore, SQLiteEffectStore
+from ops.gmail_identity import GmailAccountIdentity, identity_from_profile
 from ops.provider_errors import (
     ConfigurationRequiredError,
     PhaseUnavailableError,
@@ -63,6 +65,8 @@ _TOOL_REQUIRED_FIELDS: dict[str, frozenset[str]] = {
     "GMAIL_GET_PROFILE": frozenset({"user_id"}),
     "GMAIL_GET_ATTACHMENT": frozenset({"message_id", "attachment_id", "file_name"}),
 }
+_IDENTITY_CACHE_SECONDS = 300.0
+
 _SECRET_LINE = re.compile(
     r"(?im)\b(?P<kind>client[_ -]?secret|api[_ -]?key|access[_ -]?token|"
     r"refresh[_ -]?token)\s*[:=]\s*(?P<value>[^\s,;<>]{8,})"
@@ -131,6 +135,9 @@ class GmailWorker:
         self._session_id: str | None = None
         self._session: Any = None
         self._connection_lock = asyncio.Lock()
+        self._identity_lock = asyncio.Lock()
+        self._identity: GmailAccountIdentity | None = None
+        self._identity_expires_at = 0.0
 
     async def ensure_connected(self) -> str:
         self._require_configuration()
@@ -148,19 +155,72 @@ class GmailWorker:
                     capability="Composio Gmail connection",
                     reason_code="provider_request_failed",
                 ) from None
-            # GMAIL_GET_PROFILE is a best-effort health probe. Some connected
-            # accounts lack the read-only profile scope while still allowing
-            # send/fetch/reply, so a probe failure must not block outreach.
+            self._session_id = session_id
+            # Preserve existing send/fetch behavior when profile scope is absent,
+            # but cache a verified identity when the provider returns one. Signup
+            # calls the strict get_connected_identity() method below.
             try:
-                await asyncio.to_thread(
+                profile = await asyncio.to_thread(
                     self._execute_checked,
                     "GMAIL_GET_PROFILE",
                     {"user_id": self._settings.composio_user_id},
                 )
+                self._cache_identity(self._identity_from_profile(profile))
             except Exception:
                 pass
-            self._session_id = session_id
             return session_id
+
+    async def get_connected_identity(self) -> GmailAccountIdentity:
+        """Resolve the exact Gmail mailbox bound to the configured connection."""
+
+        await self.ensure_connected()
+        if self._identity is not None and time.monotonic() < self._identity_expires_at:
+            return self._identity
+        async with self._identity_lock:
+            if self._identity is not None and time.monotonic() < self._identity_expires_at:
+                return self._identity
+            try:
+                profile = await self._execute_read(
+                    "GMAIL_GET_PROFILE",
+                    {"user_id": self._settings.composio_user_id},
+                    capability="Composio Gmail identity",
+                )
+                identity = self._identity_from_profile(profile)
+            except (ConfigurationRequiredError, ProviderContractError, ProviderOperationError):
+                raise
+            except Exception:
+                raise ProviderContractError(
+                    phase=4,
+                    capability="Composio Gmail identity",
+                    reason_code="gmail_profile_incompatible",
+                ) from None
+            self._cache_identity(identity)
+            return identity
+
+    def _identity_from_profile(self, profile: Mapping[str, object]) -> GmailAccountIdentity:
+        connected_account = self._settings.composio_gmail_connected_account_id
+        if connected_account is None:
+            raise ConfigurationRequiredError(
+                phase=4,
+                capability="Composio Gmail identity",
+                reason_code="gmail_connected_account_missing",
+            )
+        try:
+            return identity_from_profile(
+                profile,
+                connected_account_id=str(connected_account),
+                composio_user_id=self._settings.composio_user_id,
+            )
+        except ValueError:
+            raise ProviderContractError(
+                phase=4,
+                capability="Composio Gmail identity",
+                reason_code="gmail_profile_incompatible",
+            ) from None
+
+    def _cache_identity(self, identity: GmailAccountIdentity) -> None:
+        self._identity = identity
+        self._identity_expires_at = time.monotonic() + _IDENTITY_CACHE_SECONDS
 
     async def send_outreach(
         self,
@@ -554,6 +614,8 @@ class GmailWorker:
         return sent
 
     async def close(self) -> None:
+        self._identity = None
+        self._identity_expires_at = 0.0
         client = self._sdk_client
         self._sdk_client = None
         if client is not None and callable(getattr(client, "close", None)):

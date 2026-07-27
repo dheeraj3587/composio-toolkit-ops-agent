@@ -6,9 +6,18 @@ import re
 from typing import Annotated, Literal
 from urllib.parse import parse_qsl, urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from ops.state import AccessRoute, BrowserProvider, CredentialCreationPolicy
+from ops.policies import (
+    AccountPolicy,
+    CredentialCreationPolicy,
+    CredentialPolicy,
+    DeveloperAppPolicy,
+    account_creation_requested,
+    legacy_credential_creation_policy,
+    normalize_legacy_policy_payload,
+)
+from ops.state import AccessRoute, BrowserProvider
 
 VAULT_REFERENCE_PATTERN = re.compile(r"^vault://[a-z0-9-]+/[a-z0-9_-]+/[A-Za-z0-9_-]+$")
 VaultReference = Annotated[str, Field(min_length=12, max_length=512)]
@@ -113,14 +122,30 @@ class OperationsRequest(StrictModel):
     # Immutable execution-engine choice. Older callers and checkpoints default to
     # Browser Use; the website sends its explicit operator selection.
     browser_provider: BrowserProvider = "browser_use"
-    # Immutable authorization boundary for developer-app/key creation. Legacy
-    # API/CLI callers remain read-only unless they opt in explicitly.
-    credential_creation_policy: CredentialCreationPolicy = "reuse_only"
+    # Three independent authorization boundaries. Account creation, developer-app
+    # creation, and credential creation are not interchangeable side effects.
+    account_policy: AccountPolicy = "reuse_existing"
+    developer_app_policy: DeveloperAppPolicy = "reuse_existing"
+    credential_policy: CredentialPolicy = "reuse_existing"
     dry_run: bool = True
-    # Explicit local intent only. It is never inferred from research, a browser
-    # page, or an LLM, and is forwarded only to the browser target selector.
-    account_creation_requested: bool = False
     outreach_recipient_override: str | None = Field(default=None, max_length=320)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_historical_policies(cls, value: object) -> object:
+        return normalize_legacy_policy_payload(value)
+
+    @property
+    def account_creation_requested(self) -> bool:
+        """Compatibility projection for older routing/worker code."""
+
+        return account_creation_requested(self.account_policy)
+
+    @property
+    def credential_creation_policy(self) -> CredentialCreationPolicy:
+        """Compatibility projection for older clients and stored audit vocabulary."""
+
+        return legacy_credential_creation_policy(self.credential_policy)
 
 
 class ScopeRequirement(StrictModel):

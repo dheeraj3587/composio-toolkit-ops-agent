@@ -8,6 +8,13 @@ from __future__ import annotations
 
 from typing import Literal, TypedDict
 
+from ops.policies import (
+    AccountPolicy,
+    CredentialCreationPolicy,
+    CredentialPolicy,
+    DeveloperAppPolicy,
+)
+
 AccessRoute = Literal[
     "self_serve",
     "approval_required",
@@ -17,7 +24,6 @@ AccessRoute = Literal[
     "unknown",
 ]
 BrowserProvider = Literal["browser_use", "playwright"]
-CredentialCreationPolicy = Literal["reuse_only", "create_if_missing"]
 
 RunStatus = Literal[
     "created",
@@ -143,6 +149,10 @@ class OperationsState(TypedDict, total=False):
     route_reason_code: str
     status: RunStatus
     browser_provider: BrowserProvider
+    account_policy: AccountPolicy
+    developer_app_policy: DeveloperAppPolicy
+    credential_policy: CredentialPolicy
+    # Historical top-level checkpoint field retained for readers of old state.
     credential_creation_policy: CredentialCreationPolicy
     state_revision: int
     last_projected_revision: int

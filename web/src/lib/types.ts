@@ -21,6 +21,10 @@ export type RunStatus =
   | "completed"
 
 export type ExecutionMode = "plan_only" | "execute_when_configured"
+export type AccountPolicy = "reuse_existing" | "create_if_missing"
+export type DeveloperAppPolicy = "reuse_existing" | "create_if_missing"
+export type CredentialPolicy = "reuse_existing" | "create_if_missing"
+/** @deprecated Use CredentialPolicy. */
 export type CredentialCreationPolicy = "reuse_only" | "create_if_missing"
 
 export interface RunSummary {
@@ -32,6 +36,10 @@ export interface RunSummary {
   access_route?: AccessRoute | null
   execution_mode: ExecutionMode
   browser_provider: BrowserProvider
+  account_policy: AccountPolicy
+  developer_app_policy: DeveloperAppPolicy
+  credential_policy: CredentialPolicy
+  /** @deprecated Transitional compatibility field from the API. */
   credential_creation_policy: CredentialCreationPolicy
   external_actions: boolean
   created_at: string
@@ -253,7 +261,9 @@ export interface OperationsRequestInput {
   requested_scope_policy: "minimum" | "recommended" | "maximum"
   execution_mode: ExecutionMode
   browser_provider: BrowserProvider
-  credential_creation_policy: CredentialCreationPolicy
+  account_policy: AccountPolicy
+  developer_app_policy: DeveloperAppPolicy
+  credential_policy: CredentialPolicy
   outreach_recipient_override: string | null
   // Optional app sign-in credentials for autonomous login. Injected into
   // the selected provider's secret boundary at session creation; never persisted.
