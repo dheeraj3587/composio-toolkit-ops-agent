@@ -1,28 +1,26 @@
-name: Agent autopatch
+name: Agent SDK compatibility patch
 
+# Temporary one-shot patcher. This file is removed before the PR merges.
 on:
-  push:
+  pull_request:
     branches:
-      - agent/playwright-demo-frontend-wiring
+      - main
 
 permissions:
   contents: write
 
 jobs:
   apply:
-    if: github.actor != 'github-actions[bot]'
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: agent/playwright-demo-frontend-wiring
+          ref: ${{ github.head_ref }}
           fetch-depth: 0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: web/package-lock.json
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -31,53 +29,481 @@ jobs:
             requirements.txt
             requirements-providers.txt
             requirements-dev.txt
-      - name: Apply narrow dependency contract updates
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Apply the verified SDK compatibility patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+          requirements = Path("requirements-providers.txt")
+          requirements.write_text(
+              """# External orchestration and provider adapters. Runtime calls remain configuration-gated.\nlanggraph==1.2.9\nlanggraph-checkpoint-sqlite==3.1.0\n\nbrowser-use-sdk==3.10.0\nplaywright==1.61.0\n\ncomposio==0.18.0\n\ngoogle-genai==2.12.1\nperplexityai==0.42.0\n# Published You.com Python SDK. The adapter uses the 2.3 Search/Contents surface\n# and degrades the optional structured Research fallback when those later request\n# fields are unavailable. Search + Contents + Gemini remain the assignment path.\nyoudotcom==2.3.0\n""",
+              encoding="utf-8",
+          )
+
+          path = Path("ops/you_research.py")
+          text = path.read_text(encoding="utf-8")
+          text = text.replace("import importlib\n", "import importlib\nimport inspect\n", 1)
+
+          old_contract = '''SDK contract (verified against the version pinned in
+``requirements-providers.txt`` — see ``tests/test_you_research.py::TestSdkContract``,
+which reads that pin and fails loudly if a future upgrade changes the surface):
+
+* ``search_post_async`` accepts ``include_domains`` as a JSON array of bare
+  domains; used as the provider-side first filter, with local policy validation
+  as the actual security boundary AFTER results return. The field is OMITTED when
+  there is nothing to filter on — an empty array is an empty allowlist, not
+  "unfiltered".
+* ``contents.generate_async`` accepts ``max_age`` and ``crawl_timeout`` and
+  ``formats`` (``markdown``/``html``/``metadata``); we request markdown only.
+* ``research_async`` accepts ``source_control`` (include_domains) and
+  ``output_schema`` and returns ``output.sources`` — so Research fallback uses
+  the SDK directly (no raw REST shim needed at this version).
+* Every SDK call auto-retries by default; we pass ONE explicit bounded
+  ``RetryConfig`` so retries are deterministic (429/5xx + connection errors,
+  bounded elapsed time) and never stack a second custom retry layer on top.
+* The ``You`` client is always used as an ``async with`` context manager so its
+  httpx client is closed within the same event loop that created it (the app
+  invokes enrichment via ``asyncio.run`` from sync code, so a persistent
+  loop-bound client would be unsafe).
+'''
+          new_contract = '''SDK contract (verified against the published version pinned in
+``requirements-providers.txt`` — see ``tests/test_you_research.py::TestSdkContract``):
+
+* ``search.unified_async`` is the 2.3 search operation. This release does not
+  expose ``include_domains`` on the SDK method, so discovery adds bounded
+  ``site:`` operators to the query and still applies the existing local host
+  policy to every returned URL.
+* ``contents.generate_async`` supports ``urls``, ``formats`` and
+  ``crawl_timeout``. Provider ``max_age`` is unavailable in 2.3, so freshness is
+  enforced by the existing local persistent-cache TTL.
+* ``research_async`` exists, but 2.3 does not expose ``source_control`` or
+  ``output_schema``. The optional Research fallback therefore returns no
+  candidates without making a provider request. The assignment keeps
+  ``YOU_RESEARCH_ENABLED=false`` and uses Search + Contents + Gemini.
+* ``RetryConfig`` in 2.3 accepts only ``strategy``, ``backoff`` and
+  ``retry_connection_errors``. One bounded SDK retry configuration is used.
+* The ``You`` client is always used as an ``async with`` context manager so its
+  httpx client is closed within the same event loop that created it.
+'''
+          text = replace_once(text, old_contract, new_contract, "module contract")
+
+          old_retry = '''def _bounded_retry_config() -> object:
+    """One explicit, bounded RetryConfig — the SDK's retry layer, made deterministic.
+
+    Only 429 and selected transient 5xx (plus connection errors) retry, with a
+    bounded total elapsed time. Client 4xx (400/401/402/403/404/422) are NOT in
+    the override set, so they never retry. This is the ONLY retry layer; no
+    custom retry loop wraps the SDK call.
+    """
+
+    retries = importlib.import_module("youdotcom.utils.retries")
+    return retries.RetryConfig(
+        strategy="backoff",
+        backoff=retries.BackoffStrategy(
+            initial_interval=500,
+            max_interval=8_000,
+            exponent=1.5,
+            max_elapsed_time=20_000,
+            jitter_ms=250,
+        ),
+        retry_connection_errors=True,
+        status_codes_override=["429", "500", "502", "503", "504"],
+    )
+'''
+          new_retry = '''def _bounded_retry_config() -> object:
+    """One bounded retry configuration matching the published 2.3 SDK.
+
+    Version 2.3 exposes only strategy, backoff and connection-error retry
+    controls. The outer asyncio timeout remains the total wall-clock bound, and
+    no second custom retry loop wraps the SDK call.
+    """
+
+    retries = importlib.import_module("youdotcom.utils.retries")
+    return retries.RetryConfig(
+        strategy="backoff",
+        backoff=retries.BackoffStrategy(
+            initial_interval=500,
+            max_interval=8_000,
+            exponent=1.5,
+            max_elapsed_time=20_000,
+        ),
+        retry_connection_errors=True,
+    )
+'''
+          text = replace_once(text, old_retry, new_retry, "retry config")
+
+          helper_anchor = '''# --------------------------------------------------------------------------
+# Cache helper (single-flight over the persistent cache)
+# --------------------------------------------------------------------------
+'''
+          helpers = '''def _accepts_keyword(target: object, keyword: str) -> bool:
+    """Whether a bound SDK operation accepts a keyword or arbitrary **kwargs."""
+
+    try:
+        parameters = inspect.signature(target).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == keyword or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _site_scoped_query(query: str, provider_domains: Sequence[str]) -> str:
+    """Scope 2.3 Search with official ``site:`` operators.
+
+    The published 2.3 SDK has no include_domains parameter. The site clause is a
+    credit-efficient provider hint only; local ResearchHostPolicy validation is
+    still the security boundary for every returned URL.
+    """
+
+    domains = tuple(
+        dict.fromkeys(
+            domain.removeprefix("*.").strip().casefold()
+            for domain in provider_domains[:10]
+            if domain.strip()
+        )
+    )
+    if not domains:
+        return query
+    sites = " OR ".join(f"site:{domain}" for domain in domains)
+    return f"{query} ({sites})"[:4_000]
+
+
+'''
+          text = replace_once(text, helper_anchor, helpers + helper_anchor, "SDK helpers")
+
+          old_search = '''        async def _factory() -> object:
+            youdotcom = importlib.import_module("youdotcom")
+            safesearch = importlib.import_module("youdotcom.models.safesearch")
+            kwargs: dict[str, Any] = {
+                "query": query,
+                "count": self._count,
+                "safesearch": safesearch.SafeSearch.STRICT,
+                "retries": _bounded_retry_config(),
+                "timeout_ms": int(self._timeout_seconds * 1000),
+            }
+            # An EMPTY include_domains is not "no filter" to the API — it is an
+            # empty allowlist. Omit the field entirely instead (the CLI probe
+            # deliberately searches without a domain filter).
+            if provider_domains:
+                kwargs["include_domains"] = list(provider_domains)
+            async with youdotcom.You(api_key_auth=self._api_key.get_secret_value()) as you:
+                return await you.search_post_async(**kwargs)
+'''
+          new_search = '''        async def _factory() -> object:
+            youdotcom = importlib.import_module("youdotcom")
+            safesearch = importlib.import_module("youdotcom.models.safesearch")
+            async with youdotcom.You(api_key_auth=self._api_key.get_secret_value()) as you:
+                legacy = getattr(you, "search_post_async", None)
+                operation = legacy if callable(legacy) else you.search.unified_async
+                scoped_query = query
+                kwargs: dict[str, Any] = {
+                    "query": query,
+                    "count": self._count,
+                    "safesearch": safesearch.SafeSearch.STRICT,
+                    "retries": _bounded_retry_config(),
+                    "timeout_ms": int(self._timeout_seconds * 1000),
+                }
+                if provider_domains:
+                    if _accepts_keyword(operation, "include_domains"):
+                        kwargs["include_domains"] = list(provider_domains)
+                    else:
+                        scoped_query = _site_scoped_query(query, provider_domains)
+                        kwargs["query"] = scoped_query
+                return await operation(**kwargs)
+'''
+          text = replace_once(text, old_search, new_search, "search operation")
+
+          old_contents = '''        async def _factory() -> object:
+            youdotcom = importlib.import_module("youdotcom")
+            formats = importlib.import_module("youdotcom.models.contentsformats")
+            async with youdotcom.You(api_key_auth=self._api_key.get_secret_value()) as you:
+                return await you.contents.generate_async(
+                    urls=safe_urls,
+                    formats=[formats.ContentsFormats.MARKDOWN],
+                    crawl_timeout=self._crawl_timeout,
+                    max_age=self._max_age,
+                    retries=_bounded_retry_config(),
+                    timeout_ms=int(self._request_timeout * 1000),
+                )
+'''
+          new_contents = '''        async def _factory() -> object:
+            youdotcom = importlib.import_module("youdotcom")
+            formats = importlib.import_module("youdotcom.models.contentsformats")
+            async with youdotcom.You(api_key_auth=self._api_key.get_secret_value()) as you:
+                operation = you.contents.generate_async
+                kwargs: dict[str, Any] = {
+                    "urls": safe_urls,
+                    "formats": [formats.ContentsFormats.MARKDOWN],
+                    "crawl_timeout": self._crawl_timeout,
+                    "retries": _bounded_retry_config(),
+                    "timeout_ms": int(self._request_timeout * 1000),
+                }
+                if self._max_age is not None and _accepts_keyword(operation, "max_age"):
+                    kwargs["max_age"] = self._max_age
+                return await operation(**kwargs)
+'''
+          text = replace_once(text, old_contents, new_contents, "contents operation")
+
+          old_research = '''        async def _factory() -> object:
+            youdotcom = importlib.import_module("youdotcom")
+            researchop = importlib.import_module("youdotcom.models.researchop")
+            async with youdotcom.You(api_key_auth=self._api_key.get_secret_value()) as you:
+                return await you.research_async(
+                    input=(
+                        f"Find the official login, signup, developer portal, API credential "
+                        f"management, and authentication documentation pages for {app_name}. "
+                        "Only cite official first-party pages."
+                    ),
+                    research_effort=researchop.ResearchEffort.STANDARD,
+                    source_control=researchop.SourceControl(include_domains=list(provider_domains)),
+                    output_schema=YOU_RESEARCH_SCHEMA,
+                    retries=_bounded_retry_config(),
+                    timeout_ms=int(self._timeout_seconds * 1000),
+                )
+'''
+          new_research = '''        async def _factory() -> object:
+            youdotcom = importlib.import_module("youdotcom")
+            async with youdotcom.You(api_key_auth=self._api_key.get_secret_value()) as you:
+                operation = you.research_async
+                if not (
+                    _accepts_keyword(operation, "source_control")
+                    and _accepts_keyword(operation, "output_schema")
+                ):
+                    # The published 2.3 SDK cannot make the constrained structured
+                    # fallback safely. Return no candidates without spending a call.
+                    return None
+                researchop = importlib.import_module("youdotcom.models.researchop")
+                source_control = getattr(researchop, "SourceControl", None)
+                if source_control is None:
+                    return None
+                return await operation(
+                    input=(
+                        f"Find the official login, signup, developer portal, API credential "
+                        f"management, and authentication documentation pages for {app_name}. "
+                        "Only cite official first-party pages."
+                    ),
+                    research_effort=researchop.ResearchEffort.STANDARD,
+                    source_control=source_control(include_domains=list(provider_domains)),
+                    output_schema=YOU_RESEARCH_SCHEMA,
+                    retries=_bounded_retry_config(),
+                    timeout_ms=int(self._timeout_seconds * 1000),
+                )
+'''
+          text = replace_once(text, old_research, new_research, "research operation")
+          path.write_text(text, encoding="utf-8")
+
+          tests = Path("tests/test_you_research.py")
+          test_text = tests.read_text(encoding="utf-8").replace("2.4.0", "2.3.0")
+          old_contract_tests = '''    def test_search_supports_include_domains(self) -> None:
+        import inspect
+
+        youdotcom = pytest.importorskip("youdotcom")
+        you = youdotcom.You(api_key_auth="dummy")
+        params = set(inspect.signature(you.search.unified).parameters)
+        assert "include_domains" in params
+        post = set(inspect.signature(you.search_post).parameters)
+        assert "include_domains" in post
+
+    def test_contents_supports_max_age(self) -> None:
+        import inspect
+
+        youdotcom = pytest.importorskip("youdotcom")
+        you = youdotcom.You(api_key_auth="dummy")
+        params = set(inspect.signature(you.contents.generate).parameters)
+        assert {"urls", "formats", "crawl_timeout", "max_age"} <= params
+
+    def test_research_supports_source_control_and_output_schema(self) -> None:
+        import inspect
+
+        youdotcom = pytest.importorskip("youdotcom")
+        you = youdotcom.You(api_key_auth="dummy")
+        assert hasattr(you, "research_async")
+        params = set(inspect.signature(you.research).parameters)
+        assert {"input", "research_effort", "source_control", "output_schema"} <= params
+'''
+          new_contract_tests = '''    def test_search_supports_published_unified_async(self) -> None:
+        import inspect
+
+        youdotcom = pytest.importorskip("youdotcom")
+        you = youdotcom.You(api_key_auth="dummy")
+        assert not hasattr(you, "search_post_async")
+        params = set(inspect.signature(you.search.unified_async).parameters)
+        assert {"query", "count", "safesearch", "retries", "timeout_ms"} <= params
+        assert "include_domains" not in params
+
+    def test_contents_supports_published_surface(self) -> None:
+        import inspect
+
+        youdotcom = pytest.importorskip("youdotcom")
+        you = youdotcom.You(api_key_auth="dummy")
+        params = set(inspect.signature(you.contents.generate_async).parameters)
+        assert {"urls", "formats", "crawl_timeout", "retries", "timeout_ms"} <= params
+        assert "max_age" not in params
+
+    def test_research_fallback_fields_are_unavailable_in_2_3(self) -> None:
+        import inspect
+
+        youdotcom = pytest.importorskip("youdotcom")
+        you = youdotcom.You(api_key_auth="dummy")
+        params = set(inspect.signature(you.research_async).parameters)
+        assert {"input", "research_effort", "retries", "timeout_ms"} <= params
+        assert "source_control" not in params
+        assert "output_schema" not in params
+'''
+          test_text = replace_once(
+              test_text, old_contract_tests, new_contract_tests, "SDK contract tests"
+          )
+
+          old_fake_search = '''        class _Search:
+            async def unified_async(self, **kw: object) -> object:
+                raise AssertionError("adapter must use search_post_async, not unified_async")
+'''
+          new_fake_search = '''        class _Search:
+            async def unified_async(
+                self,
+                *,
+                query: str,
+                count: int = 10,
+                safesearch: object = None,
+                retries: object = None,
+                timeout_ms: int | None = None,
+            ) -> object:
+                outer.search_calls.append(
+                    {
+                        "query": query,
+                        "count": count,
+                        "safesearch": safesearch,
+                        "retries": retries,
+                        "timeout_ms": timeout_ms,
+                    }
+                )
+                if outer._raise is not None:
+                    raise outer._raise
+                return outer._search_response
+'''
+          test_text = replace_once(test_text, old_fake_search, new_fake_search, "fake search")
+          old_legacy_method = '''    async def search_post_async(self, **kw: object) -> object:
+        self.search_calls.append(kw)
+        if self._raise is not None:
+            raise self._raise
+        return self._search_response
+
+'''
+          test_text = replace_once(test_text, old_legacy_method, "", "legacy fake search")
+          test_text = test_text.replace(
+              "def test_two_queries_with_include_domains_and_strict_safesearch(",
+              "def test_two_site_scoped_queries_with_strict_safesearch(",
+              1,
+          )
+          test_text = replace_once(
+              test_text,
+              '        assert "pipedrive.com" in first["include_domains"]  # bare wildcard sent\n',
+              '        assert "site:pipedrive.com" in first["query"]\n',
+              "search assertion",
+          )
+          test_text = test_text.replace(
+              "def test_max_pages_and_markdown_only_and_max_age_sent(",
+              "def test_max_pages_and_markdown_only_with_local_cache_age(",
+              1,
+          )
+          test_text = replace_once(
+              test_text,
+              '        assert call["max_age"] == 1234\n',
+              '        assert "max_age" not in call  # 2.3 freshness is enforced by the local cache TTL\n',
+              "contents assertion",
+          )
+          tests.write_text(test_text, encoding="utf-8")
+
+          docs = Path("docs/YOU_COM_INTEGRATION.md")
+          doc = docs.read_text(encoding="utf-8").replace("2.4.0", "2.3.0")
+          doc = doc.replace(
+              "-> Existing routing and Browser Use workflow (unchanged)",
+              "-> Existing routing and provider-selected browser workflow",
+          )
+          sdk_start = doc.index("## SDK: pinned and verified")
+          sdk_end = doc.index("## Exact vs. wildcard host semantics")
+          sdk_section = '''## SDK: pinned and verified (`youdotcom==2.3.0`)
+
+The official PyPI release is pinned in `requirements-providers.txt`, and the
+real installed signatures are checked offline by
+`tests/test_you_research.py::TestSdkContract`:
+
+* Search uses `search.unified_async`. The 2.3 method has no `include_domains`,
+  so the adapter appends bounded `site:` operators to the query and still drops
+  every result that fails `ResearchHostPolicy`.
+* Contents uses `contents.generate_async` with Markdown, crawl timeout and the
+  bounded SDK retry configuration. Version 2.3 has no provider `max_age`; the
+  persistent research cache enforces the configured freshness TTL locally.
+* `research_async` exists, but 2.3 has no constrained `source_control` or
+  structured `output_schema`. The optional Research fallback therefore makes no
+  request and returns no candidates. The assignment keeps `YOU_RESEARCH_ENABLED=false`.
+* `RetryConfig` accepts only strategy, backoff and connection-error retry in
+  this version. The outer asyncio timeout remains the total time bound.
+* Every `You` client is used with `async with` cleanup.
+
+'''
+          doc = doc[:sdk_start] + sdk_section + doc[sdk_end:]
+          filter_start = doc.index("## Provider `include_domains` + local validation")
+          filter_end = doc.index("## Persistent cache")
+          filter_section = '''## Provider query scoping + local validation
+
+The published 2.3 SDK does not expose `include_domains`. Search therefore adds
+bounded official-domain `site:` operators to each of the two discovery queries.
+This saves credits by biasing results toward reviewed hosts, but it is not the
+security boundary: every returned URL is still revalidated by
+`ResearchHostPolicy.validate_candidate_url`, and off-policy results are dropped.
+News results, live crawl, domain boosting and exclusion lists are not used.
+
+'''
+          doc = doc[:filter_start] + filter_section + doc[filter_end:]
+          research_start = doc.index("## Research fallback condition")
+          research_end = doc.index("## Field-level operational-URL evidence")
+          research_section = '''## Research fallback condition
+
+The assignment's operational path is You Search + You Contents + Gemini strict
+extraction. `YOU_RESEARCH_ENABLED` remains false because the published 2.3 SDK
+does not expose the domain-constrained structured fields required by this
+fallback. If the fallback is constructed accidentally, it detects the missing
+keywords and returns no candidates without spending a Research call.
+
+'''
+          doc = doc[:research_start] + research_section + doc[research_end:]
+          docs.write_text(doc, encoding="utf-8")
+          PY
+      - name: Commit the compatibility patch
         shell: bash
         run: |
           set -euo pipefail
-          sed -i 's/2\.5\.0/2.4.0/g' tests/test_you_research.py docs/YOU_COM_INTEGRATION.md
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          path = Path("web/package.json")
-          data = json.loads(path.read_text(encoding="utf-8"))
-          overrides = data.setdefault("overrides", {})
-          overrides.update(
-              {
-                  "brace-expansion@^1.0.0": "1.1.16",
-                  "brace-expansion@^2.0.0": "2.1.2",
-                  "brace-expansion@^3.0.0": "3.0.2",
-                  "brace-expansion@^5.0.0": "5.0.8",
-              }
-          )
-          path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add requirements-providers.txt ops/you_research.py tests/test_you_research.py docs/YOU_COM_INTEGRATION.md
+          git commit -m "fix(you): support the published 2.3 SDK"
+          git push origin HEAD:${{ github.head_ref }}
+      - name: Run existing offline checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --requirement requirements-dev.txt
+          python -m compileall api ops browser_service
+          python -m pytest tests/test_you_research.py -q
           cd web
-          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
           npm ci --no-audit --no-fund
           npm audit --audit-level=high
           npm run lint
           npm run typecheck
           npm run test
           npm run build
-          cd ..
-          python -m pip install --requirement requirements-dev.txt
-          python -m pytest tests/test_you_research.py::TestSdkContract -q
-      - name: Commit generated lockfile and contract sync
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add \
-            requirements-providers.txt \
-            tests/test_you_research.py \
-            docs/YOU_COM_INTEGRATION.md \
-            web/package.json \
-            web/package-lock.json
-          if git diff --cached --quiet; then
-            exit 0
-          fi
-          git commit -m "fix: synchronize provider and frontend dependency contracts"
-          git push origin HEAD:agent/playwright-demo-frontend-wiring
