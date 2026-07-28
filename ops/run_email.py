@@ -27,6 +27,7 @@ from ops.models import CompanyProfile, OperationalResearch, OperationsRequest
 from ops.provider_errors import ProviderContractError, ProviderOperationError
 from ops.run_errors import CredentialSubmissionError, RunConflictError
 from ops.run_projections import _public_run, _strip_quoted_reply
+from ops.run_recipe_snapshot import RecipeSnapshotError, recipe_from_run
 from ops.state import RunStatus, validate_status_transition
 from ops.storage import OperationsStorage
 
@@ -85,10 +86,6 @@ class RunEmailService:
                 self._context.poll_waiting_runs()
             except Exception:  # pragma: no cover - the loop must never die
                 pass
-            try:
-                self._context.resolve_pending_otps()
-            except Exception:  # pragma: no cover - the loop must never die
-                pass
 
     def poll_waiting_runs(self, *, limit: int = 100) -> int:
         """Poll every run awaiting a provider reply; returns how many were polled.
@@ -102,6 +99,8 @@ class RunEmailService:
             return 0
         polled = 0
         for record in context.storage.list_runs(limit=limit, offset=0):
+            if record.get("state_engine") != "canonical_v1":
+                continue
             if record.get("status") not in {"waiting_for_reply", "outreach_sent"}:
                 continue
             run_id = str(record.get("run_id") or "")
@@ -144,6 +143,23 @@ class RunEmailService:
             return OperationsRequest.model_validate(dict(request_payload)).company
         except Exception:
             return None
+
+    def company_from_record(self, record: Mapping[str, object]) -> CompanyProfile | None:
+        """Read canonical company data from the SQLite request snapshot.
+
+        Legacy records remain readable through their checkpoint, but no new run
+        depends on LangGraph or its encryption key.
+        """
+
+        request_payload = record.get("request")
+        if isinstance(request_payload, Mapping):
+            try:
+                return OperationsRequest.model_validate(dict(request_payload)).company
+            except Exception:
+                return None
+        if record.get("state_engine") == "canonical_v1":
+            return None
+        return self.company_from_checkpoint(str(record.get("thread_id") or ""))
 
     def email_credentials_bundle_change(
         self,
@@ -212,6 +228,14 @@ class RunEmailService:
             current = context.storage.get_run(run_id)
             if current is None:
                 raise KeyError("run was not found")
+            if current.get("state_engine") != "canonical_v1":
+                raise CredentialSubmissionError("legacy_run_is_read_only")
+            try:
+                recipe = recipe_from_run(current)
+            except RecipeSnapshotError as exc:
+                raise CredentialSubmissionError(exc.reason_code) from None
+            if recipe.route_kind != "gated":
+                raise CredentialSubmissionError("run_is_not_gated")
             if current["status"] not in {"waiting_for_reply", "outreach_sent"}:
                 raise CredentialSubmissionError("run_not_awaiting_reply")
             thread_id = current.get("gmail_thread_id")
@@ -244,7 +268,7 @@ class RunEmailService:
             ai_reply_body: str | None = None
             classified_by = "heuristic"
             assistant = build_email_assistant(settings)
-            company = self.company_from_checkpoint(str(current.get("thread_id") or ""))
+            company = self.company_from_record(current)
             if reply_text and assistant is not None and company is not None:
                 try:
                     ai = assistant.analyze_reply(

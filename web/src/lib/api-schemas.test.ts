@@ -6,9 +6,128 @@ import {
   appResearchResponseSchema,
   browserUiStateSchema,
   liveViewResponseSchema,
+  managedConnectionResponseSchema,
+  runDetailResponseSchema,
+  runSummarySchema,
 } from "@/lib/api-schemas"
 
 const RUN_ID = "run_0123456789abcdef0123456789abcdef"
+
+const canonicalRun = {
+  run_id: RUN_ID,
+  thread_id: "thread_canonical_123",
+  app_name: "GitHub",
+  app_slug: "github",
+  status: "connection_required",
+  access_route: "self_serve",
+  created_at: "2026-07-28T10:00:00Z",
+  updated_at: "2026-07-28T10:01:00Z",
+  execution_mode: "execute_when_configured",
+  browser_provider: "playwright",
+  credential_creation_policy: "create_if_missing",
+  recipe_version: "2026-07-28.v1",
+  route_kind: "managed_auth",
+  readiness_tier: "managed_auth_ready",
+  attempt: 0,
+  phase: "connection_required",
+  reason_code: "managed_connection_required",
+  state_engine: "canonical_v1",
+  external_actions: false,
+}
+
+describe("canonical route contracts", () => {
+  it("accepts immutable recipe, route, provider, readiness, and state metadata", () => {
+    const parsed = runSummarySchema.safeParse(canonicalRun)
+
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.status).toBe("connection_required")
+      expect(parsed.data.route_kind).toBe("managed_auth")
+      expect(parsed.data.recipe_version).toBe("2026-07-28.v1")
+      expect(parsed.data.state_engine).toBe("canonical_v1")
+    }
+  })
+
+  it("defaults new metadata only for a structurally valid legacy response", () => {
+    const legacy = { ...canonicalRun }
+    for (const field of [
+      "recipe_version",
+      "route_kind",
+      "readiness_tier",
+      "attempt",
+      "phase",
+      "reason_code",
+      "state_engine",
+    ] as const) {
+      delete legacy[field]
+    }
+
+    const parsed = runSummarySchema.safeParse({ ...legacy, status: "completed" })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.recipe_version).toBeNull()
+      expect(parsed.data.route_kind).toBeNull()
+      expect(parsed.data.phase).toBe("legacy")
+      expect(parsed.data.state_engine).toBe("legacy")
+    }
+  })
+
+  it("accepts one strict backend-authorized primary action", () => {
+    const parsed = runDetailResponseSchema.safeParse({
+      run: canonicalRun,
+      research: null,
+      phases: null,
+      security: null,
+      primary_action: {
+        kind: "connect_account",
+        enabled: true,
+        reason_code: "managed_connection_required",
+      },
+    })
+
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.primary_action?.kind).toBe("connect_account")
+    }
+    expect(
+      runDetailResponseSchema.safeParse({
+        run: canonicalRun,
+        research: null,
+        phases: null,
+        security: null,
+        primary_action: {
+          kind: "invented_action",
+          enabled: true,
+          reason_code: "drift",
+        },
+      }).success,
+    ).toBe(false)
+  })
+
+  it("accepts an ephemeral HTTPS provider redirect and rejects unsafe redirects", () => {
+    const response = {
+      run: canonicalRun,
+      connection_request_id: "conn_request_123",
+      state: "pending",
+      redirect_url: "https://accounts.example.com/oauth/authorize?state=opaque&token=opaque",
+      replayed: false,
+    }
+
+    expect(managedConnectionResponseSchema.safeParse(response).success).toBe(true)
+    expect(
+      managedConnectionResponseSchema.safeParse({
+        ...response,
+        redirect_url: "http://accounts.example.com/oauth/authorize",
+      }).success,
+    ).toBe(false)
+    expect(
+      managedConnectionResponseSchema.safeParse({
+        ...response,
+        redirect_url: "https://user:password@accounts.example.com/oauth/authorize", // pragma: allowlist secret
+      }).success,
+    ).toBe(false)
+  })
+})
 
 const explicitNullResponse = {
   app: {
@@ -295,13 +414,13 @@ describe("live view contract synchronization", () => {
     }
   })
 
-  it("rejects an interactive grant that claims read-only access", () => {
+  it("accepts an interactive grant with server-enforced read-only access", () => {
     expect(
       liveViewResponseSchema.safeParse({
         ...interactive,
         interaction_available: false,
       }).success,
-    ).toBe(false)
+    ).toBe(true)
   })
 
   it("rejects a viewer path that addresses a different run", () => {

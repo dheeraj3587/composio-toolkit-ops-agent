@@ -2,6 +2,9 @@
 
 FROM python:3.11-slim
 
+ARG APP_REVISION=local-uncommitted
+LABEL org.opencontainers.image.revision=$APP_REVISION
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -29,7 +32,7 @@ COPY requirements-api.txt requirements-providers.txt ./
 # NOTE: no Chromium binary is installed here, deliberately. The Python package
 # alone cannot launch a browser, which is why BROWSER_PROVIDER=playwright must
 # point at the separate browser service (see Dockerfile.browser and
-# compose.assignment.yaml). Running a browser inside the control-plane container
+# compose.prod.yaml). Running a browser inside the control-plane container
 # would let a crash or memory spike take down the API.
 RUN python -m pip install --no-cache-dir \
     --requirement requirements-api.txt \
@@ -45,7 +48,7 @@ RUN find /app/api /app/ops /app/data/p1 -type d -exec chmod 0555 {} + \
 
 USER ops
 # /private preserves the development default; /data is the production mount;
-# /vault is the SHARED credential vault the assignment stack mounts so the browser
+# /vault is the SHARED credential vault the production stack mounts so the browser
 # service can resolve one-time `vault://` references. All are pre-created owned by
 # "ops" with mode 0700 so a first-run named volume inherits that ownership and the
 # application's private-file permission checks (ops/private_files.py) pass under

@@ -1,12 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
+  connectManagedRun: vi.fn(),
   getLiveView: vi.fn(),
+  pollManagedConnection: vi.fn(),
+  redirect: vi.fn(),
   revalidatePath: vi.fn(),
 }))
 
 vi.mock("server-only", () => ({}))
 vi.mock("next/cache", () => ({ revalidatePath: mocks.revalidatePath }))
+vi.mock("next/navigation", () => ({ redirect: mocks.redirect }))
 vi.mock("@/lib/api", () => {
   class ApiError extends Error {
     constructor(
@@ -20,14 +24,21 @@ vi.mock("@/lib/api", () => {
   return {
     ApiError,
     PhaseConflictError: class PhaseConflictError extends ApiError {},
+    connectManagedRun: mocks.connectManagedRun,
     getLiveView: mocks.getLiveView,
+    pollManagedConnection: mocks.pollManagedConnection,
     performPhaseAction: vi.fn(),
     resumeWithBrowserLogin: vi.fn(),
     submitCredentials: vi.fn(),
   }
 })
 
-import { openLiveView, type LiveViewState } from "@/app/runs/[runId]/actions"
+import {
+  openLiveView,
+  runManagedConnectionAction,
+  type LiveViewState,
+  type ManagedConnectionActionState,
+} from "@/app/runs/[runId]/actions"
 
 const RUN_ID = "run_11111111111111111111111111111111"
 const initialState: LiveViewState = {
@@ -47,6 +58,73 @@ function runForm(): FormData {
   form.set("run_id", RUN_ID)
   return form
 }
+
+const initialManagedState: ManagedConnectionActionState = {
+  message: null,
+  tone: "neutral",
+  state: null,
+}
+
+function managedForm(operation: "connect" | "poll"): FormData {
+  const form = runForm()
+  form.set("managed_action", operation)
+  return form
+}
+
+describe("managed connection actions", () => {
+  beforeEach(() => {
+    mocks.connectManagedRun.mockReset()
+    mocks.pollManagedConnection.mockReset()
+    mocks.redirect.mockReset()
+    mocks.revalidatePath.mockReset()
+  })
+
+  it("starts managed auth and immediately redirects to the ephemeral provider URL", async () => {
+    mocks.connectManagedRun.mockResolvedValue({
+      run: { run_id: RUN_ID },
+      connection_request_id: "conn_123",
+      state: "pending",
+      redirect_url: "https://accounts.example.com/oauth/authorize?state=opaque",
+      replayed: false,
+    })
+
+    await runManagedConnectionAction(initialManagedState, managedForm("connect"))
+
+    expect(mocks.connectManagedRun).toHaveBeenCalledWith(RUN_ID)
+    expect(mocks.revalidatePath).toHaveBeenCalledWith(`/runs/${RUN_ID}`)
+    expect(mocks.redirect).toHaveBeenCalledWith(
+      "https://accounts.example.com/oauth/authorize?state=opaque",
+    )
+  })
+
+  it("polls only the existing request and reports active state", async () => {
+    mocks.pollManagedConnection.mockResolvedValue({
+      run: { run_id: RUN_ID },
+      connection_request_id: "conn_123",
+      state: "active",
+      redirect_url: null,
+      replayed: false,
+    })
+
+    const result = await runManagedConnectionAction(initialManagedState, managedForm("poll"))
+
+    expect(mocks.pollManagedConnection).toHaveBeenCalledWith(RUN_ID)
+    expect(mocks.connectManagedRun).not.toHaveBeenCalled()
+    expect(result).toMatchObject({ state: "active", tone: "neutral" })
+    expect(mocks.redirect).not.toHaveBeenCalled()
+  })
+
+  it("rejects an invalid run before calling either managed endpoint", async () => {
+    const form = managedForm("connect")
+    form.set("run_id", "../../other-run")
+
+    const result = await runManagedConnectionAction(initialManagedState, form)
+
+    expect(result.tone).toBe("error")
+    expect(mocks.connectManagedRun).not.toHaveBeenCalled()
+    expect(mocks.pollManagedConnection).not.toHaveBeenCalled()
+  })
+})
 
 describe("openLiveView", () => {
   beforeEach(() => mocks.getLiveView.mockReset())

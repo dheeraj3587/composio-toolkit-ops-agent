@@ -13,7 +13,6 @@ from typing import Any, Protocol, cast
 
 from pydantic import SecretStr
 
-from ops import runtime_extensions
 from ops.browser_api_trace_catalog import get_browser_api_trace
 from ops.browser_worker import BrowserObservation, BrowserSessionContext
 from ops.config import Settings
@@ -373,17 +372,8 @@ class DurableOperationsWorkflow:
         }
 
     def _route(self, state: OperationsState) -> dict[str, object]:
-        """Select the access route, honoring an installed routing override.
+        """Select the legacy access route without process-global overrides."""
 
-        The override receives this workflow and the state, exactly as the core node
-        does, and may call :meth:`_core_route` to build on the core decision instead
-        of replacing it. Dispatch happens per call, so an override applies no matter
-        which module the deciding code lives in.
-        """
-
-        override = runtime_extensions.active().route
-        if override is not None:
-            return override(self, state)
         return self._core_route(state)
 
     def _core_route(self, state: OperationsState) -> dict[str, object]:
@@ -415,11 +405,8 @@ class DurableOperationsWorkflow:
         }
 
     def _after_route(self, state: OperationsState) -> str:
-        """Pick the next node after routing, honoring an installed override."""
+        """Pick the next node in the legacy workflow."""
 
-        override = runtime_extensions.active().after_route
-        if override is not None:
-            return override(self, state)
         return self._core_after_route(state)
 
     def _core_after_route(self, state: OperationsState) -> str:
@@ -649,11 +636,8 @@ class DurableOperationsWorkflow:
         return update
 
     def _after_browser(self, state: OperationsState) -> str:
-        """Pick the next node after the browser, honoring an installed override."""
+        """Pick the next node after the legacy browser step."""
 
-        override = runtime_extensions.active().after_browser
-        if override is not None:
-            return override(self, state)
         return self._core_after_browser(state)
 
     def _core_after_browser(self, state: OperationsState) -> str:

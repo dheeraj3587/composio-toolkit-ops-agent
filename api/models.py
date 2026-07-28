@@ -16,6 +16,7 @@ from pydantic import (
     model_validator,
 )
 
+from ops.app_recipes import ReadinessTier, RouteKind
 from ops.models import OperationalResearch
 from ops.state import AccessRoute, BrowserProvider, CredentialCreationPolicy, RunStatus
 
@@ -214,6 +215,9 @@ class PhaseState(StrictApiModel):
 
 class ProviderState(StrictApiModel):
     provider: Literal[
+        "recipes",
+        "composio_managed_auth",
+        "gmail",
         "langgraph",
         "vault",
         "perplexity",
@@ -276,7 +280,30 @@ class RunSummary(StrictApiModel):
     execution_mode: Literal["plan_only", "execute_when_configured"]
     browser_provider: BrowserProvider
     credential_creation_policy: CredentialCreationPolicy
+    recipe_version: str | None = None
+    route_kind: RouteKind | None = None
+    readiness_tier: ReadinessTier | None = None
+    attempt: int = Field(default=0, ge=0)
+    phase: str = "legacy"
+    reason_code: ReasonCode | None = None
+    state_engine: Literal["canonical_v1", "legacy"] = "legacy"
     external_actions: bool
+
+
+class PrimaryAction(StrictApiModel):
+    """The single backend-authorized next action for one run."""
+
+    kind: Literal[
+        "connect_account",
+        "poll_connection",
+        "open_browser",
+        "submit_credentials",
+        "review_outreach",
+        "poll_reply",
+        "none",
+    ]
+    enabled: bool
+    reason_code: ReasonCode
 
 
 # The browser session's observable lifecycle, as the backend actually recorded it.
@@ -334,6 +361,22 @@ class RunDetailResponse(StrictApiModel):
     # Explicit browser permissions. Optional for contract compatibility with
     # existing clients, but always populated by this API.
     browser: BrowserUiState | None = None
+    primary_action: PrimaryAction | None = None
+
+
+class ManagedConnectionResponse(StrictApiModel):
+    """Immediate managed-auth result; redirect_url is ephemeral and no-store."""
+
+    run: RunSummary
+    connection_request_id: str = Field(min_length=1, max_length=200)
+    state: Literal["pending", "active", "terminal"]
+    redirect_url: BoundedHttpUrl | None = None
+    replayed: bool = False
+
+    @field_validator("redirect_url")
+    @classmethod
+    def redirect_is_https(cls, value: str | None) -> str | None:
+        return _validate_http_url(value) if value is not None else None
 
 
 class RunListResponse(StrictApiModel):
@@ -372,7 +415,9 @@ class LiveViewResponse(StrictApiModel):
       client polls ``screenshot_url`` for masked PNG frames. Frames are viewable
       but not interactive, so ``interaction_available`` is False.
     * ``interactive_remote`` — an exact, short-lived private grant consumed by the
-      Next.js server and converted to the reviewed same-origin viewer path.
+      Next.js server and converted to the reviewed same-origin viewer path. It may
+      be server-enforced view-only while automation is running; control is exposed
+      only when ``interaction_available`` is true.
     * ``unavailable`` — no viewer exists, so no viewer URL may be present.
 
     ``screenshot_url`` is a bounded same-origin API path. ``interactive_url`` is
@@ -477,7 +522,7 @@ class RetryRequest(StrictApiModel):
 
 class ActionReceipt(StrictApiModel):
     run_id: str
-    action: Literal["resume", "poll_email", "retry"]
+    action: Literal["resume", "poll_email", "retry", "send_outreach"]
     status: Literal["accepted", "configuration_required", "no_change"] = "accepted"
     detail: str | None = None
 
@@ -512,21 +557,6 @@ class IntegratorBundleView(StrictApiModel):
 class RunOutputResponse(StrictApiModel):
     run_id: str
     integrator_bundle: IntegratorBundleView
-
-
-class RevealCredentialsResponse(StrictApiModel):
-    """Owner-only, loopback-only raw credential reveal.
-
-    This is the single, deliberate boundary where obtained credential VALUES
-    cross the API, for the authenticated owner who initiated the run to use
-    directly in their own application. The values are resolved live from the
-    encrypted vault via the run's ``vault://`` references; they are never
-    persisted to run state, checkpoints, the ledger, logs, or Git. Everywhere
-    else in the contract credentials remain reference-only.
-    """
-
-    run_id: str
-    credentials: dict[CredentialFieldName, str] = Field(min_length=1, max_length=20)
 
 
 class SnapshotHealth(StrictApiModel):

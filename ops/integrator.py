@@ -16,6 +16,7 @@ from ops.models import (
 
 BundleStage = Literal[
     "normal",
+    "managed_connection_ready",
     "awaiting_provider",
     "human_action_required",
     "blocked",
@@ -43,6 +44,7 @@ def build_integrator_bundle(
     readiness = _readiness(
         route=research.access_route,
         refs_present=bool(refs),
+        provider_account_ready=bool(provider_account_id),
         validation=validation,
         capabilities=capabilities,
         stage=stage,
@@ -79,6 +81,7 @@ def _readiness(
     *,
     route: str,
     refs_present: bool,
+    provider_account_ready: bool,
     validation: CredentialValidationResult | None,
     capabilities: tuple[CapabilityAvailability, ...],
     stage: BundleStage,
@@ -92,6 +95,8 @@ def _readiness(
 ]:
     if stage == "failed":
         return "failed"
+    if stage == "managed_connection_ready":
+        return "credentials_ready" if provider_account_ready else "configuration_required"
     if stage == "blocked" or route == "blocked":
         return "blocked"
     if stage == "human_action_required":

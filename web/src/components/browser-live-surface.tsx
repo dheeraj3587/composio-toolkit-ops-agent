@@ -35,9 +35,8 @@ export function BrowserLiveSurface({
   remoteViewRef: RefObject<PlaywrightRemoteViewHandle | null>
 }) {
   const interactiveViewVisible =
-    isInteractiveHitl &&
+    isPlaywright &&
     liveState.mode === "interactive_remote" &&
-    liveState.interactionAvailable &&
     liveState.interactivePath !== null
   const providerLabel =
     (liveState.provider ?? (isPlaywright ? "playwright" : "browser_use")) === "playwright"
@@ -56,7 +55,7 @@ export function BrowserLiveSurface({
             {isPlaywright
               ? isInteractiveHitl
                 ? "Automation is paused. Mouse and keyboard input stay in this isolated session."
-                : "Read-only masked frames from the isolated Chromium service."
+                : "Read-only live stream from the isolated Chromium service."
               : "Interactive hosted browser session."}
           </p>
         </div>
@@ -100,6 +99,7 @@ export function BrowserLiveSurface({
           key={liveState.interactivePath}
           ref={remoteViewRef}
           interactivePath={liveState.interactivePath}
+          controlAllowed={liveState.interactionAvailable}
           onReconnect={onRequestLiveView}
         />
       ) : liveState.mode === "screenshot" && liveState.screenshotUrl ? (

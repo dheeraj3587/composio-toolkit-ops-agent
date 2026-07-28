@@ -82,6 +82,10 @@ class _PwSession:
     # Once a credential-bearing state is seen, screenshots are disabled for the
     # rest of the session unless a reviewed safe state is re-established (item 5).
     screenshots_disabled: bool = False
+    # True only after the AppRecipe selectors were installed at document start on
+    # this browser context. Unlike screenshot masking, this protects the actual
+    # X11 pixels relayed through noVNC.
+    live_pixel_mask_installed: bool = False
     # Lifecycle state + in-flight operation count (item 7).
     lifecycle: str = "ACTIVE"
     active_operations: int = 0

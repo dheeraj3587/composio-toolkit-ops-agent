@@ -1,10 +1,4 @@
-"""Phase A: browser provider abstraction + factory.
-
-The default provider must keep the Browser Use path byte-for-byte: same wiring
-condition (live opt-in + API key) and the same worker class. The setting parses
-from env and fails closed to browser_use on an unknown value. The playwright
-branch needs only the live opt-in and is selected by the factory.
-"""
+"""Provider registry and disabled Browser Use compatibility boundary."""
 
 from __future__ import annotations
 
@@ -44,8 +38,21 @@ def test_from_env_parses_provider_and_rejects_typos() -> None:
 
 
 # --- wiring condition parity --------------------------------------------------
-def test_browser_use_wiring_condition_is_unchanged(tmp_path: Path) -> None:
-    with_key = _svc(tmp_path, Settings(allow_live_browser=True, browser_use_api_key=SecretStr("k")))
+def test_browser_use_wiring_requires_the_explicit_compatibility_switch(tmp_path: Path) -> None:
+    disabled = _svc(
+        tmp_path,
+        Settings(allow_live_browser=True, browser_use_api_key=SecretStr("k")),
+    )
+    assert disabled._browser_provider_enabled(disabled._settings) is False
+
+    with_key = _svc(
+        tmp_path,
+        Settings(
+            allow_live_browser=True,
+            browser_use_api_key=SecretStr("k"),
+            browser_use_compatibility_enabled=True,
+        ),
+    )
     assert with_key._browser_provider_enabled(with_key._settings) is True
 
     # Missing API key -> not wired (exactly the pre-existing prod condition).
@@ -83,7 +90,11 @@ def test_playwright_wiring_needs_an_execution_location(tmp_path: Path) -> None:
 
 # --- factory returns the Browser Use worker for the default -------------------
 def test_factory_default_builds_a_browser_use_worker(tmp_path: Path) -> None:
-    settings = Settings(allow_live_browser=True, browser_use_api_key=SecretStr("k"))
+    settings = Settings(
+        allow_live_browser=True,
+        browser_use_api_key=SecretStr("k"),
+        browser_use_compatibility_enabled=True,
+    )
     svc = _svc(tmp_path, settings)
     worker = svc._build_browser_worker(settings)
     # Base BrowserWorker or the prod AssignmentBrowserWorker subclass, never the
@@ -101,6 +112,7 @@ def test_registry_wires_both_configured_providers_concurrently(
         browser_use_api_key=SecretStr("browser-use-test-key"),
         browser_service_url="http://browser-worker:8081",
         browser_service_token=SecretStr("service-test-token"),
+        browser_use_compatibility_enabled=True,
     )
     service = _svc(tmp_path, settings)
 

@@ -60,6 +60,17 @@ class ManagedSession:
     # Live-view availability, tracked from reality rather than assumed.
     screenshot_available: bool = False
     interactive_ready: bool = False
+    # Revoked permanently before a reviewed credential surface can be captured.
+    # Existing relays are drained at the same transition; new grants fail closed.
+    live_view_allowed: bool = True
+    # Browser-context document-start mask installed from the checked-in AppRecipe.
+    # This protects headed X11 pixels, not only API-served PNG screenshots.
+    live_pixel_mask_installed: bool = False
+    # Set only after the worker proves the reviewed credential-page predicate.
+    credential_surface_ready: bool = False
+    # Monotonic server-side boundary: grants are revoked and attachments drained
+    # before any automatic reveal or capture operation is allowed to run.
+    secret_capture_boundary_entered: bool = False
     # The (app, account, owner) triple this session's authenticated state is bound
     # to. None means storage state is not being persisted for this session.
     storage_binding: Any = None
@@ -104,14 +115,15 @@ class ManagedSession:
             live_view_mode=self.live_view_mode,
             # Previously `mode == "interactive_remote" or True`, which is always
             # True. Now reports what is actually available.
-            live_view_available=self.screenshot_available or self.interactive_ready,
+            live_view_available=self.screenshot_available
+            or (self.interactive_ready and self.live_view_allowed),
             hitl_pending=self.hitl_pending,
             # Distinct capability facts. The build includes the interactive relay;
             # availability remains session-specific and false unless enabled.
             screenshot_supported=True,
             screenshot_available=self.screenshot_available,
             interactive_supported=True,
-            interactive_available=self.interactive_ready,
+            interactive_available=self.interactive_ready and self.live_view_allowed,
             current_url_path=self.current_url_path,
             reason_code=self.reason_code,
         )
@@ -204,13 +216,23 @@ class SessionManager:
             self._capacity.release()
 
     # --- registry -------------------------------------------------------------
-    def create(self, *, owner: str, app_slug: str, live_view_mode: LiveViewMode) -> ManagedSession:
+    def create(
+        self,
+        *,
+        owner: str,
+        app_slug: str,
+        live_view_mode: LiveViewMode,
+        secret_scope: str = "",
+        account_ref: str | None = None,
+    ) -> ManagedSession:
         self._acquire_capacity()
         now = datetime.now(UTC)
         session = ManagedSession(
             session_id=f"bs_{uuid4().hex}",
             owner=owner,
             app_slug=app_slug,
+            secret_scope=secret_scope,
+            account_ref=account_ref,
             live_view_mode=live_view_mode,
             created_at=now,
             last_active_at=now,
@@ -219,6 +241,27 @@ class SessionManager:
         with self._lock:
             self._sessions[session.session_id] = session
         return session
+
+    def find_bound_sessions(
+        self,
+        *,
+        owner: str,
+        app_slug: str,
+        secret_scope: str,
+        account_ref: str,
+    ) -> tuple[str, ...]:
+        """Return only live sessions matching an exact browser-start binding."""
+
+        with self._lock:
+            return tuple(
+                session.session_id
+                for session in self._sessions.values()
+                if session.lifecycle in {"ACTIVE", "CLOSING"}
+                and session.owner == owner
+                and session.app_slug == app_slug
+                and session.secret_scope == secret_scope
+                and session.account_ref == account_ref
+            )
 
     def get(self, session_id: str) -> ManagedSession:
         with self._lock:

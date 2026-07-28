@@ -1,8 +1,8 @@
-"""Structured, secret-safe logging for the frontend <-> Browser Use link.
+"""Structured, secret-safe logging for the frontend-to-browser link.
 
 The live browser onboarding path crosses several boundaries that used to fail
 silently: the frontend run-creation/resume request, the synchronous workflow
-dispatch, the Browser Use session creation and ``run`` call, the signed live-URL
+dispatch, browser session creation, the signed live-URL
 derivation, and the live-view endpoint the frontend polls. When any hop fails,
 this module leaves a single, greppable, correlated trail in stdout (captured by
 ``docker logs``) so the failing stage is obvious.

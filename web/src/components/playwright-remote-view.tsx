@@ -48,6 +48,7 @@ export interface PlaywrightRemoteViewHandle {
 
 interface PlaywrightRemoteViewProps {
   interactivePath: string
+  controlAllowed: boolean
   onReconnect: () => void
 }
 
@@ -88,7 +89,7 @@ function sameOriginSocketUrl(interactivePath: string): string {
 export const PlaywrightRemoteView = forwardRef<
   PlaywrightRemoteViewHandle,
   PlaywrightRemoteViewProps
->(function PlaywrightRemoteView({ interactivePath, onReconnect }, ref) {
+>(function PlaywrightRemoteView({ interactivePath, controlAllowed, onReconnect }, ref) {
   const targetRef = useRef<HTMLDivElement>(null)
   const rfbRef = useRef<RfbConnection | null>(null)
   const [state, setState] = useState<ConnectionState>("connecting")
@@ -148,11 +149,13 @@ export const PlaywrightRemoteView = forwardRef<
         rfbRef.current = rfb
         rfb.scaleViewport = true
         rfb.resizeSession = false
-        rfb.viewOnly = false
+        // UX mirrors the signed server capability. Security does not depend on
+        // this flag: view grants terminate at x11vnc's -viewonly listener.
+        rfb.viewOnly = !controlAllowed
 
         rfb.addEventListener("connect", handleConnect)
         rfb.addEventListener("disconnect", handleDisconnect)
-        rfb.addEventListener("clipboard", handleClipboard)
+        if (controlAllowed) rfb.addEventListener("clipboard", handleClipboard)
       } catch {
         if (!disposed) setState("failed")
       }
@@ -167,14 +170,14 @@ export const PlaywrightRemoteView = forwardRef<
       try {
         rfb?.removeEventListener("connect", handleConnect)
         rfb?.removeEventListener("disconnect", handleDisconnect)
-        rfb?.removeEventListener("clipboard", handleClipboard)
+        if (controlAllowed) rfb?.removeEventListener("clipboard", handleClipboard)
         if (shouldDisconnect) rfb?.disconnect()
       } catch {
         // Cleanup must not break unmounting or a resume submission.
       }
       target.replaceChildren()
     }
-  }, [interactivePath])
+  }, [controlAllowed, interactivePath])
 
   /**
    * Put text on the REMOTE clipboard and press Ctrl+V inside the session.
@@ -280,10 +283,15 @@ export const PlaywrightRemoteView = forwardRef<
       <div
         ref={targetRef}
         tabIndex={0}
-        aria-label="Remote Chromium desktop; mouse and keyboard controls are active"
+        aria-label={
+          controlAllowed
+            ? "Remote Chromium desktop; mouse and keyboard controls are active"
+            : "Remote Chromium desktop; view only"
+        }
         className="relative h-[420px] w-full overflow-hidden bg-black outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 sm:h-[560px] xl:h-[640px]"
       />
 
+      {controlAllowed ? (
       <div className="space-y-3 border-t border-white/10 bg-zinc-950 px-3 py-3 text-zinc-100">
         <div className="flex flex-wrap items-end gap-2">
           <div className="min-w-[220px] flex-1">
@@ -365,6 +373,11 @@ export const PlaywrightRemoteView = forwardRef<
           {clipboardNotice}
         </p>
       </div>
+      ) : (
+        <p className="border-t border-white/10 bg-zinc-950 px-3 py-3 text-[11px] text-zinc-400">
+          Live view is read-only while the agent is working. Controls unlock only at a human handoff.
+        </p>
+      )}
     </section>
   )
 })

@@ -1,105 +1,53 @@
-"""Offline owner-only credential submission through the real vault + validator.
-
-Every test is offline-safe: the browser adapter is a fake, the vault is the real
-encrypted SQLiteSecretStore, and the read-only validator runs against an
-in-process ``httpx.MockTransport``. No live HubSpot, Browser Use, or Composio
-call occurs. These tests prove the submit boundary encrypts raw values, returns
-references only, validates read-only, and never leaks the raw secret.
-"""
+"""Compact offline checks for canonical owner-submitted credentials."""
 
 from __future__ import annotations
 
-import secrets
 from pathlib import Path
 
-import httpx
 import pytest
 from cryptography.fernet import Fernet
 from pydantic import SecretStr
 
 from ops.browser_worker import BrowserObservation, BrowserSessionContext
-from ops.composio_capability import ComposioCapabilityReport
 from ops.config import Settings
-from ops.credential_validator import (
-    HUBSPOT_ACCOUNT_INFO_ENDPOINT,
-    CredentialValidator,
-    PolicyBoundCredentialValidator,
-    hubspot_validation_policy,
-)
-from ops.graph import WorkflowDependencies, build_graph
-from ops.models import CompanyProfile, OperationalResearch, OperationsRequest
-from ops.p1_adapter import P1LookupFound, P1OperationalAdapter, to_operational_research
-from ops.run_service import CredentialSubmissionError, RunService
+from ops.models import CompanyProfile, OperationsRequest
+from ops.run_errors import CredentialSubmissionError
+from ops.run_service import RunService
 from ops.secret_store import SQLiteSecretStore
 
-SELF_SERVE_APP = "HubSpot"
-RAW_TOKEN = "hs-owner-supplied-token-DO-NOT-PERSIST"  # pragma: allowlist secret
+RAW_TOKEN = "canonical-owner-token-DO-NOT-PERSIST"  # pragma: allowlist secret
 
 
-class _FakeBrowser:
+class _EntryOnlyPlaywright:
+    provider_name = "playwright"
+
     async def start(self, profile_id: str | None, **_kwargs: object) -> BrowserSessionContext:
         return BrowserSessionContext(
-            profile_id=profile_id or "profile-hs",
-            session_id="browser-sess-1",
-            live_view_available=False,
-            allowed_domains=("developers.hubspot.com",),
-            created_at="2026-01-01T00:00:00Z",
-            inactivity_expires_at="2026-01-01T00:15:00Z",
-            maximum_expires_at="2026-01-01T04:00:00Z",
+            profile_id=profile_id or "telegram-owner",
+            session_id="playwright-telegram-1",
+            live_view_available=True,
+            allowed_domains=("web.telegram.org",),
+            created_at="2026-07-28T00:00:00Z",
+            inactivity_expires_at="2026-07-28T00:15:00Z",
+            maximum_expires_at="2026-07-28T04:00:00Z",
         )
 
     async def navigate_onboarding(
         self,
-        context: object,
+        context: BrowserSessionContext,
         research: object,
-        *,
-        sensitive_data: object = None,
-        credential_creation_policy: str = "reuse_only",
+        **_kwargs: object,
     ) -> BrowserObservation:
-        del context, research, sensitive_data, credential_creation_policy
+        del context, research
         return BrowserObservation(
-            status="credential_page_ready",
-            current_url="https://developers.hubspot.com/apps/new",
-            page_title="Create a developer app",
+            status="developer_console_ready",
+            current_url="https://web.telegram.org/",
+            page_title="Telegram",
+            reason_code="reviewed_public_entry_reached",
         )
 
-    async def resume_after_hitl(
-        self,
-        context: object,
-        signal: object,
-        research: object = None,
-        *,
-        sensitive_data: object = None,
-        credential_creation_policy: str = "reuse_only",
-        provider_session_id: object = None,
-    ) -> BrowserObservation:
-        raise AssertionError("resume is out of scope")
-
-
-class _StubPreflight:
-    async def evaluate(
-        self, *, app_name: str, app_slug: str | None = None, required_tools: object = ()
-    ) -> ComposioCapabilityReport:
-        del app_name, app_slug, required_tools
-        return ComposioCapabilityReport(
-            app_slug="hubspot",
-            toolkit_available=False,
-            toolkit_slug=None,
-            required_auth_schemes=(),
-            managed_auth_available=False,
-            active_connected_account=False,
-            required_tools_present=False,
-            capability_state="toolkit_unavailable",
-            reason_code="composio_toolkit_absent",
-            detail="stub",
-        )
-
-
-def _request() -> OperationsRequest:
-    return OperationsRequest(
-        app_name=SELF_SERVE_APP,
-        company=_company(),
-    )
+    async def stop(self, context: BrowserSessionContext) -> None:
+        del context
 
 
 def _company() -> CompanyProfile:
@@ -107,162 +55,133 @@ def _company() -> CompanyProfile:
         legal_name="Example Labs, Inc.",
         website="https://example.com",
         work_email_ref="vault://company/work_email/profile_1",
-        use_case="Deliver an authorized integration via the provider developer API.",
+        use_case="Connect the authorized Telegram integration.",
     )
 
 
-def _reviewed_hubspot_research(app_name: str) -> OperationalResearch:
-    found = P1OperationalAdapter().lookup(app_name)
-    assert isinstance(found, P1LookupFound)
-    return to_operational_research(found.record).model_copy(
-        update={
-            "login_url": "https://app.hubspot.com/login",
-            "credential_management_url": "https://developers.hubspot.com/apps",
-        }
-    )
-
-
-def _validator(status_code: int) -> PolicyBoundCredentialValidator:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.host == "api.hubapi.com"
-        assert request.url.path == "/account-info/2026-03/details"
-        assert request.headers["Authorization"] == f"Bearer {RAW_TOKEN}"
-        return httpx.Response(status_code, json={"portalId": 12345})
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    return PolicyBoundCredentialValidator(
-        validator=CredentialValidator(
-            secret_store=_shared_store,
-            http_client=client,
-            policies=(hubspot_validation_policy(),),
-        ),
-        endpoints={"hubspot": HUBSPOT_ACCOUNT_INFO_ENDPOINT},
-    )
-
-
-_shared_store: SQLiteSecretStore
-
-
-def _service(tmp: Path, *, status_code: int) -> RunService:
-    global _shared_store
-    _shared_store = SQLiteSecretStore(tmp / "private" / "vault.db", Fernet.generate_key())
-    workflow = build_graph(
-        checkpoint_path=tmp / "private" / "checkpoints.db",
-        encryption_key=secrets.token_bytes(32),
-        dependencies=WorkflowDependencies(
-            research_loader=_reviewed_hubspot_research,
-            browser=_FakeBrowser(),  # type: ignore[arg-type]
-        ),
-    )
+def _service(tmp_path: Path) -> tuple[RunService, SQLiteSecretStore]:
+    store = SQLiteSecretStore(tmp_path / "private" / "vault.db", Fernet.generate_key())
     service = RunService.from_paths(
-        db_path=tmp / "private" / "ops.db",
+        db_path=tmp_path / "private" / "ops.db",
         settings=Settings(),
-        workflow=workflow,
-        capability_preflight=_StubPreflight(),  # type: ignore[arg-type]
     )
-    service._secret_store = _shared_store
-    service._credential_validator = _validator(status_code)  # type: ignore[assignment]
-    return service
+    browser = _EntryOnlyPlaywright()
+    service._browser_workers = {"playwright": browser}  # type: ignore[assignment]
+    service._browser_worker = browser  # type: ignore[assignment]
+    service._secret_store = store
+    return service, store
 
 
-def _run_at_browser_running(service: RunService) -> str:
-    run = service.create_run(_request(), execution_mode="execute_when_configured")
-    assert run["status"] == "browser_running"
+def _entry_reached(service: RunService) -> str:
+    run = service.create_run(
+        OperationsRequest(
+            app_name="Telegram",
+            company=_company(),
+            browser_provider="playwright",
+        ),
+        execution_mode="execute_when_configured",
+    )
+    for thread in service._browser_threads:
+        thread.join(timeout=5)
+    stored = service.storage.get_run(str(run["run_id"]))
+    assert stored is not None
+    assert stored["status"] == "browser_running"
+    assert stored["phase"] == "entry_reached"
     return str(run["run_id"])
 
 
-def test_valid_submission_completes_with_reference_only_bundle(tmp_path: Path) -> None:
-    service = _service(tmp_path, status_code=200)
-    run_id = _run_at_browser_running(service)
+def test_owner_submission_vaults_reference_without_claiming_validation(tmp_path: Path) -> None:
+    service, store = _service(tmp_path)
+    run_id = _entry_reached(service)
 
     result = service.submit_owner_credentials(
         run_id,
         company=_company(),
-        fields={"access_token": SecretStr(RAW_TOKEN)},
+        fields={"bot_token": SecretStr(RAW_TOKEN)},
     )
 
-    assert result["status"] == "completed"
-    output = service.get_output(run_id)
-    assert output is not None
-    assert output["readiness"] == "credentials_ready"
-    assert set(output["credential_refs"]) == {"access_token"}
-    for reference in output["credential_refs"].values():
-        assert reference.startswith("vault://hubspot/access_token/")
+    assert result["status"] == "credentials_ready"
+    assert result["phase"] == "credential_ready"
+    assert result["reason_code"] == "owner_credentials_vaulted_unvalidated"
+    bundle = service.get_output(run_id)
+    assert bundle is not None
+    reference = str(bundle["credential_refs"]["bot_token"])
+    assert reference.startswith("vault://telegram/bot_token/")
+    assert store.get(reference) == RAW_TOKEN
 
 
-def test_invalid_credentials_return_configuration_required(tmp_path: Path) -> None:
-    service = _service(tmp_path, status_code=401)
-    run_id = _run_at_browser_running(service)
-
-    result = service.submit_owner_credentials(
-        run_id,
-        company=_company(),
-        fields={"access_token": SecretStr(RAW_TOKEN)},
-    )
-
-    assert result["status"] == "configuration_required"
-
-
-def test_raw_token_never_persisted_anywhere(tmp_path: Path) -> None:
-    service = _service(tmp_path, status_code=200)
-    run_id = _run_at_browser_running(service)
-
+def test_owner_submission_never_persists_raw_value(tmp_path: Path) -> None:
+    service, _store = _service(tmp_path)
+    run_id = _entry_reached(service)
     service.submit_owner_credentials(
         run_id,
         company=_company(),
-        fields={"access_token": SecretStr(RAW_TOKEN)},
+        fields={"bot_token": SecretStr(RAW_TOKEN)},
     )
 
-    stored = service.storage.get_run(run_id)
-    output = service.get_output(run_id)
-    timeline = service.get_timeline(run_id)
-    haystack = repr(stored) + repr(output) + repr(timeline)
+    haystack = repr(service.storage.get_run(run_id)) + repr(service.get_timeline(run_id))
     assert RAW_TOKEN not in haystack
-
-    for db_name in ("ops.db", "checkpoints.db"):
-        db_path = tmp_path / "private" / db_name
-        if db_path.exists():
-            assert RAW_TOKEN.encode() not in db_path.read_bytes()
-
-    # The value is retrievable only through its exact vault reference.
-    reference = next(iter(service.get_output(run_id)["credential_refs"].values()))  # type: ignore[index]
-    assert _shared_store.get(reference) == RAW_TOKEN
+    assert RAW_TOKEN.encode() not in (tmp_path / "private" / "ops.db").read_bytes()
 
 
-def test_submission_requires_browser_running_state(tmp_path: Path) -> None:
-    service = _service(tmp_path, status_code=200)
-    run = service.create_run(_request(), execution_mode="plan_only")
+def test_owner_submission_requires_exact_recipe_fields(tmp_path: Path) -> None:
+    service, _store = _service(tmp_path)
+    run_id = _entry_reached(service)
 
-    with pytest.raises(CredentialSubmissionError) as excinfo:
-        service.submit_owner_credentials(
-            str(run["run_id"]),
-            company=_company(),
-            fields={"access_token": SecretStr(RAW_TOKEN)},
-        )
-    assert excinfo.value.reason_code == "run_not_awaiting_credentials"
-
-
-def test_unconfigured_boundary_is_rejected(tmp_path: Path) -> None:
-    service = _service(tmp_path, status_code=200)
-    run_id = _run_at_browser_running(service)
-    service._credential_validator = None
-
-    with pytest.raises(CredentialSubmissionError) as excinfo:
+    with pytest.raises(CredentialSubmissionError) as raised:
         service.submit_owner_credentials(
             run_id,
             company=_company(),
-            fields={"access_token": SecretStr(RAW_TOKEN)},
+            fields={"api_key": SecretStr(RAW_TOKEN)},
         )
-    assert excinfo.value.reason_code == "credential_boundary_not_configured"
+    assert raised.value.reason_code == "credential_fields_do_not_match_recipe"
 
 
-def test_empty_or_malformed_fields_are_rejected(tmp_path: Path) -> None:
-    service = _service(tmp_path, status_code=200)
-    run_id = _run_at_browser_running(service)
+def test_owner_submission_after_restart_uses_creation_time_field_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ops.app_recipes as recipe_module
 
-    with pytest.raises(CredentialSubmissionError):
-        service.submit_owner_credentials(run_id, company=_company(), fields={})
-    with pytest.raises(CredentialSubmissionError):
-        service.submit_owner_credentials(
-            run_id, company=_company(), fields={"Bad Kind": SecretStr(RAW_TOKEN)}
-        )
+    service, store = _service(tmp_path)
+    run_id = _entry_reached(service)
+    original = recipe_module.get_app_recipe("telegram")
+    assert original is not None
+    payload = original.model_dump(mode="python")
+    payload["credential_fields"] = (
+        {
+            "name": "api_key",
+            "label": "Changed API key",
+            "kind": "api_key",
+            "secret": True,
+        },
+    )
+    changed = type(original).model_validate(payload)
+    monkeypatch.setattr(recipe_module, "get_app_recipe", lambda _slug: changed)
+
+    restarted = RunService.from_paths(
+        db_path=tmp_path / "private" / "ops.db",
+        settings=Settings(),
+    )
+    restarted._secret_store = store
+    result = restarted.submit_owner_credentials(
+        run_id,
+        company=_company(),
+        fields={"bot_token": SecretStr(RAW_TOKEN)},
+    )
+
+    assert result["status"] == "credentials_ready"
+    bundle = restarted.get_output(run_id)
+    assert bundle is not None
+    assert set(bundle["credential_refs"]) == {"bot_token"}
+
+
+def test_owner_submission_cannot_be_replayed(tmp_path: Path) -> None:
+    service, _store = _service(tmp_path)
+    run_id = _entry_reached(service)
+    fields = {"bot_token": SecretStr(RAW_TOKEN)}
+    service.submit_owner_credentials(run_id, company=_company(), fields=fields)
+
+    with pytest.raises(CredentialSubmissionError) as raised:
+        service.submit_owner_credentials(run_id, company=_company(), fields=fields)
+    assert raised.value.reason_code == "run_not_awaiting_credentials"

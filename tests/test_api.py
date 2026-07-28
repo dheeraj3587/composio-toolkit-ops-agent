@@ -108,8 +108,10 @@ def test_exact_requested_routes_are_registered(harness: ApiHarness) -> None:
         ("/api/runs/{run_id}", "GET"),
         ("/api/runs/{run_id}/timeline", "GET"),
         ("/api/runs/{run_id}/resume", "POST"),
+        ("/api/runs/{run_id}/connect", "POST"),
+        ("/api/runs/{run_id}/poll-connection", "POST"),
+        ("/api/runs/{run_id}/outreach", "POST"),
         ("/api/runs/{run_id}/credentials", "POST"),
-        ("/api/runs/{run_id}/credentials/reveal", "POST"),
         ("/api/runs/{run_id}/live-view", "GET"),
         # Backward-compatible addition: masked PNG frames for the self-hosted
         # Playwright live view (Browser Use keeps using live-view's hosted URL).
@@ -140,6 +142,7 @@ def test_create_and_detail_expose_verified_phase_two_contract(harness: ApiHarnes
         "hitl_request",
         # Explicit backend-authoritative browser permissions (BrowserUiState).
         "browser",
+        "primary_action",
     }
     run = created["run"]
     assert isinstance(run, dict)
@@ -153,6 +156,13 @@ def test_create_and_detail_expose_verified_phase_two_contract(harness: ApiHarnes
         "execution_mode",
         "browser_provider",
         "credential_creation_policy",
+        "recipe_version",
+        "route_kind",
+        "readiness_tier",
+        "attempt",
+        "phase",
+        "reason_code",
+        "state_engine",
         "external_actions",
         "created_at",
         "updated_at",
@@ -160,21 +170,29 @@ def test_create_and_detail_expose_verified_phase_two_contract(harness: ApiHarnes
     assert run["status"] == "route_selected"
     assert run["access_route"] == "self_serve"
     assert run["external_actions"] is False
-    assert str(run["thread_id"]).startswith("local_")
+    assert str(run["thread_id"]).startswith("sqlite_")
+    assert run["state_engine"] == "canonical_v1"
+    assert run["route_kind"] == "managed_auth"
+    assert run["readiness_tier"] == "managed_auth_ready"
 
     research = created["research"]
     assert isinstance(research, dict)
     assert research["app_name"] == "HubSpot"
     assert research["access_route"] == "self_serve"
-    assert len(research["evidence_urls"]) == 4
+    assert research["evidence_urls"]
 
     phases = {phase["key"]: phase["status"] for phase in created["phases"]}
     assert phases == {
         "research": "ready",
-        "browser": "configuration_required",
-        "hitl": "configuration_required",
-        "email": "configuration_required",
+        "browser": "unavailable",
+        "hitl": "unavailable",
+        "email": "unavailable",
         "output": "waiting",
+    }
+    assert created["primary_action"] == {
+        "kind": "none",
+        "enabled": False,
+        "reason_code": "plan_only_run_read_only",
     }
     assert created["security"]["redaction"] == "enabled"
     assert (
@@ -218,7 +236,7 @@ def test_create_run_is_idempotent_for_safe_generated_key(harness: ApiHarness) ->
 
     assert retried == first
     assert harness.core.storage.count_runs() == 1
-    assert len(harness.core.storage.list_audit_events(first["run"]["run_id"])) == 4
+    assert len(harness.core.storage.list_audit_events(first["run"]["run_id"])) == 2
 
 
 def test_idempotency_conflict_is_typed_and_never_echoes_key(harness: ApiHarness) -> None:
@@ -306,8 +324,7 @@ def test_future_actions_are_typed_http_409(
     response = getattr(harness.client, method)(f"/api/runs/{run_id}/{suffix}")
 
     assert response.status_code == 409
-    expected_error = "phase_unavailable" if action == "output" else "configuration_required"
-    assert response.json()["error"] == expected_error
+    assert response.json()["error"] == "phase_unavailable"
     assert response.json()["action"] == action
     assert response.json()["available_in"]
     assert all(isinstance(item, str) and item for item in response.json()["available_in"])

@@ -53,6 +53,13 @@ _PUBLIC_RUN_FIELDS = (
     "updated_at",
     "browser_provider",
     "credential_creation_policy",
+    "recipe_version",
+    "route_kind",
+    "readiness_tier",
+    "attempt",
+    "phase",
+    "reason_code",
+    "state_engine",
 )
 
 

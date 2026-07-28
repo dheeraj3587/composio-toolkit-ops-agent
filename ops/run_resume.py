@@ -55,8 +55,6 @@ class RunResumeContext(Protocol):
         self, *, app_slug: str, values: Mapping[str, SecretStr]
     ) -> tuple[str, ...]: ...
 
-    def _reusable_login_values(self, app_slug: str) -> dict[str, SecretStr]: ...
-
     def _browser_login_payload(
         self,
         *,
@@ -136,13 +134,10 @@ class RunResumeService:
                 )
             login_values: Mapping[str, SecretStr] | None = browser_login
             login_source = "owner_supplied"
-            if not login_values and signal != "cancelled":
-                # Autonomy: a login gate we already hold credentials for must be
-                # resolved by the agent, not by asking the human a second time.
-                reusable = context._reusable_login_values(app_slug)
-                if reusable:
-                    login_values = reusable
-                    login_source = "vault_reuse"
+            # Resume never recreates consumed credential references. Only values
+            # explicitly included in THIS owner request may be injected. Reusable
+            # credentials can seed a fresh run, but CAPTCHA/provider-verification
+            # resume must inspect and continue the existing browser session.
             injected_login_fields: list[str] = sorted(login_values) if login_values else []
             sensitive_data: dict[str, str] | None = None
             if login_values:

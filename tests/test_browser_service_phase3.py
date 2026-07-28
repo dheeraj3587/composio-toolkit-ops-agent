@@ -37,6 +37,7 @@ from ops.browser_live_view import (
     issue_live_view_token,
     verify_live_view_token,
 )
+from ops.app_recipes import get_app_recipe
 from ops.browser_storage_state import EncryptedStorageStateStore, StorageStateBinding
 from ops.browser_worker import BrowserObservation, BrowserSessionContext
 
@@ -71,6 +72,10 @@ RESEARCH_PAYLOAD: dict[str, Any] = {
     "confidence": 0.9,
 }
 
+_PIPEDRIVE_RECIPE = get_app_recipe("pipedrive")
+assert _PIPEDRIVE_RECIPE is not None
+RECIPE_SNAPSHOT: dict[str, object] = _PIPEDRIVE_RECIPE.model_dump(mode="json")
+
 
 class _FakePwSession:
     """Stands in for ops.playwright_worker's per-session record."""
@@ -101,10 +106,32 @@ class _FakeWorker:
         self.received_displays: list[str | None] = []
         self.storage_state = {"cookies": [{"name": "session", "value": "SUPERSECRETCOOKIEVALUE"}]}
         self.capture_calls: list[tuple[str, str]] = []
+        self.boundary_events: list[str] = []
+        self.navigate_result_status = "human_action_required"
+        self.capture_probe: Any = None
+
+    async def install_live_pixel_mask(
+        self,
+        context: BrowserSessionContext,
+        app_slug: str,
+        *,
+        recipe: Any = None,
+    ) -> bool:
+        assert recipe is not None and recipe.app_slug == app_slug
+        del context
+        self.boundary_events.append(f"mask:{app_slug}")
+        return True
 
     async def auto_capture_credentials(
-        self, handle: str, app_slug: str, secret_store: Any
+        self,
+        handle: str,
+        app_slug: str,
+        secret_store: Any,
+        **_kwargs: object,
     ) -> dict[str, str] | None:
+        self.boundary_events.append("capture")
+        if self.capture_probe is not None:
+            self.capture_probe()
         self.capture_calls.append((handle, app_slug))
         reference = secret_store.put(
             app_slug=app_slug,
@@ -117,14 +144,17 @@ class _FakeWorker:
         self,
         profile_id: str | None,
         *,
+        recipe: Any = None,
         storage_state: dict[str, Any] | None = None,
         display: str | None = None,
     ) -> BrowserSessionContext:
         # Mirrors the real worker: the service may hand over previously saved,
         # already-decrypted authenticated state (never a filesystem path), plus the
         # PRIVATE X display leased to this session.
+        assert recipe is not None and recipe.app_slug == "pipedrive"
         self.received_storage_state = storage_state
         self.received_displays.append(display)
+        self.boundary_events.append("start")
         self._counter += 1
         handle = f"pw_fake_{self._counter}"
         self._sessions[handle] = _FakePwSession()
@@ -148,9 +178,18 @@ class _FakeWorker:
         credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
         del research, credential_creation_policy
+        self.boundary_events.append("navigate")
         self.seen_sensitive.append(dict(sensitive_data or {}))
         if self.navigate_delay:
             await asyncio.sleep(self.navigate_delay)
+        if self.navigate_result_status == "credential_page_ready":
+            return BrowserObservation(
+                status="credential_page_ready",
+                current_url="https://app.pipedrive.com/settings/api",
+                page_title="API token",
+                credential_field_labels=("API token",),
+                reason_code="reviewed_success_predicate_satisfied",
+            )
         return BrowserObservation(
             status="human_action_required",
             current_url="https://app.pipedrive.com/settings/api?tab=personal",
@@ -246,7 +285,11 @@ def _client(
 def _create_session(client: TestClient, **kwargs: Any) -> dict[str, Any]:
     response = client.post(
         "/internal/browser/sessions",
-        json={"app_slug": "pipedrive", **kwargs},
+        json={
+            "app_slug": "pipedrive",
+            "recipe_snapshot": RECIPE_SNAPSHOT,
+            **kwargs,
+        },
         headers=_headers(),
     )
     assert response.status_code == 201, response.text
@@ -388,8 +431,15 @@ class TestSessionRpcLifecycle:
             ),
         )
         client, worker = _client()
+        worker.navigate_result_status = "credential_page_ready"
         with client:
             session_id = _create_session(client)["session_id"]
+            ready = client.post(
+                f"/internal/browser/sessions/{session_id}/navigate",
+                json={"research": RESEARCH_PAYLOAD},
+                headers=_headers(),
+            )
+            assert ready.status_code == 200
             response = client.post(
                 f"/internal/browser/sessions/{session_id}/capture-credentials",
                 json={},
@@ -736,6 +786,28 @@ class TestInteractiveHitlGrants:
         assert body["mode"] == "screenshot"
         assert body["url"] is None
 
+    def test_running_session_receives_view_only_grant(self) -> None:
+        client, _ = _client(_interactive_settings())
+        with client:
+            session_id = _create_session(client)["session_id"]
+            response = client.post(
+                f"/internal/browser/sessions/{session_id}/live-view", headers=_headers()
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["mode"] == "interactive_remote"
+        assert body["view_allowed"] is True
+        assert body["control_allowed"] is False
+        token = body["url"].split("token=", 1)[1]
+        verified = verify_live_view_token(
+            token,
+            secret=TOKEN,
+            expected_session_id=session_id,
+            expected_owner=OWNER,
+        )
+        assert verified.access == "view"
+
     def test_live_view_grant_is_bound_and_expiring_when_enabled(self) -> None:
         client, _ = _client(_interactive_settings())
         with client:
@@ -752,6 +824,8 @@ class TestInteractiveHitlGrants:
         assert response.status_code == 200
         body = response.json()
         assert body["mode"] == "interactive_remote"
+        assert body["view_allowed"] is True
+        assert body["control_allowed"] is True
         assert body["session_id"] == session_id
         # The URL points at the private-network relay, not a public host.
         assert body["url"].startswith("http://browser-worker:8081/internal/browser/live-view/novnc")
@@ -821,7 +895,26 @@ class TestInteractiveHitlGrants:
                 interactive_enabled=True,
                 hitl_pending=False,
             )
-        assert excinfo.value.reason_code == "hitl_not_pending"
+        assert excinfo.value.reason_code == "control_not_allowed"
+
+    def test_view_grant_is_allowed_while_control_is_not(self) -> None:
+        token, _ = issue_live_view_token(
+            session_id="bs_1", owner=OWNER, secret=TOKEN, access="view"
+        )
+
+        assert (
+            authorize_live_view(
+                token=token,
+                session_id="bs_1",
+                caller_owner=OWNER,
+                secret=TOKEN,
+                session_owner=OWNER,
+                session_lifecycle="ACTIVE",
+                interactive_enabled=True,
+                hitl_pending=False,
+            )
+            == "view"
+        )
 
     def test_websocket_relay_is_refused_without_a_valid_grant(self) -> None:
         from starlette.websockets import WebSocketDisconnect
@@ -952,12 +1045,14 @@ class TestInteractiveHitlGrants:
                 ).status_code
                 == 200
             )
-            # A fresh grant is no longer available, and the old signed token is
-            # rejected because authorization also consults live HITL state.
+            # Resume downgrades the fresh grant to view-only, and the old control
+            # token is rejected because authorization also consults live HITL state.
             refreshed = client.post(
                 f"/internal/browser/sessions/{session_id}/live-view", headers=_headers()
             ).json()
-            assert refreshed["mode"] == "screenshot"
+            assert refreshed["mode"] == "interactive_remote"
+            assert refreshed["view_allowed"] is True
+            assert refreshed["control_allowed"] is False
             token = grant["url"].split("token=", 1)[1].split("&", 1)[0]
             with pytest.raises(LiveViewDenied) as excinfo:
                 authorize_live_view(
@@ -970,7 +1065,7 @@ class TestInteractiveHitlGrants:
                     interactive_enabled=True,
                     hitl_pending=False,
                 )
-            assert excinfo.value.reason_code == "hitl_not_pending"
+            assert excinfo.value.reason_code == "control_not_allowed"
 
     def test_failed_attachment_drain_restores_hitl_for_retry(self) -> None:
         class _DoneAttachment:
@@ -1548,7 +1643,7 @@ class TestProviderAwareHealth:
 
 # ------------------------------------------------- 10. container / compose shape
 class TestContainerIsolationShape:
-    """Structural guarantees about the image and the sandbox stack.
+    """Structural guarantees about the image and canonical production stack.
 
     Docker is not available in this environment, so these assertions validate the
     FILES rather than a built image — they are honest about what they check: the
@@ -1557,7 +1652,7 @@ class TestContainerIsolationShape:
 
     @staticmethod
     def _compose() -> dict[str, Any]:
-        raw = (REPO_ROOT / "compose.playwright.sandbox.yaml").read_text()
+        raw = (REPO_ROOT / "compose.prod.yaml").read_text()
         parsed: dict[str, Any] = yaml.safe_load(raw)
         return parsed
 
@@ -1570,9 +1665,13 @@ class TestContainerIsolationShape:
 
         service = self._compose()["services"]["browser-worker"]
         assert "ports" not in service
-        # Nor may any other service in this stack expose one.
-        for name, definition in self._compose()["services"].items():
-            assert "ports" not in definition, f"{name} must not publish a port"
+        assert "ports" not in self._compose()["services"]["api"]
+        assert "ports" not in self._compose()["services"]["web"]
+        assert self._compose()["services"]["caddy"]["ports"] == [
+            "80:80",
+            "443:443",
+            "443:443/udp",
+        ]
 
     def test_browser_worker_runs_chromium_safely_and_non_root(self) -> None:
         service = self._compose()["services"]["browser-worker"]
@@ -1595,7 +1694,7 @@ class TestContainerIsolationShape:
         assert '"--no-access-log"' in cmd
 
     def test_uvicorn_websocket_filter_strips_live_grant_query_and_tokens(self) -> None:
-        secret = "signed-live-view-secret"
+        secret = "signed-live-view-secret"  # pragma: allowlist secret - redaction fixture
         record = logging.LogRecord(
             name="uvicorn.error",
             level=logging.INFO,
@@ -1627,19 +1726,21 @@ class TestContainerIsolationShape:
         assert secret not in generic.getMessage()
         assert "token=[REDACTED]" in generic.getMessage()
 
-    def test_sandbox_stack_holds_no_secret_literals(self) -> None:
-        raw = (REPO_ROOT / "compose.playwright.sandbox.yaml").read_text()
+    def test_production_stack_holds_no_secret_literals(self) -> None:
+        raw = (REPO_ROOT / "compose.prod.yaml").read_text()
         service = self._compose()["services"]["browser-worker"]
         # Secrets arrive by interpolation from --env-file, never inline. The value
         # is the interpolation EXPRESSION, which is the point: no literal here.
-        assert service["environment"]["BROWSER_SERVICE_TOKEN"] == "${BROWSER_SERVICE_TOKEN:-}"
+        assert service["environment"]["BROWSER_SERVICE_TOKEN"] == (
+            "${BROWSER_SERVICE_TOKEN:?BROWSER_SERVICE_TOKEN is required}"
+        )
         assert service["environment"]["BROWSER_STORAGE_STATE_KEY"] == (
             "${BROWSER_STORAGE_STATE_KEY:-}"
         )
         assert not re.search(r"(?i)(api_key|token|secret)\s*:\s*['\"]?[A-Za-z0-9_\-]{16,}", raw)
 
-    def test_defaults_keep_live_browsing_and_interactive_hitl_off(self) -> None:
-        """Every dangerous switch must DEFAULT to off, even if the env is empty."""
+    def test_production_defaults_fail_closed_except_for_the_live_view_transport(self) -> None:
+        """Execution is opt-in; a configured session always has a view transport."""
 
         environment = self._compose()["services"]["browser-worker"]["environment"]
 
@@ -1649,8 +1750,7 @@ class TestContainerIsolationShape:
             return match.group(1) if match else str(expression)
 
         assert default_of(environment["ALLOW_LIVE_BROWSER"]) == "false"
-        assert default_of(environment["BROWSER_INTERACTIVE_HITL_ENABLED"]) == "false"
-        assert default_of(environment["PLAYWRIGHT_DISABLE_SANDBOX"]) == "false"
+        assert default_of(environment["BROWSER_INTERACTIVE_HITL_ENABLED"]) == "true"
         # Not interpolated at all: hard-coded off.
         assert environment["ALLOW_LIVE_VENDOR_EMAIL"] == "false"
 

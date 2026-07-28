@@ -81,7 +81,7 @@ def test_status_returns_sanitized_run_and_timeline(
     assert run["run_id"] == run_id
     assert run["status"] == "route_selected"
     assert isinstance(timeline, list)
-    assert timeline[0]["event_type"] == "dry_run_created"
+    assert timeline[0]["event_type"] == "run_created"
     assert timeline[0]["payload"]["external_actions"] is False
     assert timeline[-1]["event_type"] == "route_selected"
     assert timeline[-1]["payload"]["external_actions"] is False

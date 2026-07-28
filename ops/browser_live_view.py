@@ -1,4 +1,4 @@
-"""Short-lived, session-bound interactive HITL grants.
+"""Short-lived, session-bound Playwright live-view grants.
 
 Screenshot-only HITL cannot solve a CAPTCHA, an account chooser, or an MFA
 prompt — those need real interaction. Interactive access is therefore supported,
@@ -9,7 +9,7 @@ session), so access is gated by a token that is:
 * **bound to ONE session id** (a token for session A cannot open session B),
 * **bound to the owner** (another run's operator cannot use it),
 * **short-lived** (minutes, not hours), and
-* **single-purpose** (it authorizes viewing/interacting, nothing else).
+* **capability-bound** (a view grant can never be upgraded into browser control).
 
 There is no raw public VNC port and no unauthenticated noVNC: the container
 publishes nothing, and the URL is only reachable on the private network. The
@@ -25,11 +25,12 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import Literal
+from typing import Literal, cast
 
 LiveViewMode = Literal["screenshot", "interactive_remote"]
+LiveViewAccess = Literal["view", "control"]
 
-_TOKEN_VERSION = "lv1"
+_TOKEN_VERSION = "lv2"
 
 
 class LiveViewTokenError(RuntimeError):
@@ -46,6 +47,7 @@ class LiveViewToken:
 
     session_id: str
     owner: str
+    access: LiveViewAccess
     expires_at: datetime
 
     def is_expired(self, now: datetime | None = None) -> bool:
@@ -66,6 +68,7 @@ def issue_live_view_token(
     session_id: str,
     owner: str,
     secret: str,
+    access: LiveViewAccess = "control",
     ttl_seconds: int = 300,
     now: datetime | None = None,
 ) -> tuple[str, datetime]:
@@ -73,6 +76,8 @@ def issue_live_view_token(
 
     if not session_id or not owner:
         raise LiveViewTokenError("session_and_owner_required")
+    if access not in {"view", "control"}:
+        raise LiveViewTokenError("live_view_access_invalid")
     if not secret:
         raise LiveViewTokenError("live_view_secret_missing")
     issued = now or datetime.now(UTC)
@@ -81,6 +86,7 @@ def issue_live_view_token(
         "v": _TOKEN_VERSION,
         "sid": session_id,
         "own": owner,
+        "acc": access,
         "exp": int(expires_at.timestamp()),
     }
     body = _b64(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
@@ -115,16 +121,24 @@ def verify_live_view_token(
         raise LiveViewTokenError("unsupported_token_version")
     session_id = str(payload.get("sid") or "")
     owner = str(payload.get("own") or "")
+    access = str(payload.get("acc") or "")
     # Binding checks: a token is valid ONLY for its own session and owner.
     if not hmac.compare_digest(session_id, expected_session_id):
         raise LiveViewTokenError("session_mismatch")
     if not hmac.compare_digest(owner, expected_owner):
         raise LiveViewTokenError("owner_mismatch")
+    if access not in {"view", "control"}:
+        raise LiveViewTokenError("live_view_access_invalid")
     try:
         expires_at = datetime.fromtimestamp(int(payload.get("exp", 0)), tz=UTC)
     except (ValueError, TypeError, OSError):
         raise LiveViewTokenError("malformed_token") from None
-    verified = LiveViewToken(session_id=session_id, owner=owner, expires_at=expires_at)
+    verified = LiveViewToken(
+        session_id=session_id,
+        owner=owner,
+        access=cast(LiveViewAccess, access),
+        expires_at=expires_at,
+    )
     if verified.is_expired(now):
         raise LiveViewTokenError("token_expired")
     return verified
@@ -171,6 +185,7 @@ class LiveViewAudit:
 
 __all__ = [
     "LiveViewAudit",
+    "LiveViewAccess",
     "LiveViewMode",
     "LiveViewToken",
     "LiveViewTokenError",

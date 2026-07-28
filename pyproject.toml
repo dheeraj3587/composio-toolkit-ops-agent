@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "composio-toolkit-ops-agent"
 version = "0.1.0"
-description = "Secure P2 operations foundation for the Composio toolkit research pipeline."
+description = "Recipe-driven operations control plane for managed auth, Playwright, and gated routes."
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 

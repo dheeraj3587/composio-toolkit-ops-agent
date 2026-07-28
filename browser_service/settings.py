@@ -52,6 +52,10 @@ class BrowserServiceSettings(BaseModel):
     # (base + i). Only ever reached over loopback, so these are never published
     # and never accepted from a caller.
     vnc_port_base: int = Field(default=5900, ge=1, le=65_535)
+    # Separate x11vnc listener started with ``-viewonly``. Routing a view grant to
+    # this port is the server-side enforcement boundary; noVNC's client-side
+    # ``viewOnly`` flag is only a UX aid and is never trusted as authorization.
+    view_vnc_port_base: int = Field(default=5910, ge=1, le=65_535)
     live_view_token_seconds: int = Field(default=300, ge=30, le=3_600)
     # Private-network base for the grant URL. Configuration-supplied ONLY — never
     # derived from a request header, page content, or a redirect (a Host-header
@@ -84,10 +88,14 @@ class BrowserServiceSettings(BaseModel):
                 "sessions (PLAYWRIGHT_MAX_SESSIONS)"
             )
         highest_vnc_port = self.vnc_port_base + self.max_sessions - 1
-        if highest_vnc_port > 65_535:
-            raise ValueError("BROWSER_VNC_PORT is too high for the requested session count")
+        highest_view_vnc_port = self.view_vnc_port_base + self.max_sessions - 1
+        if highest_vnc_port > 65_535 or highest_view_vnc_port > 65_535:
+            raise ValueError("a VNC port base is too high for the requested session count")
         reserved = {self.port, self.novnc_port}
-        collisions = reserved & set(range(self.vnc_port_base, highest_vnc_port + 1))
+        control_ports = set(range(self.vnc_port_base, highest_vnc_port + 1))
+        view_ports = set(range(self.view_vnc_port_base, highest_view_vnc_port + 1))
+        collisions = reserved & (control_ports | view_ports)
+        collisions |= control_ports & view_ports
         if collisions:
             raise ValueError(
                 "the per-session VNC port range collides with the service port or "
@@ -151,6 +159,7 @@ class BrowserServiceSettings(BaseModel):
 
         token = _text("BROWSER_SERVICE_TOKEN")
         storage_key = _text("BROWSER_STORAGE_STATE_KEY") or _text("SECRET_VAULT_KEY")
+        vnc_port_base = _int("BROWSER_VNC_PORT", 5900)
         return cls(
             service_token=SecretStr(token) if token else None,
             host=_text("BROWSER_SERVICE_HOST") or "0.0.0.0",  # noqa: S104 - private network
@@ -166,7 +175,10 @@ class BrowserServiceSettings(BaseModel):
             # Both are now the BASE of a per-slot range, keeping the existing env
             # var names so an existing single-session deployment is unchanged.
             display_num_base=_int("BROWSER_DISPLAY_NUM", 99),
-            vnc_port_base=_int("BROWSER_VNC_PORT", 5900),
+            vnc_port_base=vnc_port_base,
+            view_vnc_port_base=_int(
+                "BROWSER_VIEW_ONLY_VNC_PORT", vnc_port_base + MAX_DISPLAY_SLOTS
+            ),
             live_view_token_seconds=_int("BROWSER_LIVE_VIEW_TOKEN_SECONDS", 300),
             novnc_base_url=(_text("BROWSER_NOVNC_BASE_URL") or "http://browser-worker:8081").rstrip(
                 "/"

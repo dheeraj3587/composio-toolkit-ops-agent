@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ops.models import validate_vault_reference
 
@@ -40,6 +40,7 @@ class CreateSessionRequest(_Strict):
 
     # Reviewed app slug; the service resolves its own host policy from this.
     app_slug: str = Field(min_length=1, max_length=120)
+    recipe_snapshot: dict[str, object] | None = None
     # Opaque profile identifier (never a filesystem path from the caller).
     profile_id: str | None = Field(default=None, max_length=200)
     live_view_mode: LiveViewMode = "screenshot"
@@ -53,6 +54,34 @@ class CreateSessionRequest(_Strict):
     # references may be consumed only for the matching scope, so a reference minted
     # for one run cannot be replayed by another.
     secret_scope: str = Field(default="", max_length=200, pattern=r"^[A-Za-z0-9_-]*$")
+
+    @model_validator(mode="after")
+    def _storage_state_requires_account_binding(self) -> CreateSessionRequest:
+        if self.use_storage_state and not self.account_ref:
+            raise ValueError("storage state requires an account reference")
+        if self.account_ref is not None and re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_-]{0,199}", self.account_ref
+        ) is None:
+            raise ValueError("account reference is invalid")
+        return self
+
+
+class ReconcileSessionsRequest(_Strict):
+    """Find sessions created for one exact persisted browser-start intent."""
+
+    app_slug: str = Field(min_length=1, max_length=120)
+    secret_scope: str = Field(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_-]+$")
+    account_ref: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$",
+    )
+
+
+class ReconcileSessionsResponse(_Strict):
+    """Opaque service session ids matching one exact start binding."""
+
+    session_ids: tuple[str, ...] = ()
 
 
 class SessionSummary(_Strict):
@@ -86,6 +115,9 @@ class NavigateRequest(_Strict):
 
     # The verified OperationalResearch payload (non-secret, strict upstream).
     research: dict[str, object]
+    # Creation-time AppRecipe snapshot supplied by the canonical API. Legacy
+    # callers may omit it, but canonical operations always bind it explicitly.
+    recipe_snapshot: dict[str, object] | None = None
     # Vault REFERENCES only — never raw credential values.
     credential_refs: dict[str, str] = Field(default_factory=dict)
     # Explicit local intent. The service never infers account existence from a
@@ -99,6 +131,7 @@ class ResumeRequest(_Strict):
 
     signal: str = Field(min_length=1, max_length=64)
     research: dict[str, object] | None = None
+    recipe_snapshot: dict[str, object] | None = None
     credential_refs: dict[str, str] = Field(default_factory=dict)
     credential_creation_policy: Literal["reuse_only", "create_if_missing"] = "reuse_only"
 
@@ -140,8 +173,14 @@ class CaptureCredentialsResponse(_Strict):
         return references
 
 
+class CaptureCredentialsRequest(_Strict):
+    """Creation-time recipe needed for selector-bound deterministic capture."""
+
+    recipe_snapshot: dict[str, object] | None = None
+
+
 class LiveViewGrant(_Strict):
-    """A short-lived, session-bound interactive-HITL grant.
+    """A short-lived, session-bound view or control grant.
 
     The URL is returned ONCE for immediate operator use and is never durably
     persisted by the API (see ops.browser_live_view).
@@ -152,6 +191,19 @@ class LiveViewGrant(_Strict):
     url: str | None = None
     expires_at: str = ""
     session_id: str = ""
+    view_allowed: bool = False
+    control_allowed: bool = False
+
+    @model_validator(mode="after")
+    def _capabilities_match_mode(self) -> LiveViewGrant:
+        if self.control_allowed and not self.view_allowed:
+            raise ValueError("control requires view capability")
+        if self.mode == "screenshot":
+            if self.url is not None or self.view_allowed or self.control_allowed:
+                raise ValueError("screenshot mode cannot carry a remote capability")
+        elif self.url is None or not self.view_allowed:
+            raise ValueError("remote mode requires a view grant")
+        return self
 
 
 class HealthResponse(_Strict):
@@ -185,6 +237,8 @@ __all__ = [
     "NavigateRequest",
     "ObservationResponse",
     "ProviderHealthState",
+    "ReconcileSessionsRequest",
+    "ReconcileSessionsResponse",
     "ResumeRequest",
     "SessionLifecycle",
     "SessionSummary",

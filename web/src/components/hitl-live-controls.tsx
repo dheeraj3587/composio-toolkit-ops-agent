@@ -50,10 +50,10 @@ function SubmitButton({ label, pendingLabel }: { label: string; pendingLabel: st
 /**
  * Provider-aware owner controls for the browser phase.
  *
- * Browser Use supplies an interactive hosted iframe. Playwright supplies masked
- * screenshots while autonomous work is running and same-origin noVNC control
- * only while the workflow is paused for HITL. Mutation controls are rendered
- * only from the backend-authoritative BrowserUiState booleans.
+ * Browser Use supplies an interactive hosted iframe. Playwright supplies a
+ * continuous same-origin noVNC stream. The signed grant is view-only while
+ * autonomous work runs and permits control only while the workflow is paused for
+ * HITL. Mutation controls come only from backend-authoritative capabilities.
  */
 export function HitlLiveControls({
   runId,
@@ -75,13 +75,17 @@ export function HitlLiveControls({
   const [livePending, startLiveTransition] = useTransition()
   const liveRequestInFlight = useRef<number | null>(null)
   const liveRequestSequence = useRef(0)
-  const interactiveRunWithGrant = useRef<string | null>(null)
+  const remoteGrantIdentity = useRef<string | null>(null)
   const remoteViewRef = useRef<PlaywrightRemoteViewHandle>(null)
   const isPlaywright = browser?.provider === "playwright"
   const isInteractiveHitl =
     isPlaywright &&
     browser?.lifecycle === "waiting_for_hitl" &&
     browser.interaction_available
+  const isPlaywrightRemote =
+    isPlaywright &&
+    browser?.live_view_available === true &&
+    browser.live_view_mode === "interactive_remote"
 
   const requestLiveView = useCallback(() => {
     if (liveRequestInFlight.current !== null) return
@@ -112,17 +116,20 @@ export function HitlLiveControls({
   }, [runId, startLiveTransition])
 
   useEffect(() => {
-    if (isInteractiveHitl) {
-      // Attach once when this run enters HITL. A timestamp refresh while the
-      // operator is connected must not mint a token or replace the RFB session.
-      if (interactiveRunWithGrant.current !== runId) {
-        interactiveRunWithGrant.current = runId
+    if (isPlaywrightRemote) {
+      // Attach once per capability generation. The transition from autonomous
+      // view to HITL control deliberately requests a fresh signed token; ordinary
+      // page refreshes must not churn a healthy RFB connection.
+      const identity = `${runId}:${isInteractiveHitl ? "control" : "view"}`
+      if (remoteGrantIdentity.current !== identity) {
+        remoteViewRef.current?.disconnect()
+        remoteGrantIdentity.current = identity
         requestLiveView()
       }
       return
     }
 
-    interactiveRunWithGrant.current = null
+    remoteGrantIdentity.current = null
     requestLiveView()
 
     // Browser Use and interactive noVNC remain connected after the first grant.
@@ -138,6 +145,7 @@ export function HitlLiveControls({
     browserStateVersion,
     isInteractiveHitl,
     isPlaywright,
+    isPlaywrightRemote,
     requestLiveView,
     resumeState.interactiveStateVersion,
     runId,
@@ -147,7 +155,7 @@ export function HitlLiveControls({
     remoteViewRef.current?.disconnect()
     // The next backend state version represents a new HITL generation on the
     // same run and therefore needs a fresh, short-lived WebSocket grant.
-    interactiveRunWithGrant.current = null
+    remoteGrantIdentity.current = null
     liveRequestSequence.current += 1
     liveRequestInFlight.current = null
     setLiveState({

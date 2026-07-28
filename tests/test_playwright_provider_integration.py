@@ -61,9 +61,9 @@ class _ScreenshotWorker:
 
 
 class _InteractiveGrantWorker(_ScreenshotWorker):
-    def request_live_view_sync(self, session_id: str) -> tuple[str, str, str]:
+    def request_live_view_sync(self, session_id: str) -> tuple[str, str, str, bool]:
         assert session_id == "bs_1"
-        return "interactive_remote", _INTERACTIVE_GRANT, "2026-07-25T00:05:00+00:00"
+        return "interactive_remote", _INTERACTIVE_GRANT, "2026-07-25T00:05:00+00:00", True
 
 
 def _service_with_worker(tmp_path: Path, worker: object, *, session_id: str = "s1") -> RunService:
@@ -104,12 +104,15 @@ def test_screenshot_lookup_requires_a_session(tmp_path: Path) -> None:
     assert service.get_browser_screenshot(run_id) is None
 
 
-def test_playwright_grant_is_minted_only_for_waiting_hitl_and_never_persisted(
+def test_playwright_grant_is_minted_for_running_and_hitl_without_being_persisted(
     tmp_path: Path,
 ) -> None:
     service = _service_with_worker(tmp_path, _InteractiveGrantWorker(), session_id="bs_1")
     run_id = service._test_run_id  # type: ignore[attr-defined]
-    assert service.get_browser_interactive_grant(run_id) is None
+    with service.storage.unit_of_work() as transaction:
+        transaction.update_run(run_id, status="browser_running")
+    running_grant = service.get_browser_interactive_grant(run_id)
+    assert running_grant is not None and running_grant[1] == _INTERACTIVE_GRANT
 
     with service.storage.unit_of_work() as transaction:
         transaction.update_run(run_id, status="waiting_for_hitl")
@@ -247,7 +250,7 @@ class _FakeCoreService:
         live_url: str | None,
         screenshot: tuple[bytes, str] | None,
         browser_provider: str,
-        interactive_grant: tuple[str, str, str] | None = None,
+        interactive_grant: tuple[str, str, str, bool] | None = None,
     ) -> None:
         self._live_url = live_url
         self._screenshot = screenshot
@@ -269,7 +272,7 @@ class _FakeCoreService:
         del run_id
         return self._screenshot
 
-    def get_browser_interactive_grant(self, run_id: str) -> tuple[str, str, str] | None:
+    def get_browser_interactive_grant(self, run_id: str) -> tuple[str, str, str, bool] | None:
         del run_id
         return self._interactive_grant
 
@@ -279,7 +282,7 @@ def _projected_live_view(
     live_url: str | None,
     screenshot: tuple[bytes, str] | None,
     browser_provider: str = "browser_use",
-    interactive_grant: tuple[str, str, str] | None = None,
+    interactive_grant: tuple[str, str, str, bool] | None = None,
 ) -> LiveViewResponse:
     from api.service import LocalRunService
 
@@ -330,12 +333,31 @@ def test_playwright_hitl_live_view_returns_a_fresh_interactive_grant() -> None:
             "interactive_remote",
             _INTERACTIVE_GRANT,
             "2026-07-25T00:05:00+00:00",
+            True,
         ),
     )
 
     assert view.mode == "interactive_remote"
     assert view.interactive_url == _INTERACTIVE_GRANT
     assert view.interaction_available is True
+
+
+def test_playwright_running_live_view_is_remote_and_view_only() -> None:
+    view = _projected_live_view(
+        live_url=None,
+        screenshot=None,
+        browser_provider="playwright",
+        interactive_grant=(
+            "interactive_remote",
+            _INTERACTIVE_GRANT,
+            "2026-07-25T00:05:00+00:00",
+            False,
+        ),
+    )
+
+    assert view.mode == "interactive_remote"
+    assert view.available is True
+    assert view.interaction_available is False
 
 
 def test_idle_live_view_reports_the_configured_provider_without_a_viewer() -> None:
@@ -505,9 +527,10 @@ def test_production_deployment_wires_isolated_playwright() -> None:
     assert "Dockerfile.api" in compose
 
 
-def test_production_env_example_keeps_browser_use_default() -> None:
+def test_production_env_example_selects_playwright_for_the_rollout() -> None:
     example = (_REPO / ".env.production.example").read_text(encoding="utf-8")
-    assert "BROWSER_PROVIDER=browser_use" in example
+    assert "BROWSER_PROVIDER=playwright" in example
+    assert "BROWSER_USE_COMPATIBILITY_ENABLED=false" in example
     assert "BROWSER_SERVICE_TOKEN=" in example
 
 

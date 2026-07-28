@@ -23,6 +23,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.api
+      args:
+        APP_REVISION: ${APP_REVISION:-local-uncommitted}
     # Provider keys, vault/AES keys, Composio identifiers and CORS origins are
     # supplied from the untracked .env.production file. Marked not-required so
     # `docker compose config` can be validated with the example env file.
@@ -32,7 +34,8 @@ services:
     # Production-safe defaults are defined here. Live provider capabilities stay
     # disabled unless the untracked production environment explicitly opts in.
     # BROWSER_PROVIDER is only the compatibility default for callers that omit a
-    # per-run choice; both configured adapters are wired independently.
+    # per-run choice. Browser Use remains a disabled compatibility adapter during
+    # this rollout; reviewed browser recipes always select Playwright.
     environment:
       ALLOW_LIVE_VENDOR_EMAIL: ${ALLOW_LIVE_VENDOR_EMAIL:-false}
       ALLOW_LIVE_BROWSER: ${ALLOW_LIVE_BROWSER:-false}
@@ -40,20 +43,21 @@ services:
       # this flag. It MUST be true for those operator actions to work; default
       # false keeps them disabled until explicitly enabled.
       ALLOW_LOCAL_CREDENTIAL_SUBMISSION: ${ALLOW_LOCAL_CREDENTIAL_SUBMISSION:-false}
-      # Per-session Browser Use cost ceiling. Kept high so a live onboarding task
-      # never stops mid-run on the cap; lower it deliberately if desired.
-      BROWSER_USE_MAX_COST_USD: ${BROWSER_USE_MAX_COST_USD:-50.0}
-      BROWSER_PROVIDER: ${BROWSER_PROVIDER:-browser_use}
+      BROWSER_PROVIDER: ${BROWSER_PROVIDER:-playwright}
+      BROWSER_USE_COMPATIBILITY_ENABLED: "false"
       BROWSER_SERVICE_URL: http://browser-worker:8081
       BROWSER_SERVICE_TOKEN: ${BROWSER_SERVICE_TOKEN:?BROWSER_SERVICE_TOKEN is required}
       BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-production-owner}
       # The API must project the same interactive capability the isolated browser
       # service enforces; otherwise a real grant exists but the evaluator UI reports
       # screenshot-only and never requests it.
-      BROWSER_INTERACTIVE_HITL_ENABLED: ${BROWSER_INTERACTIVE_HITL_ENABLED:-false}
+      BROWSER_INTERACTIVE_HITL_ENABLED: ${BROWSER_INTERACTIVE_HITL_ENABLED:-true}
       PLAYWRIGHT_IN_PROCESS_SANDBOX: "false"
       OPS_ENABLE_API_DOCS: "false"
       RUN_LIVE_TESTS: "0"
+      YOU_SEARCH_ENABLED: "false"
+      YOU_CONTENTS_ENABLED: "false"
+      YOU_RESEARCH_ENABLED: "false"
       OPS_INTERNAL_API_TOKEN: ${OPS_INTERNAL_API_TOKEN:?OPS_INTERNAL_API_TOKEN is required}
       LANGGRAPH_STRICT_MSGPACK: "true"
       OPS_DB_PATH: /data/ops.db
@@ -96,6 +100,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.browser
+      args:
+        APP_REVISION: ${APP_REVISION:-local-uncommitted}
     init: true
     ipc: host
     shm_size: 1gb
@@ -110,16 +116,15 @@ services:
       BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-production-owner}
       BROWSER_SESSION_INACTIVITY_SECONDS: ${BROWSER_SESSION_INACTIVITY_SECONDS:-900}
       BROWSER_SESSION_MAX_AGE_SECONDS: ${BROWSER_SESSION_MAX_AGE_SECONDS:-3600}
-      # Each session leases its OWN X display stack (display_pool), so concurrency
-      # is bounded by host memory rather than by a shared display. The default
-      # stays at one to keep sequential rehearsal behavior deterministic; raise
-      # PLAYWRIGHT_MAX_SESSIONS and BROWSER_DISPLAY_SLOTS together.
-      PLAYWRIGHT_MAX_SESSIONS: ${PLAYWRIGHT_MAX_SESSIONS:-1}
-      BROWSER_DISPLAY_SLOTS: ${PLAYWRIGHT_MAX_SESSIONS:-1}
+      # This rollout deliberately permits one interactive session. Keep both
+      # capacity owners hard-bound here so an environment override cannot make
+      # the single-VPS acceptance claim untrue.
+      PLAYWRIGHT_MAX_SESSIONS: "1"
+      BROWSER_DISPLAY_SLOTS: "1"
       PLAYWRIGHT_DISABLE_SANDBOX: ${PLAYWRIGHT_DISABLE_SANDBOX:-true}
       # Opt-in remains environment controlled, but is no longer hard-disabled by
       # Compose after the deployment explicitly enables it.
-      BROWSER_INTERACTIVE_HITL_ENABLED: ${BROWSER_INTERACTIVE_HITL_ENABLED:-false}
+      BROWSER_INTERACTIVE_HITL_ENABLED: ${BROWSER_INTERACTIVE_HITL_ENABLED:-true}
       # The policy-constrained browser action loop needs at least one JSON
       # inference backend. Values stay inside this private service.
       # Groq is FIRST in build_json_inference's chain and the only strict-schema
@@ -172,6 +177,8 @@ services:
     build:
       context: .
       dockerfile: web/Dockerfile
+      args:
+        APP_REVISION: ${APP_REVISION:-local-uncommitted}
     # Only server-only runtime values reach the frontend container. Provider
     # secrets are intentionally NOT passed here. OPS_API_URL and
     # OPS_INTERNAL_API_TOKEN are read exclusively by Next.js server code
@@ -254,8 +261,8 @@ networks:
     driver: bridge
 
 volumes:
-  # Persistent SQLite state: ops.db, checkpoints.db, secret_vault.db,
-  # provider_effects.db. A first-run named volume inherits the ops:0700
+  # Canonical SQLite state plus the temporary read-only legacy checkpoint and
+  # provider-effect databases. A first-run named volume inherits the ops:0700
   # ownership pre-created in Dockerfile.api at /data.
   ops_data:
   browser_profiles:

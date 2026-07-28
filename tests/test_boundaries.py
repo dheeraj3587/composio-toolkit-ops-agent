@@ -22,7 +22,6 @@ PROVIDER_BOUNDARY_FILES = (
     "p1_adapter.py",
     "operational_research.py",
     "browser_worker.py",
-    "developer_app_worker.py",
     "credential_capture.py",
     "credential_validator.py",
     "gmail_worker.py",

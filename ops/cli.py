@@ -1,4 +1,4 @@
-"""Local-only command line interface for the Phase 0/1/2 operations ledger.
+"""Local-only command line interface for the canonical operations ledger.
 
 The CLI exposes a narrow, sanitized view of verified P1 lookup and deterministic
 routing. It does not invoke providers, send email, start browsers, or produce an
@@ -459,7 +459,7 @@ def _default_company(args: argparse.Namespace) -> CompanyProfile:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="composio-ops",
-        description="Secure local operations ledger (Phase 0/1/2).",
+        description="Secure local operations ledger.",
     )
     parser.add_argument("--db-path", help=argparse.SUPPRESS)
     subparsers = parser.add_subparsers(dest="command", required=True)

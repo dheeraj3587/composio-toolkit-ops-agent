@@ -45,12 +45,15 @@ export function RunTable({ runs }: { runs: RunSummary[] }) {
             <TableRow key={run.run_id} className="border-border hover:bg-brand-50/35">
               <TableCell>
                 <span className="block text-sm font-semibold leading-tight">{run.app_name}</span>
-                <span className="mt-1 block max-w-48 truncate font-mono text-[10px] text-muted-foreground">
-                  {humanize(run.browser_provider)} · {humanize(run.credential_creation_policy)} · {run.run_id}
+                <span className="mt-1 block max-w-64 truncate font-mono text-[10px] text-muted-foreground">
+                  {humanize(run.browser_provider)} · recipe {run.recipe_version ?? "legacy"}
                 </span>
               </TableCell>
-              <TableCell className="font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
-                {humanize(run.access_route)}
+              <TableCell>
+                <span className="block font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
+                  {humanize(run.route_kind ?? run.access_route)}
+                </span>
+                <StatusBadge status={run.readiness_tier} className="mt-1" />
               </TableCell>
               <TableCell><StatusBadge status={run.status} /></TableCell>
               <TableCell className="hidden text-xs text-muted-foreground lg:table-cell" title={formatTimestamp(run.updated_at)}>

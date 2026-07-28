@@ -85,7 +85,7 @@ def test_reconcile_marks_stranded_browser_run_recoverable(tmp_path: Path) -> Non
     assert "run_reconciled_on_startup" in events
 
 
-def test_reconcile_leaves_waiting_for_hitl_runs_resumable(tmp_path: Path) -> None:
+def test_reconcile_marks_hitl_without_a_live_provider_session_lost(tmp_path: Path) -> None:
     service = RunService.from_paths(db_path=tmp_path / "ops.db")
     service.initialize()
     run = service.create_run(_request("HubSpot"), execution_mode="plan_only")
@@ -99,6 +99,12 @@ def test_reconcile_leaves_waiting_for_hitl_runs_resumable(tmp_path: Path) -> Non
 
     service._reconcile_stranded_runs()
 
-    # waiting_for_hitl is resumable (provider session id now persists), so it must
-    # NOT be reconciled away.
-    assert service.get_run(run_id)["status"] == "waiting_for_hitl"
+    # A status token alone is not proof that Chromium survived. With no configured
+    # provider and no persisted live session, reconciliation must fail closed.
+    reconciled = service.get_run(run_id)
+    assert reconciled["status"] == "configuration_required"
+    assert reconciled["phase"] == "session_lost"
+    assert reconciled["reason_code"] == "provider_unavailable_session_lost"
+    assert "run_reconciled_on_startup" in [
+        event["event_type"] for event in service.get_timeline(run_id)
+    ]

@@ -25,6 +25,7 @@ from typing import Any, Protocol, cast
 
 from pydantic import SecretStr
 
+from ops.app_recipes import AppRecipe, recipe_to_validation_policy
 from ops.integrator import build_integrator_bundle
 from ops.models import (
     CompanyProfile,
@@ -35,8 +36,9 @@ from ops.models import (
 from ops.provider_errors import ConfigurationRequiredError
 from ops.run_errors import CredentialSubmissionError, RunConflictError
 from ops.run_projections import _clean_credential_value, _public_run
+from ops.run_recipe_snapshot import RecipeSnapshotError, recipe_from_run
 from ops.secret_store import SQLiteSecretStore
-from ops.state import BrowserProvider, RunStatus, validate_status_transition
+from ops.state import BrowserProvider, RunStatus
 from ops.storage import OperationsStorage
 
 
@@ -219,6 +221,8 @@ class RunCredentialService:
         research: OperationalResearch,
         request: OperationsRequest,
         captured: Mapping[str, str],
+        *,
+        recipe: AppRecipe | None = None,
     ) -> _CredentialOutcome:
         """Validate deterministically-captured vault refs and build the bundle.
 
@@ -246,8 +250,21 @@ class RunCredentialService:
             ),
         ]
         try:
+            validation_policy = (
+                recipe_to_validation_policy(recipe) if recipe is not None else None
+            )
+            if recipe is not None and validation_policy is None:
+                raise CredentialSubmissionError("immutable_validation_policy_missing")
             result = asyncio.run(
-                validator.validate(app_slug=research.app_slug, credential_refs=references)
+                validator.validate(
+                    app_slug=research.app_slug,
+                    credential_refs=references,
+                    **(
+                        {"policy": validation_policy}
+                        if validation_policy is not None
+                        else {}
+                    ),
+                )
             )
         except ConfigurationRequiredError as exc:
             return _CredentialOutcome(
@@ -342,83 +359,192 @@ class RunCredentialService:
             if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,99}", kind) is None:
                 raise CredentialSubmissionError("invalid_credential_field")
         store = self._context._secret_store
-        validator = self._context._credential_validator
-        if store is None or validator is None:
+        if store is None:
             raise CredentialSubmissionError("credential_boundary_not_configured")
 
         lock = self._context._run_lock(run_id)
         if not lock.acquire(blocking=False):
             raise RunConflictError(run_id, "submit_credentials")
+        references: dict[str, str] = {}
         try:
-            with self.storage.unit_of_work() as transaction:
-                current = transaction.get_run(run_id)
-                if current is None:
-                    raise KeyError("run was not found")
-                if current["status"] != "browser_running":
-                    raise CredentialSubmissionError("run_not_awaiting_credentials")
-                research_payload = current.get("operational_research")
-                if not isinstance(research_payload, Mapping):
-                    raise CredentialSubmissionError("verified_research_unavailable")
-                research = OperationalResearch.model_validate(dict(research_payload))
-                app_slug = research.app_slug
+            current = self.storage.get_run(run_id)
+            if current is None:
+                raise KeyError("run was not found")
+            if current.get("state_engine") != "canonical_v1":
+                raise CredentialSubmissionError("legacy_run_is_read_only")
+            if current.get("status") != "browser_running" or current.get("phase") not in {
+                "credential_ready",
+                "entry_reached",
+            }:
+                raise CredentialSubmissionError("run_not_awaiting_credentials")
+            try:
+                recipe = recipe_from_run(current)
+            except RecipeSnapshotError as exc:
+                raise CredentialSubmissionError(exc.reason_code) from None
+            if recipe.route_kind != "playwright":
+                raise CredentialSubmissionError("run_is_not_playwright")
+            expected_fields = {field.name for field in recipe.credential_fields}
+            if set(fields) != expected_fields:
+                raise CredentialSubmissionError("credential_fields_do_not_match_recipe")
+            validator = self._context._credential_validator
+            if recipe.validation is not None and validator is None:
+                raise CredentialSubmissionError("credential_validation_not_configured")
+            research_payload = current.get("operational_research")
+            if not isinstance(research_payload, Mapping):
+                raise CredentialSubmissionError("verified_research_unavailable")
+            research = OperationalResearch.model_validate(dict(research_payload))
+            app_slug = research.app_slug
+            effect_identity = f"{run_id}:owner-credential-submit:v1"
 
-                references: dict[str, str] = {}
+            # Commit the intent before touching the vault or validation endpoint.
+            with self.storage.unit_of_work() as transaction:
+                _effect, reserved = transaction.reserve_side_effect(
+                    run_id=run_id,
+                    operation_key=effect_identity,
+                    provider="owner_vault",
+                )
+                record = transaction.get_run(run_id)
+                if record is None:
+                    raise KeyError("run was not found")
+                transaction.update_run(
+                    run_id,
+                    phase="credential_submission_reserved",
+                    reason_code="credential_submission_reserved",
+                    effect_identity=effect_identity,
+                    state_revision=int(record.get("state_revision", 0) or 0) + 1,
+                )
+                transaction.append_audit_event(
+                    run_id=run_id,
+                    event_type="credential_submission_reserved",
+                    payload={
+                        "kinds": sorted(fields),
+                        "external_actions": False,
+                    },
+                )
+            if not reserved:
+                raise CredentialSubmissionError("credential_submission_reconciliation_required")
+
+            # Vault and provider validation are deliberately outside every run DB
+            # transaction. Raw values are cleared as each field crosses the vault.
+            try:
+                for kind, secret in fields.items():
+                    cleaned = _clean_credential_value(secret.get_secret_value())
+                    if not cleaned:
+                        raise CredentialSubmissionError("empty_credential_value")
+                    reference = store.put(app_slug=app_slug, kind=kind, value=cleaned)
+                    references[kind] = validate_vault_reference(reference)
+                    del cleaned
+            except Exception:
+                for reference in references.values():
+                    try:
+                        store.delete(reference)
+                    except Exception:  # pragma: no cover - best-effort rollback
+                        pass
+                self.storage.update_side_effect(
+                    run_id=run_id,
+                    operation_key=effect_identity,
+                    status="failed",
+                )
+                raise CredentialSubmissionError("vault_write_failed") from None
+
+            result = None
+            if recipe.validation is not None:
                 try:
-                    for kind, secret in fields.items():
-                        cleaned = _clean_credential_value(secret.get_secret_value())
-                        if not cleaned:
-                            raise CredentialSubmissionError("empty_credential_value")
-                        reference = store.put(
+                    validation_policy = recipe_to_validation_policy(recipe)
+                    if validation_policy is None:  # pragma: no cover - model invariant
+                        raise CredentialSubmissionError("immutable_validation_policy_missing")
+                    result = asyncio.run(
+                        validator.validate(
                             app_slug=app_slug,
-                            kind=kind,
-                            value=cleaned,
+                            credential_refs=references,
+                            policy=validation_policy,
                         )
-                        references[kind] = validate_vault_reference(reference)
-                except Exception:
+                    )
+                except ConfigurationRequiredError as exc:
                     for reference in references.values():
                         try:
                             store.delete(reference)
-                        except Exception:  # pragma: no cover - best-effort rollback
+                        except Exception:  # pragma: no cover - best-effort cleanup
                             pass
-                    raise CredentialSubmissionError("vault_write_failed") from None
-
-                result = asyncio.run(
-                    validator.validate(app_slug=app_slug, credential_refs=references)
-                )
-                bundle = build_integrator_bundle(
-                    research=research,
-                    company=company,
-                    credential_refs=references,
-                    validation=result,
-                    stage="normal",
-                )
-
-                revision = int(current.get("state_revision", 0) or 0) + 1
-                if result.status == "valid":
-                    validate_status_transition("browser_running", "credentials_ready", "submit")
-                    validate_status_transition("credentials_ready", "completed", "submit")
-                    final_status: RunStatus = "completed"
-                else:
-                    validate_status_transition(
-                        "browser_running", "configuration_required", "submit"
+                    references.clear()
+                    self.storage.update_side_effect(
+                        run_id=run_id,
+                        operation_key=effect_identity,
+                        status="failed",
                     )
-                    final_status = "configuration_required"
+                    with self.storage.unit_of_work() as transaction:
+                        record = transaction.get_run(run_id)
+                        if record is None:
+                            raise KeyError("run was not found") from None
+                        revision = int(record.get("state_revision", 0) or 0) + 1
+                        transaction.update_run(
+                            run_id,
+                            phase=str(current.get("phase") or "credential_ready"),
+                            reason_code=exc.reason_code,
+                            state_revision=revision,
+                            last_projected_revision=revision,
+                        )
+                    raise CredentialSubmissionError(exc.reason_code) from None
+            bundle = build_integrator_bundle(
+                research=research,
+                company=company,
+                credential_refs=references,
+                validation=result,
+                stage="normal",
+                operational_notes=(
+                    ()
+                    if result is not None
+                    else ("Credential was owner-submitted; live validation is not reviewed.",)
+                ),
+            )
 
+            if result is None:
+                final_status: RunStatus = "credentials_ready"
+                final_phase = "credential_ready"
+                reason_code = "owner_credentials_vaulted_unvalidated"
+            elif result.status == "valid":
+                final_status = "completed"
+                final_phase = "completed"
+                reason_code = result.reason_code
+            else:
+                final_status = "configuration_required"
+                final_phase = "credential_validation_failed"
+                reason_code = (
+                    result.reason_code
+                    if result.status in {"invalid", "failed"}
+                    else "validation_outcome_unknown"
+                )
+
+            validation_payload = (
+                {
+                    "status": result.status,
+                    "reason_code": result.reason_code,
+                    "http_status": result.http_status,
+                    "endpoint": result.endpoint,
+                    "checked_at": result.checked_at,
+                    "account_identifier": result.account_identifier,
+                }
+                if result is not None
+                else {
+                    "status": "not_reviewed",
+                    "reason_code": "validation_policy_not_reviewed",
+                }
+            )
+            with self.storage.unit_of_work() as transaction:
+                record = transaction.get_run(run_id)
+                if record is None:
+                    raise KeyError("run was not found")
+                revision = int(record.get("state_revision", 0) or 0) + 1
                 updated = transaction.update_run(
                     run_id,
                     status=final_status,
+                    phase=final_phase,
+                    reason_code=reason_code,
                     state_revision=revision,
                     last_projected_revision=revision,
                     external_actions=True,
                     integrator_bundle=bundle.model_dump(mode="json"),
-                    validation={
-                        "status": result.status,
-                        "reason_code": result.reason_code,
-                        "http_status": result.http_status,
-                        "endpoint": result.endpoint,
-                        "checked_at": result.checked_at,
-                        "account_identifier": result.account_identifier,
-                    },
+                    validation=validation_payload,
                 )
                 transaction.append_audit_event(
                     run_id=run_id,
@@ -429,18 +555,19 @@ class RunCredentialService:
                         "external_actions": True,
                     },
                 )
-                transaction.append_audit_event(
-                    run_id=run_id,
-                    event_type="credentials_validated",
-                    payload={
-                        "validation_status": result.status,
-                        "reason_code": result.reason_code,
-                        "http_status": result.http_status,
-                        "endpoint": result.endpoint,
-                        "account_identifier": result.account_identifier,
-                        "external_actions": True,
-                    },
-                )
+                if result is not None:
+                    transaction.append_audit_event(
+                        run_id=run_id,
+                        event_type="credentials_validated",
+                        payload={
+                            "validation_status": result.status,
+                            "reason_code": result.reason_code,
+                            "http_status": result.http_status,
+                            "endpoint": result.endpoint,
+                            "account_identifier": result.account_identifier,
+                            "external_actions": True,
+                        },
+                    )
                 transaction.append_audit_event(
                     run_id=run_id,
                     event_type="integrator_bundle_generated",
@@ -451,27 +578,44 @@ class RunCredentialService:
                         "external_actions": True,
                     },
                 )
-                if final_status == "completed":
-                    transaction.append_audit_event(
-                        run_id=run_id,
-                        event_type="credentials_ready",
-                        payload={"status": "credentials_ready", "external_actions": True},
-                    )
-                    transaction.append_audit_event(
-                        run_id=run_id,
-                        event_type="run_completed",
-                        payload={"status": "completed", "external_actions": True},
-                    )
+                transaction.append_audit_event(
+                    run_id=run_id,
+                    event_type="run_completed"
+                    if final_status == "completed"
+                    else "credentials_ready",
+                    payload={"status": final_status, "external_actions": True},
+                )
                 projected = _public_run(updated)
                 release_provider = cast(
-                    BrowserProvider, current.get("browser_provider", "browser_use")
+                    BrowserProvider, current.get("browser_provider", "playwright")
                 )
+            self.storage.update_side_effect(
+                run_id=run_id,
+                operation_key=effect_identity,
+                status="completed",
+            )
+        except Exception:
+            # If the state commit fails after vaulting, do not strand raw material
+            # outside a run that can reference it.
+            if references and self.storage.get_run(run_id) is not None:
+                latest = self.storage.get_run(run_id)
+                if latest is None or latest.get("phase") == "credential_submission_reserved":
+                    for reference in references.values():
+                        try:
+                            store.delete(reference)
+                        except Exception:  # pragma: no cover - best-effort cleanup
+                            pass
+            raise
         finally:
             lock.release()
         self._context._release_browser_session(
             self._context._session_context_for(run_id),
             release_provider,
-            reason=f"credentials_{final_status}",
+            reason=(
+                "credentials_ready"
+                if final_status == "credentials_ready"
+                else f"credentials_{final_status}"
+            ),
         )
         return projected
 

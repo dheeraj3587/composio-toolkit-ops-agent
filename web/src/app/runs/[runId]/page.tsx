@@ -5,6 +5,7 @@ import { connection } from "next/server"
 import { ArrowLeft, CircleOff, Clock3, Fingerprint, Globe2, Mail, Route, Settings2 } from "lucide-react"
 
 import { HitlLiveControls } from "@/components/hitl-live-controls"
+import { CanonicalPrimaryAction } from "@/components/canonical-primary-action"
 import { PhaseActionForm } from "@/components/phase-action-form"
 import { ProviderStateCard } from "@/components/provider-state-card"
 import { RunAutoRefresh } from "@/components/run-auto-refresh"
@@ -51,6 +52,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
   const outputPhase = phases.get("output")
   const researchPhase = phases.get("research")
   const browser = detail.browser ?? null
+  const primaryAction = detail.primary_action ?? null
 
   // The backend owns every browser permission. A run status alone does not prove
   // that a session is live, a credential page is verified, or a resume is legal.
@@ -80,7 +82,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
     : detail.run.status === "waiting_for_hitl" &&
       detail.hitl_request?.resumable === true
 
-  const canPoll = !isPlanOnly && ["outreach_sent", "waiting_for_reply"].includes(detail.run.status)
+  const canPoll = !primaryAction && !isPlanOnly && ["outreach_sent", "waiting_for_reply"].includes(detail.run.status)
   const missingFields = Array.from(new Set([
     ...(detail.missing_fields ?? []),
     ...(detail.research?.missing_fields ?? []),
@@ -93,17 +95,25 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
 
       <header className="flex flex-col gap-6 border-b border-border pb-7 xl:flex-row xl:items-end xl:justify-between">
         <div>
-          <div className="flex flex-wrap items-center gap-3"><p className="eyebrow">Run · {detail.run.app_slug}</p><StatusBadge status={detail.run.status} /></div>
+          <div className="flex flex-wrap items-center gap-3">
+            <p className="eyebrow">Run · {detail.run.app_slug}</p>
+            <StatusBadge status={detail.run.status} />
+            <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">
+              External actions · {detail.run.external_actions ? "Enabled" : "Off"}
+            </Badge>
+          </div>
           <h1 className="mt-3 text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">{detail.run.app_name}</h1>
           <p className="mt-3 break-all font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">{detail.run.run_id}</p>
         </div>
-        <div className="grid overflow-hidden rounded-md border border-border bg-border sm:grid-cols-2 xl:min-w-[920px] xl:grid-cols-6">
-          <Meta icon={Fingerprint} label="Access route" value={humanize(detail.run.access_route)} />
+        <div className="grid overflow-hidden rounded-md border border-border bg-border sm:grid-cols-2 xl:min-w-[920px] xl:grid-cols-4 2xl:grid-cols-8">
+          <Meta icon={Route} label="Frozen route" value={humanize(detail.run.route_kind ?? detail.run.access_route)} />
+          <Meta icon={Settings2} label="Readiness" value={humanize(detail.run.readiness_tier)} />
+          <Meta icon={Globe2} label="Frozen provider" value={humanize(detail.run.browser_provider)} />
+          <Meta icon={Fingerprint} label="Recipe" value={detail.run.recipe_version ?? "Legacy"} />
+          <Meta icon={Settings2} label="Run phase" value={humanize(detail.run.phase)} />
           <Meta icon={Settings2} label="Execution mode" value={humanize(detail.run.execution_mode)} />
-          <Meta icon={Globe2} label="Browser engine" value={humanize(detail.run.browser_provider)} />
-          <Meta icon={Settings2} label="Credential policy" value={humanize(detail.run.credential_creation_policy)} />
           <Meta icon={Clock3} label="Updated · UTC" value={formatTimestamp(detail.run.updated_at)} />
-          <Meta icon={CircleOff} label="External actions" value={detail.run.external_actions ? "Enabled" : "Off"} />
+          <Meta icon={CircleOff} label="State engine" value={humanize(detail.run.state_engine)} />
         </div>
       </header>
 
@@ -127,6 +137,10 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         </Alert>
       ) : null}
 
+      {primaryAction ? (
+        <CanonicalPrimaryAction runId={runId} action={primaryAction} />
+      ) : null}
+
       <section aria-labelledby="phase-map">
         <div className="mb-3 flex items-end justify-between gap-4"><div><p className="eyebrow">Durable workflow</p><h2 id="phase-map" className="mt-1 text-xl font-semibold">Operational phases</h2></div><Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">Backend state</Badge></div>
         <PhaseGrid phases={displayPhases} />
@@ -140,21 +154,23 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         </div>
       </section>
 
-      <section aria-labelledby="execution-surfaces">
+      <section id="browser-session" aria-labelledby="execution-surfaces" className="scroll-mt-6">
         <div className="mb-3"><p className="eyebrow">Execution surfaces</p><h2 id="execution-surfaces" className="mt-1 text-xl font-semibold">Provider and human gates</h2></div>
         <div className={hasBrowserSession ? "grid gap-6 lg:grid-cols-2" : "grid gap-6 lg:grid-cols-3"}>
           <div className={hasBrowserSession ? "lg:col-span-2" : "h-full"}>
             <CapabilityPanel title="Browser onboarding" icon={Globe2} phase={browserPhase}>
               {hasBrowserSession ? (
-                <HitlLiveControls
-                  runId={runId}
-                  browser={browser}
-                  browserStateVersion={detail.run.updated_at}
-                  canResumeInteractive={interactivePlaywrightResume}
-                  fieldName={detail.research?.credential_fields?.[0] ?? "api_token"}
-                  fieldLabel={humanize(detail.research?.credential_fields?.[0] ?? "API token")}
-                />
-              ) : isRetryable(browserPhase) ? (
+                <div id="credential-submission" className="scroll-mt-6">
+                  <HitlLiveControls
+                    runId={runId}
+                    browser={browser}
+                    browserStateVersion={detail.run.updated_at}
+                    canResumeInteractive={interactivePlaywrightResume}
+                    fieldName={detail.research?.credential_fields?.[0] ?? "api_token"}
+                    fieldLabel={humanize(detail.research?.credential_fields?.[0] ?? "API token")}
+                  />
+                </div>
+              ) : !primaryAction && isRetryable(browserPhase) ? (
                 <PhaseActionForm runId={runId} action="retry" capability="browser" label="Retry browser phase" />
               ) : (
                 <ControlUnavailable />
@@ -162,9 +178,11 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
             </CapabilityPanel>
           </div>
           <HitlPanel request={isPlanOnly ? null : detail.hitl_request} action={canResume && !interactivePlaywrightResume ? <PhaseActionForm runId={runId} action="resume" label="Resume after human action" /> : undefined} />
-          <CapabilityPanel title="Provider email" icon={Mail} phase={emailPhase}>
-            {canPoll ? <PhaseActionForm runId={runId} action="poll-email" label="Poll controlled inbox" /> : isRetryable(emailPhase) ? <PhaseActionForm runId={runId} action="retry" capability="email" label="Retry email phase" /> : <ControlUnavailable />}
-          </CapabilityPanel>
+          <div id="outreach-review" className="h-full scroll-mt-6">
+            <CapabilityPanel title="Provider email" icon={Mail} phase={emailPhase}>
+              {canPoll ? <PhaseActionForm runId={runId} action="poll-email" label="Poll controlled inbox" /> : !primaryAction && isRetryable(emailPhase) ? <PhaseActionForm runId={runId} action="retry" capability="email" label="Retry email phase" /> : <ControlUnavailable />}
+            </CapabilityPanel>
+          </div>
         </div>
       </section>
 
@@ -179,9 +197,9 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         </section>
       ) : null}
 
-      <section className="grid items-stretch gap-6 lg:grid-cols-2">
+      <section className={primaryAction ? "grid items-stretch gap-6" : "grid items-stretch gap-6 lg:grid-cols-2"}>
         <OutputPanel output={output} />
-        <div className="panel rounded-md p-5">
+        {!primaryAction ? <div className="panel rounded-md p-5">
           <p className="eyebrow">Bounded controls</p>
           <h2 className="mt-1 text-lg font-semibold">Retry authority</h2>
           <p className="mt-2 text-xs leading-5 text-muted-foreground">Retries are idempotent backend commands. A configuration-required or no-change receipt is shown as such, never as success.</p>
@@ -189,7 +207,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
             <RetryControl label="Research" runId={runId} capability="research" enabled={!isPlanOnly && isRetryable(researchPhase)} />
             <RetryControl label="Credential validation" runId={runId} capability="validation" enabled={!isPlanOnly && isRetryable(outputPhase)} />
           </div>
-        </div>
+        </div> : null}
       </section>
 
       <section aria-labelledby="timeline">

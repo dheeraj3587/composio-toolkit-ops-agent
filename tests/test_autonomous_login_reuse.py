@@ -166,7 +166,7 @@ def _waiting(service: RunService, run_id: str, action_type: str) -> None:
     )
 
 
-def test_login_gate_is_resumed_when_credentials_are_remembered(
+def test_login_gate_is_not_resumed_from_remembered_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service = _service(tmp_path)
@@ -179,8 +179,8 @@ def test_login_gate_is_resumed_when_credentials_are_remembered(
     recorder = _Recorder()
     monkeypatch.setattr(service, "resume_run", recorder)
 
-    assert service.advance_autonomous_runs() == 1
-    assert recorder.resumed == ["run_login"]
+    assert service.advance_autonomous_runs() == 0
+    assert recorder.resumed == []
 
 
 def test_login_gate_is_left_alone_without_stored_credentials(
@@ -232,9 +232,9 @@ def test_advancement_is_bounded_per_run(tmp_path: Path, monkeypatch: pytest.Monk
     for _ in range(5):
         service.advance_autonomous_runs()
 
-    # A login that keeps failing must settle into a truthful human gate rather
-    # than resuming forever.
-    assert recorder.resumed == ["run_login", "run_login"]
+    # Resume never recreates consumed login references, even with a non-zero
+    # legacy advancement budget.
+    assert recorder.resumed == []
 
 
 def test_advancement_is_off_when_the_budget_is_zero(

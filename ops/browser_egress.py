@@ -148,8 +148,28 @@ _REVIEWED_EGRESS_EXTENSIONS: dict[str, ReviewedEgressExtensions] = {
 }
 
 
-def reviewed_egress_extensions(app_slug: str) -> ReviewedEgressExtensions:
-    """Return static, exact egress additions for one reviewed application."""
+def reviewed_egress_extensions(
+    app_slug: str,
+    *,
+    recipe: object | None = None,
+) -> ReviewedEgressExtensions:
+    """Return separately reviewed resource/IdP hosts from the canonical recipe."""
+
+    from ops.app_recipes import AppRecipe, get_app_recipe
+
+    resolved = recipe if isinstance(recipe, AppRecipe) else get_app_recipe(app_slug)
+    if (
+        resolved is not None
+        and resolved.app_slug == app_slug
+        and resolved.route_kind == "playwright"
+        and resolved.browser is not None
+    ):
+        browser = resolved.browser
+        return ReviewedEgressExtensions(
+            identity_provider_hosts=browser.identity_provider_hosts,
+            active_script_hosts=browser.static_resource_hosts,
+            passive_asset_hosts=browser.static_resource_hosts,
+        )
 
     return _REVIEWED_EGRESS_EXTENSIONS.get(app_slug, ReviewedEgressExtensions())
 

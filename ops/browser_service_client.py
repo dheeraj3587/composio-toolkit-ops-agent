@@ -38,6 +38,12 @@ TOKEN_HEADER = "X-Browser-Service-Token"
 OWNER_HEADER = "X-Browser-Session-Owner"
 
 ReconcileOutcome = Literal["resumable", "session_lost", "unreachable"]
+StartReconcileOutcome = Literal[
+    "no_session",
+    "orphan_closed",
+    "unreachable",
+    "close_failed",
+]
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024
@@ -163,6 +169,7 @@ class BrowserServiceClient:
         self,
         profile_id: str | None,
         *,
+        recipe: Any = None,
         app_slug: str = "",
         account_ref: str | None = None,
         secret_scope: str | None = None,
@@ -177,6 +184,10 @@ class BrowserServiceClient:
             "live_view_mode": live_view_mode,
             "use_storage_state": use_storage_state,
         }
+        if recipe is not None:
+            body["recipe_snapshot"] = (
+                recipe.model_dump(mode="json") if hasattr(recipe, "model_dump") else recipe
+            )
         try:
             response = await self._request("POST", "/internal/browser/sessions", json_body=body)
         except httpx.RequestError:
@@ -210,6 +221,7 @@ class BrowserServiceClient:
         context: BrowserSessionContext,
         research: Any,
         *,
+        recipe: Any = None,
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
         credential_creation_policy: str = "reuse_only",
@@ -219,6 +231,7 @@ class BrowserServiceClient:
             research,
             path="navigate",
             credential_refs=sensitive_data,
+            recipe=recipe,
             signal=None,
             account_creation_requested=account_creation_requested,
             credential_creation_policy=credential_creation_policy,
@@ -230,6 +243,7 @@ class BrowserServiceClient:
         signal: str,
         research: Any = None,
         *,
+        recipe: Any = None,
         sensitive_data: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
@@ -240,6 +254,7 @@ class BrowserServiceClient:
             research,
             path="resume",
             credential_refs=sensitive_data,
+            recipe=recipe,
             signal=signal,
             credential_creation_policy=credential_creation_policy,
         )
@@ -251,12 +266,17 @@ class BrowserServiceClient:
         *,
         path: str,
         credential_refs: Mapping[str, str] | None,
+        recipe: Any = None,
         signal: str | None,
         account_creation_requested: bool = False,
         credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
         refs = _vault_references_only(credential_refs)
         body: dict[str, object] = {"credential_refs": refs}
+        if recipe is not None:
+            body["recipe_snapshot"] = (
+                recipe.model_dump(mode="json") if hasattr(recipe, "model_dump") else recipe
+            )
         if account_creation_requested:
             body["account_creation_requested"] = True
         body["credential_creation_policy"] = credential_creation_policy
@@ -300,6 +320,8 @@ class BrowserServiceClient:
         handle: str,
         app_slug: str,
         secret_store: object | None = None,
+        *,
+        recipe: Any = None,
     ) -> dict[str, str] | None:
         """Ask the service to capture into its vault; accept references only."""
 
@@ -314,7 +336,13 @@ class BrowserServiceClient:
             response = await self._request(
                 "POST",
                 f"/internal/browser/sessions/{handle}/capture-credentials",
-                json_body={},
+                json_body={
+                    "recipe_snapshot": (
+                        recipe.model_dump(mode="json")
+                        if hasattr(recipe, "model_dump")
+                        else recipe
+                    )
+                },
             )
         except httpx.RequestError:
             raise ProviderOperationError(
@@ -431,8 +459,8 @@ class BrowserServiceClient:
             return None
         return data, datetime.now(UTC).isoformat()
 
-    async def request_live_view(self, session_id: str) -> tuple[str, str | None, str]:
-        """Request an interactive grant: (mode, url_or_None, expires_at).
+    async def request_live_view(self, session_id: str) -> tuple[str, str | None, str, bool]:
+        """Request a live grant: (mode, url_or_None, expires_at, control_allowed).
 
         The URL is for IMMEDIATE operator use and must never be persisted to run
         state, logs, or checkpoints.
@@ -443,18 +471,19 @@ class BrowserServiceClient:
                 "POST", f"/internal/browser/sessions/{session_id}/live-view", timeout=20.0
             )
         except httpx.RequestError:
-            return "screenshot", None, ""
+            return "screenshot", None, "", False
         if response.status_code >= 400:
-            return "screenshot", None, ""
+            return "screenshot", None, "", False
         payload = response.json()
         return (
             str(payload.get("mode") or "screenshot"),
             payload.get("url"),
             str(payload.get("expires_at") or ""),
+            payload.get("control_allowed") is True,
         )
 
-    def request_live_view_sync(self, session_id: str) -> tuple[str, str, str] | None:
-        """Mint one fresh interactive grant for immediate server-side projection.
+    def request_live_view_sync(self, session_id: str) -> tuple[str, str, str, bool] | None:
+        """Mint one fresh view/control grant for immediate server-side projection.
 
         The returned URL is intentionally not cached on this client. Its only
         consumer converts it to a same-origin path in the Next.js server action.
@@ -486,7 +515,7 @@ class BrowserServiceClient:
         expires_at = payload.get("expires_at")
         if mode != "interactive_remote" or not isinstance(grant_url, str):
             return None
-        return mode, grant_url, str(expires_at or "")
+        return mode, grant_url, str(expires_at or ""), payload.get("control_allowed") is True
 
     async def stop(self, context: BrowserSessionContext) -> None:
         try:

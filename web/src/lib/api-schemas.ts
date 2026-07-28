@@ -40,6 +40,7 @@ const runStatus = z.enum([
   "created",
   "researching",
   "route_selected",
+  "connection_required",
   "browser_running",
   "waiting_for_hitl",
   "outreach_sent",
@@ -54,6 +55,23 @@ const runStatus = z.enum([
 // the run-detail projection (BrowserUiState) and the live-view response use them.
 export const browserProviderSchema = z.enum(["browser_use", "playwright"])
 export const credentialCreationPolicySchema = z.enum(["reuse_only", "create_if_missing"])
+export const routeKindSchema = z.enum(["managed_auth", "playwright", "gated"])
+export const readinessTierSchema = z.enum([
+  "managed_auth_ready",
+  "browser_ready",
+  "owner_submit_ready",
+  "outreach_ready",
+  "outreach_review_required",
+])
+export const primaryActionKindSchema = z.enum([
+  "connect_account",
+  "poll_connection",
+  "open_browser",
+  "submit_credentials",
+  "review_outreach",
+  "poll_reply",
+  "none",
+])
 export const liveViewModeSchema = z.enum([
   "hosted_url",
   "screenshot",
@@ -139,7 +157,20 @@ export const runSummarySchema = z.strictObject({
   execution_mode: z.enum(["plan_only", "execute_when_configured"]),
   browser_provider: z.enum(["browser_use", "playwright"]),
   credential_creation_policy: credentialCreationPolicySchema.default("reuse_only"),
+  recipe_version: boundedText(80).nullable().default(null),
+  route_kind: routeKindSchema.nullable().default(null),
+  readiness_tier: readinessTierSchema.nullable().default(null),
+  attempt: z.number().int().nonnegative().default(0),
+  phase: boundedText(120).default("legacy"),
+  reason_code: safeToken.nullable().default(null),
+  state_engine: z.enum(["canonical_v1", "legacy"]).default("legacy"),
   external_actions: z.boolean(),
+})
+
+const primaryAction = z.strictObject({
+  kind: primaryActionKindSchema,
+  enabled: z.boolean(),
+  reason_code: safeToken,
 })
 
 const phaseState = z.strictObject({
@@ -238,6 +269,27 @@ export const runDetailResponseSchema = z.strictObject({
   provider_states: z.array(providerStatus).max(30).optional(),
   // Optional so an older backend still parses; always sent by this API.
   browser: browserUiStateSchema.nullish().default(null),
+  primary_action: primaryAction.nullish().default(null),
+})
+
+const managedRedirectUrl = z.string().min(8).max(MAX_URL_LENGTH).refine((value) => {
+  if (/[\u0000-\u0020\u007f]/.test(value)) return false
+  try {
+    const parsed = new URL(value)
+    return parsed.protocol === "https:" && !parsed.username && !parsed.password && !!parsed.hostname
+  } catch {
+    return false
+  }
+})
+
+export const managedConnectionResponseSchema = z.strictObject({
+  run: runSummarySchema,
+  connection_request_id: boundedText(200),
+  state: z.enum(["pending", "active", "terminal"]),
+  // This URL is consumed immediately by a server redirect. OAuth query values
+  // may be opaque, so it intentionally uses a dedicated HTTPS-only validator.
+  redirect_url: managedRedirectUrl.nullish().default(null),
+  replayed: z.boolean().default(false),
 })
 
 export const runListResponseSchema = z.strictObject({
@@ -322,7 +374,7 @@ export const healthResponseSchema = z.strictObject({
 
 export const actionReceiptSchema = z.strictObject({
   run_id: runId,
-  action: z.enum(["resume", "poll_email", "retry"]),
+  action: z.enum(["resume", "poll_email", "retry", "send_outreach"]),
   status: z.enum(["accepted", "configuration_required", "unavailable", "no_change"]),
   detail: optionalText(500).optional(),
 })
@@ -467,13 +519,9 @@ export const liveViewResponseSchema = z
         message: "A screenshot live view is not interactive.",
       })
     }
-    if (value.mode === "interactive_remote" && !value.interaction_available) {
-      context.addIssue({
-        code: "custom",
-        path: ["interaction_available"],
-        message: "An interactive remote view must allow interaction.",
-      })
-    }
+    // A Playwright remote stream may deliberately be view-only while autonomous
+    // work is running. The signed grant and browser service enforce that mode;
+    // this boolean controls only whether the UI exposes input affordances.
     // Screenshot routes remain bound to THIS run. Interactive grants are bound
     // by their signed browser-service session token and revalidated server-side.
     if (

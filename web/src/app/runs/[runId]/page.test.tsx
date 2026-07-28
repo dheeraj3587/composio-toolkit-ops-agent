@@ -87,6 +87,7 @@ describe("RunDetailPage", () => {
       run_id: "run_frontend_123",
       items: [
         {
+          event_id: 1,
           event_type: "route_selected",
           summary: "Access route selected.",
           status: "recorded",
@@ -107,7 +108,59 @@ describe("RunDetailPage", () => {
     expect(screen.queryByText("Static backend blocker.")).not.toBeInTheDocument()
     expect(screen.queryByRole("button", { name: /retry browser phase/i })).not.toBeInTheDocument()
     expect(screen.getByText("Plan Only")).toBeInTheDocument()
-    expect(screen.getByText("Off")).toBeInTheDocument()
+    expect(screen.getByText(/External actions · Off/)).toBeInTheDocument()
     expect(screen.getByText("Access route selected.")).toBeInTheDocument()
+  })
+
+  it("shows frozen canonical metadata and only the backend-authorized primary action", async () => {
+    const runId = "run_11111111111111111111111111111111"
+    mocks.getRun.mockResolvedValue({
+      run: {
+        run_id: runId,
+        thread_id: "thread_canonical_123",
+        app_name: "GitHub",
+        app_slug: "github",
+        status: "connection_required",
+        access_route: "self_serve",
+        execution_mode: "execute_when_configured",
+        browser_provider: "playwright",
+        credential_creation_policy: "create_if_missing",
+        recipe_version: "2026-07-28.v1",
+        route_kind: "managed_auth",
+        readiness_tier: "managed_auth_ready",
+        attempt: 0,
+        phase: "connection_required",
+        reason_code: "managed_connection_required",
+        state_engine: "canonical_v1",
+        external_actions: false,
+        created_at: "2026-07-28T10:00:00Z",
+        updated_at: "2026-07-28T10:01:00Z",
+      },
+      research: null,
+      phases: null,
+      security: null,
+      route_decision: null,
+      hitl_request: null,
+      missing_fields: [],
+      provider_states: [],
+      browser: null,
+      primary_action: {
+        kind: "connect_account",
+        enabled: true,
+        reason_code: "managed_connection_required",
+      },
+    })
+    mocks.getTimeline.mockResolvedValue({ run_id: runId, items: [] })
+    mocks.getRunOutput.mockRejectedValue(new Error("No output"))
+
+    render(await RunDetailPage({ params: Promise.resolve({ runId }) }))
+
+    expect(screen.getByText("Frozen route")).toBeInTheDocument()
+    expect(screen.getByText("Managed Auth")).toBeInTheDocument()
+    expect(screen.getByText("Managed Auth Ready")).toBeInTheDocument()
+    expect(screen.getByText("2026-07-28.v1")).toBeInTheDocument()
+    expect(screen.getByText("Canonical V1")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Connect account" })).toBeEnabled()
+    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument()
   })
 })

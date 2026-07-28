@@ -62,15 +62,23 @@ def test_provider_sdks_are_isolated_from_the_core_requirement_group() -> None:
 
 
 def test_container_defaults_disable_live_actions_and_bind_host_ports_to_loopback() -> None:
-    compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    production = (ROOT / "compose.prod.yaml").read_text(encoding="utf-8")
+    local = (ROOT / "compose.local.yaml").read_text(encoding="utf-8")
     dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
 
-    assert 'ALLOW_LIVE_BROWSER: "false"' in compose
-    assert 'ALLOW_LIVE_VENDOR_EMAIL: "false"' in compose
-    assert 'OPS_ENABLE_API_DOCS: "false"' in compose
-    assert 'RUN_LIVE_TESTS: "0"' in compose
-    assert '"127.0.0.1:${OPS_API_PORT:-8000}:8000"' in compose
-    assert '"127.0.0.1:${OPS_WEB_PORT:-3000}:3000"' in compose
+    assert "ALLOW_LIVE_BROWSER: ${ALLOW_LIVE_BROWSER:-false}" in production
+    assert "ALLOW_LIVE_VENDOR_EMAIL: ${ALLOW_LIVE_VENDOR_EMAIL:-false}" in production
+    assert 'BROWSER_USE_COMPATIBILITY_ENABLED: "false"' in production
+    assert 'YOU_SEARCH_ENABLED: "false"' in production
+    assert 'YOU_CONTENTS_ENABLED: "false"' in production
+    assert 'YOU_RESEARCH_ENABLED: "false"' in production
+    assert 'PLAYWRIGHT_MAX_SESSIONS: "1"' in production
+    assert 'BROWSER_DISPLAY_SLOTS: "1"' in production
+    assert "${PLAYWRIGHT_MAX_SESSIONS" not in production
+    assert 'OPS_ENABLE_API_DOCS: "false"' in production
+    assert 'RUN_LIVE_TESTS: "0"' in production
+    assert '"127.0.0.1:${OPS_API_PORT:-8000}:8000"' in local
+    assert '"127.0.0.1:${OPS_WEB_PORT:-3000}:3000"' in local
     for secret_name in {
         "BROWSER_USE_API_KEY",
         "COMPOSIO_API_KEY",
@@ -79,7 +87,12 @@ def test_container_defaults_disable_live_actions_and_bind_host_ports_to_loopback
         "PERPLEXITY_API_KEY",
         "SECRET_VAULT_KEY",
     }:
-        assert secret_name not in compose
+        assignments = [
+            line.split(":", maxsplit=1)[1].strip()
+            for line in production.splitlines()
+            if line.strip().startswith(f"{secret_name}:")
+        ]
+        assert all(value.startswith("${") for value in assignments)
     for private_pattern in {
         ".env",
         "*.db",
@@ -113,10 +126,33 @@ def test_production_proxy_keeps_fastapi_private_and_requires_internal_token() ->
 
 
 def test_security_gate_shell_is_syntactically_valid() -> None:
-    result = subprocess.run(
-        ["bash", "-n", str(ROOT / "scripts" / "security_gate.sh")],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
+    for script in (
+        "security_gate.sh",
+        "deploy-droplet.sh",
+        "backup-production-data.sh",
+    ):
+        result = subprocess.run(
+            ["bash", "-n", str(ROOT / "scripts" / script)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"{script}: {result.stderr}"
+
+
+def test_release_utilities_capture_and_verify_deployment_truth() -> None:
+    deploy = (ROOT / "scripts" / "deploy-droplet.sh").read_text(encoding="utf-8")
+    backup = (ROOT / "scripts" / "backup-production-data.sh").read_text(encoding="utf-8")
+
+    assert "PLAYWRIGHT_MAX_SESSIONS" in deploy
+    assert "BROWSER_DISPLAY_SLOTS" in deploy
+    assert '"${PUBLIC_ORIGIN}/healthz"' in deploy
+    assert '"${PUBLIC_ORIGIN}/system"' in deploy
+    assert 'unauthenticated_status" = "401"' in deploy
+    assert "/api/system/health" not in deploy
+
+    assert "org.opencontainers.image.revision" in backup
+    assert "runtime_config/deployed-sha.txt" in backup
+    assert "runtime_config/compose.prod.yaml" in backup
+    assert "runtime_config/deploy/Caddyfile" in backup
+    assert ".env.production" not in backup.split("tar czf", maxsplit=1)[1]

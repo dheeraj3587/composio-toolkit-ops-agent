@@ -5,7 +5,7 @@ PYTHON ?= python3.11
 PIP := $(PYTHON) -m pip
 
 .PHONY: help venv install-core install-providers install-dev install-browser \
-	api web streamlit test lint typecheck compile audit frontend-check security docker-up
+	api web test lint typecheck compile audit frontend-check security docker-up
 
 help: ## Show supported development commands.
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -32,21 +32,18 @@ api: ## Run the local FastAPI service with reload and local-only binding.
 web: ## Run the Next.js development server.
 	cd web && npm run dev
 
-streamlit: ## Run the trusted internal Streamlit interface locally.
-	$(PYTHON) -m streamlit run streamlit_app.py --server.address 127.0.0.1
-
 test: ## Run normal offline-safe Python tests; live tests remain excluded.
-	RUN_LIVE_TESTS=0 $(PYTHON) -m pytest -q
+	RUN_LIVE_TESTS=0 $(PYTHON) -m pytest -q -m "not live and not browser"
 
 lint: ## Run Python lint and formatting verification.
 	$(PYTHON) -m ruff check .
 	$(PYTHON) -m ruff format --check .
 
 typecheck: ## Run strict Python type checking.
-	$(PYTHON) -m mypy ops api streamlit_app.py
+	$(PYTHON) -m mypy ops api
 
 compile: ## Compile Python sources without writing application state.
-	$(PYTHON) -m compileall -q ops api streamlit_app.py
+	$(PYTHON) -m compileall -q ops api
 
 audit: ## Audit all Python and frontend dependencies.
 	$(PYTHON) -m pip_audit -r requirements-dev.txt
@@ -59,4 +56,5 @@ security: ## Run the complete local security and quality gate.
 	./scripts/security_gate.sh
 
 docker-up: ## Build and run the loopback-only Compose stack.
-	docker compose up --build
+	docker compose -f compose.prod.yaml -f compose.local.yaml \
+		--env-file .env.production up --build

@@ -12,8 +12,9 @@ layer.
 
 The fix is to make a display an OWNED, LEASED resource rather than a global one:
 
-* slot ``i`` is display ``:(display_base + i)`` with x11vnc on
-  ``vnc_port_base + i``,
+* slot ``i`` is display ``:(display_base + i)`` with control x11vnc on
+  ``vnc_port_base + i`` and server-enforced read-only x11vnc on
+  ``view_vnc_port_base + i``,
 * a session leases exactly one slot for its whole lifetime,
 * that session's Chromium launches with that slot's ``DISPLAY``, so the slot's
   desktop contains that session's browser and nothing else,
@@ -58,6 +59,7 @@ class DisplaySlot:
     index: int
     display_num: int
     vnc_port: int
+    view_vnc_port: int
 
     @property
     def display(self) -> str:
@@ -74,7 +76,14 @@ class DisplayPool:
     needed, so the caller does not have to special-case the feature flag.
     """
 
-    def __init__(self, *, slots: int, display_base: int = 99, vnc_port_base: int = 5_900) -> None:
+    def __init__(
+        self,
+        *,
+        slots: int,
+        display_base: int = 99,
+        vnc_port_base: int = 5_900,
+        view_vnc_port_base: int = 5_910,
+    ) -> None:
         if slots < 0:
             raise ValueError("display slot count cannot be negative")
         if slots > MAX_DISPLAY_SLOTS:
@@ -82,7 +91,10 @@ class DisplayPool:
         self._lock = threading.Lock()
         self._all: tuple[DisplaySlot, ...] = tuple(
             DisplaySlot(
-                index=index, display_num=display_base + index, vnc_port=vnc_port_base + index
+                index=index,
+                display_num=display_base + index,
+                vnc_port=vnc_port_base + index,
+                view_vnc_port=view_vnc_port_base + index,
             )
             for index in range(slots)
         )

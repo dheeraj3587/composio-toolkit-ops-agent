@@ -103,8 +103,11 @@ def test_binding_uses_the_remembered_login_email() -> None:
     binding = service._verification_binding("pipedrive")
     assert binding is not None
     assert binding.expected_recipient == _LOGIN_EMAIL
-    assert "app.pipedrive.com" in binding.reviewed_patterns
-    assert "*.pipedrive.com" in binding.reviewed_patterns
+    assert binding.reviewed_patterns == (
+        "app.pipedrive.com",
+        "developers.pipedrive.com",
+        "oauth.pipedrive.com",
+    )
 
 
 def test_explicit_recipient_wins_so_a_signup_can_bind_its_new_identity() -> None:

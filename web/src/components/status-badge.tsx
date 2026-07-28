@@ -8,13 +8,26 @@ import { cn } from "@/lib/utils"
 // ---------------------------------------------------------------------------
 
 // Run outcomes — positive
-const positive = new Set(["credentials_ready", "completed", "complete", "ready", "configured", "healthy", "pass", "self_serve"])
+const positive = new Set([
+  "credentials_ready",
+  "completed",
+  "complete",
+  "ready",
+  "configured",
+  "healthy",
+  "pass",
+  "self_serve",
+  "managed_auth_ready",
+  "browser_ready",
+  "owner_submit_ready",
+  "outreach_ready",
+])
 // Run outcomes — negative
 const negative = new Set(["blocked", "failed", "fail"])
 // Run outcomes — in-progress
-const running = new Set(["researching", "route_selected", "browser_running", "running", "validating_credentials"])
+const running = new Set(["researching", "route_selected", "connection_required", "browser_running", "running", "validating_credentials"])
 // Run outcomes — gated
-const gated = new Set(["gated", "approval_required", "partner_gated", "hybrid"])
+const gated = new Set(["gated", "managed_auth", "playwright", "approval_required", "partner_gated", "hybrid"])
 // Unknown / absent / intentionally not attempted
 const unknown = new Set(["unknown", "not_reported", "unavailable", "not_available", "not_started", "not_attempted"])
 // Policy — intentionally disabled or unavailable by reviewed runtime policy
@@ -22,7 +35,7 @@ const policy = new Set(["disabled", "policy_unavailable"])
 // Configuration — present but awaiting runtime evidence
 const configPresent = new Set(["configured_not_verified"])
 // Configuration — missing
-const configMissing = new Set(["not_configured"])
+const configMissing = new Set(["not_configured", "outreach_review_required"])
 
 function tone(status: string): string {
   // Policy: distinct indigo treatment — not a failure, not neutral

@@ -20,12 +20,14 @@ endpoints use:
 
 1. the grant token must verify (HMAC signature, bound session id, bound owner,
    unexpired) — see ``ops.browser_live_view.verify_live_view_token``,
-2. the session must exist, be ``ACTIVE``, be awaiting HITL, and be owned by the caller,
-3. only then is a TCP connection opened to x11vnc on **loopback inside this
-   container**, which is the only place the VNC port is reachable.
+2. the session must exist, be ``ACTIVE``, be viewable, and be owned by the caller,
+3. control grants additionally require a live HITL pause, and
+4. only then is a TCP connection opened to the matching x11vnc listener on
+   **loopback inside this container**. View grants use a separate server-side
+   ``-viewonly`` listener, so a modified client cannot turn viewing into control.
 
-The container publishes no port (``compose.playwright.sandbox.yaml`` has no
-``ports:``), so this surface is reachable only on the private Compose network,
+The browser worker publishes no host port in ``compose.prod.yaml``, so this
+surface is reachable only on the private Compose network,
 and every open/close is audited without the token or the URL.
 """
 
@@ -77,9 +79,10 @@ def authorize_live_view(
     session_owner: str | None,
     session_lifecycle: str | None,
     interactive_enabled: bool,
+    view_allowed: bool = True,
     hitl_pending: bool = False,
 ) -> str:
-    """Authorize one interactive attachment, or raise ``LiveViewDenied``.
+    """Authorize one view/control attachment and return its signed capability.
 
     Fail-closed ordering: the feature flag, then the signed grant, then the live
     session's own ownership. Every check must pass; none is skipped when another
@@ -93,7 +96,7 @@ def authorize_live_view(
     if not secret:
         raise LiveViewDenied("live_view_secret_missing")
     try:
-        verify_live_view_token(
+        grant = verify_live_view_token(
             token,
             secret=secret,
             expected_session_id=session_id,
@@ -109,9 +112,11 @@ def authorize_live_view(
         raise LiveViewDenied("session_not_found")
     if session_lifecycle != "ACTIVE":
         raise LiveViewDenied("session_closing")
-    if not hitl_pending:
-        raise LiveViewDenied("hitl_not_pending")
-    return "live_view_authorized"
+    if not view_allowed:
+        raise LiveViewDenied("live_view_not_available")
+    if grant.access == "control" and not hitl_pending:
+        raise LiveViewDenied("control_not_allowed")
+    return grant.access
 
 
 async def relay_websocket_to_vnc(

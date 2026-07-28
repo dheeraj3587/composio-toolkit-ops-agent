@@ -20,6 +20,10 @@ set -eu
 DISPLAY_NUM="${BROWSER_DISPLAY_NUM:-99}"
 SCREEN_GEOMETRY="${BROWSER_SCREEN_GEOMETRY:-1280x1024x24}"
 VNC_PORT="${BROWSER_VNC_PORT:-5900}"
+# A distinct loopback listener enforces view-only access inside x11vnc itself.
+# Keep ten ports between the defaults because the display pool supports at most
+# ten slots (control 5900-5909, view-only 5910-5919).
+VIEW_VNC_PORT="${BROWSER_VIEW_ONLY_VNC_PORT:-$((VNC_PORT + 10))}"
 
 is_enabled() {
     case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
@@ -73,6 +77,7 @@ if is_enabled "${BROWSER_INTERACTIVE_HITL_ENABLED:-false}"; then
     while [ "${slot}" -lt "${DISPLAY_SLOTS}" ]; do
         slot_display=$((DISPLAY_NUM + slot))
         slot_vnc_port=$((VNC_PORT + slot))
+        slot_view_vnc_port=$((VIEW_VNC_PORT + slot))
 
         # Virtual framebuffer: Chromium can then run headful, which is what makes a
         # human handoff (CAPTCHA, account chooser, MFA) actually solvable.
@@ -104,6 +109,22 @@ if is_enabled "${BROWSER_INTERACTIVE_HITL_ENABLED:-false}"; then
             -nopw \
             -shared \
             -forever \
+            -noxdamage \
+            -quiet \
+            >/dev/null 2>&1 &
+
+        # A second loopback-only server exports the SAME private display but
+        # refuses keyboard, pointer and clipboard input at the VNC server. This is
+        # the autonomous ``browser_running`` stream. Even a modified noVNC client
+        # cannot upgrade a signed view grant into browser control.
+        x11vnc \
+            -display ":${slot_display}" \
+            -rfbport "${slot_view_vnc_port}" \
+            -localhost \
+            -nopw \
+            -shared \
+            -forever \
+            -viewonly \
             -noxdamage \
             -quiet \
             >/dev/null 2>&1 &

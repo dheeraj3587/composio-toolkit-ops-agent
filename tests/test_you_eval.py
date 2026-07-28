@@ -30,7 +30,7 @@ def _fixture(url: str, **overrides: object) -> EvidenceCandidate:
 
 
 # Sanitized, hand-built fixture candidate sets. Real URL shapes for each
-# vendor, verified during this integration (see docs/YOU_COM_INTEGRATION.md),
+# vendor, verified during offline recipe authoring (see docs/APP_RECIPES.md),
 # not live search output.
 _FIXTURES: dict[str, tuple[EvidenceCandidate, ...]] = {
     "pipedrive": (

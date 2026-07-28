@@ -101,11 +101,16 @@ def test_run_detail_explains_route_and_configuration_without_claiming_success(
 
     assert created.status_code == 201
     body = created.json()
-    assert body["route_decision"]["reason_code"] == "verified_evidence_route"
+    assert body["route_decision"]["reason_code"] == "managed_connection_required"
     assert body["route_decision"]["is_final"] is True
-    assert body["missing_fields"]
+    assert body["missing_fields"] == []
     assert body["run"]["external_actions"] is False
-    assert all(item["status"] != "ready" for item in body["provider_states"])
+    recipes = next(item for item in body["provider_states"] if item["provider"] == "recipes")
+    assert recipes["status"] == "ready"
+    managed = next(
+        item for item in body["provider_states"] if item["provider"] == "composio_managed_auth"
+    )
+    assert managed["status"] == "not_configured"
     assert all(
         phase["status"] != "complete"
         for phase in body["phases"]
@@ -113,7 +118,7 @@ def test_run_detail_explains_route_and_configuration_without_claiming_success(
     )
 
 
-def test_retry_returns_typed_configuration_required_without_external_action(
+def test_plan_only_retry_is_rejected_without_external_action(
     tmp_path: Path,
 ) -> None:
     application = create_app(db_path=tmp_path / "private" / "ops.db")
@@ -125,13 +130,10 @@ def test_retry_returns_typed_configuration_required_without_external_action(
             json={"capability": "email"},
         )
 
-    assert response.status_code == 200
-    assert response.json() == {
-        "run_id": run_id,
-        "action": "retry",
-        "status": "configuration_required",
-        "detail": "Required provider configuration or policy opt-in is missing.",
-    }
+    assert response.status_code == 409
+    assert response.json()["error"] == "phase_unavailable"
+    assert response.json()["action"] == "retry"
+    assert response.json()["external_actions"] is False
 
 
 def test_docs_and_cors_are_explicit_configuration(tmp_path: Path) -> None:
@@ -279,7 +281,7 @@ def test_create_run_rejects_unknown_fields(tmp_path: Path) -> None:
     assert response.json()["fields"] == ["unknown_field"]
 
 
-def test_execute_when_configured_via_api_is_configuration_required_without_key(
+def test_execute_when_configured_via_api_waits_for_managed_connection_without_key(
     tmp_path: Path,
 ) -> None:
     from api.service import LocalRunService
@@ -296,12 +298,16 @@ def test_execute_when_configured_via_api_is_configuration_required_without_key(
     assert response.status_code == 201
     run = response.json()["run"]
     assert run["execution_mode"] == "execute_when_configured"
-    assert run["status"] == "configuration_required"
+    assert run["status"] == "connection_required"
+    assert run["state_engine"] == "canonical_v1"
+    assert run["route_kind"] == "managed_auth"
     assert run["status"] != "accepted"
     assert run["external_actions"] is False
 
 
-def test_execute_when_configured_via_api_runs_graph_when_key_present(tmp_path: Path) -> None:
+def test_execute_when_configured_does_not_put_langgraph_on_the_new_run_path(
+    tmp_path: Path,
+) -> None:
     from pydantic import SecretStr
 
     from api.service import LocalRunService
@@ -321,13 +327,12 @@ def test_execute_when_configured_via_api_runs_graph_when_key_present(tmp_path: P
 
     assert response.status_code == 201
     run = response.json()["run"]
-    # The FastAPI lifespan built the durable workflow and execute_when_configured ran it.
     assert run["execution_mode"] == "execute_when_configured"
-    # The durable graph ran, then failed closed because the static P1 baseline has
-    # no evidence-backed login/credential URLs for browser execution.
-    assert run["status"] == "configuration_required"
+    assert run["state_engine"] == "canonical_v1"
+    assert run["status"] == "connection_required"
     assert run["status"] != "accepted"
     assert run["external_actions"] is False
+    assert not settings.checkpoint_db_path.exists()
 
 
 def test_run_conflict_is_mapped_to_http_409(

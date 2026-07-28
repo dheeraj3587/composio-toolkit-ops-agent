@@ -54,7 +54,11 @@ describe("PlaywrightRemoteView", () => {
 
   it("connects noVNC to the same origin without putting the grant in the DOM", async () => {
     const { unmount } = render(
-      <PlaywrightRemoteView interactivePath={INTERACTIVE_PATH} onReconnect={vi.fn()} />,
+      <PlaywrightRemoteView
+        interactivePath={INTERACTIVE_PATH}
+        controlAllowed
+        onReconnect={vi.fn()}
+      />,
     )
 
     await waitFor(() => expect(rfbMocks.instances).toHaveLength(1))
@@ -88,7 +92,11 @@ describe("PlaywrightRemoteView", () => {
     const user = userEvent.setup()
     const onReconnect = vi.fn()
     render(
-      <PlaywrightRemoteView interactivePath={INTERACTIVE_PATH} onReconnect={onReconnect} />,
+      <PlaywrightRemoteView
+        interactivePath={INTERACTIVE_PATH}
+        controlAllowed
+        onReconnect={onReconnect}
+      />,
     )
 
     await waitFor(() => expect(rfbMocks.instances).toHaveLength(1))
@@ -107,7 +115,13 @@ describe("PlaywrightRemoteView", () => {
 
   it("pastes typed text into the remote session and clears it from the DOM", async () => {
     const user = userEvent.setup()
-    render(<PlaywrightRemoteView interactivePath={INTERACTIVE_PATH} onReconnect={vi.fn()} />)
+    render(
+      <PlaywrightRemoteView
+        interactivePath={INTERACTIVE_PATH}
+        controlAllowed
+        onReconnect={vi.fn()}
+      />,
+    )
 
     await waitFor(() => expect(rfbMocks.instances).toHaveLength(1))
     const rfb = rfbMocks.instances[0]
@@ -125,7 +139,13 @@ describe("PlaywrightRemoteView", () => {
   })
 
   it("surfaces text copied inside the remote browser", async () => {
-    render(<PlaywrightRemoteView interactivePath={INTERACTIVE_PATH} onReconnect={vi.fn()} />)
+    render(
+      <PlaywrightRemoteView
+        interactivePath={INTERACTIVE_PATH}
+        controlAllowed
+        onReconnect={vi.fn()}
+      />,
+    )
 
     await waitFor(() => expect(rfbMocks.instances).toHaveLength(1))
     const rfb = rfbMocks.instances[0]
@@ -140,11 +160,28 @@ describe("PlaywrightRemoteView", () => {
     render(
       <PlaywrightRemoteView
         interactivePath="https://browser-worker:8081/internal/browser/live-view/novnc?session=pw_1&token=t"
+        controlAllowed={false}
         onReconnect={vi.fn()}
       />,
     )
 
     expect(await screen.findByText(/browser connection · failed/i)).toBeInTheDocument()
     expect(rfbMocks.instances).toHaveLength(0)
+  })
+
+  it("keeps an autonomous stream view-only and hides input affordances", async () => {
+    render(
+      <PlaywrightRemoteView
+        interactivePath={INTERACTIVE_PATH}
+        controlAllowed={false}
+        onReconnect={vi.fn()}
+      />,
+    )
+
+    await waitFor(() => expect(rfbMocks.instances).toHaveLength(1))
+    expect(rfbMocks.instances[0]?.viewOnly).toBe(true)
+    expect(screen.getByLabelText(/remote chromium desktop; view only/i)).toBeInTheDocument()
+    expect(screen.queryByLabelText(/send text into the remote browser/i)).not.toBeInTheDocument()
+    expect(screen.getByText(/controls unlock only at a human handoff/i)).toBeInTheDocument()
   })
 })

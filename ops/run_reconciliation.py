@@ -91,6 +91,16 @@ class RunReconciliationService:
                     status = record.get("status")
                     run_id = str(record.get("run_id") or "")
                     worker = self._context._browser_worker_for(record)
+                    if worker is None and status in {"browser_running", "waiting_for_hitl"}:
+                        # A disabled/unconfigured provider cannot own a live session.
+                        # Preserve the run and its audit history, but stop presenting
+                        # a dead viewer as resumable.
+                        self.reconcile_one_stranded(
+                            run_id,
+                            stranded_statuses=("browser_running", "waiting_for_hitl"),
+                            reason="provider_unavailable_session_lost",
+                        )
+                        continue
                     reattach = bool(getattr(worker, "supports_restart_reattach", True))
                     stranded_statuses = (
                         ("browser_running",)
@@ -180,6 +190,8 @@ class RunReconciliationService:
                 transaction.update_run(
                     run_id,
                     status="configuration_required",
+                    phase="session_lost",
+                    reason_code=reason,
                     state_revision=revision,
                     last_projected_revision=revision,
                 )
@@ -189,7 +201,8 @@ class RunReconciliationService:
                     payload={
                         "previous_status": previous_status,
                         "status": "configuration_required",
-                        "reason": reason,
+                        "reason_code": reason,
+                        "phase": "session_lost",
                         "external_actions": False,
                     },
                 )

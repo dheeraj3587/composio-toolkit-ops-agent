@@ -1,15 +1,9 @@
 """Autonomous continuation of human gates the agent can resolve by itself.
 
-This sweep exists so a run that stops at a login form the service already holds
-credentials for does not sit waiting for a human who has nothing to add. It is
-deliberately independent of the email poller: that thread only starts when Gmail is
-configured, so autonomous login continuation would never have run on a deployment
-without an inbox.
-
-The safety properties live in ``advance_autonomous_runs`` and are unchanged: only
-genuinely machine-resolvable gates advance, an advance without stored credentials
-is skipped rather than retried into the same gate, and every run has a bounded
-budget so a login that keeps failing settles into a truthful human gate.
+Resume is deliberately non-autonomous: a consumed login reference is never
+recreated after a CAPTCHA, verification prompt, or other HITL pause. Reusable
+credentials may seed a fresh run, but continuing an existing session requires an
+explicit owner resume (and new login values only when the owner submits them).
 """
 
 from __future__ import annotations
@@ -31,7 +25,7 @@ from ops.storage import OperationsStorage
 # excluded: it can represent CAPTCHA, device approval, consent, account selection,
 # or another security prompt, and auto-resuming it both defeats HITL and can turn a
 # solvable gate into a failed login before the evaluator can attach.
-_AUTO_ADVANCEABLE_GATES: frozenset[str] = frozenset({"login_required"})
+_AUTO_ADVANCEABLE_GATES: frozenset[str] = frozenset()
 
 
 class RunAdvanceContext(Protocol):
@@ -100,26 +94,19 @@ class RunAdvanceService:
                 pass
 
     def advance_autonomous_runs(self, *, limit: int = 100) -> int:
-        """Resume every waiting run whose human gate the agent can resolve itself.
+        """Leave every existing browser HITL session for an explicit owner resume.
 
-        Only gates that are genuinely machine-resolvable are advanced:
-
-        * ``login_required`` — advanced ONLY when reusable credentials for the app
-          are stored, so this never becomes a pointless retry loop.
-
-        Provider verification, CAPTCHA, passkey, device approval, account selection,
-        billing and legal gates are never advanced: they require a real human in the
-        interactive browser. ``email_otp`` is left to ``resolve_pending_otps``, which
-        has the inbox.
-
-        Every advance is bounded per run by ``max_autonomous_advances``, so a login
-        that keeps failing settles into a truthful human gate.
+        The loop remains as a compatibility no-op while the old setting is removed
+        from deployments. In particular, remembered credentials are not converted
+        into fresh one-time references during Resume.
         """
 
         context = self._context
         settings = context._settings or Settings.from_env()
         budget = int(getattr(settings, "max_autonomous_advances", 0))
         if budget <= 0:
+            return 0
+        if not _AUTO_ADVANCEABLE_GATES:
             return 0
         advanced = 0
         for record in context.storage.list_runs(limit=limit, offset=0):

@@ -9,6 +9,7 @@ import {
   appSearchResponseSchema,
   healthResponseSchema,
   liveViewResponseSchema,
+  managedConnectionResponseSchema,
   runDetailResponseSchema,
   runListResponseSchema,
   runOutputResponseSchema,
@@ -23,6 +24,7 @@ import type {
   HealthResponse,
   IntegratorOutput,
   LiveViewResponse,
+  ManagedConnectionResponse,
   OperationsRequestInput,
   PhaseConflict,
   RunDetailResponse,
@@ -213,6 +215,24 @@ export function getRun(runId: string): Promise<RunDetailResponse> {
 
 export function getTimeline(runId: string): Promise<TimelineResponse> {
   return apiRequest(runPath(runId, "/timeline"), timelineResponseSchema)
+}
+
+export function connectManagedRun(runId: string): Promise<ManagedConnectionResponse> {
+  return apiRequest(
+    runPath(runId, "/connect"),
+    managedConnectionResponseSchema,
+    { method: "POST" },
+    CREDENTIAL_TIMEOUT_MS,
+  )
+}
+
+export function pollManagedConnection(runId: string): Promise<ManagedConnectionResponse> {
+  return apiRequest(
+    runPath(runId, "/poll-connection"),
+    managedConnectionResponseSchema,
+    { method: "POST" },
+    CREDENTIAL_TIMEOUT_MS,
+  )
 }
 
 export async function getRunOutput(runId: string): Promise<IntegratorOutput> {

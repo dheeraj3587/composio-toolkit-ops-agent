@@ -33,6 +33,7 @@ _PLAYWRIGHT_INTERACTIVE = _PLAYWRIGHT.model_copy(update={"browser_interactive_hi
 _BROWSER_USE = Settings(
     allow_live_browser=True,
     browser_use_api_key=SecretStr("bu-key"),
+    browser_use_compatibility_enabled=True,
     allow_local_credential_submission=True,
 )
 
@@ -82,6 +83,20 @@ def test_browser_use_still_requires_its_own_key() -> None:
     assert configured.screenshot_available is False
 
 
+def test_browser_use_key_does_not_enable_disabled_compatibility_adapter() -> None:
+    disabled = _BROWSER_USE.model_copy(update={"browser_use_compatibility_enabled": False})
+
+    state = project_browser_ui(
+        settings=disabled,
+        run_status="browser_running",
+        event_types={"browser_session_started"},
+        browser_session_id="bu_1",
+    )
+
+    assert state.lifecycle == "unavailable"
+    assert state.live_view_available is False
+
+
 # --- rule 3/4: a running session is not a credential page ---------------------
 def test_browser_session_start_does_not_enable_credential_submission() -> None:
     state = project_browser_ui(
@@ -105,6 +120,20 @@ def test_credential_page_ready_enables_credential_submission() -> None:
 
     assert state.credential_page_verified is True
     assert state.lifecycle == "credential_page_ready"
+    assert state.can_submit_credential is True
+
+
+def test_reviewed_entry_only_route_enables_owner_submission_without_false_page_claim() -> None:
+    state = project_browser_ui(
+        settings=_PLAYWRIGHT,
+        browser_provider="playwright",
+        run_status="browser_running",
+        event_types={"browser_session_started", "browser_entry_reached"},
+        browser_session_id="pw_1",
+        owner_submission_ready=True,
+    )
+
+    assert state.credential_page_verified is False
     assert state.can_submit_credential is True
 
 
@@ -282,7 +311,7 @@ def test_screenshot_availability_requires_an_actual_frame() -> None:
     assert without_frame.live_view_available is False
 
 
-def test_interactive_playwright_is_advertised_only_during_hitl() -> None:
+def test_interactive_playwright_streams_continuously_but_controls_only_during_hitl() -> None:
     waiting = project_browser_ui(
         settings=_PLAYWRIGHT_INTERACTIVE,
         run_status="waiting_for_hitl",
@@ -309,7 +338,7 @@ def test_interactive_playwright_is_advertised_only_during_hitl() -> None:
 
     assert waiting.live_view_mode == "interactive_remote"
     assert waiting.interaction_available is True
-    assert running.live_view_mode == "screenshot"
+    assert running.live_view_mode == "interactive_remote"
     assert running.interaction_available is False
     assert disabled.live_view_mode == "screenshot"
     assert disabled.interaction_available is False
@@ -359,8 +388,8 @@ def test_production_api_main_projection_is_provider_aware(tmp_path: Path) -> Non
     detail_payload = _production_detail(tmp_path)
     browser = detail_payload["browser"]
 
-    # api.main installs install_assignment_projection(), so this is the production
-    # projection, and it must report the SELECTED provider.
+    # api.main uses the same unpatched application factory as tests, and the
+    # production projection must report the selected provider.
     assert browser["provider"] == "playwright"
     assert browser["lifecycle"] == "not_started"
     assert browser["reason_code"] == "plan_only_run"
@@ -371,7 +400,7 @@ def test_production_api_main_projection_is_provider_aware(tmp_path: Path) -> Non
     # Readiness is reported independently for both providers. Playwright is
     # configured without requiring a Browser Use key.
     states = {state["provider"]: state for state in detail_payload["provider_states"]}
-    assert states["browser_use"]["status"] == "not_configured"
+    assert states["browser_use"]["status"] == "disabled"
     assert states["playwright"]["status"] == "configured_not_verified"
 
     # The production phase projection describes the selected provider too.

@@ -35,13 +35,18 @@ done
 if [[ "${gate_scope}" == "all" || "${gate_scope}" == "backend" ]]; then
   grep_output="$(mktemp "${TMPDIR:-/tmp}/composio-ops-secret-grep.XXXXXX")"
   scan_output="$(mktemp "${TMPDIR:-/tmp}/composio-ops-detect-secrets.XXXXXX")"
-  trap 'rm -f "${grep_output}" "${scan_output}"' EXIT
+  baseline_copy="$(mktemp "${TMPDIR:-/tmp}/composio-ops-secrets-baseline.XXXXXX")"
+  trap 'rm -f "${grep_output}" "${scan_output}" "${baseline_copy}"' EXIT
 
   if [[ ! -f .secrets.baseline ]]; then
     echo "security gate: .secrets.baseline is required" >&2
     echo "generate and audit it with detect-secrets before running this gate" >&2
     exit 1
   fi
+  # detect-secrets refreshes line metadata while scanning and refuses a dirty
+  # tracked baseline. Scan against an exact temporary copy so this gate is
+  # read-only and works before the operator stages their reviewed changes.
+  cp .secrets.baseline "${baseline_copy}"
 
   secret_scan_files=()
   while IFS= read -r -d '' candidate; do
@@ -54,7 +59,7 @@ if [[ "${gate_scope}" == "all" || "${gate_scope}" == "backend" ]]; then
   done < <(git ls-files -z --cached --others --exclude-standard)
 
   if (( ${#secret_scan_files[@]} > 0 )); then
-    detect-secrets-hook --baseline .secrets.baseline "${secret_scan_files[@]}"
+    detect-secrets-hook --baseline "${baseline_copy}" "${secret_scan_files[@]}"
   fi
   # Run the required recursive scanner without printing candidate material. The audited
   # baseline hook above is the enforcing comparison for source-controlled files.
@@ -64,9 +69,12 @@ if [[ "${gate_scope}" == "all" || "${gate_scope}" == "backend" ]]; then
 
   ruff check .
   ruff format --check .
-  RUN_LIVE_TESTS=0 pytest -q
-  mypy ops api streamlit_app.py
-  python -m compileall -q ops api streamlit_app.py
+  # Provider/live and real-Chromium suites are explicit acceptance jobs. Keep
+  # this repository gate deterministic and offline while still running the full
+  # contract/state/security suite.
+  RUN_LIVE_TESTS=0 pytest -q -m "not live and not browser"
+  mypy ops api
+  python -m compileall -q ops api
   pip-audit -r requirements-dev.txt
 
   git grep --untracked -nEI \

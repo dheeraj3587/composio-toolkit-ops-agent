@@ -103,8 +103,11 @@ class Settings(BaseModel):
     ops_internal_api_token: SecretStr | None = Field(default=None, repr=False)
 
     langgraph_strict_msgpack: bool = True
-    composio_user_id: str = "ops-assignment-user"
+    composio_user_id: str = "ops-owner"
     composio_gmail_connected_account_id: str | None = None
+    # Public, same-origin return location for managed OAuth. The adapter validates
+    # it as a stable HTTPS URL and never persists the provider redirect URL.
+    managed_auth_callback_base_url: str | None = None
 
     # Gemini production model is pinned to a specific stable id by default; a
     # hot-swapped ``*-latest`` alias is intentionally not the default. The
@@ -140,6 +143,9 @@ class Settings(BaseModel):
     # Compatibility default for API/CLI callers that omit the immutable per-run
     # selection. It does not prevent the other configured adapter from being wired.
     browser_provider: Literal["browser_use", "playwright"] = "browser_use"
+    # A key alone must never authorize paid compatibility execution during the
+    # Playwright-only recovery rollout.
+    browser_use_compatibility_enabled: bool = False
     # Self-hosted Playwright limits. Each session is a real Chromium process, so the
     # cap is sized for a small VPS. --no-sandbox is opt-in (see _launch_args).
     playwright_max_sessions: int = Field(default=2, ge=1, le=10)
@@ -150,7 +156,7 @@ class Settings(BaseModel):
     # restart.
     browser_service_url: str | None = None
     browser_service_token: SecretStr | None = Field(default=None, repr=False)
-    browser_service_owner: str = "ops-assignment-user"
+    browser_service_owner: str = "ops-owner"
     # Explicit capability switch for the one-session headed/noVNC assignment path.
     # The browser service independently enforces max_sessions=1 when this is true.
     browser_interactive_hitl_enabled: bool = False
@@ -324,9 +330,12 @@ class Settings(BaseModel):
             "langgraph_strict_msgpack": _boolean(
                 source.get("LANGGRAPH_STRICT_MSGPACK"), default=True
             ),
-            "composio_user_id": _optional(source.get("COMPOSIO_USER_ID")) or "ops-assignment-user",
+            "composio_user_id": _optional(source.get("COMPOSIO_USER_ID")) or "ops-owner",
             "composio_gmail_connected_account_id": _optional(
                 source.get("COMPOSIO_GMAIL_CONNECTED_ACCOUNT_ID")
+            ),
+            "managed_auth_callback_base_url": _optional(
+                source.get("MANAGED_AUTH_CALLBACK_BASE_URL")
             ),
             "gemini_model": _optional(source.get("GEMINI_MODEL")) or "gemini-3.5-flash",
             "browser_use_model": _optional(source.get("BROWSER_USE_MODEL")) or "claude-opus-4.7",
@@ -341,6 +350,9 @@ class Settings(BaseModel):
                 ("browser_use", "playwright"),
                 default="browser_use",
             ),
+            "browser_use_compatibility_enabled": _boolean(
+                source.get("BROWSER_USE_COMPATIBILITY_ENABLED"), default=False
+            ),
             "playwright_max_sessions": _integer(source.get("PLAYWRIGHT_MAX_SESSIONS"), default=2),
             "playwright_disable_sandbox": _boolean(
                 source.get("PLAYWRIGHT_DISABLE_SANDBOX"), default=False
@@ -348,7 +360,7 @@ class Settings(BaseModel):
             "browser_service_url": _optional(source.get("BROWSER_SERVICE_URL")),
             "browser_service_token": _secret(source.get("BROWSER_SERVICE_TOKEN")),
             "browser_service_owner": (
-                _optional(source.get("BROWSER_SERVICE_OWNER")) or "ops-assignment-user"
+                _optional(source.get("BROWSER_SERVICE_OWNER")) or "ops-owner"
             ),
             "browser_interactive_hitl_enabled": _boolean(
                 source.get("BROWSER_INTERACTIVE_HITL_ENABLED"), default=False

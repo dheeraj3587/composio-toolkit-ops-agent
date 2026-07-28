@@ -20,16 +20,16 @@ from typing import Any, Literal, Protocol, cast
 import httpx
 from pydantic import SecretStr
 
-from ops import runtime_extensions
+from ops.app_recipes import AppRecipe, get_app_validation_policy, load_app_recipe_catalog
 from ops.browser_worker import BrowserWorker
+from ops.canonical_runtime import CanonicalRuntime
 from ops.composio_capability import ComposioCapabilityPreflight, ComposioCapabilityReport
+from ops.composio_managed_auth import ComposioManagedAuthProvider
 from ops.config import Settings
 from ops.credential_validator import (
     CredentialValidationResult,
     CredentialValidator,
     PolicyBoundCredentialValidator,
-    hubspot_validation_policy,
-    pipedrive_validation_policy,
 )
 from ops.effect_ledger import SQLiteEffectStore
 from ops.email_verification import (
@@ -40,7 +40,6 @@ from ops.gmail_worker import GmailWorker
 from ops.graph import (
     DurableOperationsWorkflow,
     WorkflowDependencies,
-    build_graph,
 )
 from ops.models import (
     CapabilityAvailability,
@@ -48,7 +47,6 @@ from ops.models import (
     OperationalResearch,
     OperationsRequest,
 )
-from ops.network_endpoint_policy import validation_endpoint as network_validation_endpoint
 from ops.operational_research import (
     GeminiStructuredExtractor,
     OfficialEvidenceFetcher,
@@ -186,6 +184,7 @@ class RunService:
         capability_preflight: ComposioCapabilityPreflight | None = None,
         credential_capturer: CredentialCapturePort | None = None,
         credential_validator: CredentialValidationPort | None = None,
+        managed_auth_provider: ComposioManagedAuthProvider | None = None,
     ) -> None:
         self.storage = storage
         self.p1_adapter = p1_adapter or P1OperationalAdapter()
@@ -207,6 +206,7 @@ class RunService:
         # run truthfully stops at browser_running (M5 behavior).
         self._credential_capturer = credential_capturer
         self._credential_validator = credential_validator
+        self._managed_auth_provider = managed_auth_provider
         self._run_locks: dict[str, threading.RLock] = {}
         self._run_locks_guard = threading.Lock()
         # Resources owned and closed by this service when built at startup.
@@ -287,6 +287,12 @@ class RunService:
         return RunCreationService(self)
 
     @property
+    def _canonical(self) -> CanonicalRuntime:
+        """The single SQLite-backed state machine for every reviewed recipe."""
+
+        return CanonicalRuntime(self)
+
+    @property
     def _resume(self) -> RunResumeService:
         """HITL resume on the run's existing session and thread."""
 
@@ -346,6 +352,7 @@ class RunService:
         capability_preflight: ComposioCapabilityPreflight | None = None,
         credential_capturer: CredentialCapturePort | None = None,
         credential_validator: CredentialValidationPort | None = None,
+        managed_auth_provider: ComposioManagedAuthProvider | None = None,
     ) -> RunService:
         return cls(
             storage=OperationsStorage(db_path),
@@ -356,6 +363,7 @@ class RunService:
             capability_preflight=capability_preflight,
             credential_capturer=credential_capturer,
             credential_validator=credential_validator,
+            managed_auth_provider=managed_auth_provider,
         )
 
     def initialize(self) -> None:
@@ -363,6 +371,9 @@ class RunService:
 
         self.storage.initialize()
         load_verified_snapshot(self.p1_adapter.snapshot_root)
+        # The approved matrix is process policy. A malformed/incomplete recipe
+        # catalog is a startup error, never a per-run fallback.
+        load_app_recipe_catalog()
 
     def startup(self) -> None:
         """Initialize storage and construct real dependencies only when configured.
@@ -376,27 +387,23 @@ class RunService:
 
         self.initialize()
         settings = self._settings or Settings.from_env()
+        self._settings = settings
         self._wiring = []
 
         # Read-only Composio capability preflight; fails closed when unconfigured.
+        # This is a normal constructor dependency, not a production-only import-time
+        # override, so tests and the deployed application use the same graph.
         if self._capability_preflight is None:
-            preflight_factory = runtime_extensions.active().capability_preflight_factory
-            self._capability_preflight = (
-                preflight_factory(settings)
-                if preflight_factory is not None
-                else ComposioCapabilityPreflight(settings=settings)
-            )
+            self._capability_preflight = ComposioCapabilityPreflight(settings=settings)
         self._record_wiring("composio_preflight", self._capability_preflight, configured=True)
 
-        # One-probe research enricher (Perplexity discovery optional, Gemini
-        # extraction mandatory). Only built when Gemini is configured; the owned
-        # httpx client performs bounded official-evidence fetches.
-        if self._enricher is None:
-            self._enricher = self._build_research_enricher(settings)
+        # Runtime research is deliberately disabled. You.com and model-backed URL
+        # discovery are recipe-authoring tools only; a live run consumes a reviewed,
+        # versioned AppRecipe and can never spend research credits or expand policy.
         self._record_wiring(
-            "research_enricher",
-            self._enricher,
-            configured=settings.google_genai_api_key is not None,
+            "runtime_research",
+            None,
+            configured=False,
         )
         # You.com is a sanitized wiring-audit ENTRY, never a live probe: a
         # normal health/startup check must never spend a You.com credit. See
@@ -446,40 +453,35 @@ class RunService:
             configured=self._credential_capturer is not None,
         )
 
-        if self._workflow is not None:
-            self._record_wiring("workflow", self._workflow, configured=True, wired=True)
-            return
-        if settings.langgraph_aes_key is None:
-            self._record_wiring("workflow", None, configured=False)
-            return
-        try:
-            self._workflow = build_graph(
-                checkpoint_path=settings.checkpoint_db_path,
-                encryption_key=settings.langgraph_aes_key,
-                dependencies=self._build_workflow_dependencies(settings),
-            )
-        except ConfigurationRequiredError:
-            self._workflow = None
-        except (ValueError, TypeError) as exc:
-            # A malformed LANGGRAPH_AES_KEY (wrong byte length) must not crash-loop
-            # the container. Fail closed (no durable workflow) with a clear,
-            # value-free diagnostic; runs then report configuration_required.
-            LOGGER.error(
-                "LANGGRAPH_AES_KEY is invalid (%s); the durable workflow is "
-                "disabled. Expected a 16, 24, or 32-byte key.",
-                type(exc).__name__,
-            )
-            self._workflow = None
-        self._record_wiring("workflow", self._workflow, configured=True)
+        # Provider construction is independent of LangGraph. New runs are driven
+        # by the canonical SQLite state machine; a constructor-injected workflow is
+        # retained only so pre-migration runs can still be inspected by a temporary
+        # legacy adapter.
+        self._build_workflow_dependencies(settings)
+        if self._managed_auth_provider is None and settings.composio_api_key is not None:
+            try:
+                self._managed_auth_provider = ComposioManagedAuthProvider.from_settings(
+                    settings,
+                    effect_store=self._effect_store,
+                )
+            except (ConfigurationRequiredError, ImportError, AttributeError, TypeError):
+                self._managed_auth_provider = None
+        self._record_wiring(
+            "composio_managed_auth",
+            self._managed_auth_provider,
+            configured=settings.composio_api_key is not None,
+        )
+        self._record_wiring(
+            "legacy_workflow",
+            self._workflow,
+            configured=self._workflow is not None,
+            wired=self._workflow is not None,
+        )
         # Recover any runs stranded by the previous shutdown before serving.
         self._reconcile_stranded_runs()
         # Start the autonomous email poller so the agent listens for and answers
         # provider replies on its own, with no manual polling.
         self._start_email_poller()
-        # Start the autonomous advancement sweep so a human gate the agent can
-        # resolve itself (a login form whose credentials are already authorized)
-        # is retried without anyone pressing Resume.
-        self._start_autonomous_advancer()
 
     def _reconcile_stranded_runs(self) -> None:
         """Recover runs stranded by the previous shutdown."""
@@ -774,18 +776,17 @@ class RunService:
             follow_redirects=False,
         )
         self._validation_http_client = client
+        policies = tuple(
+            policy
+            for recipe in load_app_recipe_catalog().apps
+            if (policy := get_app_validation_policy(recipe.app_slug)) is not None
+        )
         validator = CredentialValidator(
             secret_store=self._secret_store,
             http_client=client,
-            policies=(hubspot_validation_policy(), pipedrive_validation_policy()),
+            policies=policies,
         )
-        # Read-only validation endpoints come from the reviewed NetworkEndpointPolicy
-        # (the single source of truth for exact backend endpoints).
-        endpoints: dict[str, str] = {}
-        for slug in ("hubspot", "pipedrive"):
-            endpoint = network_validation_endpoint(slug)
-            if endpoint is not None:
-                endpoints[slug] = endpoint
+        endpoints = {policy.app_slug: policy.allowed_endpoints[0] for policy in policies}
         return PolicyBoundCredentialValidator(validator=validator, endpoints=endpoints)
 
     def _build_workflow_dependencies(self, settings: Settings) -> WorkflowDependencies:
@@ -869,9 +870,12 @@ class RunService:
 
         from ops.browser_readiness import browser_configuration_state
 
+        selected = provider or settings.browser_provider
+        if selected == "browser_use" and not settings.browser_use_compatibility_enabled:
+            return False
         # One shared, provider-aware helper (also used by health + retry eligibility)
         # so a Playwright deployment is never judged by a Browser Use key.
-        return browser_configuration_state(settings, provider)
+        return browser_configuration_state(settings, selected)
 
     def _browser_worker_for(
         self,
@@ -942,10 +946,9 @@ class RunService:
     ) -> BrowserWorker:
         """Select the browser backend.
 
-        The Browser Use default comes from the installed browser-worker factory when a
-        deployment registered one (see ``ops.runtime_extensions``), otherwise from the
-        core ``BrowserWorker``. Resolving through the registry rather than through this
-        module's namespace means the choice no longer depends on where this code lives.
+        Browser Use uses the core compatibility adapter. It is wired only when its
+        own live opt-in and credential are configured; it is never selected as a
+        fallback for a Playwright run.
 
         For ``playwright`` the NORMAL path is now the isolated browser service over
         authenticated RPC. Previously this always returned the in-process worker, so
@@ -987,9 +990,6 @@ class RunService:
                     owner=settings.browser_service_owner,
                 ),
             )
-        worker_factory = runtime_extensions.active().browser_worker_factory
-        if worker_factory is not None:
-            return worker_factory(settings)
         return BrowserWorker(settings=settings)
 
     def _record_wiring(
@@ -1024,10 +1024,11 @@ class RunService:
         self._email_poller_stop.set()
         if self._email_poller_thread is not None:
             self._email_poller_thread.join(timeout=5)
+            self._email_poller_thread = None
         self._advance_stop.set()
         if self._advance_thread is not None:
             self._advance_thread.join(timeout=5)
-            self._email_poller_thread = None
+            self._advance_thread = None
         workflow = self._workflow
         self._workflow = None
         if workflow is not None:
@@ -1073,11 +1074,22 @@ class RunService:
         flag is no longer consulted as a runtime control.
         """
 
+        if self._canonical.recipe_for_request(request) is not None:
+            return self._canonical.create_run(
+                request,
+                idempotency_key=idempotency_key,
+                execution_mode=execution_mode,
+                browser_login=browser_login,
+            )
+        if execution_mode == "execute_when_configured":
+            raise CredentialSubmissionError("reviewed_recipe_required")
+        # The remaining P1 apps stay research-only. They retain the conservative
+        # local projection but cannot enter any provider path.
         return self._creation.create_run(
             request,
             idempotency_key=idempotency_key,
-            execution_mode=execution_mode,
-            browser_login=browser_login,
+            execution_mode="plan_only",
+            browser_login=None,
         )
 
     def _spawn_async_browser(
@@ -1224,10 +1236,17 @@ class RunService:
         research: OperationalResearch,
         request: OperationsRequest,
         captured: Mapping[str, str],
+        *,
+        recipe: AppRecipe | None = None,
     ) -> _CredentialOutcome:
         """Validate deterministically-captured vault refs and build the bundle."""
 
-        return self._credentials.finalize_captured_credentials(research, request, captured)
+        return self._credentials.finalize_captured_credentials(
+            research,
+            request,
+            captured,
+            recipe=recipe,
+        )
 
     def _record_verified_research(
         self,
@@ -1299,11 +1318,6 @@ class RunService:
     def get_output(self, run_id: str) -> dict[str, Any] | None:
         return self._queries.get_output(run_id)
 
-    def reveal_credentials(self, run_id: str) -> dict[str, str] | None:
-        """Owner-only raw credential reveal resolved live from the encrypted vault."""
-
-        return self._queries.reveal_credentials(run_id)
-
     def project(
         self,
         run_id: str,
@@ -1354,7 +1368,7 @@ class RunService:
 
         return self._live_view.get_browser_screenshot(run_id)
 
-    def get_browser_interactive_grant(self, run_id: str) -> tuple[str, str, str] | None:
+    def get_browser_interactive_grant(self, run_id: str) -> tuple[str, str, str, bool] | None:
         """Mint an ephemeral Playwright grant only for an active human handoff."""
 
         return self._live_view.get_browser_interactive_grant(run_id)
@@ -1398,7 +1412,36 @@ class RunService:
     ) -> dict[str, Any]:
         """Resume a waiting_for_hitl run on the SAME browser session/thread."""
 
-        return self._resume.resume_run(run_id, signal=signal, browser_login=browser_login)
+        record = self.storage.get_run(run_id)
+        if record is None:
+            raise KeyError("run was not found")
+        if record.get("state_engine") == "canonical_v1":
+            return self._canonical.resume_run(
+                run_id,
+                signal=signal,
+                browser_login=browser_login,
+            )
+        raise CredentialSubmissionError("legacy_run_is_read_only")
+
+    def connect_managed_run(self, run_id: str) -> dict[str, Any]:
+        """Create or replay one managed Composio connection link."""
+
+        return self._canonical.connect_managed_run(run_id)
+
+    def retry_browser_run(self, run_id: str) -> dict[str, Any]:
+        """Retry one recoverable canonical Playwright attempt without login reuse."""
+
+        return self._canonical.retry_browser_run(run_id)
+
+    def poll_managed_connection(self, run_id: str) -> dict[str, Any]:
+        """Advance a managed run only after Composio reports ACTIVE."""
+
+        return self._canonical.poll_managed_connection(run_id)
+
+    def send_gated_outreach(self, run_id: str) -> dict[str, Any]:
+        """Execute reviewed outreach only through the controlled Gmail boundary."""
+
+        return self._canonical.send_gated_outreach(run_id)
 
     def submit_owner_credentials(
         self,

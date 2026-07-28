@@ -1,4 +1,4 @@
-"""Injectable API service and Phase 0/1 adapter over the existing local ledger."""
+"""Injectable API boundary over the canonical run ledger and legacy reader."""
 
 from __future__ import annotations
 
@@ -26,9 +26,10 @@ from api.models import (
     HealthResponse,
     HitlRequestView,
     LiveViewResponse,
+    ManagedConnectionResponse,
     PhaseState,
+    PrimaryAction,
     ProviderState,
-    RevealCredentialsResponse,
     RouteDecisionView,
     RunDetailResponse,
     RunListResponse,
@@ -39,6 +40,7 @@ from api.models import (
     TimelineEvent,
     TimelineResponse,
 )
+from ops.app_recipes import load_app_recipe_catalog
 from ops.browser_readiness import browser_configuration_state
 from ops.config import Settings, load_settings
 from ops.models import CompanyProfile, OperationalResearch, OperationsRequest
@@ -78,7 +80,7 @@ class PhaseUnavailableError(RuntimeError):
 
 
 class RunService(Protocol):
-    """Stable orchestration boundary implemented by local and future Phase 2 services."""
+    """Stable orchestration boundary shared by API implementations."""
 
     async def startup(self) -> None: ...
 
@@ -117,9 +119,13 @@ class RunService(Protocol):
 
     async def poll_email(self, run_id: str) -> ActionReceipt: ...
 
-    async def get_output(self, run_id: str) -> RunOutputResponse: ...
+    async def connect_managed(self, run_id: str) -> ManagedConnectionResponse: ...
 
-    async def reveal_credentials(self, run_id: str) -> RevealCredentialsResponse: ...
+    async def poll_managed_connection(self, run_id: str) -> ManagedConnectionResponse: ...
+
+    async def send_gated_outreach(self, run_id: str) -> ActionReceipt: ...
+
+    async def get_output(self, run_id: str) -> RunOutputResponse: ...
 
     async def retry(self, run_id: str, capability: str) -> ActionReceipt: ...
 
@@ -166,7 +172,7 @@ _EVENT_SUMMARIES = {
 
 
 class LocalRunService:
-    """Leak-resistant HTTP adapter over the Phase 2 application service."""
+    """Leak-resistant HTTP adapter over the canonical application service."""
 
     def __init__(
         self,
@@ -197,6 +203,8 @@ class LocalRunService:
 
     @staticmethod
     def _summary(record: dict[str, object]) -> RunSummary:
+        raw_attempt = record.get("attempt", 0)
+        attempt = int(raw_attempt) if isinstance(raw_attempt, int | str) else 0
         return RunSummary(
             run_id=str(record["run_id"]),
             thread_id=str(record["thread_id"]),
@@ -209,8 +217,101 @@ class LocalRunService:
             execution_mode=record.get("execution_mode", "plan_only"),  # type: ignore[arg-type]
             browser_provider=record.get("browser_provider", "browser_use"),  # type: ignore[arg-type]
             credential_creation_policy=record.get("credential_creation_policy", "reuse_only"),  # type: ignore[arg-type]
+            recipe_version=(
+                str(record["recipe_version"]) if record.get("recipe_version") else None
+            ),
+            route_kind=record.get("route_kind"),  # type: ignore[arg-type]
+            readiness_tier=record.get("readiness_tier"),  # type: ignore[arg-type]
+            attempt=attempt,
+            phase=str(record.get("phase") or "legacy"),
+            reason_code=(str(record["reason_code"]) if record.get("reason_code") else None),
+            state_engine=record.get("state_engine", "legacy"),  # type: ignore[arg-type]
             external_actions=bool(record.get("external_actions", False)),
         )
+
+    def _primary_action(self, record: Mapping[str, object], summary: RunSummary) -> PrimaryAction:
+        if summary.status == "completed":
+            return PrimaryAction(kind="none", enabled=False, reason_code="run_completed")
+        if summary.execution_mode == "plan_only":
+            return PrimaryAction(kind="none", enabled=False, reason_code="plan_only_run_read_only")
+        if summary.status == "credentials_ready":
+            return PrimaryAction(
+                kind="none",
+                enabled=False,
+                reason_code="credential_stored_validation_not_reviewed",
+            )
+        if summary.route_kind == "managed_auth":
+            managed_enabled = bool(
+                self._settings.composio_api_key is not None
+                and self._settings.managed_auth_callback_base_url
+            )
+            if record.get("connection_request_id"):
+                return PrimaryAction(
+                    kind="poll_connection",
+                    enabled=managed_enabled,
+                    reason_code=(
+                        "managed_connection_pending"
+                        if managed_enabled
+                        else "composio_managed_auth_not_configured"
+                    ),
+                )
+            return PrimaryAction(
+                kind="connect_account",
+                enabled=managed_enabled,
+                reason_code=(
+                    "managed_connection_required"
+                    if managed_enabled
+                    else "composio_managed_auth_not_configured"
+                ),
+            )
+        if summary.route_kind == "playwright":
+            if summary.phase in {"credential_ready", "entry_reached"}:
+                owner_actions_enabled = self._settings.allow_local_credential_submission
+                return PrimaryAction(
+                    kind="submit_credentials",
+                    enabled=owner_actions_enabled,
+                    reason_code=(
+                        "owner_credential_submission_disabled"
+                        if not owner_actions_enabled
+                        else "owner_credential_submission_required"
+                        if summary.phase == "credential_ready"
+                        else "owner_credential_submission_available"
+                    ),
+                )
+            return PrimaryAction(
+                kind="open_browser",
+                enabled=summary.status in {"browser_running", "waiting_for_hitl"},
+                reason_code=(
+                    "playwright_session_live"
+                    if summary.status in {"browser_running", "waiting_for_hitl"}
+                    else "playwright_session_not_live"
+                ),
+            )
+        if summary.route_kind == "gated":
+            if summary.status in {"outreach_sent", "waiting_for_reply"}:
+                return PrimaryAction(
+                    kind="poll_reply",
+                    enabled=True,
+                    reason_code="outreach_reply_pending",
+                )
+            controlled_outreach_enabled = bool(
+                self._settings.composio_api_key is not None
+                and self._settings.composio_gmail_connected_account_id
+                and self._settings.outreach_recipient_override
+            )
+            outreach_ready = summary.readiness_tier == "outreach_ready"
+            return PrimaryAction(
+                kind="review_outreach",
+                enabled=outreach_ready and controlled_outreach_enabled,
+                reason_code=(
+                    "outreach_contact_review_required"
+                    if not outreach_ready
+                    else "controlled_outreach_not_configured"
+                    if not controlled_outreach_enabled
+                    else "controlled_outreach_ready"
+                ),
+            )
+        return PrimaryAction(kind="none", enabled=False, reason_code="legacy_run_read_only")
 
     def _provider_states(self) -> list[ProviderState]:
         settings = self._settings
@@ -220,10 +321,13 @@ class LocalRunService:
             *,
             configured: bool,
             enabled: bool = True,
+            ready: bool = False,
             detail: str,
         ) -> ProviderState:
             if not enabled:
                 status = "disabled"
+            elif ready:
+                status = "ready"
             elif configured:
                 status = "configured_not_verified"
             else:
@@ -232,13 +336,22 @@ class LocalRunService:
 
         live_browser_enabled = bool(getattr(settings, "allow_live_browser", False))
         gmail_configured = bool(
-            settings.composio_api_key is not None and settings.composio_gmail_connected_account_id
+            settings.composio_api_key is not None
+            and settings.composio_gmail_connected_account_id
+            and settings.outreach_recipient_override
+        )
+        managed_configured = bool(
+            settings.composio_api_key is not None and settings.managed_auth_callback_base_url
+        )
+        browser_use_enabled = bool(
+            live_browser_enabled and settings.browser_use_compatibility_enabled
         )
         return [
             state(
-                "langgraph",
-                configured=settings.langgraph_aes_key is not None,
-                detail="Encrypted workflow checkpoints require a dedicated AES key.",
+                "recipes",
+                configured=True,
+                ready=len(load_app_recipe_catalog().apps) == 50,
+                detail="The reviewed 50-app recipe catalog passed startup validation.",
             ),
             state(
                 "vault",
@@ -246,23 +359,22 @@ class LocalRunService:
                 detail="The credential vault requires a separate Fernet key.",
             ),
             state(
-                "perplexity",
-                configured=settings.perplexity_api_key is not None,
-                detail="Search is used only for bounded official-document discovery.",
-            ),
-            state(
-                "gemini",
-                configured=settings.google_genai_api_key is not None,
-                detail="Structured extraction runs only against fetched official evidence.",
-            ),
-            state(
-                "composio",
-                configured=gmail_configured,
-                enabled=settings.allow_live_vendor_email,
+                "composio_managed_auth",
+                configured=managed_configured,
                 detail=(
-                    "Live Gmail is policy-disabled."
-                    if not settings.allow_live_vendor_email
-                    else "Gmail configuration has not been verified against the pinned schema."
+                    "Managed connection links are configured; live status is checked only on an owner action."
+                    if managed_configured
+                    else "Managed auth requires COMPOSIO_API_KEY and MANAGED_AUTH_CALLBACK_BASE_URL."
+                ),
+            ),
+            state(
+                "gmail",
+                configured=gmail_configured,
+                enabled=gmail_configured,
+                detail=(
+                    "Controlled-sink Gmail is configured; live vendor delivery remains disabled."
+                    if gmail_configured
+                    else "Controlled outreach requires Composio Gmail and OUTREACH_RECIPIENT_OVERRIDE."
                 ),
             ),
             state(
@@ -277,12 +389,14 @@ class LocalRunService:
             ),
             state(
                 "browser_use",
-                configured=browser_configuration_state(settings, "browser_use"),
-                enabled=live_browser_enabled,
+                configured=(
+                    browser_use_enabled and browser_configuration_state(settings, "browser_use")
+                ),
+                enabled=browser_use_enabled,
                 detail=self._browser_provider_detail(
                     provider="browser_use",
                     settings=settings,
-                    live_enabled=live_browser_enabled,
+                    live_enabled=browser_use_enabled,
                 ),
             ),
         ]
@@ -292,6 +406,8 @@ class LocalRunService:
         """Provider health detail. Never launches a browser from the API path."""
 
         if not live_enabled:
+            if provider == "browser_use" and not settings.browser_use_compatibility_enabled:
+                return "Browser Use compatibility execution is disabled for this rollout."
             return "Live browser execution is policy-disabled."
         if provider != "playwright":
             if settings.browser_use_api_key is None:
@@ -363,8 +479,9 @@ class LocalRunService:
                 available=False,
             )
         )
-        has_checkpoint_key = self._settings.langgraph_aes_key is not None
-        # Provider-aware: a Playwright deployment needs no Browser Use key.
+        route_kind = str(record.get("route_kind") or "")
+        run_status = str(record.get("status") or "")
+        run_phase = str(record.get("phase") or "")
         browser_provider: BrowserProvider = (
             "playwright" if record.get("browser_provider") == "playwright" else "browser_use"
         )
@@ -372,54 +489,112 @@ class LocalRunService:
             self._settings,
             browser_provider,
         )
-        # The detail text must describe the SELECTED provider. Reporting Browser Use's
-        # v3 allowlist limitation on a Playwright deployment would be simply false:
-        # the self-hosted harness enforces the host allowlist itself via route
-        # interception, which is the reason it exists.
         browser_detail = self._browser_phase_detail(
             provider=browser_provider, configured=has_browser_configuration
         )
         has_email_configuration = bool(
             self._settings.composio_api_key is not None
             and self._settings.composio_gmail_connected_account_id
-            and self._settings.allow_live_vendor_email
+            and self._settings.outreach_recipient_override
         )
         bundle_ready = record.get("integrator_bundle") is not None
-        return [
-            research_phase,
-            PhaseState(
+
+        if route_kind != "playwright":
+            browser_phase = PhaseState(
                 key="browser",
                 name="Browser",
-                phase="5/6",
-                status="unavailable" if has_browser_configuration else "configuration_required",
-                detail=browser_detail,
+                phase="browser",
+                status="unavailable",
+                detail="This recipe does not use browser automation.",
                 available=False,
-            ),
-            PhaseState(
+            )
+            hitl_phase = PhaseState(
                 key="hitl",
                 name="HITL",
-                phase="3",
-                status="ready" if has_checkpoint_key else "configuration_required",
-                detail=(
-                    "Encrypted durable interrupts are available when a run requests human action."
-                    if has_checkpoint_key
-                    else "LANGGRAPH_AES_KEY is required for durable interrupt and resume."
+                phase="hitl",
+                status="unavailable",
+                detail="No browser handoff is part of this route.",
+                available=False,
+            )
+        else:
+            if run_status == "waiting_for_hitl":
+                browser_status = "waiting"
+            elif run_status == "browser_running" and run_phase in {
+                "credential_ready",
+                "entry_reached",
+            }:
+                browser_status = "ready"
+            elif run_status == "browser_running":
+                browser_status = "running"
+            elif run_status in {"failed", "blocked", "configuration_required"}:
+                browser_status = run_status
+            else:
+                browser_status = "ready" if has_browser_configuration else "configuration_required"
+            browser_phase = PhaseState(
+                key="browser",
+                name="Browser",
+                phase="browser",
+                status=browser_status,  # type: ignore[arg-type]
+                detail=browser_detail,
+                available=has_browser_configuration,
+            )
+            hitl_phase = PhaseState(
+                key="hitl",
+                name="HITL",
+                phase="hitl",
+                status=(
+                    "waiting"
+                    if run_status == "waiting_for_hitl"
+                    else "ready"
+                    if has_browser_configuration
+                    else "configuration_required"
                 ),
-                available=has_checkpoint_key,
-            ),
-            PhaseState(
+                detail=(
+                    "The same Playwright session is paused for owner control."
+                    if run_status == "waiting_for_hitl"
+                    else "HITL state is persisted in the canonical SQLite run record."
+                ),
+                available=has_browser_configuration,
+            )
+
+        if route_kind != "gated":
+            email_phase = PhaseState(
                 key="email",
                 name="Email",
-                phase="4",
-                status="ready" if has_email_configuration else "configuration_required",
-                detail=(
-                    "Pinned, least-privilege Gmail execution is configured but runs only on an "
-                    "explicit action."
+                phase="outreach",
+                status="unavailable",
+                detail="This recipe does not use controlled outreach.",
+                available=False,
+            )
+        elif record.get("readiness_tier") == "outreach_review_required":
+            email_phase = PhaseState(
+                key="email",
+                name="Email",
+                phase="outreach",
+                status="unavailable",
+                detail="A reviewed vendor contact is required before outreach can be enabled.",
+                available=False,
+            )
+        else:
+            email_phase = PhaseState(
+                key="email",
+                name="Email",
+                phase="outreach",
+                status=(
+                    "waiting"
+                    if run_status in {"outreach_sent", "waiting_for_reply"}
+                    else "ready"
                     if has_email_configuration
-                    else "Composio Gmail account configuration and live-email policy opt-in are required."
+                    else "configuration_required"
                 ),
+                detail="Outreach is bounded to the configured controlled sink.",
                 available=has_email_configuration,
-            ),
+            )
+        return [
+            research_phase,
+            browser_phase,
+            hitl_phase,
+            email_phase,
             PhaseState(
                 key="output",
                 name="Output",
@@ -487,6 +662,10 @@ class LocalRunService:
             screenshot_present=screenshot_present,
             session_lost=session_lost_recorded(events),
             plan_only=str(record.get("execution_mode") or "") == "local_dry_run",
+            owner_submission_ready=(
+                record.get("readiness_tier") == "owner_submit_ready"
+                and record.get("phase") == "entry_reached"
+            ),
         )
 
     def _detail(self, summary: RunSummary) -> RunDetailResponse:
@@ -540,6 +719,7 @@ class LocalRunService:
             provider_states=self._provider_states(),
             hitl_request=hitl_view,
             browser=self._browser_ui(record, hitl_view),
+            primary_action=self._primary_action(record, summary),
         )
 
     def _create_sync(
@@ -810,15 +990,23 @@ class LocalRunService:
         browser_login: BrowserLoginInput | None = None,
         signal: str = "completed",
     ) -> ActionReceipt:
-        await self.get_run(run_id)
-        if self._settings.langgraph_aes_key is None:
+        detail = await self.get_run(run_id)
+        if detail.run.state_engine != "canonical_v1":
             raise PhaseUnavailableError(
                 run_id=run_id,
                 action="resume",
-                available_in=("phase_3",),
-                error="configuration_required",
+                available_in=("canonical_v1",),
+                error="phase_unavailable",
             )
-        # Map the owner login input onto the Browser Use secure-placeholder names.
+        if detail.run.execution_mode == "plan_only" or detail.run.status != "waiting_for_hitl":
+            raise PhaseUnavailableError(
+                run_id=run_id,
+                action="resume",
+                available_in=("waiting_for_hitl",),
+                error="phase_unavailable",
+                message="Resume is available only while a canonical run is waiting for HITL.",
+            )
+        # Map owner input onto the provider-neutral secret boundary names.
         # SecretStr keeps values wrapped until the core service resolves them in
         # memory for the single resume call.
         login_map: dict[str, SecretStr] | None = None
@@ -849,21 +1037,23 @@ class LocalRunService:
                 interaction_available=True,
                 reason_code="hosted_session_live",
             )
-        # Interactive Playwright grants are minted only while this immutable run
-        # is paused for HITL. The private URL is transient: the Next server validates
-        # and converts it to the reviewed same-origin WebSocket path immediately.
+        # Playwright grants are minted for both autonomous viewing and HITL. The
+        # browser service signs the capability: autonomous grants are view-only;
+        # a live HITL pause may receive control. The private URL remains transient.
         grant_getter = getattr(self._service, "get_browser_interactive_grant", None)
         grant = grant_getter(run_id) if callable(grant_getter) else None
         if provider == "playwright" and grant is not None:
-            _, interactive_url, _expires_at = grant
+            _, interactive_url, _expires_at, control_allowed = grant
             return LiveViewResponse(
                 run_id=run_id,
                 provider="playwright",
                 available=True,
                 mode="interactive_remote",
                 interactive_url=interactive_url,
-                interaction_available=True,
-                reason_code="interactive_session_live",
+                interaction_available=control_allowed,
+                reason_code=(
+                    "interactive_control_live" if control_allowed else "interactive_view_only_live"
+                ),
             )
         # Self-hosted Playwright has no hosted URL; the client polls masked frames.
         # Frames are viewable but not drivable, so interaction is not advertised.
@@ -914,7 +1104,18 @@ class LocalRunService:
         return await run_in_threadpool(self._live_screenshot_sync, run_id)
 
     async def poll_email(self, run_id: str) -> ActionReceipt:
-        await self.get_run(run_id)
+        detail = await self.get_run(run_id)
+        if detail.run.route_kind != "gated" or detail.run.status not in {
+            "outreach_sent",
+            "waiting_for_reply",
+        }:
+            raise PhaseUnavailableError(
+                run_id=run_id,
+                action="poll_email",
+                available_in=("outreach_sent", "waiting_for_reply"),
+                error="phase_unavailable",
+                message="Email polling is available only after controlled outreach.",
+            )
         if not (
             self._settings.composio_api_key
             and self._settings.composio_gmail_connected_account_id
@@ -953,8 +1154,98 @@ class LocalRunService:
             detail=detail,
         )
 
+    @staticmethod
+    def _managed_response(payload: Mapping[str, object]) -> ManagedConnectionResponse:
+        run = payload.get("run")
+        if not isinstance(run, dict):
+            raise RuntimeError("managed connection response is missing its run")
+        return ManagedConnectionResponse(
+            run=LocalRunService._summary(run),
+            connection_request_id=str(payload.get("connection_request_id") or ""),
+            state=payload.get("state", "pending"),  # type: ignore[arg-type]
+            redirect_url=(
+                str(payload["redirect_url"]) if payload.get("redirect_url") is not None else None
+            ),
+            replayed=bool(payload.get("replayed", False)),
+        )
+
+    def _connect_managed_sync(self, run_id: str) -> ManagedConnectionResponse:
+        try:
+            return self._managed_response(self._service.connect_managed_run(run_id))
+        except KeyError:
+            raise RunNotFoundError(run_id) from None
+
+    async def connect_managed(self, run_id: str) -> ManagedConnectionResponse:
+        self._require_started()
+        return await run_in_threadpool(self._connect_managed_sync, run_id)
+
+    def _poll_managed_sync(self, run_id: str) -> ManagedConnectionResponse:
+        try:
+            return self._managed_response(self._service.poll_managed_connection(run_id))
+        except KeyError:
+            raise RunNotFoundError(run_id) from None
+
+    async def poll_managed_connection(self, run_id: str) -> ManagedConnectionResponse:
+        self._require_started()
+        return await run_in_threadpool(self._poll_managed_sync, run_id)
+
+    def _send_gated_outreach_sync(self, run_id: str) -> ActionReceipt:
+        try:
+            record = self._service.send_gated_outreach(run_id)
+        except KeyError:
+            raise RunNotFoundError(run_id) from None
+        return ActionReceipt(
+            run_id=run_id,
+            action="send_outreach",
+            status="accepted",
+            detail=(
+                "Controlled-sink outreach was recorded; run status: "
+                f"{str(record.get('status') or 'unknown').replace('_', ' ')}."
+            ),
+        )
+
+    async def send_gated_outreach(self, run_id: str) -> ActionReceipt:
+        self._require_started()
+        return await run_in_threadpool(self._send_gated_outreach_sync, run_id)
+
     async def retry(self, run_id: str, capability: str) -> ActionReceipt:
         detail = await self.get_run(run_id)
+        if detail.run.execution_mode == "plan_only":
+            raise PhaseUnavailableError(
+                run_id=run_id,
+                action="retry",
+                available_in=("execute_when_configured",),
+                error="phase_unavailable",
+                message="Plan-only runs are immutable.",
+            )
+        if capability == "browser":
+            if detail.run.route_kind != "playwright" or detail.run.browser_provider != "playwright":
+                raise PhaseUnavailableError(
+                    run_id=run_id,
+                    action="retry",
+                    available_in=("failed_playwright_run",),
+                    error="phase_unavailable",
+                )
+            if not browser_configuration_state(self._settings, "playwright"):
+                return ActionReceipt(
+                    run_id=run_id,
+                    action="retry",
+                    status="configuration_required",
+                    detail="Required provider configuration or policy opt-in is missing.",
+                )
+            try:
+                retried = await run_in_threadpool(self._service.retry_browser_run, run_id)
+            except KeyError:
+                raise RunNotFoundError(run_id) from None
+            return ActionReceipt(
+                run_id=run_id,
+                action="retry",
+                status="accepted",
+                detail=(
+                    "A new Playwright attempt started without reusing login values "
+                    f"(attempt {int(retried.get('attempt', 0) or 0)})."
+                ),
+            )
         requirements = {
             "research": bool(
                 self._settings.perplexity_api_key and self._settings.google_genai_api_key
@@ -1007,22 +1298,6 @@ class LocalRunService:
             action="output",
             available_in=("output",),
         )
-
-    def _reveal_credentials_sync(self, run_id: str) -> RevealCredentialsResponse:
-        revealed = self._service.reveal_credentials(run_id)
-        if revealed is None:
-            raise RunNotFoundError(run_id)
-        if not revealed:
-            raise PhaseUnavailableError(
-                run_id=run_id,
-                action="reveal_credentials",
-                available_in=("output",),
-            )
-        return RevealCredentialsResponse(run_id=run_id, credentials=dict(revealed))
-
-    async def reveal_credentials(self, run_id: str) -> RevealCredentialsResponse:
-        self._require_started()
-        return await run_in_threadpool(self._reveal_credentials_sync, run_id)
 
     async def health(self) -> HealthResponse:
         self._require_started()

@@ -72,8 +72,8 @@ class RunLiveViewService:
             return (result[0], result[1])
         return None
 
-    def get_browser_interactive_grant(self, run_id: str) -> tuple[str, str, str] | None:
-        """Mint an ephemeral Playwright grant only for an active human handoff.
+    def get_browser_interactive_grant(self, run_id: str) -> tuple[str, str, str, bool] | None:
+        """Mint an ephemeral Playwright view/control grant for an active run.
 
         The signed URL is returned once to the API projection and is never written
         to storage, checkpoints, audit events, worker caches, or logs.
@@ -83,8 +83,14 @@ class RunLiveViewService:
         if (
             record is None
             or record.get("browser_provider") != "playwright"
-            or record.get("status") != "waiting_for_hitl"
+            or record.get("status") not in {"browser_running", "waiting_for_hitl"}
         ):
+            return None
+        provider_status = record.get("provider_status")
+        if isinstance(provider_status, Mapping) and provider_status.get("browser") in {
+            "credential_page_ready",
+            "credentials_ready",
+        }:
             return None
         session_id = record.get("browser_session_id")
         if not isinstance(session_id, str) or not session_id:
@@ -96,12 +102,13 @@ class RunLiveViewService:
         result = requester(session_id)
         if (
             isinstance(result, tuple)
-            and len(result) == 3
+            and len(result) == 4
             and result[0] == "interactive_remote"
             and isinstance(result[1], str)
             and isinstance(result[2], str)
+            and isinstance(result[3], bool)
         ):
-            return cast("tuple[str, str, str]", result)
+            return cast("tuple[str, str, str, bool]", result)
         return None
 
     def get_browser_live_url(self, run_id: str) -> str | None:

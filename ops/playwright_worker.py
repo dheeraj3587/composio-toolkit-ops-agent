@@ -34,10 +34,15 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from ops.app_recipes import (
+    AppRecipe,
+    get_app_recipe,
+    recipe_to_browser_trace,
+    recipe_to_capture_spec,
+)
 from ops.browser_api_trace_catalog import (
     BrowserApiTrace,
     BrowserApiTraceStep,
-    get_browser_api_trace,
 )
 from ops.browser_candidates import (
     ActionCandidate,
@@ -91,7 +96,6 @@ from ops.browser_worker import (
     validate_allowed_domains,
 )
 from ops.config import Settings
-from ops.credential_capture_specs import get_capture_spec
 from ops.inference import build_json_inference
 from ops.model_input_dlp import (
     contains_secret_material,
@@ -130,6 +134,7 @@ from ops.playwright_gates import (  # noqa: F401
 )
 from ops.playwright_gates import classify_structural_gate as classify_structural_gate
 from ops.playwright_gates import detect_human_gate as detect_human_gate
+from ops.playwright_live_mask import install_live_pixel_mask as _install_live_pixel_mask
 from ops.playwright_login_dom import (  # noqa: F401
     _has_password_field,
     _inject_login,
@@ -396,6 +401,7 @@ class PlaywrightBrowserWorker:
         self,
         profile_id: str | None,
         *,
+        recipe: AppRecipe | None = None,
         storage_state: dict[str, Any] | None = None,
         app_slug: str = "",
         account_ref: str | None = None,
@@ -418,7 +424,7 @@ class PlaywrightBrowserWorker:
         # screenshot mode. The browser SERVICE (BrowserServiceClient) is where these
         # values actually matter.
         # ``app_slug`` is re-recorded on the session at navigation time.
-        del app_slug, account_ref, secret_scope, use_storage_state, live_view_mode
+        del recipe, app_slug, account_ref, secret_scope, use_storage_state, live_view_mode
         self._require_configuration()
         try:
             module = importlib.import_module("playwright.async_api")
@@ -523,6 +529,7 @@ class PlaywrightBrowserWorker:
         context: BrowserSessionContext,
         research: OperationalResearch,
         *,
+        recipe: AppRecipe | None = None,
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
         credential_creation_policy: str = "reuse_only",
@@ -534,11 +541,35 @@ class PlaywrightBrowserWorker:
                 capability="Playwright browser", reason_code="session_missing"
             )
         self._research[context.session_id] = research
-        patterns = self._resolve_patterns(research)
+        bound_recipe = recipe or get_app_recipe(research.app_slug)
+        if (
+            bound_recipe is None
+            or bound_recipe.app_slug != research.app_slug
+            or bound_recipe.route_kind != "playwright"
+        ):
+            raise ProviderOperationError(
+                capability="Playwright browser", reason_code="immutable_recipe_required"
+            )
+        patterns = self._resolve_patterns(research, recipe=bound_recipe)
         session.patterns = patterns
         session.app_slug = research.app_slug
 
-        trace = get_browser_api_trace(research.app_slug)
+        # Screenshot masking cannot protect the headed X11 desktop. Install the
+        # recipe-owned document-start mask before the first vendor navigation; in
+        # production the browser service also requires this before issuing any
+        # live-view grant.
+        if not session.live_pixel_mask_installed:
+            if not await self.install_live_pixel_mask(
+                context,
+                research.app_slug,
+                recipe=bound_recipe,
+            ):
+                raise ProviderOperationError(
+                    capability="Playwright live view",
+                    reason_code="live_pixel_mask_install_failed",
+                )
+
+        trace = recipe_to_browser_trace(bound_recipe)
         account_state = derive_account_state(
             restored_storage_state=session.restored_storage_state,
             sensitive_data=sensitive_data,
@@ -550,7 +581,7 @@ class PlaywrightBrowserWorker:
 
         # Phase 2 guards are installed HERE (not at launch) because they need the
         # app's reviewed host patterns, which only exist once research resolves.
-        await self._install_interaction_guards(session, patterns)
+        await self._install_interaction_guards(session, patterns, recipe=bound_recipe)
 
         # A login-bound run must enter the reviewed authentication egress stage
         # before the first document is requested. Modern login pages load their
@@ -589,6 +620,7 @@ class PlaywrightBrowserWorker:
         return await self._run_action_loop(
             session,
             research,
+            recipe=bound_recipe,
             sensitive_data=sensitive_data,
             credential_creation_policy=credential_creation_policy,
         )
@@ -599,6 +631,7 @@ class PlaywrightBrowserWorker:
         signal: str,
         research: OperationalResearch | None = None,
         *,
+        recipe: AppRecipe | None = None,
         sensitive_data: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
@@ -622,22 +655,74 @@ class PlaywrightBrowserWorker:
             raise ProviderOperationError(
                 capability="Playwright browser", reason_code="verified_research_required"
             )
+        bound_recipe = recipe or get_app_recipe(resolved.app_slug)
+        if (
+            bound_recipe is None
+            or bound_recipe.app_slug != resolved.app_slug
+            or bound_recipe.route_kind != "playwright"
+        ):
+            raise ProviderOperationError(
+                capability="Playwright browser", reason_code="immutable_recipe_required"
+            )
         # A "cancelled" resume ends the run at a human gate rather than re-driving.
         if normalized_signal == "cancelled":
             return self._human_required(session, "The human cancelled the browser step.")
         return await self._run_action_loop(
             session,
             resolved,
+            recipe=bound_recipe,
             sensitive_data=sensitive_data,
             credential_creation_policy=credential_creation_policy,
             resume_signal=normalized_signal,
         )
+
+    async def install_live_pixel_mask(
+        self,
+        context: BrowserSessionContext,
+        app_slug: str,
+        *,
+        recipe: AppRecipe | None = None,
+    ) -> bool:
+        """Install AppRecipe masking on the real browser context, fail closed.
+
+        Selectors are resolved locally from the checked-in recipe; an RPC caller
+        can select an app but can never supply or widen the masking policy.
+        """
+
+        session = self._sessions.get(context.session_id)
+        bound_recipe = recipe or get_app_recipe(app_slug)
+        browser_recipe = bound_recipe.browser if bound_recipe is not None else None
+        if (
+            session is None
+            or bound_recipe is None
+            or bound_recipe.app_slug != app_slug
+            or bound_recipe.route_kind != "playwright"
+            or browser_recipe is None
+        ):
+            return False
+        if session.live_pixel_mask_installed:
+            return True
+
+        async def _install() -> bool:
+            return await _install_live_pixel_mask(
+                context=session.context,
+                page=_active_page(session),
+                selectors=browser_recipe.sensitive_selectors,
+            )
+
+        try:
+            installed = await self._loop.run(_install(), timeout=_OP_TIMEOUT_SECONDS)
+        except Exception:
+            return False
+        session.live_pixel_mask_installed = installed is True
+        return session.live_pixel_mask_installed
 
     async def _run_action_loop(
         self,
         session: _PwSession,
         research: OperationalResearch,
         *,
+        recipe: AppRecipe,
         sensitive_data: Mapping[str, str] | None,
         credential_creation_policy: str = "reuse_only",
         resume_signal: str | None = None,
@@ -653,7 +738,7 @@ class PlaywrightBrowserWorker:
         signals actually visible on the page — never because a model said so.
         """
 
-        trace = get_browser_api_trace(research.app_slug)
+        trace = recipe_to_browser_trace(recipe)
         if trace is None:
             return self._human_required(session, "No reviewed navigation trace is available.")
 
@@ -717,6 +802,20 @@ class PlaywrightBrowserWorker:
             if trace.success.has_positive_condition() and predicate_satisfied(
                 trace.success, inspection
             ):
+                entry_only = bool(
+                    recipe.route_kind == "playwright"
+                    and recipe.browser is not None
+                    and recipe.browser.scope == "entry_only"
+                )
+                if entry_only:
+                    await self.refresh_live_view(session)
+                    return BrowserObservation(
+                        status="developer_console_ready",
+                        current_url=inspection.url,
+                        page_title=inspection.title or "Reviewed public entry",
+                        non_secret_notes=("Verified reviewed public-entry predicate.",),
+                        reason_code="reviewed_public_entry_reached",
+                    )
                 session.egress.advance_to(EgressStage.CREDENTIAL_SURFACE)
                 session.screenshots_disabled = True
                 session.screenshot = None
@@ -1537,7 +1636,11 @@ class PlaywrightBrowserWorker:
             return None
 
     async def _install_interaction_guards(
-        self, session: _PwSession, patterns: tuple[str, ...]
+        self,
+        session: _PwSession,
+        patterns: tuple[str, ...],
+        *,
+        recipe: AppRecipe,
     ) -> None:
         """Install the page/popup registry, dialog handler and download guard.
 
@@ -1546,7 +1649,7 @@ class PlaywrightBrowserWorker:
         the reviewed per-app patterns — never from page content or model output.
         """
 
-        extras = reviewed_egress_extensions(session.app_slug)
+        extras = reviewed_egress_extensions(session.app_slug, recipe=recipe)
         session.egress_policy = build_egress_policy(
             patterns,
             identity_provider_hosts=extras.identity_provider_hosts,
@@ -1794,10 +1897,18 @@ class PlaywrightBrowserWorker:
             reason_code=reason_code,
         )
 
-    def _resolve_patterns(self, research: OperationalResearch) -> tuple[str, ...]:
+    def _resolve_patterns(
+        self,
+        research: OperationalResearch,
+        *,
+        recipe: AppRecipe,
+    ) -> tuple[str, ...]:
         try:
             allowed = build_browser_allowed_hosts(
-                research.app_slug, research, access_route=research.access_route
+                research.app_slug,
+                research,
+                access_route=research.access_route,
+                recipe=recipe,
             )
         except BrowserPolicyInactiveError as exc:
             raise ProviderOperationError(
@@ -1806,7 +1917,12 @@ class PlaywrightBrowserWorker:
         return validate_allowed_domains(allowed.patterns())
 
     async def auto_capture_credentials(
-        self, handle: str, app_slug: str, secret_store: SecretStore | None = None
+        self,
+        handle: str,
+        app_slug: str,
+        secret_store: SecretStore | None = None,
+        *,
+        recipe: AppRecipe | None = None,
     ) -> dict[str, str] | None:
         """Deterministically read the app's credential from the live page and vault it.
 
@@ -1822,7 +1938,10 @@ class PlaywrightBrowserWorker:
 
         store = secret_store or self._secret_store
         session = self._sessions.get(handle)
-        spec = get_capture_spec(app_slug)
+        bound_recipe = recipe or get_app_recipe(app_slug)
+        if bound_recipe is None or bound_recipe.app_slug != app_slug:
+            return None
+        spec = recipe_to_capture_spec(bound_recipe)
         if session is None or spec is None or store is None:
             return None
         if not navigation_allowed(spec.url, session.patterns):

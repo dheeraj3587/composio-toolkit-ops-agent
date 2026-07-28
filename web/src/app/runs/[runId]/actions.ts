@@ -1,11 +1,14 @@
 "use server"
 
 import { revalidatePath } from "next/cache"
+import { redirect } from "next/navigation"
 
 import {
   ApiError,
+  connectManagedRun,
   getLiveView,
   getRun,
+  pollManagedConnection,
   performPhaseAction,
   PhaseConflictError,
   resumeWithBrowserLogin,
@@ -18,6 +21,76 @@ import type {
   RetryCapability,
   RunPhaseAction,
 } from "@/lib/types"
+
+export interface ManagedConnectionActionState {
+  message: string | null
+  tone: "neutral" | "error"
+  state: "pending" | "active" | "terminal" | null
+}
+
+export async function runManagedConnectionAction(
+  _previousState: ManagedConnectionActionState,
+  formData: FormData,
+): Promise<ManagedConnectionActionState> {
+  const runId = String(formData.get("run_id") ?? "").slice(0, 180)
+  const operation = String(formData.get("managed_action") ?? "")
+  if (!/^run_[0-9a-f]{32}$/.test(runId) || !["connect", "poll"].includes(operation)) {
+    return { message: "The managed connection request is invalid.", tone: "error", state: null }
+  }
+
+  let result
+  try {
+    result = operation === "connect"
+      ? await connectManagedRun(runId)
+      : await pollManagedConnection(runId)
+  } catch (error) {
+    if (error instanceof PhaseConflictError) {
+      return {
+        message: "The backend no longer authorizes this managed connection action.",
+        tone: "error",
+        state: null,
+      }
+    }
+    return {
+      message:
+        error instanceof ApiError
+          ? "The managed connection provider did not accept this action."
+          : "The managed connection action could not be completed.",
+      tone: "error",
+      state: null,
+    }
+  }
+
+  revalidatePath(`/runs/${encodeURIComponent(runId)}`)
+  if (operation === "connect" && result.redirect_url) {
+    // The provider URL is schema-validated, used once, and never stored in page
+    // data or run state. Next emits the redirect after this server action.
+    redirect(result.redirect_url)
+  }
+
+  if (result.state === "active") {
+    return {
+      message: "Managed account connected. The run is ready to continue.",
+      tone: "neutral",
+      state: "active",
+    }
+  }
+  if (result.state === "terminal") {
+    return {
+      message: "The provider closed this connection request. Start a new run to try again.",
+      tone: "error",
+      state: "terminal",
+    }
+  }
+  return {
+    message:
+      operation === "poll"
+        ? "The managed account is not active yet. Complete provider authorization, then poll again."
+        : "The existing managed authorization request is still pending.",
+    tone: "neutral",
+    state: "pending",
+  }
+}
 
 export interface PhaseActionState {
   message: string | null
@@ -156,11 +229,7 @@ export async function openLiveView(
       }
     }
 
-    if (
-      result.mode === "interactive_remote" &&
-      result.interactive_url &&
-      result.interaction_available
-    ) {
+    if (result.mode === "interactive_remote" && result.interactive_url) {
       return {
         provider: result.provider,
         mode: "interactive_remote",
@@ -168,8 +237,10 @@ export async function openLiveView(
         screenshotUrl: null,
         interactivePath: sameOriginInteractivePath(result.interactive_url),
         capturedAt: result.captured_at ?? null,
-        interactionAvailable: true,
-        message: "Interactive Playwright session ready.",
+        interactionAvailable: result.interaction_available,
+        message: result.interaction_available
+          ? "Interactive Playwright session ready."
+          : "Live Playwright session ready in view-only mode.",
         tone: "neutral",
       }
     }

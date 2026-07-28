@@ -10,6 +10,7 @@ export type RunStatus =
   | "created"
   | "researching"
   | "route_selected"
+  | "connection_required"
   | "browser_running"
   | "waiting_for_hitl"
   | "outreach_sent"
@@ -22,6 +23,28 @@ export type RunStatus =
 
 export type ExecutionMode = "plan_only" | "execute_when_configured"
 export type CredentialCreationPolicy = "reuse_only" | "create_if_missing"
+export type RouteKind = "managed_auth" | "playwright" | "gated"
+export type ReadinessTier =
+  | "managed_auth_ready"
+  | "browser_ready"
+  | "owner_submit_ready"
+  | "outreach_ready"
+  | "outreach_review_required"
+export type StateEngine = "canonical_v1" | "legacy"
+export type PrimaryActionKind =
+  | "connect_account"
+  | "poll_connection"
+  | "open_browser"
+  | "submit_credentials"
+  | "review_outreach"
+  | "poll_reply"
+  | "none"
+
+export interface PrimaryAction {
+  kind: PrimaryActionKind
+  enabled: boolean
+  reason_code: string
+}
 
 export interface RunSummary {
   run_id: string
@@ -33,6 +56,13 @@ export interface RunSummary {
   execution_mode: ExecutionMode
   browser_provider: BrowserProvider
   credential_creation_policy: CredentialCreationPolicy
+  recipe_version: string | null
+  route_kind: RouteKind | null
+  readiness_tier: ReadinessTier | null
+  attempt: number
+  phase: string
+  reason_code: string | null
+  state_engine: StateEngine
   external_actions: boolean
   created_at: string
   updated_at: string
@@ -190,6 +220,15 @@ export interface RunDetailResponse {
   missing_fields?: string[]
   provider_states?: ProviderStatus[]
   browser?: BrowserUiState | null
+  primary_action?: PrimaryAction | null
+}
+
+export interface ManagedConnectionResponse {
+  run: RunSummary
+  connection_request_id: string
+  state: "pending" | "active" | "terminal"
+  redirect_url?: string | null
+  replayed: boolean
 }
 
 export interface TimelineItem {
@@ -306,7 +345,8 @@ export type LiveViewMode = "hosted_url" | "screenshot" | "interactive_remote" | 
  *   `captured_at`). Frames are viewable only, so `interaction_available` is false.
  * - `interactive_remote`: the private browser service supplies a short-lived,
  *   signed grant. Server-only code validates and converts it to a same-origin
- *   path before it can enter client state.
+ *   path before it can enter client state. The stream can be view-only while
+ *   automation runs; `interaction_available` truthfully reports control.
  * - `unavailable`: no viewer exists and no viewer URL is present.
  *
  * `screenshot_url` is a bounded same-origin relative API path. `interactive_url`
@@ -330,7 +370,7 @@ export type RetryCapability = "research" | "browser" | "email" | "validation"
 
 export interface ActionReceipt {
   run_id: string
-  action: "resume" | "poll_email" | "retry"
+  action: "resume" | "poll_email" | "retry" | "send_outreach"
   status: "accepted" | "configuration_required" | "unavailable" | "no_change"
   detail?: string | null
 }

@@ -7,8 +7,8 @@ owns Chromium and exposes a small, authenticated, private-network RPC surface
 that the API's provider client speaks to.
 
 Nothing here is published publicly: every route lives under ``/internal`` and
-requires the shared browser-service token, and the container publishes no host
-port (see ``compose.playwright.sandbox.yaml``).
+requires the shared browser-service token, and the browser worker publishes no
+host port in ``compose.prod.yaml``.
 """
 
 from __future__ import annotations

@@ -23,6 +23,7 @@ RunStatus = Literal[
     "created",
     "researching",
     "route_selected",
+    "connection_required",
     "browser_running",
     "waiting_for_hitl",
     "outreach_sent",
@@ -45,13 +46,30 @@ class IllegalStatusTransition(ValueError):
 # may become ``completed``.
 _LEGAL_STATUS_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     "created": frozenset(
-        {"researching", "route_selected", "configuration_required", "blocked", "failed"}
+        {
+            "researching",
+            "route_selected",
+            "connection_required",
+            "configuration_required",
+            "blocked",
+            "failed",
+        }
     ),
     "researching": frozenset(
         {"researching", "route_selected", "configuration_required", "blocked", "failed"}
     ),
     "route_selected": frozenset(
-        {"browser_running", "outreach_sent", "configuration_required", "blocked", "failed"}
+        {
+            "connection_required",
+            "browser_running",
+            "outreach_sent",
+            "configuration_required",
+            "blocked",
+            "failed",
+        }
+    ),
+    "connection_required": frozenset(
+        {"connection_required", "completed", "configuration_required", "blocked", "failed"}
     ),
     "browser_running": frozenset(
         {

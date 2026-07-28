@@ -14,17 +14,17 @@
 #   shm_size: 1gb       # avoids --disable-dev-shm-usage crashes
 #   pids_limit: 512
 #
-# The Playwright provider remains opt-in (BROWSER_PROVIDER=playwright) and the
-# base production stack is untouched. This image is started by the assignment
-# override (compose.assignment.yaml, layered over compose.prod.yaml) and by the
-# evaluation sandbox (compose.playwright.sandbox.yaml), so Chromium availability
-# is a build-time fact rather than a runtime surprise.
+# This image is the only browser execution path in the production stack, so
+# Chromium availability is a build-time fact rather than a runtime surprise.
 #
 # It now runs the browser SERVICE (browser_service.main:app) rather than a one-shot
 # probe, so Chromium's lifetime is decoupled from the API's: restarting the API no
 # longer kills a live browser session.
 
 FROM python:3.11-slim
+
+ARG APP_REVISION=local-uncommitted
+LABEL org.opencontainers.image.revision=$APP_REVISION
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

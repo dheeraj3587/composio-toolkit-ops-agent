@@ -88,9 +88,12 @@ class CredentialValidator:
         app_slug: str,
         credential_refs: dict[str, str],
         read_only_endpoint: str,
+        policy_override: CredentialValidationPolicy | None = None,
     ) -> CredentialValidationResult:
         endpoint = _sanitize_endpoint(read_only_endpoint)
-        policy = self._policies.get(app_slug)
+        policy = policy_override or self._policies.get(app_slug)
+        if policy is not None and policy.app_slug != app_slug:
+            raise PermissionError("validation policy app does not match the run")
         if self._secret_store is None or self._http_client is None or policy is None:
             raise ConfigurationRequiredError(
                 phase=6,
@@ -247,8 +250,9 @@ class PolicyBoundCredentialValidator:
         *,
         app_slug: str,
         credential_refs: dict[str, str],
+        policy: CredentialValidationPolicy | None = None,
     ) -> CredentialValidationResult:
-        endpoint = self._endpoints.get(app_slug)
+        endpoint = policy.allowed_endpoints[0] if policy is not None else self._endpoints.get(app_slug)
         if endpoint is None:
             raise ConfigurationRequiredError(
                 phase=6,
@@ -259,6 +263,7 @@ class PolicyBoundCredentialValidator:
             app_slug=app_slug,
             credential_refs=credential_refs,
             read_only_endpoint=endpoint,
+            policy_override=policy,
         )
 
 

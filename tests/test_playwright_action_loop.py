@@ -27,6 +27,8 @@ _HOST = "app.pipedrive.com"
 _PATTERNS = (_HOST, f"*.{_HOST.split('.', 1)[1]}")
 _TOKEN = "b" * 40
 
+pytestmark = pytest.mark.browser
+
 
 def _worker(**overrides: object) -> PlaywrightBrowserWorker:
     settings = Settings(allow_live_browser=True, **overrides)  # type: ignore[arg-type]
@@ -83,7 +85,7 @@ def _synthetic_trace(
 def _install_trace(monkeypatch: object, trace: object) -> None:
     import ops.playwright_worker as worker_module
 
-    monkeypatch.setattr(worker_module, "get_browser_api_trace", lambda slug: trace)  # type: ignore[attr-defined]
+    monkeypatch.setattr(worker_module, "recipe_to_browser_trace", lambda recipe: trace)
 
 
 def _start(worker: PlaywrightBrowserWorker) -> object:
@@ -393,7 +395,10 @@ def test_login_bound_navigation_enters_authentication_stage_before_first_documen
         worker.navigate_onboarding(
             context,  # type: ignore[arg-type]
             _research(),
-            sensitive_data={"login_email": "ops@example.test", "login_password": "pw"},
+            sensitive_data={
+                "login_email": "ops@example.test",
+                "login_password": "pw",  # pragma: allowlist secret - login fixture
+            },
         )
     )
     asyncio.run(worker.stop(context))  # type: ignore[arg-type]
@@ -487,9 +492,9 @@ def test_model_cannot_declare_success_without_a_reviewed_signal() -> None:
 
     asyncio.run(worker._loop.run(_load()))
 
-    from ops.browser_api_trace_catalog import get_browser_api_trace
+    from ops.app_recipes import get_app_browser_trace
 
-    trace = get_browser_api_trace("pipedrive")
+    trace = get_app_browser_trace("pipedrive")
     assert trace is not None
     # Success can ONLY come from verify_credential_page, which requires reviewed
     # structural evidence. A Dashboard page has none, so it returns None.

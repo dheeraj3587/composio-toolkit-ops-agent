@@ -25,8 +25,8 @@ vi.mock("@/components/playwright-remote-view", async () => {
   return {
     PlaywrightRemoteView: React.forwardRef<
       { disconnect: () => void },
-      { interactivePath: string; onReconnect: () => void }
-    >(function MockRemoteView({ interactivePath, onReconnect }, ref) {
+      { interactivePath: string; controlAllowed: boolean; onReconnect: () => void }
+    >(function MockRemoteView({ interactivePath, onReconnect, controlAllowed }, ref) {
       React.useImperativeHandle(ref, () => ({
         disconnect() {
           mocks.order.push("disconnect")
@@ -34,7 +34,13 @@ vi.mock("@/components/playwright-remote-view", async () => {
       }))
 
       return (
-        <div aria-label="mock interactive playwright browser">
+        <div
+          aria-label={
+            controlAllowed
+              ? "mock controlled playwright browser"
+              : "mock view-only playwright browser"
+          }
+        >
           <span>{interactivePath.split("?")[0]}</span>
           <button type="button" onClick={onReconnect}>Reconnect remote</button>
         </div>
@@ -98,17 +104,28 @@ describe("HitlLiveControls interactive lifecycle", () => {
       />,
     )
 
-    expect(await screen.findByLabelText(/mock interactive playwright browser/i)).toBeInTheDocument()
+    expect(await screen.findByLabelText(/mock controlled playwright browser/i)).toBeInTheDocument()
     expect(document.body.textContent).not.toContain("browser-worker")
 
+    mocks.openLiveView.mockResolvedValue({
+      provider: "playwright",
+      mode: "interactive_remote",
+      liveUrl: null,
+      screenshotUrl: null,
+      interactivePath: INTERACTIVE_PATH.replace("signed-grant", "signed-view-grant"),
+      capturedAt: null,
+      interactionAvailable: false,
+      message: "Live Playwright session ready in view-only mode.",
+      tone: "neutral",
+    })
     rerender(
       <HitlLiveControls
         runId={RUN_ID}
-        browser={{ ...waitingBrowser, lifecycle: "running" }}
+        browser={{ ...waitingBrowser, lifecycle: "running", interaction_available: false }}
         browserStateVersion="v2"
       />,
     )
-    expect(screen.queryByLabelText(/mock interactive playwright browser/i)).not.toBeInTheDocument()
+    expect(await screen.findByLabelText(/mock view-only playwright browser/i)).toBeInTheDocument()
 
     rerender(
       <HitlLiveControls
@@ -117,7 +134,7 @@ describe("HitlLiveControls interactive lifecycle", () => {
         browserStateVersion="v3"
       />,
     )
-    expect(screen.queryByLabelText(/mock interactive playwright browser/i)).not.toBeInTheDocument()
+    expect(await screen.findByLabelText(/mock view-only playwright browser/i)).toBeInTheDocument()
   })
 
   it("requests a fresh grant only after the operator asks to reconnect", async () => {
@@ -131,7 +148,7 @@ describe("HitlLiveControls interactive lifecycle", () => {
       />,
     )
 
-    await screen.findByLabelText(/mock interactive playwright browser/i)
+    await screen.findByLabelText(/mock controlled playwright browser/i)
     expect(mocks.openLiveView).toHaveBeenCalledOnce()
 
     rerender(
@@ -160,12 +177,12 @@ describe("HitlLiveControls interactive lifecycle", () => {
       />,
     )
 
-    await screen.findByLabelText(/mock interactive playwright browser/i)
+    await screen.findByLabelText(/mock controlled playwright browser/i)
     await user.click(screen.getByRole("button", { name: /disconnect and resume/i }))
 
     await waitFor(() => expect(mocks.runPhaseAction).toHaveBeenCalledOnce())
     expect(mocks.order).toEqual(["disconnect", "resume"])
-    expect(screen.queryByLabelText(/mock interactive playwright browser/i)).not.toBeInTheDocument()
+    expect(screen.queryByLabelText(/mock controlled playwright browser/i)).not.toBeInTheDocument()
     expect(document.body.textContent).not.toContain("signed-grant")
   })
 })

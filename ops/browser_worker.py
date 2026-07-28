@@ -9,7 +9,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -39,6 +39,9 @@ from ops.provider_errors import (
     ProviderContractError,
     ProviderOperationError,
 )
+
+if TYPE_CHECKING:
+    from ops.app_recipes import AppRecipe
 
 # Bounded windows used to describe session lifetime in sanitized state. The
 # signed live-view URL is never represented; only its presence is recorded.
@@ -227,6 +230,7 @@ class BrowserWorker:
         self,
         profile_id: str | None,
         *,
+        recipe: AppRecipe | None = None,
         app_slug: str = "",
         account_ref: str | None = None,
         secret_scope: str | None = None,
@@ -236,7 +240,7 @@ class BrowserWorker:
         # Accept and IGNORE the Playwright-specific metadata so a single call site
         # in the graph works for both providers. Browser Use's own session-creation
         # request is unchanged — these arguments never alter its behaviour.
-        del app_slug, account_ref, secret_scope, use_storage_state, live_view_mode
+        del recipe, app_slug, account_ref, secret_scope, use_storage_state, live_view_mode
         self._require_configuration()
         client = self._get_client()
         create_kwargs: dict[str, Any] = {
@@ -284,10 +288,12 @@ class BrowserWorker:
         context: BrowserSessionContext,
         research: OperationalResearch,
         *,
+        recipe: AppRecipe | None = None,
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
         credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
+        del recipe  # Browser Use compatibility does not execute canonical recipes.
         self._require_configuration()
         if context.session_id:
             self._research[context.session_id] = research
@@ -306,10 +312,12 @@ class BrowserWorker:
         signal: str,
         research: OperationalResearch | None = None,
         *,
+        recipe: AppRecipe | None = None,
         sensitive_data: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
+        del recipe  # Browser Use compatibility does not execute canonical recipes.
         self._require_configuration()
         resolved = research or self._research.get(context.session_id)
         if resolved is None:
@@ -572,20 +580,15 @@ class BrowserWorker:
                 capability="Browser Use",
                 reason_code="browser_use_api_key_missing",
             )
-        # Fail closed if a LIVE run would use the BASE worker. This class caches a
-        # single client that is bound to the event loop it was created in, while
-        # start/navigate/resume each run in their own asyncio.run loop — reusing it
-        # across loops raises "Event loop is closed" / "bound to a different loop".
-        # Production replaces this class with the loop-safe AssignmentBrowserWorker
-        # via install_assignment_runtime() (the api.main:app entrypoint). If that
-        # patch is absent (e.g. the api.app:app entrypoint) a live run must refuse
-        # rather than silently degrade the grader-visible browser session. An
-        # injected client (offline tests) is loop-local per call and is exempt.
+        # The legacy Browser Use adapter is intentionally dormant during the
+        # Playwright rollout. Its cached SDK client is not safe across the service's
+        # per-operation event loops, so a production instance must fail closed.
+        # Injected clients remain available to offline compatibility tests.
         if self._client is None and type(self).__name__ == "BrowserWorker":
             raise ConfigurationRequiredError(
                 phase=5,
                 capability="Browser Use",
-                reason_code="assignment_runtime_not_installed",
+                reason_code="browser_use_compatibility_adapter_disabled",
             )
 
     def _get_client(self) -> Any:

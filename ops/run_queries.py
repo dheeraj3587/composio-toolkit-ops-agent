@@ -1,15 +1,13 @@
-"""Read-only run, catalog, output, and credential-reveal queries.
+"""Read-only run, catalog, and reference-only output queries.
 
 Every operation here answers a question about already-persisted state or about the
 immutable verified snapshot. None of them advance a run, contact a provider, or
-mutate anything, with one deliberate exception: ``reveal_credentials`` appends a
-sanitized audit event, because an owner reveal is itself an event worth recording.
+mutate anything.
 
 The collaborator holds a reference to the run service rather than copies of its
-dependencies, and reads ``storage``, ``p1_adapter`` and ``_secret_store`` through
+dependencies, and reads ``storage`` and ``p1_adapter`` through
 that reference on every call. That is required, not incidental: tests and scripts
-assign ``_secret_store`` and other adapters AFTER the service is constructed, so a
-cached copy taken at construction time would silently be the wrong object.
+replace adapters after construction, so a cached copy could silently be stale.
 """
 
 from __future__ import annotations
@@ -17,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Protocol, cast
 
-from ops.models import IntegratorBundle, OperationalResearch, validate_vault_reference
+from ops.models import IntegratorBundle, OperationalResearch
 from ops.operational_baselines import apply_reviewed_operational_baseline
 from ops.p1_adapter import (
     P1LookupFound,
@@ -27,9 +25,7 @@ from ops.p1_adapter import (
     to_operational_research,
 )
 from ops.redaction import redact_data
-from ops.run_errors import CredentialSubmissionError
 from ops.run_projections import _app_projection, _public_run, _sanitized_app_list
-from ops.secret_store import SecretStoreError, SQLiteSecretStore
 from ops.storage import OperationsStorage
 
 
@@ -42,7 +38,6 @@ class RunQueryContext(Protocol):
 
     storage: OperationsStorage
     p1_adapter: P1OperationalAdapter
-    _secret_store: SQLiteSecretStore | None
 
 
 class RunQueryService:
@@ -149,46 +144,6 @@ class RunQueryService:
         if not isinstance(sanitized, dict):  # pragma: no cover - model invariant
             raise RuntimeError("output response could not be sanitized")
         return cast(dict[str, Any], sanitized)
-
-    def reveal_credentials(self, run_id: str) -> dict[str, str] | None:
-        """Owner-only raw credential reveal resolved live from the encrypted vault.
-
-        This is the single, deliberate boundary that returns obtained credential
-        VALUES, for the authenticated owner to use directly in their own app. The
-        run's ``vault://`` references are resolved in-memory and returned; the raw
-        values are never written to run state, checkpoints, the ledger, or logs.
-        Only a sanitized ``credentials_revealed`` audit event (kinds only) is
-        recorded. Returns ``None`` when the run is absent and ``{}`` when no
-        credential references exist yet.
-        """
-
-        record = self.storage.get_run(run_id)
-        if record is None:
-            return None
-        store = self._context._secret_store
-        if store is None:
-            raise CredentialSubmissionError("credential_boundary_not_configured")
-        bundle = record.get("integrator_bundle")
-        if not isinstance(bundle, Mapping):
-            return {}
-        references = bundle.get("credential_refs")
-        if not isinstance(references, Mapping) or not references:
-            return {}
-        revealed: dict[str, str] = {}
-        try:
-            for kind, reference in references.items():
-                validated_reference = validate_vault_reference(str(reference))
-                revealed[str(kind)] = store.get(validated_reference)
-        except SecretStoreError:
-            raise CredentialSubmissionError("credential_reference_unresolved") from None
-        with self.storage.unit_of_work() as transaction:
-            if transaction.get_run(run_id) is not None:
-                transaction.append_audit_event(
-                    run_id=run_id,
-                    event_type="credentials_revealed",
-                    payload={"kinds": sorted(revealed), "external_actions": False},
-                )
-        return revealed
 
     def snapshot_provenance(self) -> P1SnapshotProvenance:
         return load_verified_snapshot(self._context.p1_adapter.snapshot_root).provenance

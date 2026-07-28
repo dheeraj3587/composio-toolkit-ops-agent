@@ -348,14 +348,16 @@ class TestResearchHostPolicy:
             p.validate_candidate_url(f"https://evil.{_DEV_HOST}/x")
 
     def test_reviewed_wildcard_accepts_reviewed_subdomain(self) -> None:
-        p = ResearchHostPolicy(wildcard_domains=["pipedrive.com"], resolver=_FakeResolver())
-        assert p.validate_candidate_url(f"https://{_HOST}/x") == f"https://{_HOST}/x"
+        p = ResearchHostPolicy(wildcard_domains=["example.com"], resolver=_FakeResolver())
+        assert p.validate_candidate_url("https://docs.example.com/x") == (
+            "https://docs.example.com/x"
+        )
 
     def test_reviewed_wildcard_rejects_bare_root(self) -> None:
         # Matches ops.browser_host_policy: a wildcard does NOT permit the root.
-        p = ResearchHostPolicy(wildcard_domains=["pipedrive.com"], resolver=_FakeResolver())
+        p = ResearchHostPolicy(wildcard_domains=["example.com"], resolver=_FakeResolver())
         with pytest.raises(ValueError):
-            p.validate_candidate_url("https://pipedrive.com/x")
+            p.validate_candidate_url("https://example.com/x")
 
     def test_unreviewed_host_rejected(self) -> None:
         p = ResearchHostPolicy(exact_hosts=[_HOST], resolver=_FakeResolver())
@@ -374,20 +376,23 @@ class TestResearchHostPolicy:
         with pytest.raises(ValueError):
             p.validate_candidate_url("https://malicious-newly-seen.example/login")
 
-    def test_build_uses_reviewed_browser_policy_wildcard(self) -> None:
+    def test_build_uses_exact_reviewed_pipedrive_hosts(self) -> None:
         p = ResearchHostPolicy.build(
             p1_record={"primary_docs_url": f"https://{_DEV_HOST}/", "evidence_urls": []},
             baseline=_baseline(),
             app_slug="pipedrive",
             resolver=_FakeResolver(),
         )
-        assert _DEV_HOST in p.include_domains
-        assert "*.pipedrive.com" in p.include_domains
+        assert p.include_domains == (
+            "app.pipedrive.com",
+            "developers.pipedrive.com",
+            "oauth.pipedrive.com",
+        )
 
     def test_provider_include_domains_are_bare(self) -> None:
-        p = ResearchHostPolicy(exact_hosts=[_HOST], wildcard_domains=["pipedrive.com"])
+        p = ResearchHostPolicy(exact_hosts=[_HOST], wildcard_domains=["example.com"])
         provider = p.provider_include_domains
-        assert "pipedrive.com" in provider and _HOST in provider
+        assert "example.com" in provider and _HOST in provider
         assert not any(d.startswith("*.") for d in provider)
 
     def test_sensitive_query_and_fragment_handling(self) -> None:
@@ -490,13 +495,17 @@ class TestYouSearchDiscovery:
                 app_name="Pipedrive",
                 p1_record={},
                 baseline=_baseline(),
-                official_hosts=(_HOST, "*.pipedrive.com"),
+                official_hosts=(_HOST, _DEV_HOST, "oauth.pipedrive.com"),
             )
         )
         all_calls = [c for f in FakeYou.instances for c in f.search_calls]
         assert len(all_calls) == 2  # two bounded queries (each in its own client)
         first = all_calls[0]
-        assert "pipedrive.com" in first["include_domains"]  # bare wildcard sent
+        assert set(first["include_domains"]) == {
+            _HOST,
+            _DEV_HOST,
+            "oauth.pipedrive.com",
+        }
         assert first["count"] == 5
         # strict safesearch
         assert getattr(first["safesearch"], "value", first["safesearch"]) == "strict"

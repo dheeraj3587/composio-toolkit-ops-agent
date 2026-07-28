@@ -32,11 +32,11 @@ from api.models import (
     InternalErrorResponse,
     InvalidRequestResponse,
     LiveViewResponse,
+    ManagedConnectionResponse,
     PhaseUnavailableResponse,
     ResourceNotFoundResponse,
     ResumeRequest,
     RetryRequest,
-    RevealCredentialsResponse,
     RunConflictResponse,
     RunDetailResponse,
     RunListResponse,
@@ -538,6 +538,54 @@ def create_app(
             _require_owner_action(request)
         return await run_service.resume(run_id, browser_login=browser_login, signal=signal)
 
+    @application.post(
+        "/api/runs/{run_id}/connect",
+        response_model=ManagedConnectionResponse,
+        response_model_exclude_none=True,
+        responses=common_responses,
+    )
+    async def connect_managed_run(
+        run_id: RunId,
+        request: Request,
+        run_service: ServiceDependency,
+    ) -> ManagedConnectionResponse:
+        """Start or replay the run's managed-auth connection request."""
+
+        _require_owner_action(request)
+        return await run_service.connect_managed(run_id)
+
+    @application.post(
+        "/api/runs/{run_id}/poll-connection",
+        response_model=ManagedConnectionResponse,
+        response_model_exclude_none=True,
+        responses=common_responses,
+    )
+    async def poll_managed_run_connection(
+        run_id: RunId,
+        request: Request,
+        run_service: ServiceDependency,
+    ) -> ManagedConnectionResponse:
+        """Refresh the stored managed connection request without browser fallback."""
+
+        _require_owner_action(request)
+        return await run_service.poll_managed_connection(run_id)
+
+    @application.post(
+        "/api/runs/{run_id}/outreach",
+        response_model=ActionReceipt,
+        response_model_exclude_none=True,
+        responses=common_responses,
+    )
+    async def send_gated_run_outreach(
+        run_id: RunId,
+        request: Request,
+        run_service: ServiceDependency,
+    ) -> ActionReceipt:
+        """Explicitly send reviewed outreach through the controlled-sink boundary."""
+
+        _require_owner_action(request)
+        return await run_service.send_gated_outreach(run_id)
+
     @application.get(
         "/api/runs/{run_id}/live-view",
         response_model=LiveViewResponse,
@@ -614,22 +662,6 @@ def create_app(
     )
     async def get_output(run_id: RunId, run_service: ServiceDependency) -> RunOutputResponse:
         return await run_service.get_output(run_id)
-
-    @application.post(
-        "/api/runs/{run_id}/credentials/reveal",
-        response_model=RevealCredentialsResponse,
-        responses=common_responses,
-    )
-    async def reveal_credentials(
-        run_id: RunId,
-        request: Request,
-        run_service: ServiceDependency,
-    ) -> RevealCredentialsResponse:
-        # Owner-only, loopback-only. This is the single deliberate boundary where
-        # obtained raw credential values cross the API, for the owner who
-        # initiated the run to use directly in their application.
-        _require_local_owner_submission(request)
-        return await run_service.reveal_credentials(run_id)
 
     @application.get(
         "/api/apps",

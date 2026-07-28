@@ -4,8 +4,8 @@ Chromium runs in THIS process, so an API restart no longer kills a live browser
 session and a Chromium crash no longer threatens the control plane.
 
 Every route is under ``/internal``, requires the shared browser-service token,
-and enforces session ownership. Nothing is published publicly (see
-``compose.playwright.sandbox.yaml``: no ``ports:``). Responses are sanitized
+and enforces session ownership. The browser worker publishes no host port in
+``compose.prod.yaml``. Responses are sanitized
 observations — never cookies, storage state, credential values, or the token.
 
 The Phase 1/2 safety logic is REUSED, not re-implemented: this service drives
@@ -32,6 +32,7 @@ from browser_service import __version__
 from browser_service.auth import AuthContext, assert_session_owner, token_dependency
 from browser_service.display_pool import DisplayPool, DisplayUnavailable
 from browser_service.models import (
+    CaptureCredentialsRequest,
     CaptureCredentialsResponse,
     CreateSessionRequest,
     HealthResponse,
@@ -39,6 +40,8 @@ from browser_service.models import (
     NavigateRequest,
     ObservationResponse,
     ProviderHealthState,
+    ReconcileSessionsRequest,
+    ReconcileSessionsResponse,
     ResumeRequest,
     SessionSummary,
 )
@@ -172,10 +175,13 @@ def _storage_binding(payload: CreateSessionRequest, owner: str) -> Any:
 
     from ops.browser_storage_state import StorageStateBinding
 
+    if payload.account_ref is None:
+        raise ValueError("browser account reference is required")
+
     return StorageStateBinding(
         app_slug=payload.app_slug,
         # An opaque reference, never a raw email address.
-        account_ref=payload.account_ref or payload.profile_id or "default",
+        account_ref=payload.account_ref,
         owner=owner,
     )
 
@@ -273,6 +279,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         slots=resolved.display_slots,
         display_base=resolved.display_num_base,
         vnc_port_base=resolved.vnc_port_base,
+        view_vnc_port_base=resolved.view_vnc_port_base,
     )
 
     @contextlib.asynccontextmanager
@@ -335,17 +342,40 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         await asyncio.sleep(0)
         return not live_attachments.get(session_id)
 
+    async def _enter_secret_capture_boundary(session: ManagedSession) -> None:
+        """Revoke every live pixel capability before automatic reveal/capture.
+
+        Signed grants are stateless, so revocation is enforced through the live
+        session flag consulted on every WebSocket authorization. Existing relays
+        are then closed and drained. Capture is impossible unless both that drain
+        and the browser-context document-start mask are proven.
+        """
+
+        # Revoke FIRST. A socket racing the drain now fails authorization, and the
+        # screenshot endpoint also consults this monotonic flag.
+        session.live_view_allowed = False
+        session.hitl_pending = False
+        session.screenshot_available = False
+        if not session.live_pixel_mask_installed:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="live_pixel_mask_not_installed",
+            )
+        if not await _drain_live_attachments(
+            session.session_id,
+            close_reason="secret_capture_boundary",
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="live_attachment_drain_failed",
+            )
+        session.secret_capture_boundary_entered = True
+
     def _worker() -> Any:
         if app.state.worker is None:
-            # ``api.main`` and this isolated service are different processes. The
-            # assignment host matrix therefore has to be installed here too;
-            # otherwise HubSpot remains inactive in the Playwright process and
-            # its first frame is a real white ``about:blank`` page.
-            from api.assignment_runtime import install_assignment_browser_policies
             from ops.config import Settings
             from ops.playwright_worker import PlaywrightBrowserWorker
 
-            install_assignment_browser_policies()
             app.state.worker = PlaywrightBrowserWorker(
                 settings=Settings.from_env(dotenv_path=None),
                 # Headed ONLY when interactive HITL is enabled: a headless browser
@@ -383,11 +413,22 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
     async def create_session(
         payload: CreateSessionRequest, auth: AuthContext = _AUTH
     ) -> SessionSummary:
+        recipe = _validated_recipe_snapshot(
+            payload.recipe_snapshot,
+            expected_app_slug=payload.app_slug,
+        )
+        if recipe is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="recipe_snapshot_required",
+            )
         try:
             session = manager.create(
                 owner=auth.owner,
                 app_slug=payload.app_slug,
                 live_view_mode=payload.live_view_mode,
+                secret_scope=payload.secret_scope,
+                account_ref=payload.account_ref,
             )
         except SessionUnavailable as exc:
             raise _sanitized_error(exc) from None
@@ -409,6 +450,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             storage_state = _load_storage_state(payload, auth.owner, resolved)
             context = await worker.start(
                 payload.profile_id,
+                recipe=recipe,
                 storage_state=storage_state if payload.use_storage_state else None,
                 # Headful Chromium renders to THIS session's display only. None in a
                 # headless deployment, where the worker inherits the process env.
@@ -417,12 +459,25 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             # EXPLICIT ownership: the manager can now close the real session, and
             # nothing reaches into the worker's private session dictionary.
             session.worker_context = context
+            masker = getattr(worker, "install_live_pixel_mask", None)
+            if not callable(masker) or not await masker(
+                context,
+                payload.app_slug,
+                recipe=recipe,
+            ):
+                raise ProviderOperationError(
+                    capability="Playwright live view",
+                    reason_code="live_pixel_mask_install_failed",
+                )
+            # The service, not the frontend, owns this fact. Interactive readiness
+            # is never published until the actual browser context has the recipe's
+            # document-start mask.
+            session.live_pixel_mask_installed = True
             session.reason_code = "session_started"
             session.current_page_id = context.session_id
-            # Bind the run scope and account so one-time login references can only be
-            # consumed for the matching run.
-            session.secret_scope = payload.secret_scope
-            session.account_ref = payload.account_ref
+            # The run/account binding was attached atomically when the manager
+            # admitted the session, before Chromium launch. That makes a response-
+            # loss orphan discoverable without widening the search.
             # A screenshot is NOT available until one is actually captured — a
             # launched browser is not the same as a current, non-sensitive frame.
             session.screenshot_available = False
@@ -449,6 +504,23 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             ) from None
         return session.summary()
 
+    @app.post(
+        "/internal/browser/sessions/reconcile",
+        response_model=ReconcileSessionsResponse,
+    )
+    async def reconcile_sessions(
+        payload: ReconcileSessionsRequest,
+        auth: AuthContext = _AUTH,
+    ) -> ReconcileSessionsResponse:
+        return ReconcileSessionsResponse(
+            session_ids=manager.find_bound_sessions(
+                owner=auth.owner,
+                app_slug=payload.app_slug,
+                secret_scope=payload.secret_scope,
+                account_ref=payload.account_ref,
+            )
+        )
+
     @app.get("/internal/browser/sessions/{session_id}/status", response_model=SessionSummary)
     async def session_status(session_id: str, auth: AuthContext = _AUTH) -> SessionSummary:
         session = manager.get_if_present(session_id)
@@ -473,16 +545,22 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         assert_session_owner(session_owner=session.owner, caller_owner=auth.owner)
         try:
             with manager.lease(session_id) as leased:
-                return await _drive(
+                observation = await _drive(
                     _worker(),
                     leased,
                     payload.research,
+                    payload.recipe_snapshot,
                     payload.credential_refs,
                     resolved,
                     resume_signal=None,
                     account_creation_requested=payload.account_creation_requested,
                     credential_creation_policy=payload.credential_creation_policy,
                 )
+                if observation.status == "credential_page_ready":
+                    leased.credential_surface_ready = True
+                    await _enter_secret_capture_boundary(leased)
+                    observation = observation.model_copy(update={"session": leased.summary()})
+                return observation
         except SessionUnavailable as exc:
             raise _sanitized_error(exc) from None
 
@@ -511,15 +589,21 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             )
         try:
             with manager.lease(session_id) as leased:
-                return await _drive(
+                observation = await _drive(
                     _worker(),
                     leased,
                     payload.research or {},
+                    payload.recipe_snapshot,
                     payload.credential_refs,
                     resolved,
                     resume_signal=payload.signal,
                     credential_creation_policy=payload.credential_creation_policy,
                 )
+                if observation.status == "credential_page_ready":
+                    leased.credential_surface_ready = True
+                    await _enter_secret_capture_boundary(leased)
+                    observation = observation.model_copy(update={"session": leased.summary()})
+                return observation
         except SessionUnavailable as exc:
             raise _sanitized_error(exc) from None
 
@@ -529,6 +613,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
     )
     async def capture_credentials(
         session_id: str,
+        payload: CaptureCredentialsRequest,
         auth: AuthContext = _AUTH,
     ) -> CaptureCredentialsResponse:
         """Capture a reviewed credential into the shared vault, returning refs only."""
@@ -546,11 +631,28 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             ) from None
         try:
             with manager.lease(session_id) as leased:
+                if not leased.credential_surface_ready:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="credential_surface_not_ready",
+                    )
+                # Idempotent when navigation already entered the boundary. This
+                # second enforcement prevents a direct RPC caller from bypassing
+                # revocation before an automatic reveal/capture implementation.
+                await _enter_secret_capture_boundary(leased)
+                recipe = _validated_recipe_snapshot(
+                    payload.recipe_snapshot,
+                    expected_app_slug=leased.app_slug,
+                )
+                capture_kwargs: dict[str, object] = {}
+                if recipe is not None:
+                    capture_kwargs["recipe"] = recipe
                 captured = await asyncio.wait_for(
                     _worker().auto_capture_credentials(
                         leased.current_page_id,
                         leased.app_slug,
                         store,
+                        **capture_kwargs,
                     ),
                     timeout=resolved.operation_timeout_seconds,
                 )
@@ -562,6 +664,8 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             ) from None
         except SessionUnavailable as exc:
             raise _sanitized_error(exc) from None
+        except HTTPException:
+            raise
         except (TypeError, AttributeError, AssertionError, NameError):
             raise
         except Exception:
@@ -578,6 +682,12 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         if session is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
         assert_session_owner(session_owner=session.owner, caller_owner=auth.owner)
+        if not session.live_view_allowed:
+            session.screenshot_available = False
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="live_view_revoked",
+            )
         worker = _worker()
         data: bytes | None = None
         if session.worker_context is not None:
@@ -596,16 +706,29 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
 
     @app.post("/internal/browser/sessions/{session_id}/live-view", response_model=LiveViewGrant)
     async def live_view(session_id: str, auth: AuthContext = _AUTH) -> LiveViewGrant:
-        """Issue a short-lived, session-bound interactive grant (never persisted)."""
+        """Issue a short-lived view/control grant for an active session.
+
+        A running autonomous session gets ``view``. A session paused at HITL gets
+        ``control``. The capability is signed into the token and the WebSocket
+        relay independently chooses a server-side view-only/control VNC listener.
+        """
 
         session = manager.get_if_present(session_id)
         if session is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
         assert_session_owner(session_owner=session.owner, caller_owner=auth.owner)
-        if not resolved.interactive_hitl_enabled:
-            return LiveViewGrant(mode="screenshot", url=None, session_id=session_id)
-        if not session.hitl_pending:
-            return LiveViewGrant(mode="screenshot", url=None, session_id=session_id)
+        if (
+            not resolved.interactive_hitl_enabled
+            or not session.interactive_ready
+            or not session.live_view_allowed
+        ):
+            return LiveViewGrant(
+                mode="screenshot",
+                url=None,
+                session_id=session_id,
+                view_allowed=False,
+                control_allowed=False,
+            )
         from ops.browser_live_view import (
             LiveViewAudit,
             build_interactive_url,
@@ -613,10 +736,12 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         )
 
         secret = resolved.service_token.get_secret_value() if resolved.service_token else ""
+        access = "control" if session.hitl_pending else "view"
         token, expires_at = issue_live_view_token(
             session_id=session_id,
             owner=auth.owner,
             secret=secret,
+            access=access,
             ttl_seconds=resolved.live_view_token_seconds,
         )
         # The noVNC page is served by THIS service on the private network, so the
@@ -646,6 +771,8 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             url=url,
             expires_at=expires_at.isoformat(),
             session_id=session_id,
+            view_allowed=True,
+            control_allowed=access == "control",
         )
 
     # -------------------------------------------------------- interactive HITL
@@ -667,7 +794,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         log_owner = _safe_log_identifier(session.owner) if session else "-"
         secret = resolved.service_token.get_secret_value() if resolved.service_token else ""
         try:
-            authorize_live_view(
+            access = authorize_live_view(
                 token=token,
                 session_id=session_id,
                 caller_owner=owner,
@@ -675,6 +802,9 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 session_owner=session.owner if session else None,
                 session_lifecycle=session.lifecycle if session else None,
                 interactive_enabled=resolved.interactive_hitl_enabled,
+                view_allowed=(
+                    session.interactive_ready and session.live_view_allowed if session else False
+                ),
                 hitl_pending=session.hitl_pending if session else False,
             )
         except LiveViewDenied as exc:
@@ -731,14 +861,16 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
 
             from browser_service.novnc import relay_websocket_to_vnc
 
-            # The target is derived from the session's OWN leased display, never
-            # from a caller-supplied value and never from one global port. This is
-            # what makes the grant's session binding real at the display layer: a
-            # token for session A can only ever reach A's private desktop.
+            # The target is derived from the session's OWN leased display and the
+            # SIGNED capability, never from caller input. View grants terminate at
+            # an x11vnc process launched with -viewonly, so client-side changes to
+            # noVNC cannot inject input. The slot binding also means a grant for
+            # session A can only ever reach A's private desktop.
+            target_port = slot.vnc_port if access == "control" else slot.view_vnc_port
             reason = await relay_websocket_to_vnc(
                 receive=_receive,
                 send=websocket.send_bytes,
-                target=VncTarget(port=slot.vnc_port),
+                target=VncTarget(port=target_port),
             )
         except LiveViewDenied as exc:
             reason = exc.reason_code
@@ -889,10 +1021,37 @@ async def _save_storage_state(worker: Any, session: ManagedSession, store: Any) 
             store.save(session.storage_binding, state)
 
 
+def _validated_recipe_snapshot(
+    payload: dict[str, object] | None,
+    *,
+    expected_app_slug: str,
+) -> Any:
+    """Validate a caller-bound recipe without consulting this service's catalog."""
+
+    if payload is None:
+        return None
+    from ops.app_recipes import AppRecipe
+
+    try:
+        recipe = AppRecipe.model_validate(payload)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="invalid_recipe_snapshot",
+        ) from None
+    if recipe.app_slug != expected_app_slug or recipe.route_kind != "playwright":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="recipe_app_mismatch",
+        )
+    return recipe
+
+
 async def _drive(
     worker: Any,
     session: ManagedSession,
     research_payload: dict[str, object],
+    recipe_payload: dict[str, object] | None,
     credential_refs: dict[str, str],
     settings: BrowserServiceSettings,
     *,
@@ -916,6 +1075,15 @@ async def _drive(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="invalid_research_payload"
         ) from None
+    recipe = _validated_recipe_snapshot(
+        recipe_payload,
+        expected_app_slug=session.app_slug,
+    )
+    if research.app_slug != session.app_slug:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="research_app_mismatch",
+        )
 
     handle = session.current_page_id
     context = BrowserSessionContext(
@@ -944,6 +1112,8 @@ async def _drive(
                 "sensitive_data": sensitive,
                 "credential_creation_policy": credential_creation_policy,
             }
+            if recipe is not None:
+                navigate_kwargs["recipe"] = recipe
             if account_creation_requested:
                 navigate_kwargs["account_creation_requested"] = True
             observation = await asyncio.wait_for(
@@ -951,14 +1121,14 @@ async def _drive(
                 timeout=settings.operation_timeout_seconds,
             )
         else:
+            resume_kwargs: dict[str, object] = {
+                "sensitive_data": sensitive,
+                "credential_creation_policy": credential_creation_policy,
+            }
+            if recipe is not None:
+                resume_kwargs["recipe"] = recipe
             observation = await asyncio.wait_for(
-                worker.resume_after_hitl(
-                    context,
-                    resume_signal,
-                    research,
-                    sensitive_data=sensitive,
-                    credential_creation_policy=credential_creation_policy,
-                ),
+                worker.resume_after_hitl(context, resume_signal, research, **resume_kwargs),
                 timeout=settings.operation_timeout_seconds,
             )
     except TimeoutError:

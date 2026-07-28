@@ -8,7 +8,7 @@ import type { ProviderStatus } from "@/lib/types"
 // ---------------------------------------------------------------------------
 
 const PROVIDER_TITLES: Record<string, string> = {
-  langgraph: "LangGraph checkpoint encryption",
+  langgraph: "Legacy checkpoint reader",
   vault: "Secret vault",
   perplexity: "Perplexity search",
   gemini: "Gemini extraction",
@@ -18,7 +18,7 @@ const PROVIDER_TITLES: Record<string, string> = {
 }
 
 const PROVIDER_DESCRIPTIONS: Record<string, string> = {
-  langgraph: "Encrypted workflow checkpoints for durable interrupt and resume.",
+  langgraph: "Encrypted checkpoint compatibility for read-only legacy runs.",
   vault: "Fernet-encrypted credential vault for reference-only storage.",
   perplexity: "Bounded official-document discovery via Perplexity search API.",
   gemini: "Structured extraction against fetched official evidence.",

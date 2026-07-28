@@ -90,6 +90,7 @@ def project_browser_ui(
     screenshot_present: bool = False,
     session_lost: bool = False,
     plan_only: bool = False,
+    owner_submission_ready: bool = False,
 ) -> BrowserUiState:
     """Project the browser capabilities for one run.
 
@@ -99,7 +100,10 @@ def project_browser_ui(
     """
 
     provider = resolve_provider(settings, browser_provider)
-    configured = browser_configuration_state(settings, provider)
+    configured = browser_configuration_state(settings, provider) and not (
+        provider == "browser_use"
+        and not bool(getattr(settings, "browser_use_compatibility_enabled", False))
+    )
     credential_page_verified = CREDENTIAL_PAGE_EVENT in event_types
     session_started = bool(browser_session_id) or "browser_session_started" in event_types
     terminal = run_status in TERMINAL_RUN_STATUSES
@@ -126,7 +130,9 @@ def project_browser_ui(
     # Rule 9: interactivity is a provider capability, not a run state. Only a
     # hosted provider view (or a real interactive remote) can be driven; masked
     # Playwright frames never can be.
-    interaction_available = live_view_mode in {"hosted_url", "interactive_remote"}
+    interaction_available = live_view_mode == "hosted_url" or (
+        live_view_mode == "interactive_remote" and lifecycle == "waiting_for_hitl"
+    )
 
     # Rules 10 and 11: a lost session or a terminal run permits no mutation.
     mutations_allowed = session_live and not session_lost and not terminal
@@ -145,7 +151,7 @@ def project_browser_ui(
     # been verified, and the owner-only submission endpoint must be enabled.
     can_submit_credential = bool(
         mutations_allowed
-        and credential_page_verified
+        and (credential_page_verified or owner_submission_ready)
         and bool(getattr(settings, "allow_local_credential_submission", False))
     )
 
@@ -186,6 +192,8 @@ def _lifecycle(
         return "session_lost", "browser_session_lost"
     if plan_only:
         return "not_started", "plan_only_run"
+    if not configured:
+        return "unavailable", "browser_not_configured"
     if run_status == "failed" or "browser_failed" in event_types:
         return "failed", "browser_attempt_failed"
     if run_status in TERMINAL_RUN_STATUSES:
@@ -201,8 +209,6 @@ def _lifecycle(
         return "running", "browser_session_running"
     if credential_page_verified:
         return "credential_page_ready", "credential_page_verified"
-    if not configured:
-        return "unavailable", "browser_not_configured"
     if run_status in TERMINAL_RUN_STATUSES or session_started:
         # The run either finished or had a session that is no longer live.
         return "unavailable", "no_live_browser_session"
@@ -222,15 +228,17 @@ def _live_view_mode(
     The signed hosted URL itself is resolved by the live-view endpoint from
     in-memory worker state; run detail reports only that a hosted view is expected
     for a live session, so a run projection never triggers a provider call.
-    Interactive Playwright is advertised only while a human gate is active and the
-    deployment explicitly enabled the one-session relay. Autonomous running remains
-    screenshot-only, so the UI never offers control before a handoff.
+    Playwright uses the same continuous remote surface while autonomous work runs
+    and while a human gate is active. Capability is separate from transport:
+    running is server-enforced view-only; HITL may receive a control grant.
     """
 
     if not session_live:
         return "unavailable"
     if provider == "playwright":
-        if lifecycle == "waiting_for_hitl" and interactive_enabled:
+        if lifecycle == "credential_page_ready":
+            return "unavailable"
+        if interactive_enabled:
             return "interactive_remote"
         return "screenshot" if screenshot_present else "unavailable"
     return "hosted_url"
