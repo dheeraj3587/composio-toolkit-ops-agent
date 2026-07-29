@@ -90,7 +90,7 @@ services:
       # bounded grace period before any browser reconciliation or Gmail read.
       # Once accepted, the production revision resolves OTPs, ingests replies,
       # and reconciles stranded runs without a manual poll request.
-      OPS_STARTUP_AUTOMATION_ENABLED: "true"
+      OPS_STARTUP_AUTOMATION_ENABLED: ${OPS_STARTUP_AUTOMATION_ENABLED:-false}
       OPS_AUTOMATION_START_DELAY_SECONDS: ${OPS_AUTOMATION_START_DELAY_SECONDS:-60}
       EMAIL_POLL_INTERVAL_SECONDS: ${EMAIL_POLL_INTERVAL_SECONDS:-45}
       EMAIL_POLL_MAX_RUNS_PER_CYCLE: ${EMAIL_POLL_MAX_RUNS_PER_CYCLE:-25}
