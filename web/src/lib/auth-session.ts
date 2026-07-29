@@ -63,7 +63,7 @@ export function authConfigurationValid(
   return Boolean(
     username?.trim() &&
       password &&
-      password.length >= 20 &&
+      password.length >= 8 &&
       secret &&
       secret.length >= 32 &&
       totpConfigurationValid(totpSecret) &&
