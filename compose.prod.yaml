@@ -192,6 +192,8 @@ services:
       # Opt-in remains environment controlled, but is no longer hard-disabled by
       # Compose after the deployment explicitly enables it.
       BROWSER_INTERACTIVE_HITL_ENABLED: ${BROWSER_INTERACTIVE_HITL_ENABLED:-true}
+      DISPLAY: ${DISPLAY:-:99}
+      BROWSER_DISPLAY_NUM: ${BROWSER_DISPLAY_NUM:-99}
       # The policy-constrained browser action loop needs at least one JSON
       # inference backend. Values stay inside this private service.
       # Groq is FIRST in build_json_inference's chain and the only strict-schema
