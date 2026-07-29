@@ -259,7 +259,7 @@ separate browser-only egress network for vendor sites. Chromium's sandbox is
 enabled by default, and the browser container does not share the host IPC
 namespace.
 
-### Chromium seccomp provenance
+### Chromium seccomp and AppArmor provenance
 
 `deploy/chromium-seccomp.json` is vendored byte-for-byte from Playwright
 v1.61.0's official
@@ -284,10 +284,22 @@ container acceptance job. Production and CI both run non-root, keep
 `no-new-privileges`, drop all Linux capabilities, avoid host IPC, and leave
 `PLAYWRIGHT_DISABLE_SANDBOX=false`.
 
+Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor. Chromium
+needs one for its primary Linux sandbox, so
+`deploy/composio-ops-browser.apparmor` copies Docker's current
+`docker-default` boundary and adds the single `userns` permission. The deployer
+installs it as the revisioned `composio-ops-browser-v1` host policy and Compose
+attaches it only to browser-worker. Do not disable
+`kernel.apparmor_restrict_unprivileged_userns` globally and do not set
+`PLAYWRIGHT_DISABLE_SANDBOX=true` for production open-web browsing.
+
 ## Deploy
 
-`scripts/deploy-droplet.sh` requires Docker, the Compose plugin, Git, curl,
-Python 3, `flock`, Trivy, a clean worktree, and `.env.production`. The
+`scripts/deploy-droplet.sh` runs as root and requires Docker, the Compose plugin,
+Git, curl, Python 3, `flock`, Trivy, `apparmor_parser`, a clean worktree, and
+`.env.production`. Root is required to install and load the reviewed browser
+AppArmor policy under `/etc/apparmor.d`; application containers remain
+non-root. The
 environment file must be a non-symlink regular file owned by the deploy user,
 readable by that user, and have no group/other permission bits (`0600` or
 stricter). The backup and restore helpers enforce the same rule. Deploy,
@@ -306,20 +318,23 @@ building. Recompile and review the hash lock for the target platform before
 supporting an arm64 Droplet.
 
 ```bash
-./scripts/deploy-droplet.sh
+sudo ./scripts/deploy-droplet.sh
 ```
 
 The script:
 
-1. records the exact Git revision and validates the rendered Compose security
-   contract, including delayed, acceptance-gated startup maintenance;
+1. installs the reviewed browser-only AppArmor policy, records the exact Git
+   revision, and validates the rendered Compose security contract, including
+   delayed, acceptance-gated startup maintenance;
 2. records all four previous container image IDs, freezes that revision's
    Compose and Chromium-seccomp files plus the exact prior container
    environments/runtime limits in an owner-only tmpfs bundle, and rejects
    partial, mixed-revision, or rollback-incompatible stacks before building;
 3. builds revision-tagged API, browser-worker, web, and Caddy candidates while
    the current release remains online, then verifies their image IDs and revision
-   labels and scans those exact image IDs with Trivy;
+   labels, scans those exact image IDs with Trivy, and launches a credential-free,
+   network-isolated browser probe that must prove headed Chromium, its sandbox,
+   and the interactive display stack on the actual host;
 4. atomically blocks new browser admissions and waits for active browser capacity
    to reach zero;
 5. closes Caddy before stopping either writer, creates a unique pre-deploy

@@ -77,7 +77,7 @@ The production topology is defined entirely by `compose.prod.yaml`.
 
 ```bash
 cp .env.production.example .env.production
-./scripts/deploy-droplet.sh
+sudo ./scripts/deploy-droplet.sh
 ```
 
 Before deploying, configure the domain and application login (including its
@@ -88,7 +88,11 @@ intend to use. Managed routes require Composio configuration and a public HTTPS
 callback base. Live Playwright additionally requires `ALLOW_LIVE_BROWSER=true`
 and at least one configured browser-decision model.
 
-The deployment helper refuses a dirty worktree, validates bounded Playwright capacity, builds the exact Git revision, waits for all four services, verifies image revisions, and proves public TLS plus the application-auth boundary.
+The deployment helper refuses a dirty worktree, installs the browser-only
+AppArmor policy required by Chromium's sandbox on Ubuntu, validates bounded
+Playwright capacity, proves the candidate browser on the real host before
+downtime, builds the exact Git revision, waits for all four services, verifies
+image revisions, and proves public TLS plus the application-auth boundary.
 
 Operational verification and incident commands are in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 

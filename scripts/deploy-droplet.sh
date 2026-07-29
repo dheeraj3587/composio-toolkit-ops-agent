@@ -23,6 +23,9 @@ RELEASE_LOCK_PATH="$REPO_ROOT/backups/.production-operations.lock"
 RELEASE_LOCK_FD=9
 readonly -a RELEASE_SERVICES=(api browser-worker web caddy)
 readonly -a INTERNAL_SERVICES=(browser-worker api web)
+readonly BROWSER_APPARMOR_PROFILE_NAME="composio-ops-browser-v1"
+readonly BROWSER_APPARMOR_SOURCE="deploy/composio-ops-browser.apparmor"
+readonly BROWSER_APPARMOR_DESTINATION="/etc/apparmor.d/composio-ops-browser-v1"
 
 declare -A PREVIOUS_IMAGE_ID=()
 declare -A PREVIOUS_IMAGE_REF=()
@@ -41,6 +44,7 @@ CANDIDATE_ACTIVATION_STARTED=0
 DEPLOY_ACCEPTANCE_NONCE=""
 ROLLBACK_BUNDLE_DIR=""
 ROLLBACK_PUBLIC_ORIGIN=""
+BROWSER_PREFLIGHT_CONTAINER=""
 # Never inherit an APP_REVISION from the deploy shell. It is populated from the
 # verified Git commit below and is the sole non-Docker value deliberately passed
 # through the sanitized Compose environment.
@@ -265,6 +269,27 @@ docker_command() {
 
 compose() {
 	docker_command compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
+}
+
+install_browser_apparmor_profile() {
+	[ "$(id -u)" -eq 0 ] \
+		|| fail "Production deployment must run as root to install the browser AppArmor policy."
+	[ -f "$BROWSER_APPARMOR_SOURCE" ] && [ ! -L "$BROWSER_APPARMOR_SOURCE" ] \
+		|| fail "The reviewed browser AppArmor profile is unavailable."
+	apparmor_parser -Q -W "$BROWSER_APPARMOR_SOURCE" \
+		|| fail "The reviewed browser AppArmor profile is invalid on this host."
+	install -D -o root -g root -m 0644 \
+		"$BROWSER_APPARMOR_SOURCE" "$BROWSER_APPARMOR_DESTINATION" \
+		|| fail "Could not install the browser AppArmor profile."
+	apparmor_parser -r -W "$BROWSER_APPARMOR_DESTINATION" \
+		|| fail "Could not load the browser AppArmor profile."
+}
+
+cleanup_browser_preflight() {
+	if [ -n "$BROWSER_PREFLIGHT_CONTAINER" ]; then
+		docker_command rm --force "$BROWSER_PREFLIGHT_CONTAINER" >/dev/null 2>&1 || true
+		BROWSER_PREFLIGHT_CONTAINER=""
+	fi
 }
 
 rollback_compose() {
@@ -609,6 +634,84 @@ scan_candidate_images() {
 	return "$status"
 }
 
+accept_browser_candidate_on_host() {
+	local image_id ready=0 attempt state applied_profile cleanup_stale
+	image_id="${CANDIDATE_IMAGE_ID[browser-worker]:-}"
+	[ -n "$image_id" ] || return 1
+
+	BROWSER_PREFLIGHT_CONTAINER="composio-browser-host-preflight-${APP_REVISION:0:12}"
+	cleanup_stale="$BROWSER_PREFLIGHT_CONTAINER"
+	# A prior interrupted deploy may have left only this revision-bound,
+	# label-bound probe. Never remove a same-named container we do not own.
+	if docker_command inspect "$cleanup_stale" >/dev/null 2>&1; then
+		[ "$(
+			docker_command inspect --format \
+				'{{index .Config.Labels "composio.ops.role"}}' "$cleanup_stale"
+		)" = "browser-host-preflight" ] || return 1
+		docker_command rm --force "$cleanup_stale" >/dev/null || return 1
+	fi
+	BROWSER_PREFLIGHT_CONTAINER="$cleanup_stale"
+
+	log "Proving Chromium sandbox and interactive display compatibility on this host..."
+	docker_command run --detach --rm \
+		--name "$BROWSER_PREFLIGHT_CONTAINER" \
+		--label composio.ops.role=browser-host-preflight \
+		--init \
+		--network none \
+		--user ops \
+		--read-only \
+		--tmpfs /tmp:rw,nosuid,nodev,size=1g,mode=1777 \
+		--tmpfs /browser-data:rw,nosuid,nodev,size=64m,mode=0777 \
+		--shm-size "${BROWSER_SHM_SIZE_VALUE}" \
+		--pids-limit "${BROWSER_PIDS_LIMIT_VALUE}" \
+		--memory "${BROWSER_MEM_LIMIT_VALUE}" \
+		--cpus "${BROWSER_CPUS_VALUE}" \
+		--cap-drop ALL \
+		--security-opt no-new-privileges:true \
+		--security-opt "seccomp=${REPO_ROOT}/deploy/chromium-seccomp.json" \
+		--security-opt "apparmor=${BROWSER_APPARMOR_PROFILE_NAME}" \
+		--env ALLOW_LIVE_BROWSER=true \
+		--env BROWSER_INTERACTIVE_HITL_ENABLED=true \
+		--env BROWSER_SERVICE_TOKEN=host-preflight-browser-token-00000000000000000000000000000000 \
+		--env PLAYWRIGHT_DISABLE_SANDBOX=false \
+		--env PLAYWRIGHT_MAX_SESSIONS=1 \
+		--env BROWSER_STORAGE_STATE_DIR=/browser-data/storage-state \
+		"$image_id" >/dev/null || return 1
+
+	applied_profile="$(
+		docker_command inspect --format '{{.AppArmorProfile}}' \
+			"$BROWSER_PREFLIGHT_CONTAINER"
+	)" || return 1
+	[ "$applied_profile" = "$BROWSER_APPARMOR_PROFILE_NAME" ] || return 1
+
+	for attempt in $(seq 1 40); do
+		if docker_command exec "$BROWSER_PREFLIGHT_CONTAINER" python -c \
+			'import json,sys,urllib.request; p=json.load(urllib.request.urlopen("http://127.0.0.1:8081/internal/ready", timeout=30)); sys.exit(0 if p.get("state") in ("ready","capacity_exhausted") and p.get("chromium_installed") and p.get("context_launch_ok") and p.get("janitor_running") else 1)' \
+			>/dev/null 2>&1; then
+			ready=1
+			break
+		fi
+		state="$(
+			docker_command inspect --format '{{.State.Running}}' \
+				"$BROWSER_PREFLIGHT_CONTAINER" 2>/dev/null || true
+		)"
+		[ "$state" = "true" ] || break
+		sleep 3
+	done
+
+	if [ "$ready" -ne 1 ]; then
+		docker_command exec "$BROWSER_PREFLIGHT_CONTAINER" python -c \
+			'import json,urllib.request; p=json.load(urllib.request.urlopen("http://127.0.0.1:8081/internal/health", timeout=5)); print("browser_host_preflight=" + str(p.get("state")) + ":" + str(p.get("reason_code")))' \
+			2>/dev/null || true
+		docker_command logs --tail 80 "$BROWSER_PREFLIGHT_CONTAINER" 2>&1 || true
+		cleanup_browser_preflight
+		return 1
+	fi
+
+	cleanup_browser_preflight
+	return 0
+}
+
 browser_drain_call() {
 	local method="$1"
 	# The Python process runs INSIDE browser-worker and reads its own environment.
@@ -871,6 +974,7 @@ stop_uncertain_rollback_stack() {
 release_exit() {
 	local status=$?
 	trap - EXIT INT TERM
+	cleanup_browser_preflight
 	if [ "$status" -ne 0 ] && [ "$RELEASE_COMPLETE" -eq 0 ]; then
 		if [ "$ROLLBACK_REQUIRED" -eq 1 ]; then
 			if ! restore_previous_release; then
@@ -897,6 +1001,8 @@ command -v python3 >/dev/null 2>&1 || fail "python3 is required for rendered che
 command -v trivy >/dev/null 2>&1 \
 	|| fail "Trivy is required to scan the exact production candidate images."
 command -v flock >/dev/null 2>&1 || fail "flock is required for production operations."
+command -v apparmor_parser >/dev/null 2>&1 \
+	|| fail "apparmor_parser is required for the Chromium sandbox policy."
 [ "$(uname -m)" = "x86_64" ] \
 	|| fail "This release lock is compiled for an x86_64/amd64 production host."
 acquire_release_lock
@@ -913,6 +1019,7 @@ private_env_file_ok \
 	|| fail ".env.production must be a private regular file owned by the deploy user."
 [ -x scripts/backup-production-data.sh ] || fail "The production backup helper is unavailable."
 [ -x scripts/restore-production-data.sh ] || fail "The production restore validator is unavailable."
+install_browser_apparmor_profile
 
 PUBLIC_DOMAIN="$(read_env_value DOMAIN || true)"
 APP_AUTH_USERNAME_VALUE="$(read_env_value OPS_AUTH_USERNAME || true)"
@@ -945,6 +1052,10 @@ DRAIN_TIMEOUT_VALUE="$(
 DRAIN_POLL_VALUE="$(
 	read_env_value DEPLOY_DRAIN_POLL_SECONDS || printf '2'
 )"
+BROWSER_MEM_LIMIT_VALUE="$(read_env_value BROWSER_MEM_LIMIT || printf '4g')"
+BROWSER_CPUS_VALUE="$(read_env_value BROWSER_CPUS || printf '2.0')"
+BROWSER_SHM_SIZE_VALUE="$(read_env_value BROWSER_SHM_SIZE || printf '2g')"
+BROWSER_PIDS_LIMIT_VALUE="$(read_env_value BROWSER_PIDS_LIMIT || printf '768')"
 
 [ -n "$PUBLIC_DOMAIN" ] || fail "DOMAIN is required for public TLS verification."
 [ "$PUBLIC_DOMAIN" != "your-domain.example" ] || fail "DOMAIN still contains the example value."
@@ -1178,6 +1289,8 @@ log "Building revision-tagged candidate images while the current stack remains l
 compose build --pull || fail "Candidate image build failed."
 capture_candidate_images || fail "Candidate image identity or revision-label verification failed."
 scan_candidate_images || fail "Exact candidate image vulnerability scan failed."
+accept_browser_candidate_on_host \
+	|| fail "Candidate browser sandbox or interactive display is incompatible with this host."
 
 if [ "$PREVIOUS_STACK" -eq 1 ]; then
 	log "Blocking new browser sessions and waiting for active work to finish..."
@@ -1261,6 +1374,7 @@ unset OPS_DEPLOY_ACCEPTANCE_NONCE DEPLOY_ACCEPTANCE_NONCE
 RELEASE_COMPLETE=1
 ROLLBACK_REQUIRED=0
 cleanup_rollback_bundle
+cleanup_browser_preflight
 trap - EXIT INT TERM
 log "Service status:"
 if ! compose ps; then

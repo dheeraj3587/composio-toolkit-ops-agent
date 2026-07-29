@@ -188,6 +188,13 @@ jobs:
           --tag composio-ops-browser:acceptance
           .
 
+      - name: Load browser-only AppArmor policy
+        run: |
+          sudo install -D -o root -g root -m 0644 \
+            deploy/composio-ops-browser.apparmor \
+            /etc/apparmor.d/composio-ops-browser-v1
+          sudo apparmor_parser -r -W /etc/apparmor.d/composio-ops-browser-v1
+
       - name: Start browser with production sandbox posture and poll readiness
         shell: bash
         run: |
@@ -228,6 +235,7 @@ jobs:
             --cap-drop ALL \
             --security-opt no-new-privileges:true \
             --security-opt seccomp=deploy/chromium-seccomp.json \
+            --security-opt apparmor=composio-ops-browser-v1 \
             --env ALLOW_LIVE_BROWSER=true \
             --env BROWSER_INTERACTIVE_HITL_ENABLED=true \
             --env "BROWSER_SERVICE_TOKEN=${browser_token}" \
@@ -459,6 +467,13 @@ jobs:
           path.write_text("\n".join(output) + "\n", encoding="utf-8")
           path.chmod(0o600)
           PY
+
+      - name: Load browser-only AppArmor policy
+        run: |
+          sudo install -D -o root -g root -m 0644 \
+            deploy/composio-ops-browser.apparmor \
+            /etc/apparmor.d/composio-ops-browser-v1
+          sudo apparmor_parser -r -W /etc/apparmor.d/composio-ops-browser-v1
 
       - name: Build and accept the complete production topology
         shell: bash

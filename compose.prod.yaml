@@ -229,6 +229,12 @@ services:
     security_opt:
       - no-new-privileges:true
       - seccomp=./deploy/chromium-seccomp.json
+      # Ubuntu 24.04 restricts unprivileged user namespaces unless an AppArmor
+      # policy explicitly grants them. This named, host-loaded policy preserves
+      # Docker's default confinement and grants only the userns operation
+      # Chromium needs for its primary sandbox. deploy-droplet.sh loads and
+      # verifies it before any candidate activation.
+      - apparmor=composio-ops-browser-v1
     healthcheck:
       test:
         - CMD

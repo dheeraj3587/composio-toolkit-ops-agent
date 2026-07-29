@@ -96,8 +96,30 @@ def _fake_docker_script() -> str:
         exit 0
     fi
 
+    if [ "${1:-}" = "run" ]; then
+        trace "BROWSER_HOST_PREFLIGHT"
+        exit 0
+    fi
+
+    if [ "${1:-}" = "exec" ]; then
+        exit 0
+    fi
+
+    if [ "${1:-}" = "rm" ]; then
+        trace "BROWSER_HOST_PREFLIGHT_CLEANUP"
+        exit 0
+    fi
+
+    if [ "${1:-}" = "logs" ]; then
+        exit 0
+    fi
+
     if [ "${1:-}" = "inspect" ]; then
         shift
+        if [ "${1:-}" != "--format" ] \
+            && [[ "${1:-}" == composio-browser-host-preflight-* ]]; then
+            exit 1
+        fi
         if [ "${1:-}" != "--format" ]; then
             python3 - "$FAKE_PREVIOUS_REV" "$@" <<'PY'
 import json
@@ -162,6 +184,12 @@ PY
                 ;;
             *org.opencontainers.image.revision*)
                 printf '%s\n' "$revision"
+                ;;
+            *AppArmorProfile*)
+                printf 'composio-ops-browser-v1\n'
+                ;;
+            *State.Running*)
+                printf 'true\n'
                 ;;
             *State.Health*)
                 trace "HEALTH $service $prefix"
@@ -332,12 +360,22 @@ PY
 def _make_fake_repo(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
     repo = tmp_path / "repo"
     scripts = repo / "scripts"
+    deploy = repo / "deploy"
     fake_bin = tmp_path / "fake-bin"
     scripts.mkdir(parents=True)
+    deploy.mkdir()
     fake_bin.mkdir()
 
     shutil.copy2(ROOT / "scripts" / "deploy-droplet.sh", scripts / "deploy-droplet.sh")
     (scripts / "deploy-droplet.sh").chmod(0o755)
+    shutil.copy2(
+        ROOT / "deploy" / "composio-ops-browser.apparmor",
+        deploy / "composio-ops-browser.apparmor",
+    )
+    shutil.copy2(
+        ROOT / "deploy" / "chromium-seccomp.json",
+        deploy / "chromium-seccomp.json",
+    )
     (repo / "compose.prod.yaml").write_text("services: {}\n", encoding="utf-8")
 
     env_lines = [
@@ -382,6 +420,28 @@ def _make_fake_repo(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
         """,
     )
     _write_executable(fake_bin / "docker", _fake_docker_script())
+    _write_executable(
+        fake_bin / "install",
+        """
+        #!/usr/bin/env bash
+        set -euo pipefail
+        source "$PWD/.fake-deploy-controls"
+        printf 'APPARMOR_INSTALL\\n' >> "$FAKE_TRACE"
+        """,
+    )
+    _write_executable(
+        fake_bin / "apparmor_parser",
+        """
+        #!/usr/bin/env bash
+        set -euo pipefail
+        source "$PWD/.fake-deploy-controls"
+        if printf '%s\\n' "$*" | grep -q -- '-Q'; then
+            printf 'APPARMOR_VALIDATE\\n' >> "$FAKE_TRACE"
+        else
+            printf 'APPARMOR_LOAD\\n' >> "$FAKE_TRACE"
+        fi
+        """,
+    )
     _write_executable(
         fake_bin / "trivy",
         """
@@ -827,8 +887,17 @@ def test_successful_release_has_transactional_order_and_secret_free_output(
         "TRIVY sha256:candidate-web",
         "TRIVY sha256:candidate-caddy",
     ]
+    assert _index(trace, "APPARMOR_VALIDATE") < _index(trace, "APPARMOR_INSTALL")
+    assert _index(trace, "APPARMOR_INSTALL") < _index(trace, "APPARMOR_LOAD")
+    assert _index(trace, "APPARMOR_LOAD") < _index(trace, "BUILD")
     assert _index(trace, "BUILD") < _index(trace, "DRAIN POST")
     assert _index(trace, "TRIVY sha256:candidate-caddy") < _index(trace, "DRAIN POST")
+    assert _index(trace, "TRIVY sha256:candidate-caddy") < _index(
+        trace, "BROWSER_HOST_PREFLIGHT"
+    )
+    assert _index(trace, "BROWSER_HOST_PREFLIGHT_CLEANUP") < _index(
+        trace, "DRAIN POST"
+    )
     assert _index(trace, "DRAIN GET") < _index(trace, "STOP caddy")
     assert _index(trace, "STOP caddy") < _index(trace, "BACKUP")
     assert _index(trace, "BACKUP") < _index(trace, "RESTORE")
@@ -1306,6 +1375,11 @@ def test_release_scripts_declare_drain_backup_and_immutable_helper_contracts() -
     assert "OPS_STARTUP_AUTOMATION_ENABLED must enable delayed" in deploy
     assert "OPS_AUTOMATION_START_DELAY_SECONDS must be between 60 and 300" in deploy
     assert "scan_candidate_images" in deploy
+    assert "install_browser_apparmor_profile" in deploy
+    assert "accept_browser_candidate_on_host" in deploy
+    assert 'BROWSER_APPARMOR_PROFILE_NAME="composio-ops-browser-v1"' in deploy
+    assert '--security-opt "apparmor=${BROWSER_APPARMOR_PROFILE_NAME}"' in deploy
+    assert "PLAYWRIGHT_DISABLE_SANDBOX=false" in deploy
     assert "--confirm-restore --leave-stopped" in deploy
     assert "COMPOSIO_PRODUCTION_LOCK_FD" in deploy
     assert "uname -m" in deploy

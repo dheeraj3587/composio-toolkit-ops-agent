@@ -61,11 +61,28 @@ def test_browser_compose_uses_profile_and_keeps_the_sandbox_boundary() -> None:
     assert service["security_opt"] == [
         "no-new-privileges:true",
         "seccomp=./deploy/chromium-seccomp.json",
+        "apparmor=composio-ops-browser-v1",
     ]
     assert service["environment"]["PLAYWRIGHT_DISABLE_SANDBOX"] == (
         "${PLAYWRIGHT_DISABLE_SANDBOX:-false}"
     )
     assert service["shm_size"] == "${BROWSER_SHM_SIZE:-2gb}"
+
+
+def test_browser_apparmor_profile_preserves_docker_boundary_and_allows_chromium_userns() -> None:
+    profile = (ROOT / "deploy" / "composio-ops-browser.apparmor").read_text(
+        encoding="utf-8"
+    )
+
+    assert "abi <abi/4.0>," in profile
+    assert "profile composio-ops-browser-v1" in profile
+    assert "userns," in profile
+    assert "network unix," in profile
+    assert "deny network alg," in profile
+    assert "deny mount," in profile
+    assert "deny @{PROC}/sysrq-trigger rwklx," in profile
+    assert "deny /sys/kernel/security/** rwklx," in profile
+    assert "flags=(unconfined)" not in profile
 
 
 def test_all_production_services_are_revision_tagged_and_resource_bounded() -> None:
@@ -230,6 +247,8 @@ def test_ci_runs_browser_with_production_sandbox_posture_and_always_cleans_up() 
     assert "--cap-drop ALL" in job
     assert "--security-opt no-new-privileges:true" in job
     assert "--security-opt seccomp=deploy/chromium-seccomp.json" in job
+    assert "--security-opt apparmor=composio-ops-browser-v1" in job
+    assert "apparmor_parser -r -W /etc/apparmor.d/composio-ops-browser-v1" in job
     assert "--env PLAYWRIGHT_DISABLE_SANDBOX=false" in job
     assert "--env ALLOW_LIVE_BROWSER=true" in job
     assert "--env BROWSER_INTERACTIVE_HITL_ENABLED=true" in job
