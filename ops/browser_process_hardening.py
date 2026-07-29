@@ -76,12 +76,9 @@ def chromium_launch_environment(display: str | None, *, headless: bool) -> dict[
     """Return the strict environment supplied to every Chromium launch."""
 
     launch_env = _allowlisted_environment(_PROCESS_ENV_ALLOWLIST)
-    if display:
-        launch_env["DISPLAY"] = display
-    elif not headless:
-        inherited_display = os.environ.get("DISPLAY")
-        if inherited_display:
-            launch_env["DISPLAY"] = inherited_display
+    target_display = display or os.environ.get("DISPLAY")
+    if target_display:
+        launch_env["DISPLAY"] = target_display
     return launch_env
 
 
