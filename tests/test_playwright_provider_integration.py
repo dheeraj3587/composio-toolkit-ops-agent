@@ -408,7 +408,8 @@ def test_configuration_state_helper_is_provider_aware() -> None:
                 allow_live_browser=True,
                 browser_provider="playwright",
                 browser_service_url="http://browser-worker:8081",
-                browser_service_token=SecretStr("service-token"),
+                browser_service_token=SecretStr("service-token-" + ("s" * 32)),
+                browser_session_capability_key=SecretStr("c" * 32),
             )
         )
         is True

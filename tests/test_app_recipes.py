@@ -92,6 +92,11 @@ def test_pipedrive_recipe_matches_reviewed_trace_capture_host_and_validation() -
     assert recipe.browser_ready is True
     assert recipe.browser is not None
     assert recipe.browser.scope == "credential_surface"
+    assert recipe.browser.signup is not None
+    assert recipe.browser.signup.flow == "email_first"
+    assert recipe.browser.signup.entry_path_prefixes == ("/en/register",)
+    assert recipe.browser.signup.entry_submit_labels == ("Sign up in two minutes",)
+    assert recipe.browser.signup.entry_submit_implies_legal_acceptance is True
     assert recipe.urls.login == "https://app.pipedrive.com/auth/login"
     assert recipe.urls.credential_management == trace.start_url == capture.url
     assert set(recipe.browser.exact_hosts) <= set(host_policy.exact_hosts)
@@ -156,6 +161,24 @@ def test_readiness_and_navigation_overclaims_fail_closed() -> None:
     browser["exact_hosts"] = ["*.pipedrive.com"]
     with pytest.raises(AppRecipeCatalogError, match="must be an exact host"):
         parse_app_recipe_catalog(wildcard_navigation)
+
+    signup_without_policy = deepcopy(_raw_catalog())
+    pipedrive_without_policy = _raw_recipe(signup_without_policy, "pipedrive")
+    pipedrive_browser = pipedrive_without_policy["browser"]
+    assert isinstance(pipedrive_browser, dict)
+    pipedrive_browser.pop("signup")
+    with pytest.raises(AppRecipeCatalogError, match="signup URL requires a reviewed signup policy"):
+        parse_app_recipe_catalog(signup_without_policy)
+
+    unreviewed_signup_path = deepcopy(_raw_catalog())
+    pipedrive_unreviewed_path = _raw_recipe(unreviewed_signup_path, "pipedrive")
+    signup_browser = pipedrive_unreviewed_path["browser"]
+    assert isinstance(signup_browser, dict)
+    signup_policy = signup_browser["signup"]
+    assert isinstance(signup_policy, dict)
+    signup_policy["entry_path_prefixes"] = ["/register-v2"]
+    with pytest.raises(AppRecipeCatalogError, match="does not match the reviewed entry path"):
+        parse_app_recipe_catalog(unreviewed_signup_path)
 
     contact_overclaim = deepcopy(_raw_catalog())
     close = _raw_recipe(contact_overclaim, "close")

@@ -36,6 +36,8 @@ if [[ "${gate_scope}" == "all" || "${gate_scope}" == "backend" ]]; then
   grep_output="$(mktemp "${TMPDIR:-/tmp}/composio-ops-secret-grep.XXXXXX")"
   scan_output="$(mktemp "${TMPDIR:-/tmp}/composio-ops-detect-secrets.XXXXXX")"
   baseline_copy="$(mktemp "${TMPDIR:-/tmp}/composio-ops-secrets-baseline.XXXXXX")"
+  audit_cache="${TMPDIR:-/tmp}/composio-ops-pip-audit-cache"
+  mkdir -p "${audit_cache}"
   trap 'rm -f "${grep_output}" "${scan_output}" "${baseline_copy}"' EXIT
 
   if [[ ! -f .secrets.baseline ]]; then
@@ -59,7 +61,18 @@ if [[ "${gate_scope}" == "all" || "${gate_scope}" == "backend" ]]; then
   done < <(git ls-files -z --cached --others --exclude-standard)
 
   if (( ${#secret_scan_files[@]} > 0 )); then
+    # The hook refreshes line metadata in the disposable baseline and returns 3
+    # even when it found no new secret. That is safe here because the real
+    # audited baseline remains read-only; exit 1 still means a new finding and
+    # must fail the gate.
+    set +e
     detect-secrets-hook --baseline "${baseline_copy}" "${secret_scan_files[@]}"
+    hook_status=$?
+    set -e
+    case "${hook_status}" in
+      0 | 3) ;;
+      *) exit "${hook_status}" ;;
+    esac
   fi
   # Run the required recursive scanner without printing candidate material. The audited
   # baseline hook above is the enforcing comparison for source-controlled files.
@@ -69,16 +82,61 @@ if [[ "${gate_scope}" == "all" || "${gate_scope}" == "backend" ]]; then
 
   ruff check .
   ruff format --check .
+  for shell_script in scripts/*.sh docker/*.sh; do
+    bash -n "${shell_script}"
+  done
   # Provider/live and real-Chromium suites are explicit acceptance jobs. Keep
   # this repository gate deterministic and offline while still running the full
-  # contract/state/security suite.
-  RUN_LIVE_TESTS=0 pytest -q -m "not live and not browser"
-  mypy ops api
-  python -m compileall -q ops api
-  pip-audit -r requirements-dev.txt
+  # contract/state/security suite. Explicitly shadow every provider credential
+  # and account binding with an empty process value: python-dotenv does not
+  # override an existing variable, so an ignored developer .env cannot
+  # accidentally turn a regression in a feature flag into a real provider call.
+  ALLOW_LIVE_BROWSER=false \
+    ALLOW_LIVE_VENDOR_EMAIL=false \
+    ALLOW_LOCAL_CREDENTIAL_SUBMISSION=false \
+    BROWSER_SERVICE_TOKEN= \
+    BROWSER_SESSION_CAPABILITY_KEY= \
+    BROWSER_SECRET_BROKER_TOKEN= \
+    BROWSER_STORAGE_STATE_KEY= \
+    BROWSER_USE_API_KEY= \
+    BROWSER_USE_COMPATIBILITY_ENABLED=false \
+    CEREBRAS_API_KEY= \
+    COMPOSIO_API_KEY= \
+    COMPOSIO_GMAIL_API_KEY= \
+    COMPOSIO_GMAIL_CONNECTED_ACCOUNT_ID= \
+    COMPOSIO_GMAIL_SIGNUP_CONNECTED_ACCOUNT_ID= \
+    COMPOSIO_GMAIL_USER_ID= \
+    COMPOSIO_USER_ID= \
+    GOOGLE_GENAI_API_KEY= \
+    GMAIL_SIGNUP_ADDRESS= \
+    GROQ_API_KEY= \
+    LANGGRAPH_AES_KEY= \
+    OPENROUTER_API_KEY= \
+    OUTREACH_RECIPIENT_OVERRIDE= \
+    PERPLEXITY_API_KEY= \
+    RUN_LIVE_TESTS=0 \
+    SECRET_VAULT_KEY= \
+    YDC_API_KEY= \
+    YOU_API_KEY= \
+    You_API_KEY= \
+    YOU_CONTENTS_ENABLED=false \
+    YOU_RESEARCH_ENABLED=false \
+    YOU_SEARCH_ENABLED=false \
+    pytest -q -m "not live and not browser"
+  mypy ops api browser_service
+  python -m compileall -q ops api browser_service
+  # Audit the exact, hash-locked dependency graph installed in both production
+  # Python images. Disabling pip prevents the audit from silently resolving a
+  # different graph (or upgrading build tooling) before querying advisories.
+  pip-audit \
+    --cache-dir "${audit_cache}" \
+    --progress-spinner off \
+    --disable-pip \
+    --require-hashes \
+    -r requirements-runtime.lock
 
   git grep --untracked -nEI \
-    '(client_secret|access_token|refresh_token|api[_-]?key|password|private[_-]?key|PRIVATE KEY|sk-|sk_live_|rk_live_|gh[pousr]_|github_pat_|AIza|xox[baprs]-|AKIA|ASIA|pplx-|SG\.)' \
+    '(client_secret|access_token|refresh_token|api[_-]?key|password|private[_-]?key|PRIVATE KEY|sk-|sk_live_|rk_live_|gh[pousr]_|github_pat_|AIza|xox[baprs]-|AKIA|ASIA|pplx-|gsk_|sk-or-v1-|ydc-sk-|bu_|ak_|csk-|SG\.)' \
     -- ':!PLAN.md' ':!.secrets.baseline' >"${grep_output}" || true
 
   python - "${grep_output}" <<'PY'
@@ -109,6 +167,12 @@ provider_key = re.compile(
     r"xox[baprs]-[A-Za-z0-9-]{10,}|"
     r"(?:AKIA|ASIA)[0-9A-Z]{16}|"
     r"pplx-[A-Za-z0-9_-]{12,}|"
+    r"gsk_[A-Za-z0-9_-]{16,}|"
+    r"sk-or-v1-[A-Za-z0-9_-]{16,}|"
+    r"ydc-sk-[A-Za-z0-9_-]{16,}|"
+    r"bu_[A-Za-z0-9_-]{16,}|"
+    r"ak_[A-Za-z0-9_-]{16,}|"
+    r"csk-[A-Za-z0-9_-]{16,}|"
     r"SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"
     r")(?![A-Za-z0-9])"
 )

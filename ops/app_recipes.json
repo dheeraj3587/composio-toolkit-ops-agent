@@ -52,15 +52,23 @@
       },
       "browser": {
         "scope": "credential_surface",
-        "exact_hosts": ["app.pipedrive.com", "developers.pipedrive.com", "oauth.pipedrive.com"],
+        "exact_hosts": ["www.pipedrive.com", "app.pipedrive.com", "developers.pipedrive.com", "oauth.pipedrive.com"],
         "identity_provider_hosts": ["www.recaptcha.net"],
         "static_resource_hosts": ["*.pipedriveassets.com", "www.gstatic.com", "www.recaptcha.net"],
+        "verification_sender_domains": ["pipedrive.com", "*.pipedrive.com"],
+        "verification_link_hosts": ["www.pipedrive.com", "app.pipedrive.com"],
         "sensitive_selectors": [
           "input[type='password']",
           "input[name='api_token']",
           "input[data-testid='api-token']",
           "input[readonly][value]"
         ],
+        "signup": {
+          "flow": "email_first",
+          "entry_path_prefixes": ["/en/register"],
+          "entry_submit_labels": ["Sign up in two minutes"],
+          "entry_submit_implies_legal_acceptance": true
+        },
         "steps": [
           {
             "order": 1,

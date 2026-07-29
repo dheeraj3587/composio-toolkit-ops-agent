@@ -10,8 +10,9 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from browser_service.display_pool import MAX_DISPLAY_SLOTS
 
@@ -24,6 +25,11 @@ class BrowserServiceSettings(BaseModel):
     # Shared secret for internal RPC. Absent => the service refuses every request
     # (fail closed), so an unconfigured deployment is inert rather than open.
     service_token: SecretStr | None = Field(default=None, repr=False)
+    # A separate capability token for the two-method API secret broker. It must
+    # never be the browser-service RPC token or the web/API control-plane token.
+    secret_broker_token: SecretStr | None = Field(default=None, repr=False)
+    secret_broker_url: str = "http://api:8000"
+    secret_broker_timeout_seconds: float = Field(default=10.0, ge=1.0, le=30.0)
 
     # Bind address/port. In Compose this is reachable only on the private network.
     host: str = "0.0.0.0"  # noqa: S104 - private Compose network only, never published
@@ -68,6 +74,18 @@ class BrowserServiceSettings(BaseModel):
     # persisted at all (rather than persisted in the clear).
     storage_state_key: SecretStr | None = Field(default=None, repr=False)
 
+    @field_validator("service_token")
+    @classmethod
+    def _validate_service_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        token = value.get_secret_value()
+        if len(token) < 32:
+            raise ValueError("BROWSER_SERVICE_TOKEN must be at least 32 characters")
+        if any(marker in token.casefold() for marker in ("replace-with", "change-me", "example")):
+            raise ValueError("BROWSER_SERVICE_TOKEN contains a placeholder")
+        return value
+
     @model_validator(mode="after")
     def _validate_interactive_hitl(self) -> BrowserServiceSettings:
         """Ensure every session slot can own a PRIVATE display stack.
@@ -79,6 +97,31 @@ class BrowserServiceSettings(BaseModel):
         service's own listeners — a collision would silently point the relay at
         the HTTP server (or at noVNC's asset port) instead of x11vnc.
         """
+
+        broker_url = urlsplit(self.secret_broker_url)
+        if (
+            broker_url.scheme != "http"
+            or not broker_url.hostname
+            or broker_url.username
+            or broker_url.password
+            or broker_url.query
+            or broker_url.fragment
+            or broker_url.path not in {"", "/"}
+        ):
+            raise ValueError(
+                "BROWSER_SECRET_BROKER_URL must be a private HTTP origin without credentials"
+            )
+        if self.secret_broker_token is not None:
+            broker_token = self.secret_broker_token.get_secret_value()
+            if len(broker_token) < 32:
+                raise ValueError("BROWSER_SECRET_BROKER_TOKEN must be at least 32 characters")
+            if (
+                self.service_token is not None
+                and broker_token == self.service_token.get_secret_value()
+            ):
+                raise ValueError(
+                    "BROWSER_SECRET_BROKER_TOKEN must differ from BROWSER_SERVICE_TOKEN"
+                )
 
         if not self.interactive_hitl_enabled:
             return self
@@ -106,6 +149,10 @@ class BrowserServiceSettings(BaseModel):
     @property
     def token_configured(self) -> bool:
         return self.service_token is not None
+
+    @property
+    def secret_broker_configured(self) -> bool:
+        return self.secret_broker_token is not None
 
     @property
     def display_slots(self) -> int:
@@ -158,10 +205,14 @@ class BrowserServiceSettings(BaseModel):
             raise ValueError(f"{name} must be true or false")
 
         token = _text("BROWSER_SERVICE_TOKEN")
-        storage_key = _text("BROWSER_STORAGE_STATE_KEY") or _text("SECRET_VAULT_KEY")
+        storage_key = _text("BROWSER_STORAGE_STATE_KEY")
+        secret_broker_token = _text("BROWSER_SECRET_BROKER_TOKEN")
         vnc_port_base = _int("BROWSER_VNC_PORT", 5900)
         return cls(
             service_token=SecretStr(token) if token else None,
+            secret_broker_token=(SecretStr(secret_broker_token) if secret_broker_token else None),
+            secret_broker_url=(_text("BROWSER_SECRET_BROKER_URL") or "http://api:8000").rstrip("/"),
+            secret_broker_timeout_seconds=_float("BROWSER_SECRET_BROKER_TIMEOUT_SECONDS", 10.0),
             host=_text("BROWSER_SERVICE_HOST") or "0.0.0.0",  # noqa: S104 - private network
             port=_int("BROWSER_SERVICE_PORT", 8081),
             max_sessions=_int("PLAYWRIGHT_MAX_SESSIONS", 2),

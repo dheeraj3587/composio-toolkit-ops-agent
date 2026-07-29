@@ -6,12 +6,13 @@ import re
 from typing import Annotated, Literal
 from urllib.parse import parse_qsl, urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ops.state import AccessRoute, BrowserProvider, CredentialCreationPolicy
 
 VAULT_REFERENCE_PATTERN = re.compile(r"^vault://[a-z0-9-]+/[a-z0-9_-]+/[A-Za-z0-9_-]+$")
 VaultReference = Annotated[str, Field(min_length=12, max_length=512)]
+AccountMode = Literal["existing_account", "create_account"]
 CapabilityStatus = Literal[
     "ready",
     "configuration_required",
@@ -109,6 +110,10 @@ class CompanyProfile(StrictModel):
 class OperationsRequest(StrictModel):
     app_name: str = Field(min_length=1, max_length=200)
     company: CompanyProfile
+    # The durable account-intent contract. ``account_creation_requested`` is
+    # retained as the browser-worker compatibility projection and is derived
+    # from this field for all new requests.
+    account_mode: AccountMode
     requested_scope_policy: Literal["minimum", "recommended", "maximum"] = "maximum"
     # Immutable execution-engine choice. Older callers and checkpoints default to
     # Browser Use; the website sends its explicit operator selection.
@@ -120,7 +125,39 @@ class OperationsRequest(StrictModel):
     # Explicit local intent only. It is never inferred from research, a browser
     # page, or an LLM, and is forwarded only to the browser target selector.
     account_creation_requested: bool = False
-    outreach_recipient_override: str | None = Field(default=None, max_length=320)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_account_intent(cls, value: object) -> object:
+        """Keep historical checkpoints readable while making mode canonical.
+
+        Older serialized requests only contain ``account_creation_requested``.
+        They are upgraded in memory without rewriting the ledger. New callers
+        provide ``account_mode`` and the worker-facing boolean is filled in
+        deterministically. Conflicting values are rejected instead of allowing
+        the API and browser to disagree about whether signup was authorized.
+        """
+
+        if not isinstance(value, dict):
+            return value
+        payload = dict(value)
+        # Historical checkpoints may contain the former per-run outreach sink.
+        # Ignore it on read; routing is governed exclusively by the deployment's
+        # OUTREACH_RECIPIENT_OVERRIDE.
+        payload.pop("outreach_recipient_override", None)
+        account_mode = payload.get("account_mode")
+        creation_requested = payload.get("account_creation_requested")
+        if account_mode is None:
+            payload["account_mode"] = (
+                "create_account" if creation_requested is True else "existing_account"
+            )
+            return payload
+        expected = account_mode == "create_account"
+        if creation_requested is None:
+            payload["account_creation_requested"] = expected
+        elif creation_requested is not expected:
+            raise ValueError("account mode conflicts with account creation intent")
+        return payload
 
 
 class ScopeRequirement(StrictModel):

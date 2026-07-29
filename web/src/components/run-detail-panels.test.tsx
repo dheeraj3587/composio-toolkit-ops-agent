@@ -100,6 +100,23 @@ describe("safe run detail panels", () => {
     expect(screen.queryByRole("button", { name: /reveal|show.*secret|copy.*secret/i })).not.toBeInTheDocument() // pragma: allowlist secret
   })
 
+  it("reports ordinary operational SQLite without claiming checkpoint encryption", () => {
+    render(
+      <SecurityPanel
+        security={{
+          operational_state_storage: "sqlite_not_app_encrypted",
+          owner_only_storage: "verified_owner_only",
+          secret_vault: "configured_not_verified", // pragma: allowlist secret
+        }}
+      />,
+    )
+
+    expect(screen.getByText("Canonical + effect state")).toBeInTheDocument()
+    expect(screen.getByText("SQLite · not app-encrypted")).toBeInTheDocument()
+    expect(screen.getByText("Fernet credential vault")).toBeInTheDocument()
+    expect(screen.queryByText(/checkpoint encryption/i)).not.toBeInTheDocument()
+  })
+
   it("renders a reference-only IntegratorBundle without credential reference values", () => {
     render(<OutputPanel output={output} />)
 

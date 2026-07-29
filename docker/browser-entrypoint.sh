@@ -32,6 +32,24 @@ is_enabled() {
     esac
 }
 
+wait_for_listener() {
+    listener_port="$1"
+    listener_pid="$2"
+    listener_label="$3"
+    attempts=0
+    while ! python -c \
+        'import socket, sys; s = socket.socket(); s.settimeout(0.2); raise SystemExit(s.connect_ex(("127.0.0.1", int(sys.argv[1]))))' \
+        "${listener_port}"
+    do
+        attempts=$((attempts + 1))
+        if ! kill -0 "${listener_pid}" 2>/dev/null || [ "${attempts}" -gt 100 ]; then
+            echo "browser-service: ${listener_label} failed to listen" >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+}
+
 # Chromium needs a WRITABLE HOME even when it persists no profile: a HEADFUL
 # startup touches $HOME for GTK/dconf, fontconfig and NSS state. The image WORKDIR
 # (/app) sits on the read-only root filesystem, so a headful launch died instantly
@@ -47,6 +65,32 @@ XDG_RUNTIME_DIR="${BROWSER_HOME}/run"
 mkdir -p "${XDG_CACHE_HOME}" "${XDG_CONFIG_HOME}" "${XDG_RUNTIME_DIR}"
 chmod 700 "${XDG_RUNTIME_DIR}"
 export HOME XDG_CACHE_HOME XDG_CONFIG_HOME XDG_RUNTIME_DIR
+
+# Display helpers are long-lived peers of the secret-bearing browser service.
+# Start them from an empty environment so they never receive the worker RPC
+# token, broker token, storage-state key, or inference/provider credentials
+# through inherited environment variables.
+# The fixed PATH also prevents an ambient path from changing which helper is
+# executed. These are the only process settings the display stack needs.
+SAFE_PROCESS_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+SAFE_TMPDIR="${TMPDIR:-/tmp}"
+SAFE_LANG="${LANG:-C.UTF-8}"
+SAFE_LC_ALL="${LC_ALL:-}"
+SAFE_TZ="${TZ:-UTC}"
+
+run_display_helper() {
+    env -i \
+        PATH="${SAFE_PROCESS_PATH}" \
+        HOME="${HOME}" \
+        XDG_CACHE_HOME="${XDG_CACHE_HOME}" \
+        XDG_CONFIG_HOME="${XDG_CONFIG_HOME}" \
+        XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR}" \
+        TMPDIR="${SAFE_TMPDIR}" \
+        LANG="${SAFE_LANG}" \
+        LC_ALL="${SAFE_LC_ALL}" \
+        TZ="${SAFE_TZ}" \
+        "$@"
+}
 
 if is_enabled "${BROWSER_INTERACTIVE_HITL_ENABLED:-false}"; then
     # ONE display stack per session slot. A single shared display was the reason
@@ -81,7 +125,8 @@ if is_enabled "${BROWSER_INTERACTIVE_HITL_ENABLED:-false}"; then
 
         # Virtual framebuffer: Chromium can then run headful, which is what makes a
         # human handoff (CAPTCHA, account chooser, MFA) actually solvable.
-        Xvfb ":${slot_display}" -screen 0 "${SCREEN_GEOMETRY}" -nolisten tcp &
+        run_display_helper \
+            Xvfb ":${slot_display}" -screen 0 "${SCREEN_GEOMETRY}" -nolisten tcp &
 
         # Wait for THIS slot's X socket rather than sleeping blindly.
         i=0
@@ -96,13 +141,13 @@ if is_enabled "${BROWSER_INTERACTIVE_HITL_ENABLED:-false}"; then
 
         # A minimal window manager so dialogs and popups are placed sanely. Bound
         # to this slot's display, so each desktop is managed independently.
-        DISPLAY=":${slot_display}" fluxbox >/dev/null 2>&1 &
+        run_display_helper DISPLAY=":${slot_display}" fluxbox >/dev/null 2>&1 &
 
         # -localhost is the load-bearing flag: x11vnc accepts connections only from
         # inside this container, so there is no raw public VNC port. -nopw is safe
         # ONLY because of that binding plus the authenticated relay in front of it;
         # a VNC password here would be a second secret with no added protection.
-        x11vnc \
+        run_display_helper x11vnc \
             -display ":${slot_display}" \
             -rfbport "${slot_vnc_port}" \
             -localhost \
@@ -112,12 +157,13 @@ if is_enabled "${BROWSER_INTERACTIVE_HITL_ENABLED:-false}"; then
             -noxdamage \
             -quiet \
             >/dev/null 2>&1 &
+        control_vnc_pid="$!"
 
         # A second loopback-only server exports the SAME private display but
         # refuses keyboard, pointer and clipboard input at the VNC server. This is
         # the autonomous ``browser_running`` stream. Even a modified noVNC client
         # cannot upgrade a signed view grant into browser control.
-        x11vnc \
+        run_display_helper x11vnc \
             -display ":${slot_display}" \
             -rfbport "${slot_view_vnc_port}" \
             -localhost \
@@ -128,6 +174,13 @@ if is_enabled "${BROWSER_INTERACTIVE_HITL_ENABLED:-false}"; then
             -noxdamage \
             -quiet \
             >/dev/null 2>&1 &
+        view_vnc_pid="$!"
+
+        # Do not start the HTTP service until BOTH enforcement listeners are
+        # accepting connections. Otherwise /internal/ready can become healthy
+        # while every live-view handoff still fails.
+        wait_for_listener "${slot_vnc_port}" "${control_vnc_pid}" "control VNC"
+        wait_for_listener "${slot_view_vnc_port}" "${view_vnc_pid}" "view-only VNC"
 
         slot=$((slot + 1))
     done

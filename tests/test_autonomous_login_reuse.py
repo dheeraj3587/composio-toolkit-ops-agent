@@ -24,11 +24,15 @@ from ops.run_service import RunService
 from ops.secret_store import (
     ACCOUNT_LOGIN_KIND_PREFIX,
     REUSABLE_LOGIN_FIELDS,
+    AccountLoginStateError,
     SQLiteSecretStore,
 )
 
 _EMAIL = "owner@example.test"
 _PASSWORD = "correct-horse-battery"  # pragma: allowlist secret
+_ACCOUNT = "acct_0123456789abcdef0123456789abcdef"
+_OTHER_ACCOUNT = "acct_fedcba9876543210fedcba9876543210"
+_RUN = "run_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 
 def _store(tmp_path: Path) -> SQLiteSecretStore:
@@ -44,27 +48,51 @@ def _service(tmp_path: Path, **overrides: Any) -> RunService:
 def test_account_login_round_trips_and_is_namespaced(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
-    reference = store.put_account_login(app_slug="pipedrive", field="login_email", value=_EMAIL)
+    reference = store.put_account_login(
+        app_slug="pipedrive",
+        account_ref=_ACCOUNT,
+        field="login_email",
+        value=_EMAIL,
+    )
 
     # A reusable sign-in secret must never share the namespace of a captured
     # integration credential, or one could be read through the other's path.
     assert reference.startswith(f"vault://pipedrive/{ACCOUNT_LOGIN_KIND_PREFIX}login_email/")
-    assert store.get_account_login(app_slug="pipedrive", field="login_email") == _EMAIL
+    assert (
+        store.get_account_login(app_slug="pipedrive", account_ref=_ACCOUNT, field="login_email")
+        == _EMAIL
+    )
 
 
 def test_account_login_replaces_rather_than_accumulates(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    store.put_account_login(app_slug="pipedrive", field="login_password", value="old-password")
-    store.put_account_login(app_slug="pipedrive", field="login_password", value=_PASSWORD)
+    store.put_account_login(
+        app_slug="pipedrive",
+        account_ref=_ACCOUNT,
+        field="login_password",
+        value="old-password",
+    )
+    store.put_account_login(
+        app_slug="pipedrive",
+        account_ref=_ACCOUNT,
+        field="login_password",
+        value=_PASSWORD,
+    )
 
     # A rotated password must not be shadowed by a stale row.
-    assert store.get_account_login(app_slug="pipedrive", field="login_password") == _PASSWORD
+    assert (
+        store.get_account_login(app_slug="pipedrive", account_ref=_ACCOUNT, field="login_password")
+        == _PASSWORD
+    )
 
 
 def test_missing_account_login_is_none_not_an_error(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
-    assert store.get_account_login(app_slug="pipedrive", field="login_email") is None
+    assert (
+        store.get_account_login(app_slug="pipedrive", account_ref=_ACCOUNT, field="login_email")
+        is None
+    )
 
 
 def test_only_reusable_login_fields_are_accepted(tmp_path: Path) -> None:
@@ -74,18 +102,140 @@ def test_only_reusable_login_fields_are_accepted(tmp_path: Path) -> None:
     # durable row, so the narrow field set is enforced at the vault boundary.
     assert REUSABLE_LOGIN_FIELDS == frozenset({"login_email", "login_password"})
     with pytest.raises(ValueError):
-        store.put_account_login(app_slug="pipedrive", field="login_otp", value="123456")
+        store.put_account_login(
+            app_slug="pipedrive",
+            account_ref=_ACCOUNT,
+            field="login_otp",
+            value="123456",
+        )
     with pytest.raises(ValueError):
-        store.get_account_login(app_slug="pipedrive", field="api_token")
+        store.get_account_login(app_slug="pipedrive", account_ref=_ACCOUNT, field="api_token")
 
 
 def test_delete_account_login_forgets_the_credential(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    store.put_account_login(app_slug="pipedrive", field="login_email", value=_EMAIL)
+    store.put_account_login(
+        app_slug="pipedrive",
+        account_ref=_ACCOUNT,
+        field="login_email",
+        value=_EMAIL,
+    )
 
-    store.delete_account_login(app_slug="pipedrive", field="login_email")
+    store.delete_account_login(app_slug="pipedrive", account_ref=_ACCOUNT, field="login_email")
 
-    assert store.get_account_login(app_slug="pipedrive", field="login_email") is None
+    assert (
+        store.get_account_login(app_slug="pipedrive", account_ref=_ACCOUNT, field="login_email")
+        is None
+    )
+
+
+def test_account_logins_are_isolated_per_bound_account(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.put_account_login(
+        app_slug="pipedrive",
+        account_ref=_ACCOUNT,
+        field="login_password",
+        value=_PASSWORD,
+    )
+    store.put_account_login(
+        app_slug="pipedrive",
+        account_ref=_OTHER_ACCOUNT,
+        field="login_password",
+        value="different-password",
+    )
+
+    assert (
+        store.get_account_login(app_slug="pipedrive", account_ref=_ACCOUNT, field="login_password")
+        == _PASSWORD
+    )
+    assert (
+        store.get_account_login(
+            app_slug="pipedrive",
+            account_ref=_OTHER_ACCOUNT,
+            field="login_password",
+        )
+        == "different-password"
+    )
+
+
+def test_existing_login_stage_cannot_clobber_known_good_pair(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.put_account_login_pair(
+        app_slug="pipedrive",
+        account_ref=_ACCOUNT,
+        email=_EMAIL,
+        password=_PASSWORD,
+    )
+
+    staged = store.stage_existing_login_pair(
+        app_slug="pipedrive",
+        account_ref=_ACCOUNT,
+        run_id=_RUN,
+        email=_EMAIL,
+        password="typed-wrong-password",  # pragma: allowlist secret
+    )
+
+    assert staged["login_password"] == "typed-wrong-password"  # pragma: allowlist secret
+    assert store.get_account_login_pair(
+        app_slug="pipedrive",
+        account_ref=_ACCOUNT,
+    ) == {"login_email": _EMAIL, "login_password": _PASSWORD}
+
+
+def test_existing_login_stage_promotes_atomically_after_success(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.put_account_login_pair(
+        app_slug="pipedrive",
+        account_ref=_ACCOUNT,
+        email=_EMAIL,
+        password=_PASSWORD,
+    )
+    store.stage_existing_login_pair(
+        app_slug="pipedrive",
+        account_ref=_ACCOUNT,
+        run_id=_RUN,
+        email="rotated@example.test",
+        password="rotated-password",  # pragma: allowlist secret
+    )
+
+    assert store.promote_staged_existing_login_pair(
+        app_slug="pipedrive",
+        account_ref=_ACCOUNT,
+        run_id=_RUN,
+    ) == ("login_email", "login_password")
+    assert store.get_account_login_pair(
+        app_slug="pipedrive",
+        account_ref=_ACCOUNT,
+    ) == {
+        "login_email": "rotated@example.test",
+        "login_password": "rotated-password",  # pragma: allowlist secret
+    }
+
+
+def test_unique_account_lookup_reuses_only_an_exact_selection(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.put_account_login_pair(
+        app_slug="pipedrive",
+        account_ref=_ACCOUNT,
+        email=_EMAIL,
+        password=_PASSWORD,
+    )
+
+    selected = store.get_unique_account_login_pair(app_slug="pipedrive")
+    assert selected == (
+        _ACCOUNT,
+        {"login_email": _EMAIL, "login_password": _PASSWORD},
+    )
+
+    store.put_account_login_pair(
+        app_slug="pipedrive",
+        account_ref=_OTHER_ACCOUNT,
+        email="other@example.test",
+        password="other-password",  # pragma: allowlist secret
+    )
+    with pytest.raises(AccountLoginStateError) as raised:
+        store.get_unique_account_login_pair(app_slug="pipedrive")
+    assert raised.value.reason_code == "stored_login_account_ambiguous"
 
 
 # --- RunService remember / reuse ---------------------------------------------
@@ -95,11 +245,12 @@ def test_owner_credentials_are_remembered_and_reused(tmp_path: Path) -> None:
 
     remembered = service._remember_reusable_login(
         app_slug="pipedrive",
+        account_ref=_ACCOUNT,
         values={"login_email": SecretStr(_EMAIL), "login_password": SecretStr(_PASSWORD)},
     )
     assert remembered == ("login_email", "login_password")
 
-    reused = service._reusable_login_values("pipedrive")
+    reused = service._reusable_login_values("pipedrive", _ACCOUNT)
     assert sorted(reused) == ["login_email", "login_password"]
     assert reused["login_email"].get_secret_value() == _EMAIL
     assert reused["login_password"].get_secret_value() == _PASSWORD
@@ -110,12 +261,14 @@ def test_a_partial_credential_pair_is_not_reused(tmp_path: Path) -> None:
     service._secret_store = _store(tmp_path)
 
     service._remember_reusable_login(
-        app_slug="pipedrive", values={"login_email": SecretStr(_EMAIL)}
+        app_slug="pipedrive",
+        account_ref=_ACCOUNT,
+        values={"login_email": SecretStr(_EMAIL)},
     )
 
     # An email with no password would type half a login and then stall, so an
     # incomplete set counts as nothing stored and the owner is asked once.
-    assert service._reusable_login_values("pipedrive") == {}
+    assert service._reusable_login_values("pipedrive", _ACCOUNT) == {}
 
 
 def test_reuse_can_be_disabled_by_policy(tmp_path: Path) -> None:
@@ -125,11 +278,12 @@ def test_reuse_can_be_disabled_by_policy(tmp_path: Path) -> None:
     assert (
         service._remember_reusable_login(
             app_slug="pipedrive",
+            account_ref=_ACCOUNT,
             values={"login_email": SecretStr(_EMAIL), "login_password": SecretStr(_PASSWORD)},
         )
         == ()
     )
-    assert service._reusable_login_values("pipedrive") == {}
+    assert service._reusable_login_values("pipedrive", _ACCOUNT) == {}
 
 
 def test_reuse_is_scoped_per_app(tmp_path: Path) -> None:
@@ -137,10 +291,11 @@ def test_reuse_is_scoped_per_app(tmp_path: Path) -> None:
     service._secret_store = _store(tmp_path)
     service._remember_reusable_login(
         app_slug="pipedrive",
+        account_ref=_ACCOUNT,
         values={"login_email": SecretStr(_EMAIL), "login_password": SecretStr(_PASSWORD)},
     )
 
-    assert service._reusable_login_values("attio") == {}
+    assert service._reusable_login_values("attio", _ACCOUNT) == {}
 
 
 # --- autonomous advancement ---------------------------------------------------
@@ -173,6 +328,7 @@ def test_login_gate_is_not_resumed_from_remembered_credentials(
     service._secret_store = _store(tmp_path)
     service._remember_reusable_login(
         app_slug="pipedrive",
+        account_ref=_ACCOUNT,
         values={"login_email": SecretStr(_EMAIL), "login_password": SecretStr(_PASSWORD)},
     )
     _waiting(service, "run_login", "login_required")
@@ -208,6 +364,7 @@ def test_gates_needing_a_real_human_are_never_advanced(
     service._secret_store = _store(tmp_path)
     service._remember_reusable_login(
         app_slug="pipedrive",
+        account_ref=_ACCOUNT,
         values={"login_email": SecretStr(_EMAIL), "login_password": SecretStr(_PASSWORD)},
     )
     _waiting(service, f"run_{action_type}", action_type)
@@ -223,6 +380,7 @@ def test_advancement_is_bounded_per_run(tmp_path: Path, monkeypatch: pytest.Monk
     service._secret_store = _store(tmp_path)
     service._remember_reusable_login(
         app_slug="pipedrive",
+        account_ref=_ACCOUNT,
         values={"login_email": SecretStr(_EMAIL), "login_password": SecretStr(_PASSWORD)},
     )
     _waiting(service, "run_login", "login_required")

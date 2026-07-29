@@ -67,6 +67,8 @@ def test_frontend_validates_success_envelopes_and_idempotency_keys() -> None:
 def test_next_security_headers_and_standalone_assets_are_configured() -> None:
     next_config = (ROOT / "web" / "next.config.ts").read_text(encoding="utf-8")
     package = (ROOT / "web" / "package.json").read_text(encoding="utf-8")
+    npm_config = (ROOT / "web" / ".npmrc").read_text(encoding="utf-8")
+    dockerfile = (ROOT / "web" / "Dockerfile").read_text(encoding="utf-8")
     standalone_script = (ROOT / "web" / "scripts" / "prepare-standalone.mjs").read_text(
         encoding="utf-8"
     )
@@ -82,8 +84,11 @@ def test_next_security_headers_and_standalone_assets_are_configured() -> None:
     for directive in ("object-src 'none'", "frame-ancestors 'none'", "form-action 'self'"):
         assert directive in next_config
 
-    assert '"postbuild": "node scripts/prepare-standalone.mjs"' in package
+    assert '"build": "next build && node scripts/prepare-standalone.mjs"' in package
     assert '"start": "node .next/standalone/server.js"' in package
+    assert "allowScripts" not in package
+    assert npm_config.strip() == "ignore-scripts=true"
+    assert "npm ci --ignore-scripts" in dockerfile
     assert 'join(root, "public")' in standalone_script
     assert 'join(root, ".next", "static")' in standalone_script
 
@@ -92,9 +97,12 @@ def test_container_runtime_has_one_writable_application_path() -> None:
     api_dockerfile = (ROOT / "Dockerfile.api").read_text(encoding="utf-8")
     requirements = (ROOT / "requirements-api.txt").read_text(encoding="utf-8").splitlines()
 
-    assert "COPY requirements-api.txt requirements-providers.txt ./" in api_dockerfile
-    assert "--requirement requirements-api.txt" in api_dockerfile
-    assert "--requirement requirements-providers.txt" in api_dockerfile
+    assert (
+        "COPY requirements-api.txt requirements-providers.txt requirements-runtime.lock ./"
+        in api_dockerfile
+    )
+    assert "--require-hashes" in api_dockerfile
+    assert "--requirement requirements-runtime.lock" in api_dockerfile
     assert "COPY --chown=root:root api ./api" in api_dockerfile
     assert "COPY --chown=root:root ops ./ops" in api_dockerfile
     assert "COPY --chown=root:root data/p1 ./data/p1" in api_dockerfile
@@ -105,7 +113,7 @@ def test_container_runtime_has_one_writable_application_path() -> None:
         "fastapi==0.139.2",
         "langgraph==1.2.9",
         "langgraph-checkpoint-sqlite==3.1.0",
-        "pycryptodome>=3.23,<4",
+        "pycryptodome==3.23.0",
         "cryptography==48.0.1",
         "pydantic==2.13.4",
         "python-dotenv==1.2.2",

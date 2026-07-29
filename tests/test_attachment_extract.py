@@ -154,7 +154,7 @@ def _fake_composio_module(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _settings() -> Settings:
     return Settings(
-        composio_api_key=SecretStr("test-key"),  # pragma: allowlist secret
+        composio_gmail_api_key=SecretStr("test-key"),  # pragma: allowlist secret
         composio_gmail_connected_account_id="gmail-acct-1",
         outreach_recipient_override="controlled@example.test",
         gmail_retry_base_delay_seconds=0.0,

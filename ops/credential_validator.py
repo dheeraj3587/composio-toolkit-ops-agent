@@ -252,7 +252,9 @@ class PolicyBoundCredentialValidator:
         credential_refs: dict[str, str],
         policy: CredentialValidationPolicy | None = None,
     ) -> CredentialValidationResult:
-        endpoint = policy.allowed_endpoints[0] if policy is not None else self._endpoints.get(app_slug)
+        endpoint = (
+            policy.allowed_endpoints[0] if policy is not None else self._endpoints.get(app_slug)
+        )
         if endpoint is None:
             raise ConfigurationRequiredError(
                 phase=6,

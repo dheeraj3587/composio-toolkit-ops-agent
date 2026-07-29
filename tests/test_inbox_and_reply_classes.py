@@ -75,7 +75,7 @@ def _fake_composio_module(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _settings() -> Settings:
     return Settings(
-        composio_api_key=SecretStr("test-key"),  # pragma: allowlist secret
+        composio_gmail_api_key=SecretStr("test-key"),  # pragma: allowlist secret
         composio_gmail_connected_account_id="gmail-acct-1",
         outreach_recipient_override="controlled@example.test",
     )
@@ -108,6 +108,37 @@ def test_search_inbox_redacts_and_flags_attachments() -> None:
     assert "REDACT" in result.sanitized_preview.upper()
 
 
+def test_search_inbox_never_projects_one_time_codes_or_magic_links() -> None:
+    messages: list[dict[str, object]] = [
+        {
+            "id": "otp",
+            "threadId": "otp-thread",
+            "from": "security@example.test",
+            "subject": "Your verification code is 481920",
+            "snippet": "Enter 481-920 to sign in.",
+            "internalDate": "500",
+        },
+        {
+            "id": "link",
+            "threadId": "link-thread",
+            "from": "security@example.test",
+            "subject": "Verify your sign in",
+            "snippet": "Open https://app.example.test/verify/opaque-magic-value",
+            "internalDate": "400",
+        },
+    ]
+
+    results = asyncio.run(_worker(messages).search_inbox(query="in:anywhere"))
+    rendered = " ".join(
+        f"{result.sanitized_subject} {result.sanitized_preview}" for result in results
+    )
+    assert "481920" not in rendered
+    assert "481-920" not in rendered
+    assert "opaque-magic-value" not in rendered
+    assert "REDACTED_VERIFICATION_CODE" in rendered
+    assert "REDACTED_VERIFICATION_LINK" in rendered
+
+
 def test_search_inbox_prefers_trusted_domain() -> None:
     messages: list[dict[str, object]] = [
         {"id": "a", "from": "x@spam.example", "internal_date": "900", "subject": "newest"},
@@ -131,7 +162,7 @@ def test_build_inbox_query_composes_validated_parts() -> None:
     query = build_inbox_query(
         sender_domain="stripe.com", subject="API access", newer_than="7d", unread=True
     )
-    assert query == "from:stripe.com subject:(API access) newer_than:7d is:unread"
+    assert query == 'from:stripe.com subject:"API access" newer_than:7d is:unread'
 
 
 def test_build_inbox_query_defaults_to_anywhere() -> None:
@@ -141,8 +172,14 @@ def test_build_inbox_query_defaults_to_anywhere() -> None:
 def test_build_inbox_query_strips_injection_attempts() -> None:
     # Newlines/quotes in the subject cannot inject extra operators.
     query = build_inbox_query(subject='hi"\nfrom:attacker.com')
-    assert "\n" not in query and '"' not in query
-    assert query.startswith("subject:(")
+    assert "\n" not in query
+    assert query == 'subject:"hi from:attacker.com"'
+
+
+def test_build_inbox_query_rejects_arbitrary_extra_operators() -> None:
+    assert build_inbox_query(extra="has:attachment") == "has:attachment"
+    with pytest.raises(ValueError):
+        build_inbox_query(extra="in:anywhere OR from:attacker.example")
 
 
 @pytest.mark.parametrize("bad", ["nonsense", "7x", "d7", "10", ""])

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Fail if any Chromium/headless-shell process is still running.
 
-Run INSIDE the browser-worker container after the tests. A leaked browser is a
-real defect: it holds memory and a session the janitor believed it closed. Uses
-only /proc so it needs no extra tools in the image.
+Run after real-browser tests, either on the CI host or inside the browser-worker
+container. A leaked browser is a real defect: it holds memory and a session the
+janitor believed it closed. Uses only /proc so it needs no extra tools.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-_NEEDLES = ("chrome", "chromium", "headless_shell")
+_NEEDLES = ("chrome", "chromium", "headless_shell", "headless-shell")
 
 
 def _orphans() -> list[str]:
@@ -23,17 +23,17 @@ def _orphans() -> list[str]:
         if not entry.name.isdigit():
             continue
         try:
-            cmdline = (
-                (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
-            )
+            # Match the kernel process name, never the full command line. The old
+            # implementation matched this script's own filename (and its parent
+            # shell command), so the assertion failed even when no browser existed.
+            # It also risked retaining browser profile arguments in memory.
+            process_name = (entry / "comm").read_text(encoding="utf-8").strip()
         except OSError:
             continue
-        lowered = cmdline.casefold()
+        lowered = process_name.casefold()
         if any(needle in lowered for needle in _NEEDLES):
-            # Report the executable name only, never full args (which could carry
-            # a profile path).
-            found.append(cmdline.split(" ", 1)[0] or entry.name)
-    return found
+            found.append(process_name or entry.name)
+    return sorted(found)
 
 
 def main() -> int:

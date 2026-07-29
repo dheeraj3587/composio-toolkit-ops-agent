@@ -19,6 +19,7 @@ from ops.run_service import RunService as CoreRunService
 def create_payload(app_name: str = "HubSpot") -> dict[str, object]:
     return {
         "app_name": app_name,
+        "account_mode": "existing_account",
         "company": {
             "legal_name": "Example Company",
             "website": "https://example.test",
@@ -28,7 +29,6 @@ def create_payload(app_name: str = "HubSpot") -> dict[str, object]:
         },
         "requested_scope_policy": "maximum",
         "dry_run": True,
-        "outreach_recipient_override": "controlled@example.test",
     }
 
 
@@ -51,9 +51,14 @@ class SuccessfulActionService(TrackingRunService):
     """Test double for the stable success contract of future phase actions."""
 
     async def resume(
-        self, run_id: str, *, browser_login: object = None, signal: str = "completed"
+        self,
+        run_id: str,
+        *,
+        browser_login: object = None,
+        browser_verification: object = None,
+        signal: str = "completed",
     ) -> ActionReceipt:
-        del browser_login, signal
+        del browser_login, browser_verification, signal
         await self.get_run(run_id)
         return ActionReceipt(run_id=run_id, action="resume")
 
@@ -94,6 +99,82 @@ def create_run(
     return response.json()
 
 
+def test_unknown_app_is_rejected_before_a_run_is_persisted(harness: ApiHarness) -> None:
+    response = harness.client.post("/api/runs", json=create_payload("Unreviewed Vendor"))
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": "not_found",
+        "message": "Resource was not found.",
+    }
+    assert harness.core.storage.count_runs() == 0
+
+
+def test_create_run_rejects_per_run_outreach_recipient_override(
+    harness: ApiHarness,
+) -> None:
+    payload = create_payload()
+    payload["outreach_recipient_override"] = "attacker@example.test"
+
+    response = harness.client.post("/api/runs", json=payload)
+
+    assert response.status_code == 422
+    assert harness.core.storage.count_runs() == 0
+
+
+def test_executable_signup_readiness_refusal_persists_no_run(tmp_path: Path) -> None:
+    from ops.config import Settings
+
+    settings = Settings(
+        allow_live_browser=True,
+        browser_provider="playwright",
+        playwright_in_process_sandbox=True,
+    )
+    db_path = tmp_path / "private" / "ops.db"
+    core = CoreRunService.from_paths(db_path=db_path, settings=settings)
+    service = LocalRunService(db_path, core_service=core, settings=settings)
+    application = create_app(service=service)
+    payload = create_payload("Pipedrive")
+    payload.pop("dry_run")
+    payload.update(
+        {
+            "account_mode": "create_account",
+            "execution_mode": "execute_when_configured",
+            "browser_provider": "playwright",
+        }
+    )
+
+    with TestClient(application) as client:
+        response = client.post("/api/runs", json=payload)
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": "provider_not_ready",
+        "message": "Required provider capability is not ready; no run was created.",
+        "provider": "gmail",
+        "reason_code": "gmail_signup_address_not_configured",
+    }
+    assert core.storage.count_runs() == 0
+
+
+def test_unreviewed_signup_route_is_refused_before_persistence(harness: ApiHarness) -> None:
+    payload = create_payload("Telegram")
+    payload.pop("dry_run")
+    payload.update(
+        {
+            "account_mode": "create_account",
+            "execution_mode": "execute_when_configured",
+            "browser_provider": "playwright",
+        }
+    )
+
+    response = harness.client.post("/api/runs", json=payload)
+
+    assert response.status_code == 409
+    assert response.json()["reason_code"] == "reviewed_signup_recipe_not_available"
+    assert harness.core.storage.count_runs() == 0
+
+
 def test_exact_requested_routes_are_registered(harness: ApiHarness) -> None:
     routes = {
         (route.path, method)
@@ -124,6 +205,7 @@ def test_exact_requested_routes_are_registered(harness: ApiHarness) -> None:
         ("/api/apps", "GET"),
         ("/api/apps/search", "GET"),
         ("/api/apps/{app_slug}/research", "GET"),
+        ("/api/system/signup-readiness", "GET"),
         ("/api/system/health", "GET"),
     }
 
@@ -153,6 +235,7 @@ def test_create_and_detail_expose_verified_phase_two_contract(harness: ApiHarnes
         "app_slug",
         "status",
         "access_route",
+        "account_mode",
         "execution_mode",
         "browser_provider",
         "credential_creation_policy",
@@ -207,25 +290,6 @@ def test_create_and_detail_expose_verified_phase_two_contract(harness: ApiHarnes
     response = harness.client.get(f"/api/runs/{run['run_id']}")
     assert response.status_code == 200
     assert response.json() == created
-
-
-def test_unknown_snapshot_app_has_typed_unknown_route_and_null_research(
-    harness: ApiHarness,
-) -> None:
-    created = create_run(harness, "App Outside Snapshot")
-
-    assert created["run"]["access_route"] == "unknown"
-    assert created["run"]["status"] == "researching"
-    assert created["research"] is None
-    assert created["run"]["external_actions"] is False
-    research_phase = next(phase for phase in created["phases"] if phase["key"] == "research")
-    assert research_phase["status"] == "waiting"
-    assert research_phase["available"] is False
-    assert "pending" in research_phase["detail"].lower()
-
-    timeline = harness.client.get(f"/api/runs/{created['run']['run_id']}/timeline")
-    assert timeline.status_code == 200
-    assert "route_pending" in {item["event_type"] for item in timeline.json()["items"]}
 
 
 def test_create_run_is_idempotent_for_safe_generated_key(harness: ApiHarness) -> None:
@@ -612,11 +676,11 @@ def test_unhandled_exception_response_is_generic_and_sanitized(tmp_path: Path) -
     assert "internal-exception-marker" not in response.text
 
 
-def test_app_catalog_lists_every_verified_app(harness: ApiHarness) -> None:
-    """The catalog endpoint must return the whole snapshot, not a page of matches.
+def test_app_catalog_lists_every_reviewed_runnable_app(harness: ApiHarness) -> None:
+    """The selector must expose exactly the recipe-bound runnable catalog.
 
-    Search alone required knowing an app's name, which is unusable for an operator
-    who does not know what the snapshot contains.
+    The P1 evidence snapshot is larger than the product's reviewed recipe matrix.
+    Snapshot-only records must not become selectable runs that later fail.
     """
 
     response = harness.client.get("/api/apps")
@@ -624,8 +688,11 @@ def test_app_catalog_lists_every_verified_app(harness: ApiHarness) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["total"] == len(payload["items"])
-    # More than the 20-result search cap, and ordered by display name.
-    assert payload["total"] > 20
+    from ops.app_recipes import load_app_recipe_catalog
+
+    reviewed_slugs = {recipe.app_slug for recipe in load_app_recipe_catalog().apps}
+    assert payload["total"] == 50
+    assert {item["app_slug"] for item in payload["items"]} == reviewed_slugs
     names = [item["app_name"] for item in payload["items"]]
     assert names == sorted(names, key=str.casefold)
     assert any(item["app_slug"] == "pipedrive" for item in payload["items"])

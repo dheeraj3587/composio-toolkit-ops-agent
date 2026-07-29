@@ -24,13 +24,15 @@ from ops.email_verification import (
     parse_addresses,
     parse_received_at_ms,
     select_verification,
+    sender_authentication_method,
+    sender_domain_of,
 )
 from ops.gmail_worker import _message_timestamp, build_inbox_query
 
 _NOW = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
 _NOW_MS = int(_NOW.timestamp() * 1000)
 _IDENTITY = "ops.signup+hubspot@gmail.com"
-_REVIEWED = ("app.hubspot.com", "*.hubspot.com")
+_REVIEWED = ("hubspot.com", "app.hubspot.com", "*.hubspot.com")
 
 
 def _candidate(
@@ -41,6 +43,9 @@ def _candidate(
     age_seconds: int = 60,
     subject: str = "Verify your email",
     body: str = "Confirm here: https://app.hubspot.com/verify-email?token=abc123",
+    authentication_results: tuple[str, ...] = (),
+    arc_authentication_results: tuple[str, ...] = (),
+    arc_seals: tuple[str, ...] = (),
 ) -> VerificationCandidate:
     return VerificationCandidate(
         message_id=message_id,
@@ -49,6 +54,9 @@ def _candidate(
         received_at=_NOW_MS - age_seconds * 1000,
         subject=subject,
         body=body,
+        authentication_results=authentication_results,
+        arc_authentication_results=arc_authentication_results,
+        arc_seals=arc_seals,
     )
 
 
@@ -82,7 +90,7 @@ def test_build_inbox_query_still_accepts_supported_units() -> None:
 def test_gmail_freshness_query_uses_documented_after_operator() -> None:
     query = gmail_freshness_query(now=_NOW, max_age_seconds=900, recipient=_IDENTITY)
     assert "after:2026/07/25" in query
-    assert f"to:{_IDENTITY}" in query
+    assert f'to:"{_IDENTITY}"' in query
     assert "newer_than" not in query
 
 
@@ -143,6 +151,21 @@ def test_stale_message_is_refused() -> None:
     assert decision.reason_code == "verification_message_stale"
 
 
+def test_message_must_follow_the_current_challenge_with_only_small_skew() -> None:
+    challenge = _NOW_MS - 60_000
+    too_old = _select(
+        _candidate(age_seconds=120),
+        verification_requested_at_ms=challenge,
+    )
+    inside_skew = _select(
+        _candidate(age_seconds=85),
+        verification_requested_at_ms=challenge,
+    )
+    assert too_old.resolved is None
+    assert too_old.reason_code == "verification_precedes_current_challenge"
+    assert inside_skew.resolved is not None
+
+
 def test_unparsable_timestamp_is_refused_rather_than_assumed_fresh() -> None:
     candidate = VerificationCandidate(
         message_id="m1",
@@ -176,10 +199,10 @@ def test_exact_plus_tag_recipient_binds() -> None:
     assert decision.resolved.evidence.recipient_binding == "exact"
 
 
-def test_untagged_same_mailbox_is_accepted_as_canonical() -> None:
+def test_untagged_mailbox_cannot_satisfy_a_tagged_run_binding() -> None:
     decision = _select(_candidate(recipients=("ops.signup@gmail.com",)))
-    assert decision.resolved is not None
-    assert decision.resolved.evidence.recipient_binding == "canonical"
+    assert decision.resolved is None
+    assert decision.reason_code == "verification_recipient_tag_missing"
 
 
 def test_another_signups_tag_is_refused() -> None:
@@ -227,6 +250,122 @@ def test_sender_subdomain_matches_a_reviewed_wildcard() -> None:
     assert decision.resolved.evidence.sender_reviewed is True
 
 
+def test_wildcard_does_not_implicitly_review_its_apex_domain() -> None:
+    decision = _select(
+        _candidate(sender="noreply@hubspot.com"),
+        reviewed_sender_patterns=("*.hubspot.com",),
+    )
+    assert decision.resolved is None
+    assert decision.reason_code == "verification_sender_not_reviewed"
+
+
+def test_sender_domain_comes_from_the_single_rfc_mailbox_not_display_text() -> None:
+    assert sender_domain_of('"support@hubspot.com" <attacker@example.test>') == "example.test"
+    assert sender_domain_of("one@hubspot.com, two@hubspot.com") == ""
+    assert sender_domain_of("HubSpot <noreply@hubspot.com>") == "hubspot.com"
+
+
+def test_authenticated_sender_is_required_when_policy_is_enabled() -> None:
+    decision = _select(
+        _candidate(),
+        require_authenticated_sender=True,
+    )
+    assert decision.resolved is None
+    assert decision.reason_code == "verification_sender_authentication_missing"
+
+
+def test_gmail_dmarc_pass_is_preferred_and_recorded_without_header_data() -> None:
+    candidate = _candidate(
+        authentication_results=(
+            "mx.google.com; spf=pass smtp.mailfrom=mailer.hubspot.com; "
+            "dkim=pass header.i=@mail.hubspot.com; "
+            "dmarc=pass (p=NONE) header.from=hubspot.com",
+        )
+    )
+    decision = _select(candidate, require_authenticated_sender=True)
+    assert decision.resolved is not None
+    assert decision.resolved.evidence.sender_authentication == "dmarc"
+    serialized = decision.resolved.evidence.model_dump_json()
+    assert "smtp.mailfrom" not in serialized
+    assert "header.from" not in serialized
+
+
+def test_aligned_dkim_pass_is_accepted_when_dmarc_is_unavailable() -> None:
+    candidate = _candidate(
+        sender="noreply@mail.hubspot.com",
+        authentication_results=(
+            "mx.google.com; dkim=pass header.i=@hubspot.com header.s=mail; "
+            "spf=fail smtp.mailfrom=attacker.example",
+        ),
+    )
+    method, reason = sender_authentication_method(
+        candidate,
+        sender_domain="mail.hubspot.com",
+    )
+    assert (method, reason) == ("dkim", "verification_sender_authenticated")
+
+
+def test_unaligned_or_untrusted_authentication_results_fail_closed() -> None:
+    unaligned = _select(
+        _candidate(
+            authentication_results=(
+                "mx.google.com; dmarc=pass header.from=attacker.example; "
+                "dkim=pass header.d=attacker.example; "
+                "spf=pass smtp.mailfrom=attacker.example",
+            )
+        ),
+        require_authenticated_sender=True,
+    )
+    forged_authserv = _select(
+        _candidate(
+            authentication_results=("attacker.example; dmarc=pass header.from=hubspot.com",)
+        ),
+        require_authenticated_sender=True,
+    )
+    assert unaligned.resolved is None
+    assert unaligned.reason_code == "verification_sender_authentication_failed"
+    assert forged_authserv.resolved is None
+    assert forged_authserv.reason_code == "verification_sender_authentication_untrusted"
+
+
+def test_authentication_result_words_inside_a_failure_reason_are_not_methods() -> None:
+    decision = _select(
+        _candidate(
+            authentication_results=(
+                "mx.google.com; spf=fail "
+                'reason="dmarc=pass header.from=hubspot.com" '
+                "smtp.mailfrom=attacker.example",
+            ),
+        ),
+        require_authenticated_sender=True,
+    )
+    assert decision.resolved is None
+    assert decision.reason_code == "verification_sender_authentication_failed"
+
+
+def test_arc_authentication_requires_a_matching_validated_seal() -> None:
+    aar = "i=2; mx.google.com; dkim=pass header.d=hubspot.com; dmarc=pass header.from=hubspot.com"
+    accepted = _select(
+        _candidate(
+            authentication_results=("mx.google.com; dmarc=fail header.from=hubspot.com; arc=pass",),
+            arc_authentication_results=(aar,),
+            arc_seals=("i=2; a=rsa-sha256; cv=pass; d=google.com",),
+        ),
+        require_authenticated_sender=True,
+    )
+    rejected = _select(
+        _candidate(
+            arc_authentication_results=(aar,),
+            arc_seals=("i=2; a=rsa-sha256; cv=none; d=attacker.example",),
+        ),
+        require_authenticated_sender=True,
+    )
+    assert accepted.resolved is not None
+    assert accepted.resolved.evidence.sender_authentication == "dmarc"
+    assert rejected.resolved is None
+    assert rejected.reason_code == "verification_sender_authentication_untrusted"
+
+
 # --- link host binding --------------------------------------------------------
 def test_link_on_an_unreviewed_host_is_refused() -> None:
     decision = _select(_candidate(body="Verify: https://evil.example.com/verify-email?token=abc"))
@@ -242,6 +381,10 @@ def test_link_with_embedded_credentials_is_refused() -> None:
     # Synthetic userinfo, present only to prove such a URL is rejected.
     url = "https://user:pw@app.hubspot.com/verify"  # pragma: allowlist secret
     assert is_safe_verification_link(url, _REVIEWED) is False
+
+
+def test_link_on_a_nonstandard_https_port_is_refused() -> None:
+    assert is_safe_verification_link("https://app.hubspot.com:8443/verify", _REVIEWED) is False
 
 
 def test_missing_reviewed_host_set_fails_closed() -> None:
@@ -288,6 +431,18 @@ def test_evidence_never_carries_the_secret_or_link_path() -> None:
     assert repr(decision.resolved.secret).find("abc123") == -1
 
 
+def test_raw_candidate_repr_never_contains_mail_content_or_auth_headers() -> None:
+    candidate = _candidate(
+        subject="Your verification code is 481920",
+        body="Open https://app.hubspot.com/verify/opaque-value",
+        authentication_results=("mx.google.com; dmarc=pass header.from=hubspot.com",),
+    )
+    rendered = repr(candidate)
+    assert "481920" not in rendered
+    assert "opaque-value" not in rendered
+    assert "header.from" not in rendered
+
+
 def test_already_consumed_message_is_skipped_for_an_older_candidate() -> None:
     newest = _candidate(message_id="used", age_seconds=30)
     older = _candidate(message_id="unused", age_seconds=120)
@@ -332,9 +487,9 @@ def test_selection_is_deterministic_for_equal_timestamps() -> None:
     forward = _select(first, second)
     backward = _select(second, first)
     assert forward.resolved is not None and backward.resolved is not None
-    # Equal timestamps must not make the winner depend on provider list order in a
-    # way that changes which secret is injected across two identical polls.
-    assert forward.resolved.evidence.received_at_ms == backward.resolved.evidence.received_at_ms
+    # Equal timestamps must not make the winner depend on provider list order.
+    assert forward.resolved.evidence.message_id == "a"
+    assert backward.resolved.evidence.message_id == "a"
 
 
 def test_candidate_older_than_a_day_is_refused_even_with_a_coarse_query() -> None:

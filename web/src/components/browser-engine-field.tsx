@@ -35,7 +35,12 @@ export function BrowserEngineField<TValues extends BrowserEngineValues>({
     providerStates.find((state) => state.provider === provider)
 
   return (
-    <fieldset className="space-y-2" aria-describedby="browser-provider-message">
+    <fieldset
+      className="space-y-2"
+      aria-describedby="browser-provider-message"
+      aria-errormessage={invalid ? "browser-provider-message" : undefined}
+      aria-invalid={invalid}
+    >
       <legend className="flex w-full items-center justify-between gap-3 text-sm font-medium">
         Browser engine
         {invalid ? <span className="font-mono text-[9px] uppercase text-destructive">Review</span> : null}
@@ -44,7 +49,7 @@ export function BrowserEngineField<TValues extends BrowserEngineValues>({
         name={"browser_provider" as Path<TValues>}
         control={control}
         render={({ field }) => (
-          <div className="grid gap-3 sm:grid-cols-2" role="radiogroup" aria-label="Browser engine">
+          <div className="grid gap-3 sm:grid-cols-2">
             {([
               {
                 value: "playwright" as const,

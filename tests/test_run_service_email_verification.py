@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import SecretStr
@@ -23,6 +24,7 @@ from ops.email_verification import (
 from ops.run_service import RunService, _verification_backoff
 
 _LOGIN_EMAIL = "ops.signup+pipedrive@gmail.com"
+_ACCOUNT_REF = "acct_0123456789abcdef0123456789abcdef"
 
 
 class _StubStorage:
@@ -43,8 +45,10 @@ class _StubLoginStore:
     def __init__(self, values: dict[str, str] | None) -> None:
         self._values = values or {}
 
-    def get_account_login(self, *, app_slug: str, field: str) -> str | None:
+    def get_account_login(self, *, app_slug: str, account_ref: str, field: str) -> str | None:
         del app_slug
+        if account_ref != _ACCOUNT_REF:
+            return None
         return self._values.get(field)
 
 
@@ -61,7 +65,11 @@ def _service(
         "run_id": "run_1",
         "status": "waiting_for_hitl",
         "app_slug": app_slug,
-        "hitl_request": {"type": "email_otp"},
+        "browser_account_ref": _ACCOUNT_REF,
+        "hitl_request": {
+            "type": "email_otp",
+            "verification_requested_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        },
     }
     service.storage = _StubStorage(record)  # type: ignore[assignment]
     service._settings = settings or Settings(
@@ -100,13 +108,12 @@ def _decision(kind: str = "link") -> VerificationDecision:
 # --- binding levels -----------------------------------------------------------
 def test_binding_uses_the_remembered_login_email() -> None:
     service = _service(login={"login_email": _LOGIN_EMAIL, "login_password": "x"})
-    binding = service._verification_binding("pipedrive")
+    binding = service._verification_binding("pipedrive", account_ref=_ACCOUNT_REF)
     assert binding is not None
     assert binding.expected_recipient == _LOGIN_EMAIL
-    assert binding.reviewed_patterns == (
+    assert binding.allowed_link_host_patterns == (
+        "www.pipedrive.com",
         "app.pipedrive.com",
-        "developers.pipedrive.com",
-        "oauth.pipedrive.com",
     )
 
 
@@ -124,7 +131,7 @@ def test_binding_without_a_recipient_still_restricts_link_hosts() -> None:
     binding = service._verification_binding("pipedrive")
     assert binding is not None
     assert binding.expected_recipient is None
-    assert binding.reviewed_patterns  # host restriction survives
+    assert binding.allowed_link_host_patterns  # host restriction survives
 
 
 def test_app_without_a_reviewed_host_set_has_no_binding() -> None:
@@ -154,7 +161,13 @@ def test_require_binding_refuses_an_unbindable_run() -> None:
 
 
 def test_binding_not_required_by_default_preserves_existing_deployments() -> None:
-    service = _service(app_slug="whatsapp-business")
+    service = _service(
+        app_slug="whatsapp-business",
+        settings=Settings(
+            gmail_verification_require_binding=False,
+            gmail_verification_poll_seconds=0.0,
+        ),
+    )
     service._fetch_bound_verification = lambda **kwargs: _decision()  # type: ignore[assignment]
     service.resume_run = lambda run_id, **kwargs: {"run_id": run_id, **kwargs}  # type: ignore[assignment]
     assert service.resolve_email_verification("run_1") is not None
@@ -175,17 +188,33 @@ def test_polling_is_bounded_by_the_attempt_budget() -> None:
     assert attempts["count"] == 2
 
 
-def test_per_run_budget_stops_repeated_calls() -> None:
+def test_repeated_sweeps_continue_until_persisted_freshness_deadline() -> None:
     service = _service(login={"login_email": _LOGIN_EMAIL, "login_password": "x"})
+    fetches = 0
+
+    def _missing(**kwargs: Any) -> VerificationDecision:
+        nonlocal fetches
+        del kwargs
+        fetches += 1
+        return VerificationDecision(resolved=None, reason_code="verification_message_not_found")
+
+    service._fetch_bound_verification = _missing  # type: ignore[assignment]
+    service.resolve_email_verification("run_1")
+    service.resolve_email_verification("run_1")
+    service.resolve_email_verification("run_1")
+    assert service._otp_attempts["run_1"] == 3
+    assert fetches == 6
+
+    # The persisted gate timestamp, rather than an in-memory call count, bounds
+    # future sweeps and survives a process restart.
+    service.storage._record["hitl_request"]["verification_requested_at"] = (  # type: ignore[index,attr-defined]
+        "2000-01-01T00:00:00Z"
+    )
     service._fetch_bound_verification = lambda **kwargs: VerificationDecision(  # type: ignore[assignment]
         resolved=None, reason_code="verification_message_not_found"
     )
-    service.resolve_email_verification("run_1")
-    service.resolve_email_verification("run_1")
-    # The third call is refused outright because the run exhausted its budget.
-    assert service._otp_attempts["run_1"] == 2
     assert service.resolve_email_verification("run_1") is None
-    assert service._otp_attempts["run_1"] == 2
+    assert service._otp_attempts["run_1"] == 3
 
 
 def test_a_link_is_injected_as_the_verification_url_field() -> None:
@@ -212,7 +241,7 @@ def test_a_code_is_injected_as_the_otp_field() -> None:
     assert set(captured["browser_login"]) == {"login_otp"}
 
 
-def test_purpose_is_passed_through_so_flows_ledger_independently() -> None:
+def test_purpose_is_passed_through_as_verification_metadata() -> None:
     service = _service(login={"login_email": _LOGIN_EMAIL, "login_password": "x"})
     seen: dict[str, Any] = {}
 
@@ -224,6 +253,27 @@ def test_purpose_is_passed_through_so_flows_ledger_independently() -> None:
     service.resume_run = lambda run_id, **kwargs: {}  # type: ignore[assignment]
     service.resolve_email_verification("run_1", purpose="signup_confirmation")
     assert seen["purpose"] == "signup_confirmation"
+    assert isinstance(seen["verification_requested_at_ms"], int)
+
+
+def test_signup_verification_binds_to_the_run_scoped_staged_email() -> None:
+    service = _service(login=None)
+    service.storage._record["request"] = {"account_mode": "create_account"}  # type: ignore[attr-defined]
+    service._staged_signup_login_values = lambda **kwargs: {  # type: ignore[method-assign]
+        "login_email": SecretStr("ops.signup+pipedrive@gmail.com"),
+        "login_password": SecretStr("generated-password"),
+    }
+    seen: dict[str, Any] = {}
+
+    def _fetch(**kwargs: Any) -> VerificationDecision:
+        seen.update(kwargs)
+        return _decision()
+
+    service._fetch_bound_verification = _fetch  # type: ignore[assignment]
+    service.resume_run = lambda run_id, **kwargs: {}  # type: ignore[assignment]
+    service.resolve_email_verification("run_1", purpose="signup_confirmation")
+    binding = seen["binding"]
+    assert binding.expected_recipient == "ops.signup+pipedrive@gmail.com"
 
 
 # --- log safety ---------------------------------------------------------------

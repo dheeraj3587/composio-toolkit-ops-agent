@@ -76,7 +76,8 @@ def test_playwright_wiring_needs_an_execution_location(tmp_path: Path) -> None:
         allow_live_browser=True,
         browser_provider="playwright",
         browser_service_url="http://browser-worker:8081",
-        browser_service_token=SecretStr("service-token"),
+        browser_service_token=SecretStr("service-token-" + ("s" * 32)),
+        browser_session_capability_key=SecretStr("c" * 32),
     )
     assert svc._browser_provider_enabled(service_backed) is True
 
@@ -111,7 +112,8 @@ def test_registry_wires_both_configured_providers_concurrently(
         allow_live_browser=True,
         browser_use_api_key=SecretStr("browser-use-test-key"),
         browser_service_url="http://browser-worker:8081",
-        browser_service_token=SecretStr("service-test-token"),
+        browser_service_token=SecretStr("service-test-token-" + ("s" * 32)),
+        browser_session_capability_key=SecretStr("c" * 32),
         browser_use_compatibility_enabled=True,
     )
     service = _svc(tmp_path, settings)

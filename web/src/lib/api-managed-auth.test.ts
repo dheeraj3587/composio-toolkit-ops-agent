@@ -2,7 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 vi.mock("server-only", () => ({}))
 
-import { connectManagedRun, pollManagedConnection } from "@/lib/api"
+import {
+  connectManagedRun,
+  performPhaseAction,
+  pollManagedConnection,
+  resumeWithBrowserVerification,
+} from "@/lib/api"
 
 const RUN_ID = "run_0123456789abcdef0123456789abcdef"
 const response = {
@@ -71,5 +76,48 @@ describe("managed-auth API client", () => {
       `http://127.0.0.1:8000/api/runs/${RUN_ID}/poll-connection`,
     )
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: "POST", cache: "no-store" })
+  })
+
+  it("uses the long action timeout for bounded Gmail verification polling", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          run_id: RUN_ID,
+          action: "poll_email",
+          status: "no_change",
+          detail: null,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+    const timeout = vi.spyOn(AbortSignal, "timeout")
+
+    await performPhaseAction(RUN_ID, "poll-email")
+
+    expect(timeout).toHaveBeenCalledWith(330_000)
+    timeout.mockRestore()
+  })
+
+  it("sends a manual verification value only in the resume request body", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          run_id: RUN_ID,
+          action: "resume",
+          status: "accepted",
+          detail: null,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    const result = await resumeWithBrowserVerification(RUN_ID, { code: "654321" })
+
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit
+    expect(JSON.parse(String(request.body))).toEqual({
+      signal: "completed",
+      browser_verification: { code: "654321" },
+    })
+    expect(JSON.stringify(result)).not.toContain("654321")
   })
 })

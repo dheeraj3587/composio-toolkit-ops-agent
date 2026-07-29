@@ -181,7 +181,7 @@ class BrowserObservation:
 
 @dataclass(frozen=True, slots=True)
 class BrowserSessionContext:
-    """Sanitized session metadata; bearer capability URLs are never represented."""
+    """Sanitized session metadata; bearer capabilities are never represented."""
 
     profile_id: str
     session_id: str
@@ -190,6 +190,9 @@ class BrowserSessionContext:
     created_at: str
     inactivity_expires_at: str
     maximum_expires_at: str
+    # Non-secret immutable run identifier used by the API to re-derive the
+    # browser-service capability after a restart. The bearer value is never stored.
+    capability_scope: str = ""
 
 
 class TrustedRawBrowserOperation(Protocol[T_co]):
@@ -291,9 +294,12 @@ class BrowserWorker:
         recipe: AppRecipe | None = None,
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
+        signup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
-        del recipe  # Browser Use compatibility does not execute canonical recipes.
+        # Browser Use compatibility does not execute canonical recipes or the
+        # deterministic Playwright signup contract.
+        del recipe, signup_fields
         self._require_configuration()
         if context.session_id:
             self._research[context.session_id] = research
@@ -314,10 +320,14 @@ class BrowserWorker:
         *,
         recipe: AppRecipe | None = None,
         sensitive_data: Mapping[str, str] | None = None,
+        account_creation_requested: bool = False,
+        signup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
-        del recipe  # Browser Use compatibility does not execute canonical recipes.
+        # Browser Use compatibility does not execute canonical recipes or the
+        # deterministic Playwright signup contract.
+        del recipe, account_creation_requested, signup_fields
         self._require_configuration()
         resolved = research or self._research.get(context.session_id)
         if resolved is None:

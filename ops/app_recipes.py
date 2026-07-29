@@ -49,6 +49,7 @@ CredentialFieldKind = Literal[
 CaptureMode = Literal["managed_connection", "automatic", "owner_submit", "none"]
 BrowserRecipeScope = Literal["entry_only", "credential_surface"]
 BrowserAction = Literal["navigate", "authenticate_then_navigate", "capture_boundary"]
+SignupFlow = Literal["email_first"]
 HitlGate = Literal[
     "captcha",
     "mfa",
@@ -244,12 +245,55 @@ class BrowserStep(_RecipeModel):
         return self
 
 
+class SignupPolicy(_RecipeModel):
+    """Reviewed deterministic signup behavior for one browser recipe.
+
+    Signup policy is deliberately narrower than the general browser trace.  It
+    authorizes only a specific initial form shape and exact submit label; it never
+    grants the model authority to infer a registration flow from page prose.
+    """
+
+    flow: SignupFlow
+    entry_path_prefixes: tuple[str, ...] = Field(min_length=1, max_length=10)
+    entry_submit_labels: tuple[str, ...] = Field(min_length=1, max_length=10)
+    entry_submit_implies_legal_acceptance: bool
+
+    @field_validator("entry_path_prefixes")
+    @classmethod
+    def validate_entry_paths(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        paths = _unique(value, "signup entry paths", 10)
+        if any(
+            not item.startswith("/")
+            or "?" in item
+            or "#" in item
+            or "//" in item
+            or len(item) > 300
+            for item in paths
+        ):
+            raise ValueError("signup entry path must be an absolute path prefix")
+        return paths
+
+    @field_validator("entry_submit_labels")
+    @classmethod
+    def validate_submit_labels(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        labels = _unique(value, "signup submit labels", 10)
+        if any(len(item) > 120 for item in labels):
+            raise ValueError("signup submit label is too long")
+        return labels
+
+
 class BrowserRecipe(_RecipeModel):
     scope: BrowserRecipeScope
     exact_hosts: tuple[str, ...] = Field(min_length=1, max_length=30)
     identity_provider_hosts: tuple[str, ...] = Field(default=(), max_length=30)
     static_resource_hosts: tuple[str, ...] = Field(default=(), max_length=30)
+    # Email is a separate trust boundary from browser navigation. Sender domains
+    # and magic-link hosts must be reviewed explicitly rather than guessed from
+    # the browser allowlist or collapsed into one overly broad pattern set.
+    verification_sender_domains: tuple[str, ...] = Field(default=(), max_length=20)
+    verification_link_hosts: tuple[str, ...] = Field(default=(), max_length=20)
     sensitive_selectors: tuple[str, ...] = Field(min_length=1, max_length=30)
+    signup: SignupPolicy | None = None
     steps: tuple[BrowserStep, ...] = Field(min_length=1, max_length=12)
     success: SuccessPredicate
 
@@ -273,6 +317,14 @@ class BrowserRecipe(_RecipeModel):
     def validate_static_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(
             _host(item, "static-resource host", wildcard=True) for item in _unique(value, "hosts")
+        )
+
+    @field_validator("verification_sender_domains", "verification_link_hosts")
+    @classmethod
+    def validate_verification_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(
+            _host(item, "verification host", wildcard=True)
+            for item in _unique(value, "verification hosts", 20)
         )
 
     @field_validator("sensitive_selectors")
@@ -453,6 +505,25 @@ class AppRecipe(_RecipeModel):
             raise ValueError("login URL is outside exact navigation hosts")
         if first.action != "navigate" or first.target_url != self.urls.login:
             raise ValueError("first Playwright step must open the reviewed login URL")
+        if self.browser.signup is not None:
+            if self.urls.signup is None:
+                raise ValueError("signup policy requires a reviewed signup URL")
+            signup_url = urlsplit(self.urls.signup)
+            signup_host = (signup_url.hostname or "").casefold()
+            if signup_host not in self.browser.exact_hosts:
+                raise ValueError("signup URL is outside exact navigation hosts")
+            matches_entry = False
+            for raw_prefix in self.browser.signup.entry_path_prefixes:
+                prefix = raw_prefix.rstrip("/") or "/"
+                if signup_url.path == prefix or (
+                    prefix != "/" and signup_url.path.startswith(f"{prefix}/")
+                ):
+                    matches_entry = True
+                    break
+            if not matches_entry:
+                raise ValueError("signup URL does not match the reviewed entry path")
+        elif self.urls.signup is not None:
+            raise ValueError("signup URL requires a reviewed signup policy")
         if self.readiness_tier == "owner_submit_ready":
             if self.capture.mode != "owner_submit" or self.browser.scope != "entry_only":
                 raise ValueError("owner-submit route needs a reviewed entry-only policy")

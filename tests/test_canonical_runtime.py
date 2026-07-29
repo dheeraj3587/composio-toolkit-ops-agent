@@ -7,6 +7,7 @@ uses a research provider.
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from collections import Counter
 from collections.abc import Iterator, Mapping
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
@@ -30,6 +32,7 @@ from ops.app_recipes import (
     load_app_recipe_catalog,
     recipe_to_operational_research,
 )
+from ops.browser_account_binding import derive_browser_account_ref
 from ops.browser_worker import BrowserObservation, BrowserSessionContext
 from ops.canonical_runtime import CanonicalRuntime
 from ops.composio_managed_auth import ManagedConnectionPoll, ManagedConnectionStart
@@ -38,6 +41,8 @@ from ops.models import CompanyProfile, OperationsRequest
 from ops.p1_adapter import P1OperationalAdapter
 from ops.playwright_routing import select_initial_target
 from ops.run_errors import CredentialSubmissionError
+from ops.run_reconciliation import RunReconciliationService
+from ops.secret_store import SQLiteSecretStore
 from ops.storage import OperationsStorage, OperationsUnitOfWork
 
 
@@ -70,7 +75,7 @@ class _FakeManagedAuth:
     def __init__(self, storage: _TransactionTrackingStorage) -> None:
         self.storage = storage
         self.start_calls: list[tuple[str, str, str]] = []
-        self.poll_calls: list[str] = []
+        self.poll_calls: list[tuple[str, str | None]] = []
         self._effects: dict[str, str] = {}
         self._poll_index = 0
 
@@ -101,9 +106,14 @@ class _FakeManagedAuth:
             replayed=False,
         )
 
-    async def poll_connection(self, connection_request_id: str) -> ManagedConnectionPoll:
+    async def poll_connection(
+        self,
+        connection_request_id: str,
+        *,
+        toolkit_slug: str | None = None,
+    ) -> ManagedConnectionPoll:
         self._assert_outside_transaction()
-        self.poll_calls.append(connection_request_id)
+        self.poll_calls.append((connection_request_id, toolkit_slug))
         self._poll_index += 1
         if self._poll_index == 1:
             return ManagedConnectionPoll(
@@ -122,6 +132,8 @@ class _FakeManagedAuth:
 
 class _FakePlaywright:
     provider_name = "playwright"
+    requires_session_capability_scope = True
+    requires_secret_broker_grants = False
 
     def __init__(
         self,
@@ -141,15 +153,23 @@ class _FakePlaywright:
         self.sensitive_mapping: Mapping[str, str] | None = None
         self.saw_expected_login_secret = False
         self.capture_calls = 0
+        self.capture_capability_scope: str | None = None
+        self.capture_broker_grant: str | None = None
+        self.navigate_secret_grants: Mapping[str, str] | None = None
+        self.resume_secret_grants: Mapping[str, str] | None = None
+        self.worker_rpc_lock_free: list[bool] = []
+        self._runtime_context: Any = None
         self.released: list[str] = []
         self.start_failures = start_failures
+        self.start_storage_state: list[bool] = []
 
     def _assert_outside_transaction(self) -> None:
         assert self.storage.transaction_open is False
 
     async def start(self, profile_id: str | None, **kwargs: object) -> BrowserSessionContext:
-        del profile_id, kwargs
+        del profile_id
         self._assert_outside_transaction()
+        self.start_storage_state.append(bool(kwargs.get("use_storage_state", True)))
         self.starts += 1
         if self.starts <= self.start_failures:
             raise RuntimeError("synthetic browser start failure")
@@ -162,6 +182,7 @@ class _FakePlaywright:
             created_at="2026-07-28T00:00:00Z",
             inactivity_expires_at="2026-07-28T00:15:00Z",
             maximum_expires_at="2026-07-28T04:00:00Z",
+            capability_scope=str(kwargs.get("secret_scope") or ""),
         )
         self.started_context = context
         return context
@@ -177,15 +198,19 @@ class _FakePlaywright:
         *,
         recipe: object | None = None,
         sensitive_data: Mapping[str, str] | None = None,
+        secret_grants: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
+        signup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
-        del account_creation_requested, credential_creation_policy
+        del account_creation_requested, signup_fields, credential_creation_policy
         self._assert_outside_transaction()
         self.navigate_context = context
         self.navigate_research = research
         self.navigate_recipe = recipe
         self.sensitive_mapping = sensitive_data
+        self.navigate_secret_grants = secret_grants
+        self._record_rpc_lock_state(context.capability_scope)
         self.saw_expected_login_secret = bool(
             sensitive_data
             and sensitive_data.get("login_email") == "owner@example.test"
@@ -208,15 +233,26 @@ class _FakePlaywright:
         *,
         recipe: object | None = None,
         sensitive_data: Mapping[str, str] | None = None,
+        secret_grants: Mapping[str, str] | None = None,
+        account_creation_requested: bool = False,
+        signup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
-        del research, sensitive_data, credential_creation_policy
+        del (
+            research,
+            sensitive_data,
+            account_creation_requested,
+            signup_fields,
+            credential_creation_policy,
+        )
         self._assert_outside_transaction()
         assert signal == "captcha_completed"
         assert provider_session_id == "browser-service-session-1"
         self.resume_context = context
         self.resume_recipe = recipe
+        self.resume_secret_grants = secret_grants
+        self._record_rpc_lock_state(context.capability_scope)
         return BrowserObservation(
             status="credential_page_ready",
             current_url="https://app.pipedrive.com/settings/api",
@@ -230,12 +266,34 @@ class _FakePlaywright:
         secret_store: object,
         *,
         recipe: object | None = None,
+        capability_scope: str,
+        broker_grant: str | None = None,
     ) -> None:
         del session_id, app_slug, secret_store
         self._assert_outside_transaction()
         self.capture_calls += 1
         self.capture_recipe = recipe
+        self.capture_capability_scope = capability_scope
+        self.capture_broker_grant = broker_grant
+        self._record_rpc_lock_state(capability_scope)
         return None
+
+    def _record_rpc_lock_state(self, run_id: str) -> None:
+        if not self.requires_secret_broker_grants:
+            return
+        acquired: list[bool] = []
+
+        def contender() -> None:
+            lock = self._runtime_context._run_lock(run_id)
+            got_lock = lock.acquire(timeout=0.5)
+            acquired.append(got_lock)
+            if got_lock:
+                lock.release()
+
+        thread = threading.Thread(target=contender)
+        thread.start()
+        thread.join(timeout=1)
+        self.worker_rpc_lock_free.append(acquired == [True])
 
 
 class _FakeGmail:
@@ -270,11 +328,17 @@ class _RuntimeContext:
     ) -> None:
         self.storage = _TransactionTrackingStorage(tmp_path / "private" / "ops.db")
         self.p1_adapter = P1OperationalAdapter()
+        vault_key = Fernet.generate_key().decode("ascii")
         self._settings = SimpleNamespace(
             managed_auth_callback_base_url="https://ops.example.test",
+            browser_login_credential_reuse=True,
+            secret_vault_key=SecretStr(vault_key),
         )
         self._browser_threads: list[threading.Thread] = []
-        self._secret_store = None
+        self._secret_store = SQLiteSecretStore(
+            tmp_path / "private" / "vault.db",
+            vault_key,
+        )
         self._credential_validator = None
         self._managed_auth_provider = _FakeManagedAuth(self.storage)
         self._gmail_worker: Any = None
@@ -283,6 +347,8 @@ class _RuntimeContext:
             if with_browser
             else None
         )
+        if self.browser is not None:
+            self.browser._runtime_context = self
         self._locks: dict[str, threading.RLock] = {}
         self.remembered_login_fields: tuple[str, ...] = ()
         self.released_sessions: list[str] = []
@@ -302,18 +368,50 @@ class _RuntimeContext:
         scope_id: str,
         values: Mapping[str, SecretStr],
     ) -> dict[str, str]:
-        del provider, app_slug, scope_id
+        del provider
+        if self.browser is not None and self.browser.requires_secret_broker_grants:
+            return {
+                name: self._secret_store.put_transient(
+                    app_slug=app_slug,
+                    kind=f"browser_login_{name}",
+                    scope_id=scope_id,
+                    value=secret.get_secret_value(),
+                )
+                for name, secret in values.items()
+            }
         return {name: secret.get_secret_value() for name, secret in values.items()}
 
     def _remember_reusable_login(
         self,
         *,
         app_slug: str,
+        account_ref: str,
         values: Mapping[str, SecretStr],
     ) -> tuple[str, ...]:
-        del app_slug
-        self.remembered_login_fields = tuple(sorted(values))
+        pair = {
+            field: values[field].get_secret_value()
+            for field in ("login_email", "login_password")
+            if field in values
+        }
+        if set(pair) != {"login_email", "login_password"}:
+            return ()
+        self._secret_store.put_account_login_pair(
+            app_slug=app_slug,
+            account_ref=account_ref,
+            email=pair["login_email"],
+            password=pair["login_password"],
+        )
+        self.remembered_login_fields = ("login_email", "login_password")
         return self.remembered_login_fields
+
+    def _reusable_login_values(self, app_slug: str, account_ref: str) -> dict[str, SecretStr]:
+        return {
+            field: SecretStr(value)
+            for field, value in self._secret_store.get_account_login_pair(
+                app_slug=app_slug,
+                account_ref=account_ref,
+            ).items()
+        }
 
     def _finalize_captured_credentials(self, *args: object, **kwargs: object) -> object:
         del args, kwargs
@@ -355,6 +453,7 @@ def _request(app_name: str, *, browser_provider: str = "browser_use") -> Operati
     return OperationsRequest(
         app_name=app_name,
         company=_company(),
+        account_mode="existing_account",
         browser_provider=cast(Any, browser_provider),
         credential_creation_policy="reuse_only",
         dry_run=False,
@@ -365,6 +464,13 @@ def _join_browser(context: _RuntimeContext) -> None:
     for thread in list(context._browser_threads):
         thread.join(timeout=3)
         assert thread.is_alive() is False
+
+
+def _transient_secret_count(store: SQLiteSecretStore) -> int:
+    with sqlite3.connect(store.db_path) as connection:
+        row = connection.execute("SELECT COUNT(*) FROM vault_entries WHERE one_time = 1").fetchone()
+    assert row is not None
+    return int(row[0])
 
 
 def test_exact_fifty_recipe_matrix_routes_to_canonical_plan_state(tmp_path: Path) -> None:
@@ -466,6 +572,10 @@ def test_managed_connect_replay_and_poll_are_idempotent_and_outside_uow(
     assert active["state"] == "active"
     assert active["run"]["status"] == "completed"
     assert active["run"]["phase"] == "completed"
+    assert context._managed_auth_provider.poll_calls == [
+        ("connection_github", "github"),
+        ("connection_github", "github"),
+    ]
     persisted = context.storage.get_run(run_id)
     assert persisted is not None
     assert persisted["connection_request_id"] == "connection_github"
@@ -477,6 +587,36 @@ def test_managed_connect_replay_and_poll_are_idempotent_and_outside_uow(
     assert "connect.example.test" not in context.storage.db_path.read_text(
         encoding="utf-8", errors="ignore"
     )
+
+
+def test_managed_connect_and_poll_reject_unsafe_callback_before_provider_call(
+    tmp_path: Path,
+) -> None:
+    context = _RuntimeContext(tmp_path)
+    runtime = CanonicalRuntime(cast(Any, context))
+    created = runtime.create_run(
+        _request("GitHub"),
+        idempotency_key=None,
+        execution_mode="execute_when_configured",
+        browser_login=None,
+    )
+    run_id = str(created["run_id"])
+
+    context._settings.managed_auth_callback_base_url = "http://127.0.0.1"
+    with pytest.raises(CredentialSubmissionError) as connect_error:
+        runtime.connect_managed_run(run_id)
+
+    assert connect_error.value.reason_code == "managed_auth_callback_not_configured"
+    assert context._managed_auth_provider.start_calls == []
+
+    context._settings.managed_auth_callback_base_url = "https://ops.example.test"
+    runtime.connect_managed_run(run_id)
+    context._settings.managed_auth_callback_base_url = "https://ops.example.test/unreviewed-base"
+    with pytest.raises(CredentialSubmissionError) as poll_error:
+        runtime.poll_managed_connection(run_id)
+
+    assert poll_error.value.reason_code == "managed_auth_callback_not_configured"
+    assert context._managed_auth_provider.poll_calls == []
 
 
 def test_managed_and_gated_operations_ignore_catalog_mutation(
@@ -608,6 +748,15 @@ def test_pipedrive_same_session_resume_and_raw_login_non_persistence(tmp_path: P
     assert context.browser is not None
     assert context.browser.saw_expected_login_secret is True
     assert context.browser.sensitive_mapping == {}
+    assert context.browser.start_storage_state == [False]
+    account_ref = str(waiting["browser_account_ref"])
+    assert (
+        context._secret_store.get_account_login_pair(
+            app_slug="pipedrive",
+            account_ref=account_ref,
+        )
+        == {}
+    )
 
     resumed = runtime.resume_run(
         run_id,
@@ -635,10 +784,576 @@ def test_pipedrive_same_session_resume_and_raw_login_non_persistence(tmp_path: P
     assert capture_effect["provider"] == "playwright_vault"
     assert capture_effect["status"] == "completed"
     assert capture_effect["external_id"] == "no_credential_found"
+    assert context.browser.capture_capability_scope == run_id
+    assert context._secret_store.get_account_login_pair(
+        app_slug="pipedrive",
+        account_ref=account_ref,
+    ) == {
+        "login_email": "owner@example.test",
+        "login_password": "raw-login-secret",  # pragma: allowlist secret
+    }
+    assert any(
+        event["event_type"] == "existing_login_promoted"
+        for event in context.storage.list_audit_events(run_id)
+    )
     durable_text = context.storage.db_path.read_text(encoding="utf-8", errors="ignore")
     assert "raw-login-secret" not in durable_text
     assert "owner@example.test" not in durable_text
     assert "raw-login-secret" not in str(context.storage.list_audit_events(run_id))
+
+
+def test_isolated_worker_receives_exact_grants_with_no_run_lock_held(
+    tmp_path: Path,
+) -> None:
+    context = _RuntimeContext(tmp_path, with_browser=True)
+    assert context.browser is not None
+    context.browser.requires_secret_broker_grants = True
+    runtime = CanonicalRuntime(cast(Any, context))
+
+    created = runtime.create_run(
+        _request("Pipedrive", browser_provider="playwright"),
+        idempotency_key=None,
+        execution_mode="execute_when_configured",
+        browser_login={
+            "login_email": SecretStr("owner@example.test"),
+            "login_password": SecretStr("raw-login-secret"),
+        },
+    )
+    run_id = str(created["run_id"])
+    _join_browser(context)
+
+    assert set(context.browser.navigate_secret_grants or {}) == {
+        "login_email",
+        "login_password",
+    }
+    runtime.resume_run(
+        run_id,
+        signal="captcha_completed",
+        browser_login=None,
+    )
+
+    assert set(context.browser.resume_secret_grants or {}) == {
+        "login_email",
+        "login_password",
+    }
+    all_grants = (
+        *(context.browser.navigate_secret_grants or {}).values(),
+        *(context.browser.resume_secret_grants or {}).values(),
+        context.browser.capture_broker_grant,
+    )
+    assert all(
+        isinstance(grant, str) and grant.startswith("bsg_") and len(grant) == 47
+        for grant in all_grants
+    )
+    # navigate, resume and automatic capture each execute after their short
+    # reservation critical section has released the per-run lock.
+    assert context.browser.worker_rpc_lock_free == [True, True, True]
+
+
+def test_resume_grant_failure_discards_transients_before_worker_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _RuntimeContext(tmp_path, with_browser=True)
+    runtime = CanonicalRuntime(cast(Any, context))
+    created = runtime.create_run(
+        _request("Pipedrive", browser_provider="playwright"),
+        idempotency_key=None,
+        execution_mode="execute_when_configured",
+        browser_login=None,
+    )
+    run_id = str(created["run_id"])
+    _join_browser(context)
+    assert context.browser is not None
+    context.browser.requires_secret_broker_grants = True
+    durable_ref = context._secret_store.put(
+        app_slug="pipedrive",
+        kind="api_token",
+        value="durable-api-token",
+    )
+
+    def fail_grant_reservation(**_kwargs: object) -> dict[str, str]:
+        raise RuntimeError("synthetic resume grant failure")
+
+    monkeypatch.setattr(runtime, "_reserve_consume_grants_locked", fail_grant_reservation)
+    with pytest.raises(RuntimeError, match="synthetic resume grant failure"):
+        runtime.resume_run(
+            run_id,
+            signal="captcha_completed",
+            browser_login={
+                "login_email": SecretStr("owner@example.test"),
+                "login_password": SecretStr("raw-login-secret"),
+            },
+        )
+
+    assert context.browser.resume_context is None
+    assert _transient_secret_count(context._secret_store) == 0
+    assert context._secret_store.get(durable_ref) == "durable-api-token"
+
+
+def test_resume_failure_after_dispatch_does_not_delete_outcome_unknown_transients(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _RuntimeContext(tmp_path, with_browser=True)
+    runtime = CanonicalRuntime(cast(Any, context))
+    created = runtime.create_run(
+        _request("Pipedrive", browser_provider="playwright"),
+        idempotency_key=None,
+        execution_mode="execute_when_configured",
+        browser_login=None,
+    )
+    run_id = str(created["run_id"])
+    _join_browser(context)
+    assert context.browser is not None
+    context.browser.requires_secret_broker_grants = True
+    dispatched_references: dict[str, str] = {}
+
+    async def fail_after_dispatch(
+        _context: BrowserSessionContext,
+        _signal: str,
+        _research: object,
+        **kwargs: object,
+    ) -> BrowserObservation:
+        sensitive_data = kwargs.get("sensitive_data")
+        assert isinstance(sensitive_data, Mapping)
+        dispatched_references.update(cast(Mapping[str, str], sensitive_data))
+        raise RuntimeError("synthetic post-dispatch failure")
+
+    monkeypatch.setattr(context.browser, "resume_after_hitl", fail_after_dispatch)
+    failed = runtime.resume_run(
+        run_id,
+        signal="captcha_completed",
+        browser_login={
+            "login_email": SecretStr("owner@example.test"),
+            "login_password": SecretStr("raw-login-secret"),
+        },
+    )
+
+    assert failed["status"] == "failed"
+    assert set(dispatched_references) == {"login_email", "login_password"}
+    assert _transient_secret_count(context._secret_store) == 2
+    for field_name, reference in dispatched_references.items():
+        context._secret_store.consume_transient(
+            reference,
+            expected_app_slug="pipedrive",
+            expected_kind=f"browser_login_{field_name}",
+            expected_scope_id=run_id,
+        )
+    assert _transient_secret_count(context._secret_store) == 0
+
+
+def test_rejected_existing_login_never_replaces_known_good_pair(tmp_path: Path) -> None:
+    context = _RuntimeContext(tmp_path, with_browser=True)
+    runtime = CanonicalRuntime(cast(Any, context))
+    submitted = {
+        "login_email": SecretStr("owner@example.test"),
+        "login_password": SecretStr("typed-wrong-password"),
+    }
+    account_ref = derive_browser_account_ref(
+        run_id="run_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        app_slug="pipedrive",
+        work_email_ref=_company().work_email_ref,
+        browser_login=submitted,
+        binding_secret=context._settings.secret_vault_key,
+    )
+    context._secret_store.put_account_login_pair(
+        app_slug="pipedrive",
+        account_ref=account_ref,
+        email="owner@example.test",
+        password="known-good-password",  # pragma: allowlist secret
+    )
+
+    created = runtime.create_run(
+        _request("Pipedrive", browser_provider="playwright"),
+        idempotency_key=None,
+        execution_mode="execute_when_configured",
+        browser_login=submitted,
+    )
+    run_id = str(created["run_id"])
+    _join_browser(context)
+    assert context._secret_store.get_account_login_pair(
+        app_slug="pipedrive",
+        account_ref=account_ref,
+    ) == {
+        "login_email": "owner@example.test",
+        "login_password": "known-good-password",  # pragma: allowlist secret
+    }
+    assert context.browser is not None and context.browser.started_context is not None
+    recipe = get_app_recipe("pipedrive")
+    assert recipe is not None
+
+    failed = runtime._apply_browser_observation(
+        run_id,
+        observation=BrowserObservation(
+            status="failed",
+            current_url="https://app.pipedrive.com/auth/login",
+            page_title="Pipedrive login",
+            reason_code="authentication_failed",
+        ),
+        research=recipe_to_operational_research(recipe),
+        request=_request("Pipedrive", browser_provider="playwright"),
+        recipe=recipe,
+        context=context.browser.started_context,
+    )
+
+    assert failed is not None and failed["status"] == "failed"
+    assert context._secret_store.get_account_login_pair(
+        app_slug="pipedrive",
+        account_ref=account_ref,
+    ) == {
+        "login_email": "owner@example.test",
+        "login_password": "known-good-password",  # pragma: allowlist secret
+    }
+
+
+def test_later_run_seeds_the_only_complete_reusable_account(tmp_path: Path) -> None:
+    context = _RuntimeContext(tmp_path, with_browser=True)
+    runtime = CanonicalRuntime(cast(Any, context))
+    context._secret_store.put_account_login_pair(
+        app_slug="pipedrive",
+        account_ref="acct_0123456789abcdef0123456789abcdef",
+        email="owner@example.test",
+        password="raw-login-secret",  # pragma: allowlist secret
+    )
+
+    created = runtime.create_run(
+        _request("Pipedrive", browser_provider="playwright"),
+        idempotency_key=None,
+        execution_mode="execute_when_configured",
+        browser_login=None,
+    )
+    _join_browser(context)
+
+    persisted = context.storage.get_run(str(created["run_id"]))
+    assert persisted is not None
+    assert persisted["browser_account_ref"] == "acct_0123456789abcdef0123456789abcdef"
+    assert context.browser is not None
+    assert context.browser.saw_expected_login_secret is True
+    assert context.browser.start_storage_state == [True]
+
+
+def test_ambiguous_reusable_accounts_fail_closed_before_browser_start(tmp_path: Path) -> None:
+    context = _RuntimeContext(tmp_path, with_browser=True)
+    runtime = CanonicalRuntime(cast(Any, context))
+    for account_ref, email in (
+        ("acct_0123456789abcdef0123456789abcdef", "one@example.test"),
+        ("acct_fedcba9876543210fedcba9876543210", "two@example.test"),
+    ):
+        context._secret_store.put_account_login_pair(
+            app_slug="pipedrive",
+            account_ref=account_ref,
+            email=email,
+            password="known-password",  # pragma: allowlist secret
+        )
+
+    result = runtime.create_run(
+        _request("Pipedrive", browser_provider="playwright"),
+        idempotency_key=None,
+        execution_mode="execute_when_configured",
+        browser_login=None,
+    )
+
+    assert result["status"] == "configuration_required"
+    assert result["phase"] == "login_account_selection"
+    assert result["reason_code"] == "stored_login_account_ambiguous"
+    assert context.browser is not None and context.browser.starts == 0
+
+
+def test_idempotent_replay_continues_pristine_staged_browser_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _RuntimeContext(tmp_path, with_browser=True)
+    runtime = CanonicalRuntime(cast(Any, context))
+    request = _request("Pipedrive", browser_provider="playwright")
+    login = {
+        "login_email": SecretStr("owner@example.test"),
+        "login_password": SecretStr("raw-login-secret"),
+    }
+    original_start = runtime._start_playwright
+
+    def crash_before_dispatch(*_args: object, **_kwargs: object) -> dict[str, Any]:
+        raise RuntimeError("simulated process exit before browser dispatch")
+
+    monkeypatch.setattr(runtime, "_start_playwright", crash_before_dispatch)
+    with pytest.raises(RuntimeError, match="simulated process exit"):
+        runtime.create_run(
+            request,
+            idempotency_key="idem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            execution_mode="execute_when_configured",
+            browser_login=login,
+        )
+    persisted = context.storage.get_idempotent_run("idem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    assert persisted is not None
+    original_run = persisted[0]
+    assert original_run["phase"] == "browser_pending"
+    assert original_run["attempt"] == 0
+
+    monkeypatch.setattr(runtime, "_start_playwright", original_start)
+    replayed = runtime.create_run(
+        request,
+        idempotency_key="idem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        execution_mode="execute_when_configured",
+        browser_login=login,
+    )
+    _join_browser(context)
+
+    assert replayed["run_id"] == original_run["run_id"]
+    assert replayed["status"] == "browser_running"
+    assert context.browser is not None
+    assert context.browser.starts == 1
+    assert context.browser.saw_expected_login_secret is True
+    assert context.browser.start_storage_state == [False]
+
+
+def test_idempotent_replay_never_duplicates_a_reserved_browser_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _RuntimeContext(tmp_path, with_browser=True)
+    runtime = CanonicalRuntime(cast(Any, context))
+    request = _request("Pipedrive", browser_provider="playwright")
+    login = {
+        "login_email": SecretStr("owner@example.test"),
+        "login_password": SecretStr("raw-login-secret"),
+    }
+    assert context.browser is not None
+    browser = context.browser
+    browser.requires_secret_broker_grants = True
+    original_start = browser.start
+
+    async def crash_after_reservation(
+        _profile_id: str | None,
+        **_kwargs: object,
+    ) -> BrowserSessionContext:
+        browser.starts += 1
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(browser, "start", crash_after_reservation)
+    with pytest.raises(KeyboardInterrupt):
+        runtime.create_run(
+            request,
+            idempotency_key="idem_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            execution_mode="execute_when_configured",
+            browser_login=login,
+        )
+    persisted = context.storage.get_idempotent_run("idem_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    assert persisted is not None
+    assert persisted[0]["attempt"] == 1
+    assert (
+        context.storage.get_side_effect(
+            str(persisted[0]["run_id"]),
+            f"{persisted[0]['run_id']}:browser-start:v1",
+        )
+        is not None
+    )
+    assert _transient_secret_count(context._secret_store) == 0
+
+    monkeypatch.setattr(browser, "start", original_start)
+    replayed = runtime.create_run(
+        request,
+        idempotency_key="idem_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        execution_mode="execute_when_configured",
+        browser_login=login,
+    )
+
+    assert replayed["run_id"] == persisted[0]["run_id"]
+    assert replayed["status"] == "configuration_required"
+    assert replayed["phase"] == "effect_reconciliation"
+    assert replayed["reason_code"] == "browser_start_reconciliation_required"
+    assert browser.starts == 1
+    assert _transient_secret_count(context._secret_store) == 0
+
+
+def test_browser_start_failure_discards_only_run_scoped_transient_login(
+    tmp_path: Path,
+) -> None:
+    context = _RuntimeContext(tmp_path, with_browser=True, browser_start_failures=1)
+    assert context.browser is not None
+    context.browser.requires_secret_broker_grants = True
+    durable_ref = context._secret_store.put(
+        app_slug="pipedrive",
+        kind="api_token",
+        value="durable-api-token",
+    )
+    runtime = CanonicalRuntime(cast(Any, context))
+
+    failed = runtime.create_run(
+        _request("Pipedrive", browser_provider="playwright"),
+        idempotency_key=None,
+        execution_mode="execute_when_configured",
+        browser_login={
+            "login_email": SecretStr("owner@example.test"),
+            "login_password": SecretStr("raw-login-secret"),
+        },
+    )
+
+    assert failed["status"] == "failed"
+    assert failed["phase"] == "browser_start_failed"
+    assert _transient_secret_count(context._secret_store) == 0
+    assert context._secret_store.get(durable_ref) == "durable-api-token"
+
+
+def test_browser_session_is_released_and_transients_discarded_when_state_commit_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _RuntimeContext(tmp_path, with_browser=True)
+    assert context.browser is not None
+    context.browser.requires_secret_broker_grants = True
+    runtime = CanonicalRuntime(cast(Any, context))
+    request = _request("Pipedrive", browser_provider="playwright")
+    created = runtime.create_run(
+        request,
+        idempotency_key=None,
+        execution_mode="plan_only",
+        browser_login=None,
+    )
+    recipe = get_app_recipe("pipedrive")
+    assert recipe is not None
+    original_unit_of_work = context.storage.unit_of_work
+    unit_of_work_calls = 0
+
+    @contextmanager
+    def fail_second_unit_of_work() -> Iterator[OperationsUnitOfWork]:
+        nonlocal unit_of_work_calls
+        unit_of_work_calls += 1
+        if unit_of_work_calls == 2:
+            raise RuntimeError("synthetic browser state commit failure")
+        with original_unit_of_work() as transaction:
+            yield transaction
+
+    monkeypatch.setattr(context.storage, "unit_of_work", fail_second_unit_of_work)
+    with pytest.raises(RuntimeError, match="synthetic browser state commit failure"):
+        runtime._start_playwright(
+            str(created["run_id"]),
+            request=request,
+            research=recipe_to_operational_research(recipe),
+            recipe=recipe,
+            browser_login={
+                "login_email": SecretStr("owner@example.test"),
+                "login_password": SecretStr("raw-login-secret"),
+            },
+        )
+
+    assert context.browser.started_context is not None
+    assert context.released_sessions == [context.browser.started_context.session_id]
+    assert _transient_secret_count(context._secret_store) == 0
+
+
+def test_browser_thread_start_failure_releases_session_and_discards_transients(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _RuntimeContext(tmp_path, with_browser=True)
+    assert context.browser is not None
+    context.browser.requires_secret_broker_grants = True
+    runtime = CanonicalRuntime(cast(Any, context))
+
+    def fail_thread_start(_thread: threading.Thread) -> None:
+        raise RuntimeError("synthetic thread start failure")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_thread_start)
+    failed = runtime.create_run(
+        _request("Pipedrive", browser_provider="playwright"),
+        idempotency_key=None,
+        execution_mode="execute_when_configured",
+        browser_login={
+            "login_email": SecretStr("owner@example.test"),
+            "login_password": SecretStr("raw-login-secret"),
+        },
+    )
+
+    assert failed["status"] == "failed"
+    assert failed["phase"] == "browser_start_failed"
+    assert failed["reason_code"] == "browser_dispatch_failed"
+    assert context.browser.started_context is not None
+    assert context.released_sessions == [context.browser.started_context.session_id]
+    assert context._browser_threads == []
+    assert _transient_secret_count(context._secret_store) == 0
+
+
+def test_navigation_grant_failure_discards_transients_before_worker_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _RuntimeContext(tmp_path, with_browser=True)
+    assert context.browser is not None
+    context.browser.requires_secret_broker_grants = True
+    runtime = CanonicalRuntime(cast(Any, context))
+
+    def fail_grant_reservation(**_kwargs: object) -> dict[str, str]:
+        raise RuntimeError("synthetic grant reservation failure")
+
+    monkeypatch.setattr(runtime, "_reserve_consume_grants_locked", fail_grant_reservation)
+    created = runtime.create_run(
+        _request("Pipedrive", browser_provider="playwright"),
+        idempotency_key=None,
+        execution_mode="execute_when_configured",
+        browser_login={
+            "login_email": SecretStr("owner@example.test"),
+            "login_password": SecretStr("raw-login-secret"),
+        },
+    )
+    _join_browser(context)
+
+    persisted = context.storage.get_run(str(created["run_id"]))
+    assert persisted is not None
+    assert persisted["status"] == "failed"
+    assert context.browser.navigate_context is None
+    assert _transient_secret_count(context._secret_store) == 0
+
+
+def test_delayed_reconciliation_continues_pristine_browser_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _RuntimeContext(tmp_path, with_browser=True)
+    runtime = CanonicalRuntime(cast(Any, context))
+    login = {
+        "login_email": SecretStr("owner@example.test"),
+        "login_password": SecretStr("raw-login-secret"),
+    }
+    original_start = runtime._start_playwright
+
+    def crash_before_dispatch(*_args: object, **_kwargs: object) -> dict[str, Any]:
+        raise RuntimeError("simulated process exit before browser dispatch")
+
+    monkeypatch.setattr(runtime, "_start_playwright", crash_before_dispatch)
+    with pytest.raises(RuntimeError, match="simulated process exit"):
+        runtime.create_run(
+            _request("Pipedrive", browser_provider="playwright"),
+            idempotency_key=None,
+            execution_mode="execute_when_configured",
+            browser_login=login,
+        )
+    pending = next(
+        record
+        for record in context.storage.list_runs(limit=10, offset=0)
+        if record["phase"] == "browser_pending"
+    )
+    monkeypatch.setattr(runtime, "_start_playwright", original_start)
+    monkeypatch.setattr(
+        context,
+        "_continue_pristine_playwright_run",
+        lambda record: runtime._continue_pristine_playwright_run(
+            record,
+            browser_login=None,
+        ),
+        raising=False,
+    )
+
+    RunReconciliationService(cast(Any, context)).reconcile_stranded_runs()
+    _join_browser(context)
+
+    recovered = context.storage.get_run(str(pending["run_id"]))
+    assert recovered is not None
+    assert recovered["status"] == "waiting_for_hitl"
+    assert recovered["attempt"] == 1
+    assert context.browser is not None
+    assert context.browser.starts == 1
+    assert context.browser.saw_expected_login_secret is True
 
 
 def test_capture_effect_replay_requires_reconciliation_without_recapture(tmp_path: Path) -> None:
@@ -880,12 +1595,13 @@ class _ManagedEndpointService:
 def test_managed_api_endpoints_are_owner_gated_typed_and_no_store(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    internal_token = "canonical-runtime-internal-token-" + ("i" * 32)
     monkeypatch.setenv("ALLOW_LOCAL_CREDENTIAL_SUBMISSION", "true")
-    monkeypatch.setenv("OPS_INTERNAL_API_TOKEN", "canonical-runtime-test-token")
+    monkeypatch.setenv("OPS_INTERNAL_API_TOKEN", internal_token)
     service = _ManagedEndpointService()
     application = create_app(service=cast(Any, service))
     run_id = "run_00000000000000000000000000000000"
-    headers = {"X-Ops-Internal-Token": "canonical-runtime-test-token"}
+    headers = {"X-Ops-Internal-Token": internal_token}
 
     with TestClient(application, raise_server_exceptions=False) as client:
         connected = client.post(f"/api/runs/{run_id}/connect", headers=headers)

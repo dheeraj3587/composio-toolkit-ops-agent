@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import os
 import sys
 from dataclasses import dataclass
 from typing import Literal
 
+from ops.browser_process_hardening import harden_playwright_parent_process
 from ops.config import Settings
 from ops.state import BrowserProvider
 
@@ -46,8 +48,8 @@ def browser_configuration_state(
 
     Playwright needs the live opt-in AND an actual place to execute: either the
     explicit in-process sandbox (tests/local debugging) or a reachable browser
-    service (URL + token). The live opt-in alone is not "configured", because the
-    factory fails closed in that state.
+    service (URL + RPC token + API-only session-capability key). The live opt-in
+    alone is not "configured", because the factory fails closed in that state.
     """
 
     selected = provider or settings.browser_provider
@@ -56,7 +58,11 @@ def browser_configuration_state(
             return False
         if bool(getattr(settings, "playwright_in_process_sandbox", False)):
             return True
-        return bool(settings.browser_service_url and settings.browser_service_token is not None)
+        return bool(
+            settings.browser_service_url
+            and settings.browser_service_token is not None
+            and settings.browser_session_capability_key is not None
+        )
     return bool(settings.allow_live_browser and settings.browser_use_api_key is not None)
 
 
@@ -74,19 +80,49 @@ async def probe_playwright(*, timeout_seconds: float = 30.0) -> BrowserReadiness
             reason_code="playwright_not_installed",
             detail="The playwright package is not installed in this image.",
         )
+    try:
+        harden_playwright_parent_process()
+    except RuntimeError:
+        return BrowserReadiness(
+            status="unavailable",
+            reason_code="playwright_parent_process_hardening_failed",
+            detail="The Playwright parent process failed its security contract.",
+        )
 
     settings = Settings.from_env()
-    args = ["--disable-dev-shm-usage"]
-    if bool(getattr(settings, "playwright_disable_sandbox", False)):
+    sandbox_disabled = bool(getattr(settings, "playwright_disable_sandbox", False))
+    interactive = bool(getattr(settings, "browser_interactive_hitl_enabled", False))
+    if interactive and not os.environ.get("DISPLAY"):
+        return BrowserReadiness(
+            status="unavailable",
+            reason_code="interactive_display_missing",
+            detail="Interactive Chromium requires an available X display.",
+        )
+    args: list[str] = []
+    if sandbox_disabled:
         args.append("--no-sandbox")
+
+    # The readiness browser runs in the same secret-bearing worker process as
+    # real sessions. It must use the identical strict child environment rather
+    # than inheriting broker, storage, RPC, or provider credentials merely
+    # because it is short-lived.
+    from ops.playwright_worker import PlaywrightBrowserWorker, _launch_reason_code
+
+    launch_env = PlaywrightBrowserWorker._launch_env(None, headless=not interactive)
 
     async def _run() -> BrowserReadiness:
         playwright = await module.async_playwright().start()
         try:
-            browser = await playwright.chromium.launch(headless=True, args=args)
+            browser = await playwright.chromium.launch(
+                # Production sessions are headed when interactive HITL is enabled.
+                # Readiness must prove that exact launch mode; a headless-only
+                # probe can stay green while every real headed session crashes.
+                headless=not interactive,
+                args=args,
+                chromium_sandbox=not sandbox_disabled,
+                env=launch_env,
+            )
         except Exception as exc:
-            from ops.playwright_worker import _launch_reason_code
-
             return BrowserReadiness(
                 status="unavailable",
                 reason_code=_launch_reason_code(exc),

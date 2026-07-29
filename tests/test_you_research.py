@@ -387,6 +387,7 @@ class TestResearchHostPolicy:
             "app.pipedrive.com",
             "developers.pipedrive.com",
             "oauth.pipedrive.com",
+            "www.pipedrive.com",
         )
 
     def test_provider_include_domains_are_bare(self) -> None:

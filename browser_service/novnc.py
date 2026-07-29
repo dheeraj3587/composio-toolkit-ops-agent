@@ -81,6 +81,7 @@ def authorize_live_view(
     interactive_enabled: bool,
     view_allowed: bool = True,
     hitl_pending: bool = False,
+    hitl_generation: int = 0,
 ) -> str:
     """Authorize one view/control attachment and return its signed capability.
 
@@ -101,6 +102,7 @@ def authorize_live_view(
             secret=secret,
             expected_session_id=session_id,
             expected_owner=caller_owner,
+            expected_hitl_generation=hitl_generation,
         )
     except LiveViewTokenError as exc:
         # Reason code only: the token itself is never echoed or logged.

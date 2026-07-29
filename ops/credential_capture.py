@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
+from ops.browser_process_hardening import harden_playwright_parent_process
 from ops.browser_worker import is_allowed_browser_url, validate_allowed_domains
 from ops.models import validate_vault_reference
 from ops.provider_errors import ConfigurationRequiredError, PhaseUnavailableError
@@ -51,6 +52,7 @@ class CredentialCapture:
         self._require_configuration()
         _validate_capture_request(cdp_url, app_slug, field_selectors)
         module = importlib.import_module("playwright.async_api")
+        harden_playwright_parent_process()
         async_playwright = module.async_playwright
         browser: Any | None = None
         async with async_playwright() as playwright:

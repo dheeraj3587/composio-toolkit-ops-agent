@@ -1,0 +1,16 @@
+# syntax=docker/dockerfile:1
+
+# Docker Hub official-image index digest for caddy:2.11.4-alpine,
+# reviewed 2026-07-29. Baking the Caddyfile into the SHA-tagged candidate makes
+# edge configuration part of the same transactional release as the app images.
+FROM caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
+
+ARG APP_REVISION=local-uncommitted
+LABEL org.opencontainers.image.revision=$APP_REVISION
+
+COPY --chown=root:root deploy/Caddyfile /etc/caddy/Caddyfile
+RUN chmod 0444 /etc/caddy/Caddyfile \
+    && DOMAIN=localhost \
+       ACME_EMAIL=validation@example.invalid \
+       BROWSER_SERVICE_OWNER=build-validation \
+       caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import threading
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
@@ -44,6 +45,9 @@ class ManagedSession:
     session_id: str
     owner: str
     app_slug: str
+    # SHA-256 of the API-derived run capability. The bearer value itself is never
+    # retained in manager state or exposed by SessionSummary.
+    session_capability_digest: bytes = b""
     # The WORKER-side handle for the real browser. Explicit ownership: the manager
     # closes the session through the worker rather than reaching into Playwright
     # objects it never actually held (previously `page` was assigned a private
@@ -84,6 +88,10 @@ class ManagedSession:
     capacity_released: bool = False
     # HITL state.
     hitl_pending: bool = False
+    # Incremented every time the session enters a new human-action gate. Live
+    # control grants are bound to this generation so a token from an earlier
+    # pause cannot become valid again during a later pause.
+    hitl_generation: int = 0
     live_view_mode: LiveViewMode = "screenshot"
     hitl_reason_code: str = ""
     # Timestamps.
@@ -151,6 +159,10 @@ class SessionManager:
         # Race-free admission: two concurrent creates must not both pass.
         self._capacity = threading.BoundedSemaphore(max_sessions)
         self._in_use = 0
+        # Deployment/backup drain gate. Admission and toggling use the SAME lock,
+        # so a racing create is linearized either wholly before begin_drain()
+        # (and may finish) or wholly after it (and is refused).
+        self._accepting_new_sessions = True
         self._closer = closer
         # Answers "is a human attached to this session's interactive relay right
         # now?". Injected so the manager needs no knowledge of the WebSocket layer.
@@ -198,10 +210,35 @@ class SessionManager:
         with self._lock:
             return self._in_use
 
-    def _acquire_capacity(self) -> None:
-        if not self._capacity.acquire(blocking=False):
-            raise SessionUnavailable("capacity_exhausted")
+    @property
+    def accepting_new_sessions(self) -> bool:
         with self._lock:
+            return self._accepting_new_sessions
+
+    def drain_status(self) -> tuple[bool, int, int]:
+        """Return one atomic, deliberately minimal admission/capacity snapshot."""
+
+        with self._lock:
+            return self._accepting_new_sessions, self._in_use, self._max_sessions
+
+    def begin_drain(self) -> None:
+        """Atomically reject new sessions while preserving every existing lease."""
+
+        with self._lock:
+            self._accepting_new_sessions = False
+
+    def undrain(self) -> None:
+        """Atomically reopen admission after a deployment/backup attempt."""
+
+        with self._lock:
+            self._accepting_new_sessions = True
+
+    def _acquire_capacity(self) -> None:
+        with self._lock:
+            if not self._accepting_new_sessions:
+                raise SessionUnavailable("service_draining")
+            if not self._capacity.acquire(blocking=False):
+                raise SessionUnavailable("capacity_exhausted")
             self._in_use += 1
 
     def _release_capacity(self, session: ManagedSession) -> None:
@@ -222,6 +259,7 @@ class SessionManager:
         owner: str,
         app_slug: str,
         live_view_mode: LiveViewMode,
+        session_capability_digest: bytes = b"",
         secret_scope: str = "",
         account_ref: str | None = None,
     ) -> ManagedSession:
@@ -231,6 +269,7 @@ class SessionManager:
             session_id=f"bs_{uuid4().hex}",
             owner=owner,
             app_slug=app_slug,
+            session_capability_digest=session_capability_digest,
             secret_scope=secret_scope,
             account_ref=account_ref,
             live_view_mode=live_view_mode,
@@ -246,6 +285,7 @@ class SessionManager:
         self,
         *,
         owner: str,
+        session_capability_digest: bytes,
         app_slug: str,
         secret_scope: str,
         account_ref: str,
@@ -253,15 +293,26 @@ class SessionManager:
         """Return only live sessions matching an exact browser-start binding."""
 
         with self._lock:
-            return tuple(
-                session.session_id
-                for session in self._sessions.values()
-                if session.lifecycle in {"ACTIVE", "CLOSING"}
-                and session.owner == owner
-                and session.app_slug == app_slug
-                and session.secret_scope == secret_scope
-                and session.account_ref == account_ref
-            )
+            matched: list[str] = []
+            for session in self._sessions.values():
+                if session.lifecycle not in {"ACTIVE", "CLOSING"}:
+                    continue
+                # Always execute BOTH constant-time authority comparisons. Do not
+                # reveal through timing whether a guessed tenant was correct.
+                owner_matches = hmac.compare_digest(session.owner, owner)
+                capability_matches = hmac.compare_digest(
+                    session.session_capability_digest,
+                    session_capability_digest,
+                )
+                authority_matches = owner_matches and capability_matches
+                if (
+                    authority_matches
+                    and session.app_slug == app_slug
+                    and session.secret_scope == secret_scope
+                    and session.account_ref == account_ref
+                ):
+                    matched.append(session.session_id)
+            return tuple(matched)
 
     def get(self, session_id: str) -> ManagedSession:
         with self._lock:
@@ -422,8 +473,15 @@ class SessionManager:
             self.janitor_running = False
 
     async def close_all(self) -> None:
-        for session in self.all_sessions():
-            await self.close(session.session_id, reason_code="service_shutdown")
+        sessions = self.all_sessions()
+        if sessions:
+            await asyncio.gather(
+                *(
+                    self.close(session.session_id, reason_code="service_shutdown")
+                    for session in sessions
+                ),
+                return_exceptions=True,
+            )
 
 
 __all__ = ["ManagedSession", "SessionManager", "SessionUnavailable"]

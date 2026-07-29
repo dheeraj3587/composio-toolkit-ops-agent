@@ -48,10 +48,12 @@ _JWT = re.compile(
     r"[A-Za-z0-9_-]{5,}(?![A-Za-z0-9_-])"
 )
 _ASSIGNMENT = re.compile(
-    r"(?ix)(\b(?:api[_-]?key|client[_-]?secret|access[_-]?token|"
-    r"refresh[_-]?token|oauth[_-]?(?:client[_-]?)?secret|"
-    r"(?:session|id|auth|oauth)[_-]?token|password|passwd|private[_-]?key|"
-    r"totp[_-]?seed|oauth[_-]?code|credentials?|token|secret|key|code)"
+    r"(?ix)(\b(?:(?:[a-z0-9]+[_-]+)*(?:"
+    r"api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|"
+    r"oauth[_-]?(?:client[_-]?)?secret|(?:session|id|auth|oauth)[_-]?token|"
+    r"password|passwd|private[_-]?key|totp[_-]?seed|credentials?|token|secret|key"
+    r")|oauth[_-]?code|authorization[_-]?code|verification[_-]?code|"
+    r"device[_-]?code|totp[_-]?code|one[_-]?time[_-]?code|code)"
     r"\b\s*[:=]\s*)"
     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;&}]+)"
 )
@@ -71,6 +73,12 @@ _PROVIDER_KEY = re.compile(
     r"xox[baprs]-[A-Za-z0-9-]{10,}|"
     r"(?:AKIA|ASIA)[0-9A-Z]{16}|"
     r"pplx-[A-Za-z0-9_-]{12,}|"
+    r"gsk_[A-Za-z0-9_-]{16,}|"
+    r"sk-or-v1-[A-Za-z0-9_-]{16,}|"
+    r"ydc-sk-[A-Za-z0-9_-]{16,}|"
+    r"bu_[A-Za-z0-9_-]{16,}|"
+    r"ak_[A-Za-z0-9_-]{16,}|"
+    r"csk-[A-Za-z0-9_-]{16,}|"
     r"SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"
     r")(?![A-Za-z0-9])"
 )
@@ -180,8 +188,20 @@ class RedactingFilter(logging.Filter):
     _standard_attributes = frozenset(logging.makeLogRecord({}).__dict__) | {"message", "asctime"}
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = redact_data(record.msg)
-        record.args = redact_data(record.args)
+        original_message = record.msg
+        record.msg = redact_data(original_message)
+        message_was_sanitized = not (
+            isinstance(original_message, str) and record.msg == original_message
+        )
+        if message_was_sanitized:
+            # A sensitive assignment in a %-style format string may consume its
+            # placeholder (for example ``TOKEN=%s`` -> ``TOKEN=[REDACTED]``).
+            # Retaining the original args would make logging raise and its internal
+            # error report can print the unredacted Arguments tuple to stderr.
+            # Drop args whenever the message template itself was sanitized.
+            record.args = ()
+        else:
+            record.args = redact_data(record.args)
         if record.exc_info is not None:
             formatted = "".join(traceback.format_exception(*record.exc_info))
             record.exc_info = None

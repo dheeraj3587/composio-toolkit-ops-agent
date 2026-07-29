@@ -54,6 +54,7 @@ const runStatus = z.enum([
 // The wired browser backend and the view it can offer. Declared here because both
 // the run-detail projection (BrowserUiState) and the live-view response use them.
 export const browserProviderSchema = z.enum(["browser_use", "playwright"])
+export const accountModeSchema = z.enum(["existing_account", "create_account"])
 export const credentialCreationPolicySchema = z.enum(["reuse_only", "create_if_missing"])
 export const routeKindSchema = z.enum(["managed_auth", "playwright", "gated"])
 export const readinessTierSchema = z.enum([
@@ -165,6 +166,7 @@ export const runSummarySchema = z.strictObject({
   reason_code: safeToken.nullable().default(null),
   state_engine: z.enum(["canonical_v1", "legacy"]).default("legacy"),
   external_actions: z.boolean(),
+  account_mode: accountModeSchema.nullish().default(null),
 })
 
 const primaryAction = z.strictObject({
@@ -193,7 +195,7 @@ const phaseCollection = z.union([
 const securityState = z.strictObject({
   redaction: safeToken.optional(),
   secret_vault: safeToken.optional(), // pragma: allowlist secret
-  checkpoint_encryption: safeToken.optional(),
+  operational_state_storage: safeToken.optional(),
   owner_only_storage: safeToken.optional(),
   live_vendor_email: safeToken.optional(),
   live_browser: safeToken.optional(),
@@ -216,7 +218,7 @@ const routeDecision = z.strictObject({
   is_final: z.boolean().optional(),
 })
 
-const providerStatus = z.strictObject({
+export const providerStatusSchema = z.strictObject({
   // The backend ProviderState status vocabulary (not_configured,
   // configured_not_verified, ready, disabled, schema_incompatible) is validated
   // as a bounded token rather than a fixed enum so new backend-reported states
@@ -224,6 +226,9 @@ const providerStatus = z.strictObject({
   provider: safeToken,
   status: safeToken,
   detail: boundedText(500),
+  reason_code: safeToken.nullish().default(null),
+  checked_at: isoTimestamp.nullish().default(null),
+  expires_at: isoTimestamp.nullish().default(null),
 })
 
 // Backend-authoritative browser capabilities (api/models.py::BrowserUiState).
@@ -266,7 +271,7 @@ export const runDetailResponseSchema = z.strictObject({
   route_decision: routeDecision.nullish(),
   hitl_request: hitlRequest.nullish(),
   missing_fields: z.array(boundedText(120)).max(100).optional(),
-  provider_states: z.array(providerStatus).max(30).optional(),
+  provider_states: z.array(providerStatusSchema).max(30).optional(),
   // Optional so an older backend still parses; always sent by this API.
   browser: browserUiStateSchema.nullish().default(null),
   primary_action: primaryAction.nullish().default(null),
@@ -369,7 +374,7 @@ export const healthResponseSchema = z.strictObject({
       }),
     )
     .max(50),
-  providers: z.array(providerStatus).max(30).optional(),
+  providers: z.array(providerStatusSchema).max(30).optional(),
 })
 
 export const actionReceiptSchema = z.strictObject({

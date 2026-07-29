@@ -3,6 +3,7 @@
 import os
 
 from ops.models import (
+    AccountMode,
     CompanyProfile,
     IntegratorBundle,
     OperationalResearch,
@@ -18,6 +19,7 @@ os.umask(0o077)
 install_redacting_filter()
 
 __all__ = [
+    "AccountMode",
     "AccessRoute",
     "CompanyProfile",
     "IntegratorBundle",

@@ -12,11 +12,13 @@ import {
   performPhaseAction,
   PhaseConflictError,
   resumeWithBrowserLogin,
+  resumeWithBrowserVerification,
   submitCredentials,
 } from "@/lib/api"
 import { sameOriginInteractivePath } from "@/lib/live-view-grant"
 import type {
   BrowserProvider,
+  BrowserVerificationInput,
   LiveViewMode,
   RetryCapability,
   RunPhaseAction,
@@ -263,6 +265,81 @@ export interface BrowserLoginState {
   tone: "neutral" | "error"
 }
 
+export interface BrowserVerificationState {
+  message: string | null
+  tone: "neutral" | "error"
+}
+
+const VERIFICATION_CODE_PATTERN = /^(?:\d{4,8}|[A-Z0-9]{5,8})$/
+
+function verificationInput(formData: FormData): BrowserVerificationInput | null {
+  const rawCode = String(formData.get("verification_code") ?? "")
+  const code = rawCode.trim().replaceAll(" ", "").replaceAll("-", "").toUpperCase()
+  const rawUrl = String(formData.get("verification_url") ?? "").trim()
+  if (Boolean(code) === Boolean(rawUrl)) return null
+  if (code) return VERIFICATION_CODE_PATTERN.test(code) ? { code } : null
+  if (rawUrl.length > 2_048) return null
+  try {
+    const parsed = new URL(rawUrl)
+    if (
+      parsed.protocol !== "https:" ||
+      !parsed.hostname ||
+      parsed.username ||
+      parsed.password
+    ) {
+      return null
+    }
+    return { url: rawUrl }
+  } catch {
+    return null
+  }
+}
+
+export async function submitBrowserVerificationAction(
+  _previousState: BrowserVerificationState,
+  formData: FormData,
+): Promise<BrowserVerificationState> {
+  const runId = String(formData.get("run_id") ?? "").slice(0, 180)
+  const verification = verificationInput(formData)
+  if (!/^run_[0-9a-f]{32}$/.test(runId) || !verification) {
+    return {
+      message: "Enter one valid verification code or HTTPS magic link.",
+      tone: "error",
+    }
+  }
+
+  try {
+    const receipt = await resumeWithBrowserVerification(runId, verification)
+    revalidatePath(`/runs/${encodeURIComponent(runId)}`)
+    return {
+      message:
+        receipt.status === "accepted"
+          ? "The one-time verification value was handed directly to the browser session."
+          : receipt.status === "no_change"
+            ? "The verification value was consumed, but the run has not advanced yet."
+            : "The browser session could not apply the verification value.",
+      tone:
+        receipt.status === "configuration_required" || receipt.status === "unavailable"
+          ? "error"
+          : "neutral",
+    }
+  } catch (error) {
+    if (error instanceof PhaseConflictError) {
+      return {
+        message: "This run is no longer waiting for email verification.",
+        tone: "error",
+      }
+    }
+    if (error instanceof ApiError) {
+      return {
+        message: "The verification value could not be submitted.",
+        tone: "error",
+      }
+    }
+    return { message: "The verification submission failed.", tone: "error" }
+  }
+}
+
 export async function submitBrowserLoginAction(
   _previousState: BrowserLoginState,
   formData: FormData,
@@ -316,7 +393,6 @@ export async function submitCredentialAction(
   const company = {
     legal_name: String(formData.get("legal_name") ?? "").slice(0, 200),
     website: String(formData.get("website") ?? "").slice(0, 2048),
-    work_email_ref: String(formData.get("work_email_ref") ?? "").slice(0, 512),
     use_case: String(formData.get("use_case") ?? "").slice(0, 2000),
     expected_volume: null,
     callback_urls: callbackRaw
@@ -328,9 +404,9 @@ export async function submitCredentialAction(
   if (!runId || !value) {
     return { message: "A run reference and credential value are required.", tone: "error", status: null }
   }
-  if (!company.legal_name || !company.website || !company.work_email_ref || !company.use_case) {
+  if (!company.legal_name || !company.website || !company.use_case) {
     return {
-      message: "Company legal name, website, work email vault reference, and use case are required.",
+      message: "Company legal name, website, and use case are required.",
       tone: "error",
       status: null,
     }

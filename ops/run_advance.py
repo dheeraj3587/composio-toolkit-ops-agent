@@ -16,6 +16,7 @@ from pydantic import SecretStr
 
 from ops.browser_link_log import log_event
 from ops.config import Settings
+from ops.deploy_acceptance import wait_for_deployment_acceptance
 from ops.run_errors import CredentialSubmissionError, RunConflictError
 from ops.storage import OperationsStorage
 
@@ -44,11 +45,13 @@ class RunAdvanceContext(Protocol):
 
     def _hitl_action_type(self, record: Mapping[str, object]) -> str | None: ...
 
-    def _reusable_login_values(self, app_slug: str) -> dict[str, SecretStr]: ...
+    def _reusable_login_values(self, app_slug: str, account_ref: str) -> dict[str, SecretStr]: ...
 
     def resume_run(self, run_id: str, *, signal: str) -> dict[str, object] | None: ...
 
     def reconcile_idle_browser_runs(self, *, limit: int = 100) -> int: ...
+
+    def _reconcile_stranded_runs(self) -> None: ...
 
 
 class RunAdvanceService:
@@ -67,22 +70,36 @@ class RunAdvanceService:
 
         context = self._context
         settings = context._settings or Settings.from_env()
-        if int(getattr(settings, "max_autonomous_advances", 0)) <= 0:
-            return
         if context._advance_thread is not None and context._advance_thread.is_alive():
             return
         interval = max(5, int(getattr(settings, "autonomous_advance_interval_seconds", 20)))
+        initial_delay = max(
+            1.0,
+            float(getattr(settings, "ops_automation_start_delay_seconds", 30.0)),
+        )
         context._advance_stop.clear()
         thread = threading.Thread(
             target=self._loop,
-            args=(interval,),
+            args=(interval, initial_delay),
             name="autonomous-advancer",
             daemon=True,
         )
         context._advance_thread = thread
         thread.start()
 
-    def _loop(self, interval: int) -> None:
+    def _loop(self, interval: int, initial_delay: float) -> None:
+        # Reconciliation can contact the isolated browser service. Delay it until
+        # after process startup, and make the delay interruptible so a candidate
+        # rejected during deployment performs no provider call.
+        if self._context._advance_stop.wait(initial_delay):
+            return
+        settings = self._context._settings or Settings.from_env()
+        if not wait_for_deployment_acceptance(settings, self._context._advance_stop):
+            return
+        try:
+            self._context._reconcile_stranded_runs()
+        except Exception:  # pragma: no cover - the loop must never die
+            pass
         while not self._context._advance_stop.wait(interval):
             try:
                 self.advance_autonomous_runs()
@@ -121,7 +138,8 @@ class RunAdvanceService:
             if context._autonomous_advances.get(run_id, 0) >= budget:
                 continue
             if action_type == "login_required" and not context._reusable_login_values(
-                str(record.get("app_slug") or "unknown")
+                str(record.get("app_slug") or "unknown"),
+                str(record.get("browser_account_ref") or run_id),
             ):
                 # Nothing to inject: asking the worker again would just re-raise
                 # the same gate. The owner still needs to supply credentials once.

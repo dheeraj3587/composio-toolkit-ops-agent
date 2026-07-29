@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib
-import os
 import re
 import threading
 from collections.abc import Mapping, Sequence
@@ -36,6 +35,7 @@ from uuid import uuid4
 
 from ops.app_recipes import (
     AppRecipe,
+    SignupPolicy,
     get_app_recipe,
     recipe_to_browser_trace,
     recipe_to_capture_spec,
@@ -85,7 +85,18 @@ from ops.browser_pages import (
     install_dialog_handler,
     install_download_guard,
 )
+from ops.browser_process_hardening import (
+    chromium_launch_environment,
+    harden_playwright_parent_process,
+)
 from ops.browser_risk import BrowserActionRiskPolicy
+from ops.browser_signup import (
+    SignupResult,
+    SignupSessionState,
+    drive_signup,
+    normalize_signup_fields,
+    signup_secret_continuation_ready,
+)
 from ops.browser_snapshot import build_ranked_snapshot
 from ops.browser_target_selection import derive_account_state
 from ops.browser_worker import (
@@ -193,11 +204,13 @@ _NAV_TIMEOUT_MS = 45_000
 # is a ceiling on that wait rather than a substitute for it.
 _ACTION_TIMEOUT_MS = 10_000
 _JANITOR_INTERVAL_SECONDS = 60.0
-_OP_TIMEOUT_SECONDS = 90.0
+_OP_TIMEOUT_SECONDS = 120.0
 
 # Bounds for the agent action loop: it must always terminate.
 _MAX_AGENT_STEPS = 20
-_MAX_AGENT_SECONDS = 180.0
+# Keep the autonomous loop below the browser-service 300 second outer deadline,
+# leaving time for serialization, encrypted-state persistence and the RPC reply.
+_MAX_AGENT_SECONDS = 270.0
 _MAX_REPEATED_STATE = 3
 _MAX_MODEL_FAILURES = 2
 _MAX_ACTION_FAILURES = 3
@@ -213,6 +226,16 @@ _ALLOWED_PRESS_KEYS = frozenset(
 _INTERACTIVE_SELECTOR = (
     "a, button, input, select, textarea, "
     "[role='button'], [role='link'], [role='menuitem'], [contenteditable='true']"
+)
+
+# Account identifiers are secret-bearing user data too. Recipe selectors protect
+# vendor-specific token fields; these fixed selectors protect login/signup email
+# values on the headed X11/noVNC desktop for every Playwright recipe.
+_ACCOUNT_IDENTIFIER_MASKS = (
+    "input[type='email']",
+    "input[autocomplete='username']",
+    "input[name='email' i]",
+    "input[name='username' i]",
 )
 
 
@@ -270,6 +293,9 @@ class PlaywrightBrowserWorker:
         self._loop = loop or shared_browser_loop()
         self._sessions: dict[str, _PwSession] = {}
         self._research: dict[str, OperationalResearch] = {}
+        # Value-free signup state is kept beside the browser session. It stores
+        # only whether this session filled/submitted the form, never field values.
+        self._signup_states: dict[str, SignupSessionState] = {}
         # Concurrency cap: sized for a small VPS (each session is a Chromium process).
         self._max_sessions = max(1, int(getattr(self._settings, "playwright_max_sessions", 2)))
         # Registry mutation happens from several application threads.
@@ -325,33 +351,37 @@ class PlaywrightBrowserWorker:
         Disabling Chromium's own sandbox weakens defence-in-depth, so it is only
         applied when the deployment explicitly asks for it (dev sandboxes and
         containers without the required seccomp/user-namespace support).
+
+        Do not add ``--disable-dev-shm-usage`` here. Production provisions a
+        private, bounded ``/dev/shm`` specifically for Chromium; redirecting
+        shared-memory files into the smaller ``/tmp`` tmpfs defeats that limit.
         """
 
-        args = ["--disable-dev-shm-usage"]
+        args: list[str] = []
         if bool(getattr(self._settings, "playwright_disable_sandbox", False)):
             args.append("--no-sandbox")
         return args
 
+    def _chromium_sandbox_enabled(self) -> bool:
+        """Playwright defaults this option to false, so enable it explicitly."""
+
+        return not bool(getattr(self._settings, "playwright_disable_sandbox", False))
+
     @staticmethod
-    def _launch_env(display: str | None) -> dict[str, str] | None:
-        """Chromium's environment, pinned to this session's private X display.
+    def _launch_env(display: str | None, *, headless: bool) -> dict[str, str]:
+        """Build Chromium's strict, secret-free child environment.
 
-        Returns ``None`` when no display was leased, so the launch call omits
-        ``env`` entirely and Chromium inherits the process environment unchanged
-        (the headless and in-process paths).
+        Playwright replaces the child environment when ``env`` is supplied. That
+        is intentional here: inheriting the worker environment would give every
+        renderer process the worker RPC tokens, broker token, storage-state key,
+        and inference/provider credentials. Only process essentials are copied.
 
-        The merge with ``os.environ`` is load-bearing: Playwright REPLACES the
-        browser process environment with whatever ``env`` contains rather than
-        merging it. Passing ``{"DISPLAY": ...}`` alone would strip HOME, PATH and
-        the XDG variables that ``docker/browser-entrypoint.sh`` deliberately points
-        at a writable tmpfs — and a headful Chromium without a writable HOME dies
-        instantly with SIGTRAP, which surfaces only as "Target page, context or
-        browser has been closed".
+        A leased display always wins. Local headed development may use the
+        process's existing display when no lease is supplied; headless Chromium
+        receives no ``DISPLAY`` at all.
         """
 
-        if not display:
-            return None
-        return {**os.environ, "DISPLAY": display}
+        return chromium_launch_environment(display, headless=headless)
 
     def _reap_expired(self) -> tuple[str, ...]:
         """Drop sessions past their inactivity or maximum lifetime.
@@ -370,6 +400,8 @@ class PlaywrightBrowserWorker:
                 handle for handle, session in self._sessions.items() if session.is_expired(now)
             ]
             reaped = [(handle, self._sessions.pop(handle)) for handle in expired]
+            for handle, _session in reaped:
+                self._signup_states.pop(handle, None)
         for _, session in reaped:
             try:
                 self._loop.run_sync(_shutdown_session(session), timeout=30.0)
@@ -414,8 +446,8 @@ class PlaywrightBrowserWorker:
         # service (e.g. ":100"). Headful Chromium renders to exactly that display,
         # which is what keeps concurrent interactive sessions isolated: x11vnc
         # serves a whole display, so sharing one would let a grant for session A
-        # stream session B's browser window. None means "inherit the process
-        # DISPLAY", which is the headless and in-process case.
+        # stream session B's browser window. A local headed worker may use its
+        # process DISPLAY when no lease is supplied; a headless launch gets none.
         # Accept the provider-neutral session metadata so the graph and the async
         # run-creation path have ONE call site for every provider. In-process
         # Chromium resolves nothing through the service RPC, so these are recorded
@@ -434,6 +466,11 @@ class PlaywrightBrowserWorker:
                 capability="Playwright browser",
                 reason_code="playwright_not_installed",
             ) from None
+        # This class is also available behind the explicitly local
+        # PLAYWRIGHT_IN_PROCESS_SANDBOX path. Protect that secret-bearing API
+        # parent before Playwright creates its Node driver, just as the isolated
+        # browser service protects itself during lifespan startup.
+        harden_playwright_parent_process()
 
         # In service mode the browser-service SessionManager is the SOLE owner of
         # admission, capacity and TTL. The worker must not run its own reaper or
@@ -453,7 +490,7 @@ class PlaywrightBrowserWorker:
                 )
             capacity_owned = True
 
-        launch_env = self._launch_env(display)
+        launch_env = self._launch_env(display, headless=self._headless)
 
         async def _launch() -> tuple[Any, Any, Any, Any, asyncio.Lock]:
             playwright = await module.async_playwright().start()
@@ -461,7 +498,8 @@ class PlaywrightBrowserWorker:
                 browser = await playwright.chromium.launch(
                     headless=self._headless,
                     args=self._launch_args(),
-                    **({"env": launch_env} if launch_env is not None else {}),
+                    chromium_sandbox=self._chromium_sandbox_enabled(),
+                    env=launch_env,
                 )
                 # Service workers are blocked: during a secret-bearing session a
                 # worker could persist and relay data outside the page lifecycle.
@@ -532,6 +570,7 @@ class PlaywrightBrowserWorker:
         recipe: AppRecipe | None = None,
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
+        signup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
         self._require_configuration()
@@ -553,6 +592,9 @@ class PlaywrightBrowserWorker:
         patterns = self._resolve_patterns(research, recipe=bound_recipe)
         session.patterns = patterns
         session.app_slug = research.app_slug
+        approved_signup_fields = (
+            normalize_signup_fields(signup_fields) if account_creation_requested else {}
+        )
 
         # Screenshot masking cannot protect the headed X11 desktop. Install the
         # recipe-owned document-start mask before the first vendor navigation; in
@@ -622,6 +664,8 @@ class PlaywrightBrowserWorker:
             research,
             recipe=bound_recipe,
             sensitive_data=sensitive_data,
+            account_creation_requested=account_creation_requested,
+            signup_fields=approved_signup_fields,
             credential_creation_policy=credential_creation_policy,
         )
 
@@ -633,6 +677,8 @@ class PlaywrightBrowserWorker:
         *,
         recipe: AppRecipe | None = None,
         sensitive_data: Mapping[str, str] | None = None,
+        account_creation_requested: bool = False,
+        signup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
@@ -672,6 +718,10 @@ class PlaywrightBrowserWorker:
             resolved,
             recipe=bound_recipe,
             sensitive_data=sensitive_data,
+            account_creation_requested=account_creation_requested,
+            signup_fields=(
+                normalize_signup_fields(signup_fields) if account_creation_requested else {}
+            ),
             credential_creation_policy=credential_creation_policy,
             resume_signal=normalized_signal,
         )
@@ -704,10 +754,13 @@ class PlaywrightBrowserWorker:
             return True
 
         async def _install() -> bool:
+            selectors = tuple(
+                dict.fromkeys((*browser_recipe.sensitive_selectors, *_ACCOUNT_IDENTIFIER_MASKS))
+            )
             return await _install_live_pixel_mask(
                 context=session.context,
                 page=_active_page(session),
-                selectors=browser_recipe.sensitive_selectors,
+                selectors=selectors,
             )
 
         try:
@@ -724,6 +777,8 @@ class PlaywrightBrowserWorker:
         *,
         recipe: AppRecipe,
         sensitive_data: Mapping[str, str] | None,
+        account_creation_requested: bool = False,
+        signup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
         resume_signal: str | None = None,
     ) -> BrowserObservation:
@@ -741,6 +796,50 @@ class PlaywrightBrowserWorker:
         trace = recipe_to_browser_trace(recipe)
         if trace is None:
             return self._human_required(session, "No reviewed navigation trace is available.")
+
+        if account_creation_requested:
+            signup_state = self._signup_states.setdefault(
+                session.handle,
+                SignupSessionState(),
+            )
+            # After registration submitted, OTP/magic-link values still use the
+            # established deterministic login secret injector. They remain local
+            # to the worker and never enter the signup state or model path.
+            if sensitive_data is not None and signup_secret_continuation_ready(
+                signup_state, sensitive_data
+            ):
+                continuation = await self._inject_credentials(session, sensitive_data)
+                if continuation is not None:
+                    continuation_observation = self._observation_from_login_result(
+                        session,
+                        continuation,
+                        # Before the final registration submit, a successful
+                        # email verification may legitimately reveal the signup
+                        # password/details form. It is not an incomplete
+                        # existing-account login; let the deterministic signup
+                        # driver consume the re-issued generated pair below.
+                        had_credentials=signup_state.submit_attempted,
+                    )
+                    if continuation_observation is not None:
+                        return continuation_observation
+            signup_result = await self._drive_signup(
+                session,
+                sensitive_data=sensitive_data or {},
+                signup_fields=signup_fields or {},
+                state=signup_state,
+                signup_policy=(recipe.browser.signup if recipe.browser is not None else None),
+                resume_signal=resume_signal,
+            )
+            signup_observation = self._observation_from_signup_result(
+                session,
+                signup_result,
+                state=signup_state,
+            )
+            if signup_observation is not None:
+                return signup_observation
+            # Signup consumed the email/password channel. Do not feed those same
+            # values into the existing-account login injector on the next page.
+            sensitive_data = None
 
         if not sensitive_data and resume_signal in {
             "human_completed",
@@ -1037,6 +1136,69 @@ class PlaywrightBrowserWorker:
                         return self._failed_observation(session, "postcondition_failed")
 
         return self._human_required(session, "The bounded browser action limit was reached.")
+
+    async def _drive_signup(
+        self,
+        session: _PwSession,
+        *,
+        sensitive_data: Mapping[str, str],
+        signup_fields: Mapping[str, str],
+        state: SignupSessionState,
+        signup_policy: SignupPolicy | None = None,
+        resume_signal: str | None,
+    ) -> SignupResult:
+        """Run deterministic signup under the session's serialized browser lock."""
+
+        async def _locked() -> SignupResult:
+            async with session.operation_lock:
+                session.last_active_at = datetime.now(UTC)
+                # Email and password are account data. Tighten egress and discard
+                # any pre-fill frame before the first possible injection.
+                session.egress.advance_to(EgressStage.AUTHENTICATING)
+                session.screenshot = None
+                session.screenshot_at = None
+                return await drive_signup(
+                    page=_active_page(session),
+                    patterns=session.patterns,
+                    sensitive_data=sensitive_data,
+                    approved_fields=signup_fields,
+                    state=state,
+                    signup_policy=signup_policy,
+                    resume_signal=resume_signal,
+                )
+
+        try:
+            return await self._loop.run(_locked(), timeout=_OP_TIMEOUT_SECONDS)
+        except (TypeError, AttributeError, AssertionError, NameError):
+            raise
+        except Exception:
+            return SignupResult(status="failed", reason_code="signup_execution_failed")
+
+    def _observation_from_signup_result(
+        self,
+        session: _PwSession,
+        result: SignupResult,
+        *,
+        state: SignupSessionState,
+    ) -> BrowserObservation | None:
+        """Project a value-free signup outcome into the provider contract."""
+
+        if result.status == "continue":
+            return None
+        if result.status == "failed":
+            return self._failed_observation(session, result.reason_code)
+        # Signup commonly has three legitimate gates (terms, CAPTCHA, then email
+        # verification), so it uses its own bounded counter rather than consuming
+        # the existing-login two-handoff budget.
+        if state.handoff_count >= 5:
+            return self._failed_observation(session, "signup_handoff_limit_reached")
+        state.handoff_count += 1
+        return self._human_required(
+            session,
+            result.instruction or "Complete the signup step in the live browser.",
+            reason_code=result.reason_code,
+            action_type=result.action_type or "provider_verification",
+        )
 
     async def _inspect_page(self, session: _PwSession) -> PageInspection:
         """Collect a bounded, secret-free view of the page (never full HTML)."""
@@ -1816,7 +1978,9 @@ class PlaywrightBrowserWorker:
                 session,
                 "Complete the reviewed email verification link.",
                 reason_code="magic_link_required",
-                action_type="provider_verification",
+                # The Gmail verification worker handles both a numeric OTP and a
+                # reviewed magic link through the same bound, one-time channel.
+                action_type="email_otp",
             )
         if result.state == "account_selection_required":
             return self._bounded_login_handoff(
@@ -2111,6 +2275,7 @@ class PlaywrightBrowserWorker:
     async def stop(self, context: BrowserSessionContext) -> None:
         with self._registry_lock:
             session = self._sessions.pop(context.session_id, None)
+            self._signup_states.pop(context.session_id, None)
         if session is not None:
             await self._teardown(session)
 
@@ -2122,6 +2287,7 @@ class PlaywrightBrowserWorker:
         with self._registry_lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
+            self._signup_states.clear()
         for session in sessions:
             await self._teardown(session)
 

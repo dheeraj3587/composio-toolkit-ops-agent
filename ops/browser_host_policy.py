@@ -134,7 +134,9 @@ def build_browser_allowed_hosts(
 
     if recipe is not None and recipe.app_slug != app_slug:
         raise BrowserPolicyInactiveError(app_slug, "immutable_recipe_app_mismatch")
-    policy = browser_policy_from_recipe(recipe) if recipe is not None else get_browser_policy(app_slug)
+    policy = (
+        browser_policy_from_recipe(recipe) if recipe is not None else get_browser_policy(app_slug)
+    )
     if policy is None:
         # A research URL is evidence, never browser authority. Unknown apps do not
         # receive an allowlist until a reviewed recipe/policy is checked in.

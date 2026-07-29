@@ -17,7 +17,7 @@ from pydantic import (
 )
 
 from ops.app_recipes import ReadinessTier, RouteKind
-from ops.models import OperationalResearch
+from ops.models import AccountMode, OperationalResearch
 from ops.state import AccessRoute, BrowserProvider, CredentialCreationPolicy, RunStatus
 
 CredentialFieldName = Annotated[
@@ -103,7 +103,9 @@ class StrictApiModel(BaseModel):
 class CompanyInput(StrictApiModel):
     legal_name: str = Field(min_length=1, max_length=200)
     website: BoundedHttpUrl
-    work_email_ref: VaultReference
+    # Optional for operators. The service derives the deterministic app-bound
+    # reference ``vault://company/work_email/<app-slug>`` when omitted.
+    work_email_ref: VaultReference | None = None
     use_case: str = Field(min_length=1, max_length=2000)
     expected_volume: str | None = Field(default=None, max_length=200)
     callback_urls: list[BoundedHttpUrl] = Field(default_factory=list, max_length=20)
@@ -123,7 +125,8 @@ class BrowserLoginInput(StrictApiModel):
     """Owner-submitted app login credentials for autonomous sign-in.
 
     The values cross the selected provider's secret boundary only for session
-    creation or one resume call and are never persisted to run state,
+    creation or one resume call. Reusable email/password pairs may be retained in
+    the encrypted, account-scoped owner vault, but never in run state,
     checkpoints, audit events, logs, or the IntegratorBundle.
     OTP/CAPTCHA/passkey/billing still require a human.
     """
@@ -132,9 +135,45 @@ class BrowserLoginInput(StrictApiModel):
     password: SecretStr
 
 
+class BrowserVerificationInput(StrictApiModel):
+    """Owner-supplied one-time email verification fallback.
+
+    Exactly one value is accepted. It crosses the same one-time browser secret
+    boundary as autonomous Gmail verification and is never written to run state,
+    checkpoints, audit events, or logs.
+    """
+
+    code: SecretStr | None = None
+    url: SecretStr | None = None
+
+    @model_validator(mode="after")
+    def _validate_one_time_value(self) -> BrowserVerificationInput:
+        if (self.code is None) == (self.url is None):
+            raise ValueError("provide exactly one verification code or URL")
+        if self.code is not None:
+            value = self.code.get_secret_value().strip().replace(" ", "").replace("-", "")
+            if re.fullmatch(r"(?:\d{4,8}|[A-Z0-9]{5,8})", value) is None:
+                raise ValueError("verification code format is invalid")
+            self.code = SecretStr(value)
+        if self.url is not None:
+            value = self.url.get_secret_value().strip()
+            parsed = urlsplit(value)
+            if (
+                len(value) > 2_048
+                or parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+            ):
+                raise ValueError("verification URL must be an HTTPS URL")
+            self.url = SecretStr(value)
+        return self
+
+
 class CreateRunRequest(StrictApiModel):
     app_name: str = Field(min_length=1, max_length=200)
     company: CompanyInput
+    account_mode: AccountMode
     requested_scope_policy: Literal["minimum", "recommended", "maximum"] = "maximum"
     execution_mode: Literal["plan_only", "execute_when_configured"] = "plan_only"
     browser_provider: BrowserProvider = "browser_use"
@@ -143,28 +182,11 @@ class CreateRunRequest(StrictApiModel):
     # explicitly supplied dry_run=true carries intent; execution_mode is the single
     # canonical control and dry_run is never rewritten from it.
     dry_run: bool = True
-    outreach_recipient_override: str | None = Field(default=None, max_length=320)
     # Optional app sign-in credentials for autonomous login. When present they are
     # injected through the selected provider's secret boundary at session
-    # creation; they are never persisted to run state, checkpoints, the ledger,
-    # logs, or the IntegratorBundle.
+    # creation. The reusable pair may be retained in the encrypted account vault,
+    # but never in run state, checkpoints, logs, or the IntegratorBundle.
     browser_login: BrowserLoginInput | None = None
-
-    @field_validator("outreach_recipient_override")
-    @classmethod
-    def outreach_override_is_email_safe(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        if (
-            value.count("@") != 1
-            or any(character.isspace() for character in value)
-            or any(character in value for character in "<>,;\r\n")
-        ):
-            raise ValueError("outreach recipient override must be a single email address")
-        local_part, domain = value.rsplit("@", 1)
-        if not local_part or not domain:
-            raise ValueError("outreach recipient override must be a single email address")
-        return value
 
     @model_validator(mode="after")
     def _reject_conflicting_dry_run_alias(self) -> CreateRunRequest:
@@ -180,6 +202,8 @@ class CreateRunRequest(StrictApiModel):
                 "dry_run=true is a deprecated alias for execution_mode='plan_only' "
                 "and cannot be combined with execution_mode='execute_when_configured'"
             )
+        if self.account_mode == "create_account" and self.browser_login is not None:
+            raise ValueError("browser_login is only accepted when account_mode='existing_account'")
         return self
 
 
@@ -236,6 +260,9 @@ class ProviderState(StrictApiModel):
         "schema_incompatible",
     ]
     detail: str
+    reason_code: ReasonCode | None = None
+    checked_at: str | None = None
+    expires_at: str | None = None
 
 
 class RouteDecisionView(StrictApiModel):
@@ -260,7 +287,7 @@ class SecurityState(StrictApiModel):
         "ready",
     ] = "not_configured"
     owner_only_storage: Literal["verified_owner_only", "verification_failed"]
-    checkpoint_encryption: Literal["ready", "not_configured"] = "not_configured"
+    operational_state_storage: Literal["sqlite_not_app_encrypted"] = "sqlite_not_app_encrypted"
     live_vendor_email: Literal["disabled", "enabled"] = "disabled"
     live_browser: Literal["disabled", "enabled"] = "disabled"
     external_actions: bool = False
@@ -273,6 +300,7 @@ class RunSummary(StrictApiModel):
     thread_id: str
     app_name: str
     app_slug: str
+    account_mode: AccountMode | None = None
     status: RunStatus
     access_route: AccessRoute | None = None
     created_at: str
@@ -514,6 +542,15 @@ class ResumeRequest(StrictApiModel):
     # autonomously with injected secure placeholders instead of the human driving
     # the live browser. Accepted only on an opted-in, loopback-only request.
     browser_login: BrowserLoginInput | None = None
+    # Secure fallback when connected Gmail is unavailable or cannot parse the
+    # provider message. Accepted only at an email-verification HITL gate.
+    browser_verification: BrowserVerificationInput | None = None
+
+    @model_validator(mode="after")
+    def _one_injected_secret_source(self) -> ResumeRequest:
+        if self.browser_login is not None and self.browser_verification is not None:
+            raise ValueError("login credentials and email verification are mutually exclusive")
+        return self
 
 
 class RetryRequest(StrictApiModel):
@@ -573,6 +610,28 @@ class HealthCheck(StrictApiModel):
     status: Literal["pass", "fail", "configuration_required", "disabled"]
 
 
+class BrowserServiceHealthView(StrictApiModel):
+    """Sanitized cached state returned by the isolated browser service."""
+
+    state: Literal[
+        "disabled",
+        "not_configured",
+        "configured_not_verified",
+        "ready",
+        "degraded",
+        "capacity_exhausted",
+        "unreachable",
+        "version_mismatch",
+    ]
+    reason_code: str
+    version: str
+    chromium_installed: bool
+    context_launch_ok: bool
+    capacity_total: int = Field(ge=0)
+    capacity_in_use: int = Field(ge=0)
+    janitor_running: bool
+
+
 class HealthResponse(StrictApiModel):
     status: Literal["healthy", "degraded"]
     phase: Literal["2"] = "2"
@@ -580,6 +639,7 @@ class HealthResponse(StrictApiModel):
     snapshot: SnapshotHealth
     checks: list[HealthCheck]
     providers: list[ProviderState] = Field(default_factory=list)
+    browser_service: BrowserServiceHealthView | None = None
 
 
 class AppSummary(StrictApiModel):
@@ -633,6 +693,15 @@ class RunNotFoundResponse(StrictApiModel):
 class ResourceNotFoundResponse(StrictApiModel):
     error: Literal["not_found"] = "not_found"
     message: Literal["Resource was not found."] = "Resource was not found."
+
+
+class ProviderReadinessResponse(StrictApiModel):
+    error: Literal["provider_not_ready"] = "provider_not_ready"
+    message: Literal["Required provider capability is not ready; no run was created."] = (
+        "Required provider capability is not ready; no run was created."
+    )
+    provider: Literal["gmail", "playwright"]
+    reason_code: ReasonCode
 
 
 class PhaseUnavailableResponse(StrictApiModel):

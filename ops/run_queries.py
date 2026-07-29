@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Protocol, cast
 
+from ops.app_recipes import load_app_recipe_catalog
 from ops.models import IntegratorBundle, OperationalResearch
 from ops.operational_baselines import apply_reviewed_operational_baseline
 from ops.p1_adapter import (
@@ -75,14 +76,17 @@ class RunQueryService:
         return None
 
     def search_apps(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
-        """Search the verified P1 catalog and return a minimal safe projection."""
+        """Search the reviewed runnable catalog and return a minimal safe projection."""
 
         if limit < 1 or limit > 100:
             raise ValueError("limit must be between 1 and 100")
         normalized = " ".join(query.casefold().split())
         snapshot = load_verified_snapshot(self._context.p1_adapter.snapshot_root)
+        runnable_slugs = {recipe.app_slug for recipe in load_app_recipe_catalog().apps}
         matches: list[dict[str, Any]] = []
         for record in snapshot.records:
+            if record.slug not in runnable_slugs:
+                continue
             haystack = " ".join((record.app, record.slug, record.category)).casefold()
             if normalized and normalized not in haystack:
                 continue
@@ -92,19 +96,24 @@ class RunQueryService:
         return _sanitized_app_list(matches, capability="app search")
 
     def list_apps(self) -> list[dict[str, Any]]:
-        """Return EVERY verified app, so the interface can offer a real choice.
+        """Return every reviewed runnable app, so the interface offers real choices.
 
         Search alone required the operator to already know an app's name. This
-        returns the whole snapshot (ordered by display name) so a selector can be
-        populated before anyone types, which is the difference between "guess the
-        spelling" and "pick from the verified catalog".
+        Returns the recipe-bound subset of the verified snapshot (ordered by
+        display name). Snapshot-only records are evidence, not runnable product
+        capabilities, so exposing them here would let an operator select a run
+        that the create boundary must reject.
 
         Same minimal projection and sanitization as ``search_apps``; the response
         is derived only from the provenance-verified snapshot.
         """
 
         snapshot = load_verified_snapshot(self._context.p1_adapter.snapshot_root)
-        ordered = sorted(snapshot.records, key=lambda record: record.app.casefold())
+        runnable_slugs = {recipe.app_slug for recipe in load_app_recipe_catalog().apps}
+        ordered = sorted(
+            (record for record in snapshot.records if record.slug in runnable_slugs),
+            key=lambda record: record.app.casefold(),
+        )
         return _sanitized_app_list(
             [_app_projection(record) for record in ordered], capability="app catalog"
         )

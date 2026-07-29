@@ -52,7 +52,11 @@ class RunResumeContext(Protocol):
     def _browser_worker_for(self, record: Any) -> BrowserWorker | None: ...
 
     def _remember_reusable_login(
-        self, *, app_slug: str, values: Mapping[str, SecretStr]
+        self,
+        *,
+        app_slug: str,
+        account_ref: str,
+        values: Mapping[str, SecretStr],
     ) -> tuple[str, ...]: ...
 
     def _browser_login_payload(
@@ -130,7 +134,12 @@ class RunResumeService:
                 # Remember the owner's sign-in credentials so the NEXT resume (or
                 # the next run) can authenticate without asking again.
                 remembered_fields = context._remember_reusable_login(
-                    app_slug=app_slug, values=browser_login
+                    app_slug=app_slug,
+                    # Legacy runs predate durable account bindings. Keep any new
+                    # write isolated to this run rather than reviving app-global
+                    # credential replacement.
+                    account_ref=run_id,
+                    values=browser_login,
                 )
             login_values: Mapping[str, SecretStr] | None = browser_login
             login_source = "owner_supplied"
@@ -225,8 +234,24 @@ class RunResumeService:
                         state.get("browser_session_id") or current.get("browser_session_id") or ""
                     )
                     try:
+                        capture_scope_kwargs = (
+                            {"capability_scope": run_id}
+                            if bool(
+                                getattr(
+                                    selected_worker,
+                                    "requires_session_capability_scope",
+                                    False,
+                                )
+                            )
+                            else {}
+                        )
                         captured_refs = asyncio.run(
-                            auto_capture(handle, research_obj.app_slug, context._secret_store)
+                            auto_capture(
+                                handle,
+                                research_obj.app_slug,
+                                context._secret_store,
+                                **capture_scope_kwargs,
+                            )
                         )
                     except Exception as exc:
                         log_event(

@@ -73,7 +73,11 @@ class RunLoginSecretService:
         )
 
     def remember_reusable_login(
-        self, *, app_slug: str, values: Mapping[str, SecretStr]
+        self,
+        *,
+        app_slug: str,
+        account_ref: str,
+        values: Mapping[str, SecretStr],
     ) -> tuple[str, ...]:
         """Persist the owner's reusable sign-in credentials for this app.
 
@@ -91,22 +95,31 @@ class RunLoginSecretService:
         settings = self._context._settings or Settings.from_env()
         if store is None or not getattr(settings, "browser_login_credential_reuse", True):
             return ()
-        remembered: list[str] = []
+        complete_pair: dict[str, str] = {}
         for login_field in sorted(REUSABLE_LOGIN_FIELDS):
             secret = values.get(login_field)
             if secret is None:
                 continue
             value = secret.get_secret_value()
-            if not value:
-                continue
-            try:
-                store.put_account_login(app_slug=app_slug, field=login_field, value=value)
-            except Exception:
-                continue  # sanitized: never log the value or the failure detail
-            remembered.append(login_field)
-        return tuple(remembered)
+            if value:
+                complete_pair[login_field] = value
+        if set(complete_pair) != REUSABLE_LOGIN_FIELDS:
+            # A partial durable identity is worse than no durable identity: it
+            # cannot authenticate and could be combined with a stale counterpart
+            # by a later writer. Runtime persistence is therefore pair-only.
+            return ()
+        try:
+            store.put_account_login_pair(
+                app_slug=app_slug,
+                account_ref=account_ref,
+                email=complete_pair["login_email"],
+                password=complete_pair["login_password"],
+            )
+        except Exception:
+            return ()
+        return tuple(sorted(REUSABLE_LOGIN_FIELDS))
 
-    def reusable_login_values(self, app_slug: str) -> dict[str, SecretStr]:
+    def reusable_login_values(self, app_slug: str, account_ref: str) -> dict[str, SecretStr]:
         """Load the remembered sign-in credentials for an app, if complete.
 
         A partial pair is useless to the deterministic login state machine (it
@@ -118,19 +131,104 @@ class RunLoginSecretService:
         settings = self._context._settings or Settings.from_env()
         if store is None or not getattr(settings, "browser_login_credential_reuse", True):
             return {}
+        pair_reader = getattr(store, "get_account_login_pair", None)
+        if callable(pair_reader):
+            try:
+                pair = pair_reader(app_slug=app_slug, account_ref=account_ref)
+            except Exception:
+                return {}
+            if set(pair) != REUSABLE_LOGIN_FIELDS:
+                return {}
+            return {field: SecretStr(pair[field]) for field in sorted(REUSABLE_LOGIN_FIELDS)}
         reader = getattr(store, "get_account_login", None)
         if not callable(reader):
             return {}
         values: dict[str, SecretStr] = {}
         for login_field in sorted(REUSABLE_LOGIN_FIELDS):
             try:
-                value = reader(app_slug=app_slug, field=login_field)
+                value = reader(
+                    app_slug=app_slug,
+                    account_ref=account_ref,
+                    field=login_field,
+                )
             except Exception:
                 return {}
             if not value:
                 return {}
             values[login_field] = SecretStr(value)
         return values
+
+    def stage_signup_login(
+        self,
+        *,
+        app_slug: str,
+        account_ref: str,
+        run_id: str,
+        values: Mapping[str, SecretStr],
+    ) -> dict[str, SecretStr]:
+        """Atomically stage one backend-generated signup pair under this run."""
+
+        store = self._context._secret_store
+        if store is None:
+            raise ConfigurationRequiredError(
+                phase=5,
+                capability="signup login staging",
+                reason_code="signup_login_vault_required",
+            )
+        email = values.get("login_email")
+        password = values.get("login_password")
+        if email is None or password is None:
+            raise ProviderOperationError(
+                capability="signup login staging",
+                reason_code="signup_login_pair_incomplete",
+            )
+        pair = store.stage_signup_login_pair(
+            app_slug=app_slug,
+            account_ref=account_ref,
+            run_id=run_id,
+            email=email.get_secret_value(),
+            password=password.get_secret_value(),
+        )
+        return {name: SecretStr(value) for name, value in pair.items()}
+
+    def staged_signup_login_values(
+        self,
+        *,
+        app_slug: str,
+        account_ref: str,
+        run_id: str,
+    ) -> dict[str, SecretStr]:
+        """Load one exact run's staged signup pair for retry/resume."""
+
+        store = self._context._secret_store
+        if store is None:
+            return {}
+        pair = store.get_staged_signup_login_pair(
+            app_slug=app_slug,
+            account_ref=account_ref,
+            run_id=run_id,
+        )
+        if set(pair) != REUSABLE_LOGIN_FIELDS:
+            return {}
+        return {name: SecretStr(value) for name, value in pair.items()}
+
+    def promote_staged_signup_login(
+        self,
+        *,
+        app_slug: str,
+        account_ref: str,
+        run_id: str,
+    ) -> tuple[str, ...]:
+        """Promote a staged pair only after an authenticated surface is observed."""
+
+        store = self._context._secret_store
+        if store is None:
+            return ()
+        return store.promote_staged_signup_login_pair(
+            app_slug=app_slug,
+            account_ref=account_ref,
+            run_id=run_id,
+        )
 
     def store_transient_browser_secrets(
         self, *, app_slug: str, scope_id: str, values: Mapping[str, str]
@@ -153,7 +251,6 @@ class RunLoginSecretService:
                 reason_code="secret_vault_required_for_browser_service",
             )
         references: dict[str, str] = {}
-        created: list[str] = []
         try:
             for name, value in values.items():
                 if name not in ALLOWED_BROWSER_SECRET_FIELDS:
@@ -173,11 +270,15 @@ class RunLoginSecretService:
                     ttl_seconds=600,
                 )
                 references[name] = reference
-                created.append(reference)
         except Exception:
-            for reference in created:
+            for name, reference in references.items():
                 with contextlib.suppress(Exception):
-                    store.delete(reference)
+                    store.delete_transient(
+                        reference,
+                        expected_app_slug=app_slug,
+                        expected_kind=f"browser_login_{name}",
+                        expected_scope_id=scope_id,
+                    )
             raise ProviderOperationError(
                 capability="browser service secrets",
                 reason_code="browser_secret_store_failed",

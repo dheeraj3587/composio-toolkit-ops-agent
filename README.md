@@ -6,7 +6,8 @@ The canonical production runtime uses:
 
 - Composio managed authentication for reviewed OAuth connections;
 - an isolated Playwright browser service for reviewed browser routes;
-- encrypted SQLite canonical state, read-only legacy checkpoint compatibility, effect receipts, and credential storage;
+- owner-only ordinary SQLite for canonical run state and effect receipts, plus a
+  separate SQLite credential vault whose secret payloads are Fernet-encrypted;
 - a FastAPI control plane behind a Next.js operator UI and Caddy.
 
 Browser Use and You.com are not runtime providers in this rollout. Production disables both; they are not fallback paths for canonical runs.
@@ -45,7 +46,9 @@ cp .env.example .env
 cp web/.env.example web/.env.local
 ```
 
-Set one private `OPS_INTERNAL_API_TOKEN` in both `.env` and `web/.env.local`. Keep live-action flags disabled for planning.
+Generate one random `OPS_INTERNAL_API_TOKEN` of at least 32 characters and set
+that same value in `.env` and `web/.env.local`. Keep it independent from every
+browser token, and keep live-action flags disabled for planning.
 
 Start the services in separate terminals:
 
@@ -77,9 +80,15 @@ cp .env.production.example .env.production
 ./scripts/deploy-droplet.sh
 ```
 
-Before deploying, configure the domain and Caddy Basic Auth, one shared internal API token, independent stable encryption keys, the browser-service token and owner, and only the providers you intend to use. Managed routes require Composio configuration and a public HTTPS callback base. Live Playwright additionally requires `ALLOW_LIVE_BROWSER=true` and at least one configured browser-decision model.
+Before deploying, configure the domain and application login (including its
+independent Base32 TOTP secret), one shared internal API token, the stable
+private keys required by the credential, browser-storage, and recovery
+boundaries, the browser-service token and owner, and only the providers you
+intend to use. Managed routes require Composio configuration and a public HTTPS
+callback base. Live Playwright additionally requires `ALLOW_LIVE_BROWSER=true`
+and at least one configured browser-decision model.
 
-The deployment helper refuses a dirty worktree, enforces one Playwright session, builds the exact Git revision, waits for all four services, verifies image revisions, and proves public TLS plus Basic Auth behavior.
+The deployment helper refuses a dirty worktree, validates bounded Playwright capacity, builds the exact Git revision, waits for all four services, verifies image revisions, and proves public TLS plus the application-auth boundary.
 
 Operational verification and incident commands are in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
@@ -87,8 +96,14 @@ Operational verification and incident commands are in [docs/OPERATIONS.md](docs/
 
 - Caddy is the only public service; FastAPI and browser RPC remain on the private Docker network.
 - Every API request requires a server-only internal token.
-- Public pages are protected by Caddy Basic Auth except `/healthz`.
-- App login values are transient and never stored in run state, checkpoints, audit events, screenshots, or model prompts.
+- Public pages and server actions are protected by a signed HTTP-only application session except `/healthz` and `/login`.
+- A candidate deployment can answer health and login probes, but cannot mutate a run, use the browser-secret broker, or mint a live-view grant until its exact revision-and-nonce acceptance marker exists.
+- Canonical run state and effect receipts are ordinary SQLite records. Their
+  boundary is owner-only filesystem and container access, not application-layer
+  encryption. Credential values are encrypted separately in the Fernet vault.
+- App login values never enter run state, checkpoints, audit events, screenshots,
+  or model prompts. Reusable email/password pairs may be retained only in the
+  encrypted account-scoped vault; OTPs and verification links remain one-time.
 - Captured and owner-submitted credentials cross directly into the encrypted vault.
 - Sensitive browser surfaces suppress screenshots before capture.
 - Interactive browser control is granted only during a recorded human-in-the-loop pause.

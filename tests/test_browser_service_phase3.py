@@ -13,6 +13,7 @@ navigation and candidate-policy behaviour that this service reuses unchanged.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import re
@@ -27,22 +28,31 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from browser_service.auth import OWNER_HEADER, TOKEN_HEADER
-from browser_service.main import UvicornWebSocketLogFilter, create_app
+from browser_service.main import (
+    UvicornWebSocketLogFilter,
+    create_app,
+    install_browser_service_log_filters,
+)
 from browser_service.models import SessionSummary
 from browser_service.novnc import LiveViewDenied, VncTarget, authorize_live_view
 from browser_service.session_manager import SessionManager, SessionUnavailable
 from browser_service.settings import BrowserServiceSettings
+from ops.app_recipes import get_app_recipe
 from ops.browser_live_view import (
     LiveViewTokenError,
     issue_live_view_token,
     verify_live_view_token,
 )
-from ops.app_recipes import get_app_recipe
+from ops.browser_session_capability import CAPABILITY_HEADER
 from ops.browser_storage_state import EncryptedStorageStateStore, StorageStateBinding
 from ops.browser_worker import BrowserObservation, BrowserSessionContext
+from ops.redaction import REDACTED, RedactingFilter
 
-TOKEN = "phase3-test-token"
+TOKEN = "phase3-test-token-" + ("t" * 32)
 OWNER = "run_owner_1"
+SESSION_CAPABILITY = "A" * 43
+BROKER_GRANT = "bsg_" + ("G" * 43)
+CAPABILITY_KEY = "phase3-capability-key-32-characters-minimum"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # A cookie value that must never appear in any response or log line.
@@ -237,6 +247,92 @@ class _FakeWorker:
             session.closed = True
 
 
+class _FakeSecretBroker:
+    """In-memory write-only broker stand-in; it has no durable read method."""
+
+    def __init__(self) -> None:
+        self.captures: list[dict[str, str]] = []
+
+    def close(self) -> None:
+        return None
+
+    def consume(self, **_kwargs: str) -> str:
+        from ops.provider_errors import ProviderOperationError
+
+        raise ProviderOperationError(
+            capability="browser secret broker",
+            reason_code="browser_secret_unavailable",
+        )
+
+    def capture(
+        self,
+        *,
+        grant: str,
+        app_slug: str,
+        kind: str,
+        scope_id: str,
+        session_id: str,
+        owner: str,
+        capability: str,
+        value: str,
+    ) -> str:
+        assert owner == OWNER
+        assert capability == SESSION_CAPABILITY
+        assert grant == BROKER_GRANT
+        self.captures.append(
+            {
+                "grant": grant,
+                "app_slug": app_slug,
+                "kind": kind,
+                "scope_id": scope_id,
+                "session_id": session_id,
+                "owner": owner,
+                "value": value,
+            }
+        )
+        return f"vault://{app_slug}/{kind}/captured_{len(self.captures)}"
+
+
+class _VaultBackedBroker(_FakeSecretBroker):
+    """Test-only API-broker stand-in over the real one-time vault operation."""
+
+    def __init__(self, store: Any) -> None:
+        super().__init__()
+        self._store = store
+
+    def consume(
+        self,
+        *,
+        grant: str,
+        reference: str,
+        app_slug: str,
+        kind: str,
+        scope_id: str,
+        session_id: str,
+        owner: str,
+        capability: str,
+    ) -> str:
+        del session_id
+        assert grant == BROKER_GRANT
+        assert owner == OWNER
+        assert capability == SESSION_CAPABILITY
+        from ops.provider_errors import ProviderOperationError
+        from ops.secret_store import TransientSecretError
+
+        try:
+            return self._store.consume_transient(
+                reference,
+                expected_app_slug=app_slug,
+                expected_kind=kind,
+                expected_scope_id=scope_id,
+            )
+        except TransientSecretError:
+            raise ProviderOperationError(
+                capability="browser secret broker",
+                reason_code="browser_secret_unavailable",
+            ) from None
+
+
 def _settings(**overrides: Any) -> BrowserServiceSettings:
     base: dict[str, Any] = {
         "service_token": SecretStr(TOKEN),
@@ -264,12 +360,18 @@ def _interactive_settings(**overrides: Any) -> BrowserServiceSettings:
     return BrowserServiceSettings(**base)
 
 
-def _headers(token: str | None = TOKEN, owner: str | None = OWNER) -> dict[str, str]:
+def _headers(
+    token: str | None = TOKEN,
+    owner: str | None = OWNER,
+    capability: str | None = SESSION_CAPABILITY,
+) -> dict[str, str]:
     headers = {}
     if token is not None:
         headers[TOKEN_HEADER] = token
     if owner is not None:
         headers[OWNER_HEADER] = owner
+    if capability is not None:
+        headers[CAPABILITY_HEADER] = capability
     return headers
 
 
@@ -279,6 +381,7 @@ def _client(
     app = create_app(settings or _settings())
     fake = worker or _FakeWorker()
     app.state.worker = fake
+    app.state.secret_broker = _FakeSecretBroker()
     return TestClient(app), fake
 
 
@@ -407,29 +510,7 @@ class TestSessionRpcLifecycle:
             gone = client.get(f"/internal/browser/sessions/{session_id}/status", headers=_headers())
             assert gone.status_code == 404
 
-    def test_capture_endpoint_vaults_locally_and_returns_only_reference(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from cryptography.fernet import Fernet
-
-        from ops.config import Settings as OpsSettings
-        from ops.secret_store import SQLiteSecretStore
-
-        key = Fernet.generate_key().decode()
-        vault_path = tmp_path / "vault" / "credentials.db"
-        real_from_env = OpsSettings.from_env
-        monkeypatch.setattr(
-            OpsSettings,
-            "from_env",
-            staticmethod(
-                lambda *a, **k: real_from_env(dotenv_path=None).model_copy(
-                    update={
-                        "secret_vault_key": SecretStr(key),
-                        "secret_vault_db_path": vault_path,
-                    }
-                )
-            ),
-        )
+    def test_capture_endpoint_uses_write_only_broker_and_returns_only_reference(self) -> None:
         client, worker = _client()
         worker.navigate_result_status = "credential_page_ready"
         with client:
@@ -442,7 +523,7 @@ class TestSessionRpcLifecycle:
             assert ready.status_code == 200
             response = client.post(
                 f"/internal/browser/sessions/{session_id}/capture-credentials",
-                json={},
+                json={"broker_grant": BROKER_GRANT},
                 headers=_headers(),
             )
 
@@ -452,16 +533,25 @@ class TestSessionRpcLifecycle:
         reference = body["credential_refs"]["api_token"]
         assert reference.startswith("vault://pipedrive/api_token/")
         assert "c" * 40 not in response.text
-        assert SQLiteSecretStore(vault_path, key).get(reference) == "c" * 40
+        broker = client.app.state.secret_broker  # type: ignore[attr-defined]
+        assert broker.captures == [
+            {
+                "grant": BROKER_GRANT,
+                "app_slug": "pipedrive",
+                "kind": "api_token",
+                "scope_id": "",
+                "session_id": session_id,
+                "owner": OWNER,
+                "value": "c" * 40,
+            }
+        ]
         assert worker.capture_calls == [("pw_fake_1", "pipedrive")]
 
-    def test_navigate_never_types_a_raw_value_and_requires_a_configured_vault(self) -> None:
+    def test_navigate_never_types_raw_or_unavailable_secret_values(self) -> None:
         """A raw credential value must never reach the worker.
 
-        Two corrections asserted together: the service now requires a configured
-        shared vault (an explicit typed error, not a silent drop), and even so a raw
-        value passed in credential_refs is never typed into the worker — resolution
-        consumes only vault references.
+        The configured broker reports the reference as unavailable before the raw
+        non-reference can be considered. Neither value is typed into the worker.
         """
 
         client, worker = _client()
@@ -475,14 +565,17 @@ class TestSessionRpcLifecycle:
                         "login_email": "vault://pipedrive/browser_login_login_email/x",
                         "login_password": "hunter2-raw-value",
                     },
+                    "secret_grants": {
+                        "login_email": BROKER_GRANT,
+                        "login_password": BROKER_GRANT,
+                    },
                 },
                 headers=_headers(),
             )
-        # No shared vault is configured in this unit-test env, so resolution fails
-        # CLOSED with a typed error surfaced as 502 — never a silent success.
         assert response.status_code == 502
-        # And the raw value never reached the worker (resolution ran first).
+        assert response.json()["detail"] == "browser_secret_unavailable"
         assert "hunter2-raw-value" not in json.dumps(worker.seen_sensitive)
+        assert worker.seen_sensitive == []
 
     def test_delete_is_idempotent(self) -> None:
         client, _ = _client()
@@ -497,7 +590,7 @@ class TestSessionRpcLifecycle:
             _create_session(client)
             response = client.post(
                 "/internal/browser/sessions",
-                json={"app_slug": "pipedrive"},
+                json={"app_slug": "pipedrive", "recipe_snapshot": RECIPE_SNAPSHOT},
                 headers=_headers(),
             )
         assert response.status_code == 429
@@ -741,6 +834,29 @@ class TestInteractiveHitlGrants:
             )
         assert excinfo.value.reason_code == "owner_mismatch"
 
+    def test_control_grant_from_an_earlier_hitl_generation_cannot_replay(self) -> None:
+        token, _ = issue_live_view_token(
+            session_id="bs_1",
+            owner=OWNER,
+            secret=TOKEN,
+            hitl_generation=1,
+        )
+
+        with pytest.raises(LiveViewDenied) as excinfo:
+            authorize_live_view(
+                token=token,
+                session_id="bs_1",
+                caller_owner=OWNER,
+                secret=TOKEN,
+                session_owner=OWNER,
+                session_lifecycle="ACTIVE",
+                interactive_enabled=True,
+                hitl_pending=True,
+                hitl_generation=2,
+            )
+
+        assert excinfo.value.reason_code == "hitl_generation_mismatch"
+
     def test_expired_token_is_rejected(self) -> None:
         issued = datetime.now(UTC) - timedelta(hours=1)
         token, expires_at = issue_live_view_token(
@@ -951,7 +1067,13 @@ class TestInteractiveHitlGrants:
                 headers=_headers(),
             )
             assert navigate.status_code == 200
-            token, _ = issue_live_view_token(session_id=session_id, owner=OWNER, secret=TOKEN)
+            session = client.app.state.manager.get_if_present(session_id)
+            token, _ = issue_live_view_token(
+                session_id=session_id,
+                owner=OWNER,
+                secret=TOKEN,
+                hitl_generation=session.hitl_generation,
+            )
             with client.websocket_connect(
                 f"/internal/browser/live-view/novnc?session={session_id}&token={token}",
                 headers=_headers(),
@@ -989,7 +1111,13 @@ class TestInteractiveHitlGrants:
                 ).status_code
                 == 200
             )
-            token, _ = issue_live_view_token(session_id=session_id, owner=OWNER, secret=TOKEN)
+            session = client.app.state.manager.get_if_present(session_id)
+            token, _ = issue_live_view_token(
+                session_id=session_id,
+                owner=OWNER,
+                secret=TOKEN,
+                hitl_generation=session.hitl_generation,
+            )
 
             def _open_socket() -> None:
                 try:
@@ -1064,6 +1192,9 @@ class TestInteractiveHitlGrants:
                     session_lifecycle="ACTIVE",
                     interactive_enabled=True,
                     hitl_pending=False,
+                    hitl_generation=client.app.state.manager.get_if_present(
+                        session_id
+                    ).hitl_generation,
                 )
             assert excinfo.value.reason_code == "control_not_allowed"
 
@@ -1100,6 +1231,59 @@ class TestInteractiveHitlGrants:
             assert response.status_code == 409
             assert response.json()["detail"] == "live_attachment_drain_failed"
             assert session is not None and session.hitl_pending is True
+
+    def test_resume_validation_failure_restores_hitl_for_safe_retry(self) -> None:
+        client, _worker = _client(_interactive_settings())
+        with client:
+            session_id = _create_session(client)["session_id"]
+            assert (
+                client.post(
+                    f"/internal/browser/sessions/{session_id}/navigate",
+                    json={"research": RESEARCH_PAYLOAD},
+                    headers=_headers(),
+                ).status_code
+                == 200
+            )
+            response = client.post(
+                f"/internal/browser/sessions/{session_id}/resume",
+                json={"signal": "human_completed", "research": {}},
+                headers=_headers(),
+            )
+            session = client.app.state.manager.get_if_present(session_id)
+
+            assert response.status_code == 422
+            assert session is not None and session.hitl_pending is True
+
+    def test_resume_provider_failure_is_outcome_unknown_not_retriable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client, worker = _client(_interactive_settings())
+
+        async def _ambiguous_failure(*_args: Any, **_kwargs: Any) -> BrowserObservation:
+            raise RuntimeError("synthetic ambiguous provider failure")
+
+        monkeypatch.setattr(worker, "resume_after_hitl", _ambiguous_failure)
+        with client:
+            session_id = _create_session(client)["session_id"]
+            assert (
+                client.post(
+                    f"/internal/browser/sessions/{session_id}/navigate",
+                    json={"research": RESEARCH_PAYLOAD},
+                    headers=_headers(),
+                ).status_code
+                == 200
+            )
+            response = client.post(
+                f"/internal/browser/sessions/{session_id}/resume",
+                json={"signal": "human_completed", "research": RESEARCH_PAYLOAD},
+                headers=_headers(),
+            )
+            session = client.app.state.manager.get_if_present(session_id)
+
+            assert response.status_code == 409
+            assert response.json()["detail"] == "browser_resume_outcome_unknown"
+            assert session is not None and session.hitl_pending is False
+            assert session.reason_code == "browser_resume_outcome_unknown"
 
     def test_relay_refuses_a_non_loopback_vnc_target(self) -> None:
         """The relay must never become an SSRF primitive."""
@@ -1138,6 +1322,7 @@ class TestRestartReattachment:
             base_url=base_url,
             token=TOKEN,
             owner=OWNER,
+            capability_key=CAPABILITY_KEY,
             client=httpx.AsyncClient(transport=transport, base_url=base_url),
         )
 
@@ -1165,7 +1350,10 @@ class TestRestartReattachment:
             )
 
         client = self._service_client("http://browser-worker:8081", httpx.MockTransport(handler))
-        assert asyncio.run(client.reconcile_session("bs_live")) == "resumable"
+        assert (
+            asyncio.run(client.reconcile_session("bs_live", capability_scope="run-restart"))
+            == "resumable"
+        )
         assert client.supports_restart_reattach is True
 
     def test_sync_live_frame_is_available_to_run_projection(self) -> None:
@@ -1186,10 +1374,11 @@ class TestRestartReattachment:
             base_url="http://browser-worker:8081",
             token=TOKEN,
             owner=OWNER,
+            capability_key=CAPABILITY_KEY,
             sync_client=sync_client,
         )
         try:
-            frame = client.latest_screenshot("bs_live")
+            frame = client.latest_screenshot("bs_live", capability_scope="run-restart")
         finally:
             sync_client.close()
 
@@ -1230,11 +1419,12 @@ class TestRestartReattachment:
             base_url="http://browser-worker:8081",
             token=TOKEN,
             owner=OWNER,
+            capability_key=CAPABILITY_KEY,
             sync_client=sync_client,
         )
         try:
-            first = client.request_live_view_sync("bs_live")
-            second = client.request_live_view_sync("bs_live")
+            first = client.request_live_view_sync("bs_live", capability_scope="run-restart")
+            second = client.request_live_view_sync("bs_live", capability_scope="run-restart")
         finally:
             sync_client.close()
 
@@ -1249,7 +1439,10 @@ class TestRestartReattachment:
             return httpx.Response(404, json={"detail": "session_not_found"})
 
         client = self._service_client("http://browser-worker:8081", httpx.MockTransport(handler))
-        assert asyncio.run(client.reconcile_session("bs_stale")) == "session_lost"
+        assert (
+            asyncio.run(client.reconcile_session("bs_stale", capability_scope="run-restart"))
+            == "session_lost"
+        )
 
     def test_closing_session_is_not_resumable(self) -> None:
         import httpx
@@ -1258,7 +1451,10 @@ class TestRestartReattachment:
             return httpx.Response(200, json={"lifecycle": "CLOSING"})
 
         client = self._service_client("http://browser-worker:8081", httpx.MockTransport(handler))
-        assert asyncio.run(client.reconcile_session("bs_closing")) == "session_lost"
+        assert (
+            asyncio.run(client.reconcile_session("bs_closing", capability_scope="run-restart"))
+            == "session_lost"
+        )
 
     def test_unreachable_service_is_inconclusive_not_lost(self) -> None:
         """An unreachable service must not be mistaken for a dead session."""
@@ -1269,7 +1465,10 @@ class TestRestartReattachment:
             raise httpx.ConnectError("no route", request=request)
 
         client = self._service_client("http://browser-worker:8081", httpx.MockTransport(handler))
-        assert asyncio.run(client.reconcile_session("bs_any")) == "unreachable"
+        assert (
+            asyncio.run(client.reconcile_session("bs_any", capability_scope="run-restart"))
+            == "unreachable"
+        )
 
     def test_absent_session_id_is_lost_without_a_network_call(self) -> None:
         import httpx
@@ -1281,7 +1480,10 @@ class TestRestartReattachment:
             return httpx.Response(200, json={"lifecycle": "ACTIVE"})
 
         client = self._service_client("http://browser-worker:8081", httpx.MockTransport(handler))
-        assert asyncio.run(client.reconcile_session(None)) == "session_lost"
+        assert (
+            asyncio.run(client.reconcile_session(None, capability_scope="run-restart"))
+            == "session_lost"
+        )
         assert calls == []
 
     def test_run_service_treats_unreachable_as_leave_alone(self) -> None:
@@ -1635,6 +1837,7 @@ class TestProviderAwareHealth:
             base_url="http://browser-worker:8081",
             token=TOKEN,
             owner=OWNER,
+            capability_key=CAPABILITY_KEY,
             client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         )
         health = asyncio.run(client.health())
@@ -1676,16 +1879,17 @@ class TestContainerIsolationShape:
     def test_browser_worker_runs_chromium_safely_and_non_root(self) -> None:
         service = self._compose()["services"]["browser-worker"]
         assert service["init"] is True
-        assert service["ipc"] == "host"
-        assert service["shm_size"] == "1gb"
-        assert service["pids_limit"] == 512
+        assert "ipc" not in service
+        assert service["shm_size"] == "${BROWSER_SHM_SIZE:-2gb}"
+        assert service["pids_limit"] == "${BROWSER_PIDS_LIMIT:-768}"
         assert service["user"] == "ops"
         assert service["read_only"] is True
         assert service["cap_drop"] == ["ALL"]
         assert "no-new-privileges:true" in service["security_opt"]
         assert service["restart"] == "unless-stopped"
-        assert service["networks"] == ["opsnet"]
+        assert service["networks"] == ["browser-control", "browser-egress"]
         assert any(volume.endswith(":/browser-data") for volume in service["volumes"])
+        assert all("/vault" not in volume for volume in service["volumes"])
         assert any(entry.startswith("/tmp:") for entry in service["tmpfs"])
 
     def test_uvicorn_access_log_cannot_capture_live_view_query_tokens(self) -> None:
@@ -1726,6 +1930,57 @@ class TestContainerIsolationShape:
         assert secret not in generic.getMessage()
         assert "token=[REDACTED]" in generic.getMessage()
 
+    def test_browser_service_reinstalls_general_redaction_on_late_uvicorn_handlers(
+        self,
+    ) -> None:
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        logger = logging.getLogger("uvicorn.error")
+        previous_level = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        sentinels = {
+            "broker": "broker-log-sentinel",
+            "capability": "capability-log-sentinel",
+            "rpc": "rpc-log-sentinel",
+            "storage": "storage-log-sentinel",
+            "vault": "vault-log-sentinel",
+            "provider": "gsk_" + ("providerlogsentinel" * 2),
+        }
+        try:
+            # Simulate a handler Uvicorn attached after module import. Lifespan calls
+            # this same idempotent installer after Uvicorn logging configuration.
+            install_browser_service_log_filters()
+            logger.info(
+                "browser diagnostics %s",
+                [
+                    f"BROWSER_SECRET_BROKER_TOKEN={sentinels['broker']}",
+                    f"BROWSER_SESSION_CAPABILITY_KEY={sentinels['capability']}",
+                    f"BROWSER_SERVICE_TOKEN={sentinels['rpc']}",
+                    f"BROWSER_STORAGE_STATE_KEY={sentinels['storage']}",
+                    f"SECRET_VAULT_KEY={sentinels['vault']}",
+                    sentinels["provider"],
+                ],
+            )
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous_level)
+
+        rendered = stream.getvalue()
+        assert REDACTED in rendered
+        assert all(value not in rendered for value in sentinels.values())
+        for logger_name in (
+            "",
+            "browser_service",
+            "browser_service.novnc",
+            "uvicorn",
+            "uvicorn.error",
+            "uvicorn.access",
+        ):
+            installed = logging.getLogger(logger_name)
+            assert any(isinstance(item, RedactingFilter) for item in installed.filters)
+        assert any(isinstance(item, RedactingFilter) for item in handler.filters)
+
     def test_production_stack_holds_no_secret_literals(self) -> None:
         raw = (REPO_ROOT / "compose.prod.yaml").read_text()
         service = self._compose()["services"]["browser-worker"]
@@ -1734,9 +1989,15 @@ class TestContainerIsolationShape:
         assert service["environment"]["BROWSER_SERVICE_TOKEN"] == (
             "${BROWSER_SERVICE_TOKEN:?BROWSER_SERVICE_TOKEN is required}"
         )
+        assert service["environment"]["BROWSER_SECRET_BROKER_TOKEN"] == (
+            "${BROWSER_SECRET_BROKER_TOKEN:?BROWSER_SECRET_BROKER_TOKEN is required}"
+        )
         assert service["environment"]["BROWSER_STORAGE_STATE_KEY"] == (
             "${BROWSER_STORAGE_STATE_KEY:-}"
         )
+        assert "SECRET_VAULT_KEY" not in service["environment"]
+        assert "SECRET_VAULT_DB_PATH" not in service["environment"]
+        assert "OPS_INTERNAL_API_TOKEN" not in service["environment"]
         assert not re.search(r"(?i)(api_key|token|secret)\s*:\s*['\"]?[A-Za-z0-9_\-]{16,}", raw)
 
     def test_production_defaults_fail_closed_except_for_the_live_view_transport(self) -> None:
@@ -1751,6 +2012,7 @@ class TestContainerIsolationShape:
 
         assert default_of(environment["ALLOW_LIVE_BROWSER"]) == "false"
         assert default_of(environment["BROWSER_INTERACTIVE_HITL_ENABLED"]) == "true"
+        assert default_of(environment["PLAYWRIGHT_DISABLE_SANDBOX"]) == "false"
         # Not interpolated at all: hard-coded off.
         assert environment["ALLOW_LIVE_VENDOR_EMAIL"] == "false"
 
@@ -1888,7 +2150,7 @@ class TestServiceOwnsTheRealSession:
             assert (
                 client.post(
                     "/internal/browser/sessions",
-                    json={"app_slug": "pipedrive"},
+                    json={"app_slug": "pipedrive", "recipe_snapshot": RECIPE_SNAPSHOT},
                     headers=_headers(),
                 ).status_code
                 == 429
@@ -1903,7 +2165,7 @@ class TestServiceOwnsTheRealSession:
             assert (
                 client.post(
                     "/internal/browser/sessions",
-                    json={"app_slug": "pipedrive"},
+                    json={"app_slug": "pipedrive", "recipe_snapshot": RECIPE_SNAPSHOT},
                     headers=_headers(),
                 ).status_code
                 == 201
@@ -1915,7 +2177,7 @@ class TestServiceOwnsTheRealSession:
             first = _create_session(client)["session_id"]
             exhausted = client.post(
                 "/internal/browser/sessions",
-                json={"app_slug": "pipedrive"},
+                json={"app_slug": "pipedrive", "recipe_snapshot": RECIPE_SNAPSHOT},
                 headers=_headers(),
             )
             assert exhausted.status_code == 429
@@ -1923,7 +2185,7 @@ class TestServiceOwnsTheRealSession:
             # The slot is genuinely reusable.
             reused = client.post(
                 "/internal/browser/sessions",
-                json={"app_slug": "pipedrive"},
+                json={"app_slug": "pipedrive", "recipe_snapshot": RECIPE_SNAPSHOT},
                 headers=_headers(),
             )
             assert reused.status_code == 201
@@ -2064,6 +2326,7 @@ class TestRpcCredentialBoundary:
             base_url="http://browser-worker:8081",
             token=TOKEN,
             owner=OWNER,
+            capability_key=CAPABILITY_KEY,
             client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         )
         context = BrowserSessionContext(
@@ -2074,6 +2337,7 @@ class TestRpcCredentialBoundary:
             created_at="2026-01-01T00:00:00+00:00",
             inactivity_expires_at="2026-01-01T00:00:00+00:00",
             maximum_expires_at="2026-01-01T04:00:00+00:00",
+            capability_scope="run-reference-only",
         )
         asyncio.run(
             client.resume_after_hitl(
@@ -2084,6 +2348,11 @@ class TestRpcCredentialBoundary:
                     "login_email": "vault://pipedrive/browser_login_login_email/r1",
                     "login_password": "vault://pipedrive/browser_login_login_password/r2",
                     "login_otp": "vault://pipedrive/browser_login_login_otp/r3",
+                },
+                secret_grants={
+                    "login_email": BROKER_GRANT,
+                    "login_password": BROKER_GRANT,
+                    "login_otp": BROKER_GRANT,
                 },
             )
         )
@@ -2133,6 +2402,7 @@ class TestProviderFactoryWiring:
                 "browser_provider": "playwright",
                 "browser_service_url": "http://browser-worker:8081",
                 "browser_service_token": SecretStr("ci-token"),
+                "browser_session_capability_key": SecretStr("c" * 32),
             }
         )
         worker = self._service()._build_browser_worker(settings)
@@ -2161,6 +2431,7 @@ class TestProviderFactoryWiring:
 class TestServiceIsSoleCapacityOwner:
     """In service mode the manager owns capacity/TTL; the worker owns neither."""
 
+    @pytest.mark.browser
     def test_service_limit_wins_over_worker_limit(self) -> None:
         """Deliberately conflicting limits: worker=1, service=2.
 
@@ -2185,12 +2456,12 @@ class TestServiceIsSoleCapacityOwner:
         with client:
             first = client.post(
                 "/internal/browser/sessions",
-                json={"app_slug": "pipedrive"},
+                json={"app_slug": "pipedrive", "recipe_snapshot": RECIPE_SNAPSHOT},
                 headers=_headers(),
             )
             second = client.post(
                 "/internal/browser/sessions",
-                json={"app_slug": "pipedrive"},
+                json={"app_slug": "pipedrive", "recipe_snapshot": RECIPE_SNAPSHOT},
                 headers=_headers(),
             )
         assert first.status_code == 201
@@ -2348,10 +2619,8 @@ class TestTransientSecretRoundTrip:
         store = SQLiteSecretStore(tmp_path / "vault" / "credentials.db", key)
         return store, key
 
-    def test_service_consumes_scoped_reference_once(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        store, key = self._shared_vault(tmp_path)
+    def test_service_consumes_scoped_reference_once(self, tmp_path: Path) -> None:
+        store, _key = self._shared_vault(tmp_path)
         # A one-time reference the CONTROL PLANE would have minted for this run.
         reference = store.put_transient(
             app_slug="pipedrive",
@@ -2359,24 +2628,9 @@ class TestTransientSecretRoundTrip:
             scope_id="run-xyz",
             value="the-real-password",
         )
-        # Point the service's vault resolution at the SAME db + key.
-        from ops.config import Settings as OpsSettings
-
-        real_from_env = OpsSettings.from_env
-
-        def _patched(*args: Any, **kwargs: Any) -> Any:
-            base = real_from_env(dotenv_path=None)
-            return base.model_copy(
-                update={
-                    "secret_vault_key": SecretStr(key),
-                    "secret_vault_db_path": store.db_path,
-                }
-            )
-
-        monkeypatch.setattr(OpsSettings, "from_env", staticmethod(_patched))
-
         from browser_service.main import _resolve_credential_refs
         from browser_service.session_manager import ManagedSession
+        from ops.provider_errors import ProviderOperationError
 
         session = ManagedSession(
             session_id="bs_1", owner=OWNER, app_slug="pipedrive", secret_scope="run-xyz"
@@ -2384,76 +2638,55 @@ class TestTransientSecretRoundTrip:
         resolved = _resolve_credential_refs(
             session=session,
             credential_refs={"login_password": reference},
-            settings=_settings(),
+            secret_grants={"login_password": BROKER_GRANT},
+            broker=_VaultBackedBroker(store),
+            owner=OWNER,
+            capability=SESSION_CAPABILITY,
         )
         assert resolved == {"login_password": "the-real-password"}
-        # Consumed: a second resolution yields nothing (the row is gone).
-        again = _resolve_credential_refs(
-            session=session,
-            credential_refs={"login_password": reference},
-            settings=_settings(),
-        )
-        assert again == {}
+        # Consumed: a second resolution fails before any browser action.
+        with pytest.raises(ProviderOperationError) as excinfo:
+            _resolve_credential_refs(
+                session=session,
+                credential_refs={"login_password": reference},
+                secret_grants={"login_password": BROKER_GRANT},
+                broker=_VaultBackedBroker(store),
+                owner=OWNER,
+                capability=SESSION_CAPABILITY,
+            )
+        assert excinfo.value.reason_code == "browser_secret_unavailable"
 
-    def test_wrong_scope_reference_is_not_resolved(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        store, key = self._shared_vault(tmp_path)
+    def test_wrong_scope_reference_is_not_resolved(self, tmp_path: Path) -> None:
+        store, _key = self._shared_vault(tmp_path)
         reference = store.put_transient(
             app_slug="pipedrive",
             kind="browser_login_login_email",
             scope_id="run-A",
             value="ops@example.test",
         )
-        from ops.config import Settings as OpsSettings
-
-        real_from_env = OpsSettings.from_env
-        monkeypatch.setattr(
-            OpsSettings,
-            "from_env",
-            staticmethod(
-                lambda *a, **k: real_from_env(dotenv_path=None).model_copy(
-                    update={
-                        "secret_vault_key": SecretStr(key),
-                        "secret_vault_db_path": store.db_path,
-                    }
-                )
-            ),
-        )
         from browser_service.main import _resolve_credential_refs
         from browser_service.session_manager import ManagedSession
+        from ops.provider_errors import ProviderOperationError
 
         # A session for a DIFFERENT run must not consume run-A's reference.
         session = ManagedSession(
             session_id="bs_1", owner=OWNER, app_slug="pipedrive", secret_scope="run-B"
         )
-        assert (
+        with pytest.raises(ProviderOperationError) as excinfo:
             _resolve_credential_refs(
                 session=session,
                 credential_refs={"login_email": reference},
-                settings=_settings(),
+                secret_grants={"login_email": BROKER_GRANT},
+                broker=_VaultBackedBroker(store),
+                owner=OWNER,
+                capability=SESSION_CAPABILITY,
             )
-            == {}
-        )
+        assert excinfo.value.reason_code == "browser_secret_unavailable"
 
-    def test_missing_shared_vault_is_an_explicit_error(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from ops.config import Settings as OpsSettings
-        from ops.provider_errors import ProviderOperationError
-
-        real_from_env = OpsSettings.from_env
-        monkeypatch.setattr(
-            OpsSettings,
-            "from_env",
-            staticmethod(
-                lambda *a, **k: real_from_env(dotenv_path=None).model_copy(
-                    update={"secret_vault_key": None}
-                )
-            ),
-        )
+    def test_missing_secret_broker_is_an_explicit_error(self) -> None:
         from browser_service.main import _resolve_credential_refs
         from browser_service.session_manager import ManagedSession
+        from ops.provider_errors import ProviderOperationError
 
         session = ManagedSession(
             session_id="bs_1", owner=OWNER, app_slug="pipedrive", secret_scope="run-1"
@@ -2462,9 +2695,31 @@ class TestTransientSecretRoundTrip:
             _resolve_credential_refs(
                 session=session,
                 credential_refs={"login_email": "vault://pipedrive/browser_login_login_email/x"},
-                settings=_settings(),
+                secret_grants={"login_email": BROKER_GRANT},
+                broker=None,
+                owner=OWNER,
+                capability="unused-without-broker",
             )
-        assert excinfo.value.reason_code == "secret_vault_not_configured"
+        assert excinfo.value.reason_code == "browser_secret_broker_unavailable"
+
+    def test_service_rejects_a_raw_secret_reference(self) -> None:
+        from browser_service.main import _resolve_credential_refs
+        from browser_service.session_manager import ManagedSession
+        from ops.provider_errors import ProviderOperationError
+
+        session = ManagedSession(
+            session_id="bs_1", owner=OWNER, app_slug="pipedrive", secret_scope="run-1"
+        )
+        with pytest.raises(ProviderOperationError) as excinfo:
+            _resolve_credential_refs(
+                session=session,
+                credential_refs={"login_password": "raw-password"},  # pragma: allowlist secret
+                secret_grants={"login_password": BROKER_GRANT},
+                broker=_FakeSecretBroker(),
+                owner=OWNER,
+                capability=SESSION_CAPABILITY,
+            )
+        assert excinfo.value.reason_code == "browser_secret_reference_invalid"
 
     def test_client_start_sends_scope_and_account_ref(self) -> None:
         import httpx
@@ -2495,6 +2750,7 @@ class TestTransientSecretRoundTrip:
             base_url="http://browser-worker:8081",
             token=TOKEN,
             owner=OWNER,
+            capability_key=CAPABILITY_KEY,
             client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         )
         asyncio.run(
@@ -2518,6 +2774,7 @@ class TestTransientSecretRoundTrip:
 
         def handler(request: httpx.Request) -> httpx.Response:
             assert request.url.path.endswith("/bs_1/capture-credentials")
+            assert json.loads(request.content)["broker_grant"] == BROKER_GRANT
             return httpx.Response(
                 200,
                 json={"credential_refs": {"api_token": "vault://pipedrive/api_token/reference_1"}},
@@ -2527,9 +2784,17 @@ class TestTransientSecretRoundTrip:
             base_url="http://browser-worker:8081",
             token=TOKEN,
             owner=OWNER,
+            capability_key=CAPABILITY_KEY,
             client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         )
-        refs = asyncio.run(client.auto_capture_credentials("bs_1", "pipedrive"))
+        refs = asyncio.run(
+            client.auto_capture_credentials(
+                "bs_1",
+                "pipedrive",
+                capability_scope="run-capture",
+                broker_grant=BROKER_GRANT,
+            )
+        )
         assert refs == {"api_token": "vault://pipedrive/api_token/reference_1"}
 
     @pytest.mark.parametrize(
@@ -2554,6 +2819,7 @@ class TestTransientSecretRoundTrip:
             base_url="http://browser-worker:8081",
             token=TOKEN,
             owner=OWNER,
+            capability_key=CAPABILITY_KEY,
             client=httpx.AsyncClient(
                 transport=httpx.MockTransport(
                     lambda request: httpx.Response(200, json=payload, request=request)
@@ -2561,7 +2827,14 @@ class TestTransientSecretRoundTrip:
             ),
         )
         with pytest.raises(ProviderOperationError) as excinfo:
-            asyncio.run(client.auto_capture_credentials("bs_1", "pipedrive"))
+            asyncio.run(
+                client.auto_capture_credentials(
+                    "bs_1",
+                    "pipedrive",
+                    capability_scope="run-capture",
+                    broker_grant=BROKER_GRANT,
+                )
+            )
         assert excinfo.value.reason_code == "invalid_capture_response"
 
 

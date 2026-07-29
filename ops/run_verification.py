@@ -22,11 +22,14 @@ from __future__ import annotations
 
 import asyncio
 import random
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast
 
 from pydantic import SecretStr
 
+from ops.app_recipes import get_app_recipe
 from ops.browser_link_log import log_event
 from ops.config import Settings
 from ops.email_verification import (
@@ -37,6 +40,7 @@ from ops.email_verification import (
 )
 from ops.email_verification import link_host as verification_link_host
 from ops.gmail_worker import GmailWorker
+from ops.run_errors import CredentialSubmissionError, RunConflictError
 from ops.storage import OperationsStorage
 
 
@@ -44,10 +48,8 @@ from ops.storage import OperationsStorage
 class _VerificationBinding:
     """The bindings available for consuming an emailed verification secret.
 
-    ``reviewed_patterns`` is never empty: an instance only exists when the app has a
-    reviewed host set, which makes it impossible to run the strict path with a
-    recipient but no host restriction - a combination that would authorize opening an
-    arbitrary link from a correctly addressed but spoofed message.
+    Sender and link patterns are separate reviewed sets. This prevents a vendor's
+    broad email-sending domain from silently becoming a browser-navigation grant.
 
     ``expected_recipient`` is ``None`` when this run's verification mailbox is not
     known yet, which downgrades the read to preference-only rather than pretending a
@@ -56,7 +58,8 @@ class _VerificationBinding:
 
     app_slug: str
     expected_recipient: str | None
-    reviewed_patterns: tuple[str, ...]
+    reviewed_sender_patterns: tuple[str, ...]
+    allowed_link_host_patterns: tuple[str, ...]
 
 
 def _verification_backoff(base_delay: float, attempt: int) -> float:
@@ -72,6 +75,39 @@ def _verification_backoff(base_delay: float, attempt: int) -> float:
     return float(delay * (0.8 + 0.4 * random.random()))
 
 
+def _verification_window_open(record: Mapping[str, object], max_age_seconds: int) -> bool:
+    """Bound repeated inbox sweeps to the age of the waiting run.
+
+    The per-call retry count is a polling batch size, not a lifetime budget. The
+    previous in-memory counter permanently abandoned a still-fresh message after a
+    few sweeps. ``verification_requested_at`` is persisted inside the active HITL
+    challenge, so this remains bounded, restart-safe, and tied to that challenge.
+    """
+
+    requested_at_ms = _verification_requested_at_ms(record)
+    if requested_at_ms is None:
+        return False
+    started = datetime.fromtimestamp(requested_at_ms / 1000, tz=UTC)
+    now = datetime.now(UTC)
+    return started - timedelta(seconds=60) <= now < started + timedelta(seconds=max_age_seconds)
+
+
+def _verification_requested_at_ms(record: Mapping[str, object]) -> int | None:
+    """Read the persisted timestamp for the exact browser challenge."""
+
+    hitl = record.get("hitl_request")
+    raw = hitl.get("verification_requested_at") if isinstance(hitl, Mapping) else None
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        started = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    return int(started.astimezone(UTC).timestamp() * 1000)
+
+
 class RunVerificationContext(Protocol):
     """Run-service state and hooks the verification flow uses."""
 
@@ -85,13 +121,22 @@ class RunVerificationContext(Protocol):
 
     def _hitl_action_type(self, record: Any) -> str | None: ...
 
-    def _reusable_login_values(self, app_slug: str) -> dict[str, SecretStr]: ...
+    def _reusable_login_values(self, app_slug: str, account_ref: str) -> dict[str, SecretStr]: ...
+
+    def _staged_signup_login_values(
+        self,
+        *,
+        app_slug: str,
+        account_ref: str,
+        run_id: str,
+    ) -> dict[str, SecretStr]: ...
 
     def _verification_binding(
         self,
         app_slug: str,
         *,
         expected_recipient: str | None = None,
+        account_ref: str | None = None,
     ) -> _VerificationBinding | None: ...
 
     def _fetch_bound_verification(
@@ -100,6 +145,7 @@ class RunVerificationContext(Protocol):
         run_id: str,
         purpose: str,
         binding: _VerificationBinding | None,
+        verification_requested_at_ms: int,
     ) -> VerificationDecision | None: ...
 
     def resume_run(
@@ -117,36 +163,71 @@ class RunVerificationService:
     def __init__(self, context: RunVerificationContext) -> None:
         self._context = context
 
-    def resolve_pending_otps(self, *, limit: int = 100) -> int:
-        """Autonomously resolve every run waiting on an emailed login code."""
+    def resolve_pending_otps(
+        self,
+        *,
+        limit: int = 1_000,
+        max_attempts_per_run: int | None = None,
+    ) -> int:
+        """Autonomously resolve bounded runs waiting on an emailed login code."""
 
         context = self._context
-        if context._gmail_worker is None:
+        if context._gmail_worker is None or limit <= 0:
             return 0
         resolved = 0
-        for record in context.storage.list_runs(limit=limit, offset=0):
-            if record.get("status") != "waiting_for_hitl":
-                continue
-            if context._hitl_action_type(record) != "email_otp":
-                continue
-            run_id = str(record.get("run_id") or "")
-            if not run_id:
-                continue
-            try:
-                if self.resolve_email_otp(run_id) is not None:
-                    resolved += 1
-            except Exception:
-                continue
+        page_size = min(100, limit)
+        for offset in range(0, limit, page_size):
+            records = context.storage.list_runs(
+                limit=min(page_size, limit - offset),
+                offset=offset,
+            )
+            if not records:
+                break
+            for record in records:
+                if record.get("status") != "waiting_for_hitl":
+                    continue
+                if context._hitl_action_type(record) != "email_otp":
+                    continue
+                run_id = str(record.get("run_id") or "")
+                if not run_id:
+                    continue
+                try:
+                    if (
+                        self.resolve_email_otp(
+                            run_id,
+                            max_attempts=max_attempts_per_run,
+                        )
+                        is not None
+                    ):
+                        resolved += 1
+                except Exception:
+                    continue
+            if len(records) < page_size:
+                break
         return resolved
 
-    def resolve_email_otp(self, run_id: str) -> dict[str, Any] | None:
+    def resolve_email_otp(
+        self,
+        run_id: str,
+        *,
+        max_attempts: int | None = None,
+    ) -> dict[str, Any] | None:
         """Resolve an emailed LOGIN verification and resume the browser with it.
 
         Retained entry point for the ``email_otp`` human gate; the purpose-aware
         implementation lives in :meth:`resolve_email_verification`.
         """
-
-        return self.resolve_email_verification(run_id, purpose="login_verification")
+        record = self._context.storage.get_run(run_id)
+        request = record.get("request") if isinstance(record, dict) else None
+        account_mode = request.get("account_mode") if isinstance(request, dict) else None
+        purpose: VerificationPurpose = (
+            "signup_confirmation" if account_mode == "create_account" else "login_verification"
+        )
+        return self.resolve_email_verification(
+            run_id,
+            purpose=purpose,
+            max_attempts=max_attempts,
+        )
 
     def resolve_email_verification(
         self,
@@ -154,6 +235,7 @@ class RunVerificationService:
         *,
         purpose: VerificationPurpose = "login_verification",
         expected_recipient: str | None = None,
+        max_attempts: int | None = None,
     ) -> dict[str, Any] | None:
         """Read the verification email for a waiting run and resume the browser.
 
@@ -162,11 +244,13 @@ class RunVerificationService:
         placeholder (never logged or persisted), and the SAME browser session is
         resumed so the agent types the code or opens the link and continues.
 
-        ``purpose`` selects the flow this verification belongs to, so an autonomous
-        signup confirmation and a login device check are ledgered independently and
-        can never consume each other's message. ``expected_recipient`` lets a signup
-        flow bind to the address it just registered, which is not yet the app's
-        remembered sign-in email; when omitted the remembered login email is used.
+        ``purpose`` describes the flow this verification belongs to.
+        ``expected_recipient`` lets a signup flow bind to the address it just
+        registered, which is not yet the app's remembered sign-in email; when
+        omitted, a signup reads its run-scoped staged identity and an existing
+        account reads its remembered login email. Message consumption itself is
+        global to the connected Gmail account, so no other run or purpose can
+        replay the same immutable provider message id.
 
         A magic SIGN-IN LINK takes priority over a numeric code because providers
         such as HubSpot device verification send a one-time link that must be opened
@@ -184,15 +268,52 @@ class RunVerificationService:
             return None
         if context._hitl_action_type(record) != "email_otp":
             return None
+        verification_requested_at_ms = _verification_requested_at_ms(record)
+        if verification_requested_at_ms is None:
+            log_event(
+                "browser.verification.challenge_timestamp_missing",
+                run_id=run_id,
+            )
+            return None
         settings = context._settings or Settings.from_env()
-        budget = max(1, int(getattr(settings, "gmail_verification_max_attempts", 3)))
-        if context._otp_attempts.get(run_id, 0) >= budget:
+        configured_budget = max(
+            1,
+            int(getattr(settings, "gmail_verification_max_attempts", 3)),
+        )
+        budget = (
+            configured_budget
+            if max_attempts is None
+            else min(configured_budget, max(1, int(max_attempts)))
+        )
+        max_age = max(
+            1,
+            int(getattr(settings, "gmail_verification_max_age_seconds", 900)),
+        )
+        if not _verification_window_open(record, max_age):
             return None
         context._otp_attempts[run_id] = context._otp_attempts.get(run_id, 0) + 1
 
         app_slug = str(record.get("app_slug") or "unknown")
-        binding = context._verification_binding(app_slug, expected_recipient=expected_recipient)
-        if binding is None and bool(getattr(settings, "gmail_verification_require_binding", False)):
+        account_ref = str(record.get("browser_account_ref") or "") or None
+        request = record.get("request")
+        account_mode = request.get("account_mode") if isinstance(request, Mapping) else None
+        if expected_recipient is None and account_mode == "create_account" and account_ref:
+            staged = context._staged_signup_login_values(
+                app_slug=app_slug,
+                account_ref=account_ref,
+                run_id=run_id,
+            )
+            signup_email = staged.get("login_email")
+            if signup_email is not None:
+                expected_recipient = signup_email.get_secret_value()
+        binding = context._verification_binding(
+            app_slug,
+            expected_recipient=expected_recipient,
+            account_ref=account_ref,
+        )
+        if (binding is None or binding.expected_recipient is None) and bool(
+            getattr(settings, "gmail_verification_require_binding", False)
+        ):
             # Fail closed: this deployment requires proof that the message belongs
             # to this run, and that proof is unavailable.
             log_event(
@@ -210,7 +331,10 @@ class RunVerificationService:
         base_delay = float(getattr(settings, "gmail_verification_poll_seconds", 5.0))
         for attempt in range(budget):
             decision = context._fetch_bound_verification(
-                run_id=run_id, purpose=purpose, binding=binding
+                run_id=run_id,
+                purpose=purpose,
+                binding=binding,
+                verification_requested_at_ms=verification_requested_at_ms,
             )
             if decision is not None and decision.is_resolved:
                 break
@@ -241,6 +365,7 @@ class RunVerificationService:
             # otherwise inert diagnostic.
             verification_kind=evidence.verification_kind,
             sender_domain=evidence.sender_domain or None,
+            sender_authentication=evidence.sender_authentication,
             link_host=evidence.link_host or None,
             code_length=evidence.code_length or None,
             age_seconds=evidence.age_seconds,
@@ -248,17 +373,52 @@ class RunVerificationService:
             sender_reviewed=evidence.sender_reviewed,
         )
         field = "login_verification_url" if evidence.verification_kind == "link" else "login_otp"
-        return context.resume_run(
-            run_id,
-            signal="completed",
-            browser_login={field: decision.resolved.secret},
+        try:
+            result = context.resume_run(
+                run_id,
+                signal="completed",
+                browser_login={field: decision.resolved.secret},
+            )
+        except (CredentialSubmissionError, RunConflictError, KeyError):
+            # These failures happen before the browser accepts the one-time value,
+            # so the reservation can safely be retried.
+            release = getattr(context._gmail_worker, "release_verification_claim", None)
+            if callable(release):
+                release(run_id=run_id, purpose=purpose, evidence=evidence)
+            raise
+        except Exception:
+            # Transport/provider failures may occur after submission. Refuse replay
+            # until an operator reconciles the provider state.
+            mark_unknown = getattr(
+                context._gmail_worker,
+                "mark_verification_claim_outcome_unknown",
+                None,
+            )
+            if callable(mark_unknown):
+                mark_unknown(run_id=run_id, purpose=purpose, evidence=evidence)
+            raise
+
+        definite_pre_use_failure = bool(
+            isinstance(result, dict)
+            and result.get("status") == "configuration_required"
+            and result.get("phase") in {"session_lost", "browser_unavailable"}
         )
+        if definite_pre_use_failure:
+            release = getattr(context._gmail_worker, "release_verification_claim", None)
+            if callable(release):
+                release(run_id=run_id, purpose=purpose, evidence=evidence)
+        else:
+            complete = getattr(context._gmail_worker, "complete_verification_claim", None)
+            if callable(complete):
+                complete(run_id=run_id, purpose=purpose, evidence=evidence)
+        return result
 
     def verification_binding(
         self,
         app_slug: str,
         *,
         expected_recipient: str | None = None,
+        account_ref: str | None = None,
     ) -> _VerificationBinding | None:
         """Resolve the bindings available for an emailed verification.
 
@@ -281,21 +441,36 @@ class RunVerificationService:
         policy = get_browser_policy(app_slug)
         if policy is None:
             return None
-        patterns = (
+        recipe = get_app_recipe(app_slug)
+        browser = recipe.browser if recipe is not None else None
+        fallback_patterns = (
             *policy.exact_hosts,
             *(f"*.{domain}" for domain in policy.vendor_wildcard_domains),
         )
-        if not patterns:
+        sender_patterns = (
+            browser.verification_sender_domains
+            if browser is not None and browser.verification_sender_domains
+            else fallback_patterns
+        )
+        link_patterns = (
+            browser.verification_link_hosts
+            if browser is not None and browser.verification_link_hosts
+            else fallback_patterns
+        )
+        if not sender_patterns or not link_patterns:
             return None
         recipient = (expected_recipient or "").strip() or None
-        if recipient is None:
-            recipient_secret = self._context._reusable_login_values(app_slug).get("login_email")
+        if recipient is None and account_ref is not None:
+            recipient_secret = self._context._reusable_login_values(app_slug, account_ref).get(
+                "login_email"
+            )
             if recipient_secret is not None:
                 recipient = recipient_secret.get_secret_value().strip() or None
         return _VerificationBinding(
             app_slug=app_slug,
             expected_recipient=recipient,
-            reviewed_patterns=patterns,
+            reviewed_sender_patterns=tuple(sender_patterns),
+            allowed_link_host_patterns=tuple(link_patterns),
         )
 
     def fetch_bound_verification(
@@ -304,6 +479,7 @@ class RunVerificationService:
         run_id: str,
         purpose: str,
         binding: _VerificationBinding | None,
+        verification_requested_at_ms: int,
     ) -> VerificationDecision | None:
         """Read one verification message, preferring the fully bound path.
 
@@ -320,16 +496,18 @@ class RunVerificationService:
             return None
         settings = self._context._settings or Settings.from_env()
         max_age = int(getattr(settings, "gmail_verification_max_age_seconds", 900))
-        patterns = binding.reviewed_patterns if binding is not None else ()
+        sender_patterns = binding.reviewed_sender_patterns if binding is not None else ()
+        link_patterns = binding.allowed_link_host_patterns if binding is not None else ()
         if binding is not None and binding.expected_recipient is not None:
             try:
                 return asyncio.run(
                     worker.fetch_verification(
                         purpose=cast("VerificationPurpose", purpose),
                         expected_recipient=binding.expected_recipient,
-                        reviewed_sender_patterns=patterns,
-                        allowed_link_host_patterns=patterns,
+                        reviewed_sender_patterns=sender_patterns,
+                        allowed_link_host_patterns=link_patterns,
                         run_id=run_id,
+                        verification_requested_at_ms=verification_requested_at_ms,
                         max_age_seconds=max_age,
                     )
                 )
@@ -340,8 +518,9 @@ class RunVerificationService:
             worker,
             run_id=run_id,
             purpose=purpose,
-            allowed_link_host_patterns=patterns,
+            allowed_link_host_patterns=link_patterns,
             max_age_seconds=max_age,
+            verification_requested_at_ms=verification_requested_at_ms,
         )
 
     def legacy_verification_read(
@@ -352,6 +531,7 @@ class RunVerificationService:
         purpose: str,
         allowed_link_host_patterns: tuple[str, ...] = (),
         max_age_seconds: int = 900,
+        verification_requested_at_ms: int,
     ) -> VerificationDecision | None:
         """Preference-only inbox read for runs without an exact recipient binding."""
 
@@ -361,6 +541,7 @@ class RunVerificationService:
                 worker.fetch_latest_login_link(
                     allowed_link_host_patterns=allowed_link_host_patterns,
                     max_age_seconds=max_age_seconds,
+                    verification_requested_at_ms=verification_requested_at_ms,
                 )
             )
         except Exception:
@@ -383,7 +564,12 @@ class RunVerificationService:
                 reason_code="verification_resolved_unbound",
             )
         try:
-            code = asyncio.run(worker.fetch_latest_otp(max_age_seconds=max_age_seconds))
+            code = asyncio.run(
+                worker.fetch_latest_otp(
+                    max_age_seconds=max_age_seconds,
+                    verification_requested_at_ms=verification_requested_at_ms,
+                )
+            )
         except Exception:
             code = None
         if code:

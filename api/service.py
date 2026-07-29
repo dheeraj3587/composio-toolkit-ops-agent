@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
+import threading
+import time
 from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 from pydantic import SecretStr
 from starlette.concurrency import run_in_threadpool
@@ -19,7 +24,9 @@ from api.models import (
     AppSearchResponse,
     AppSummary,
     BrowserLoginInput,
+    BrowserServiceHealthView,
     BrowserUiState,
+    BrowserVerificationInput,
     CreateRunRequest,
     CredentialSubmissionRequest,
     HealthCheck,
@@ -40,10 +47,19 @@ from api.models import (
     TimelineEvent,
     TimelineResponse,
 )
-from ops.app_recipes import load_app_recipe_catalog
+from ops.app_recipes import (
+    get_app_recipe,
+    get_app_recipe_for_name,
+    load_app_recipe_catalog,
+    recipe_to_operational_research,
+)
 from ops.browser_readiness import browser_configuration_state
+from ops.browser_service_client import BrowserServiceClient, BrowserServiceHealth
+from ops.composio_managed_auth import managed_auth_configuration_is_valid
 from ops.config import Settings, load_settings
-from ops.models import CompanyProfile, OperationalResearch, OperationsRequest
+from ops.deploy_acceptance import deployment_is_accepted
+from ops.gmail_worker import GmailSignupPreflight
+from ops.models import AccountMode, CompanyProfile, OperationalResearch, OperationsRequest
 from ops.run_service import CredentialSubmissionError
 from ops.run_service import RunService as CoreRunService
 from ops.state import BrowserProvider
@@ -59,6 +75,14 @@ class AppNotFoundError(LookupError):
     def __init__(self, app_slug: str) -> None:
         self.app_slug = app_slug
         super().__init__("app was not found")
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedGmailSignupPreflight:
+    result: GmailSignupPreflight
+    expires_monotonic: float
+    checked_at: str
+    expires_at: str
 
 
 class PhaseUnavailableError(RuntimeError):
@@ -86,6 +110,8 @@ class RunService(Protocol):
 
     async def shutdown(self) -> None: ...
 
+    def deployment_mutations_allowed(self) -> bool: ...
+
     async def create_run(
         self,
         request: CreateRunRequest,
@@ -110,6 +136,7 @@ class RunService(Protocol):
         run_id: str,
         *,
         browser_login: BrowserLoginInput | None = None,
+        browser_verification: BrowserVerificationInput | None = None,
         signal: str = "completed",
     ) -> ActionReceipt: ...
 
@@ -134,6 +161,8 @@ class RunService(Protocol):
     async def list_apps(self) -> AppCatalogResponse: ...
 
     async def get_app_research(self, app_slug: str) -> AppResearchResponse: ...
+
+    async def signup_readiness(self) -> ProviderState: ...
 
     async def health(self) -> HealthResponse: ...
 
@@ -171,6 +200,24 @@ _EVENT_SUMMARIES = {
 }
 
 
+def _work_email_ref_for_app(app_name: str, *, app_slug: str | None = None) -> str:
+    """Return a non-secret, deterministic work-email vault reference.
+
+    Catalog slugs are preferred so punctuation-heavy display names such as
+    ``Monday.com`` resolve to the exact same reference everywhere. The fallback
+    is only for the conservative research-only path and remains inside the
+    strict vault-reference alphabet.
+    """
+
+    resolved_slug = app_slug
+    if resolved_slug is None:
+        recipe = get_app_recipe_for_name(app_name) or get_app_recipe(app_name)
+        resolved_slug = recipe.app_slug if recipe is not None else None
+    if resolved_slug is None:
+        resolved_slug = re.sub(r"[^a-z0-9]+", "-", app_name.strip().casefold()).strip("-")
+    return f"vault://company/work_email/{resolved_slug or 'app'}"
+
+
 class LocalRunService:
     """Leak-resistant HTTP adapter over the canonical application service."""
 
@@ -188,6 +235,8 @@ class LocalRunService:
             settings=self._settings,
         )
         self._started = False
+        self._gmail_preflight_lock = threading.Lock()
+        self._gmail_preflight_cache: _CachedGmailSignupPreflight | None = None
 
     async def startup(self) -> None:
         await run_in_threadpool(self._service.startup)
@@ -197,6 +246,21 @@ class LocalRunService:
         self._started = False
         await run_in_threadpool(self._service.shutdown)
 
+    def deployment_mutations_allowed(self) -> bool:
+        """Keep production writes inert until this exact release is accepted.
+
+        Local and test runtimes do not enable startup automation and therefore
+        need no deploy marker. Production enables it in Compose; the same exact
+        revision+nonce marker that unlocks background maintenance also unlocks
+        operator and browser-broker mutations. Reading the small owner-only
+        marker for every write avoids a stale in-memory acceptance decision
+        during rollback.
+        """
+
+        if not self._settings.ops_startup_automation_enabled:
+            return True
+        return deployment_is_accepted(self._settings)
+
     def _require_started(self) -> None:
         if not self._started:
             raise RuntimeError("API service lifespan has not started")
@@ -205,11 +269,21 @@ class LocalRunService:
     def _summary(record: dict[str, object]) -> RunSummary:
         raw_attempt = record.get("attempt", 0)
         attempt = int(raw_attempt) if isinstance(raw_attempt, int | str) else 0
+        stored_request = record.get("request")
+        raw_account_mode = record.get("account_mode")
+        if raw_account_mode is None and isinstance(stored_request, Mapping):
+            raw_account_mode = stored_request.get("account_mode")
+        account_mode = (
+            cast(AccountMode, raw_account_mode)
+            if raw_account_mode in {"existing_account", "create_account"}
+            else None
+        )
         return RunSummary(
             run_id=str(record["run_id"]),
             thread_id=str(record["thread_id"]),
             app_name=str(record["app_name"]),
             app_slug=str(record["app_slug"]),
+            account_mode=account_mode,
             status=record["status"],  # type: ignore[arg-type]
             access_route=record.get("access_route"),  # type: ignore[arg-type]
             created_at=str(record["created_at"]),
@@ -241,10 +315,7 @@ class LocalRunService:
                 reason_code="credential_stored_validation_not_reviewed",
             )
         if summary.route_kind == "managed_auth":
-            managed_enabled = bool(
-                self._settings.composio_api_key is not None
-                and self._settings.managed_auth_callback_base_url
-            )
+            managed_enabled = managed_auth_configuration_is_valid(self._settings)
             if record.get("connection_request_id"):
                 return PrimaryAction(
                     kind="poll_connection",
@@ -295,7 +366,7 @@ class LocalRunService:
                     reason_code="outreach_reply_pending",
                 )
             controlled_outreach_enabled = bool(
-                self._settings.composio_api_key is not None
+                self._settings.composio_gmail_api_key is not None
                 and self._settings.composio_gmail_connected_account_id
                 and self._settings.outreach_recipient_override
             )
@@ -313,7 +384,61 @@ class LocalRunService:
             )
         return PrimaryAction(kind="none", enabled=False, reason_code="legacy_run_read_only")
 
-    def _provider_states(self) -> list[ProviderState]:
+    def _cached_gmail_preflight(
+        self,
+        *,
+        refresh: bool,
+        force: bool = False,
+    ) -> _CachedGmailSignupPreflight | None:
+        """Return one bounded, value-free Gmail readiness result.
+
+        Success is cached for one minute and failure for ten seconds. The lock is
+        also the single-flight boundary: concurrent health requests cannot fan
+        out into multiple provider reads.
+        """
+
+        settings = self._settings
+        configured = bool(
+            settings.composio_gmail_api_key is not None
+            and settings.composio_gmail_connected_account_id
+            and settings.gmail_signup_address is not None
+        )
+        if not configured:
+            return None
+        with self._gmail_preflight_lock:
+            now_monotonic = time.monotonic()
+            cached = self._gmail_preflight_cache
+            if not force and cached is not None and cached.expires_monotonic > now_monotonic:
+                return cached
+            if not refresh:
+                return None
+            try:
+                result = self._service.gmail_signup_preflight(
+                    timeout_seconds=settings.gmail_signup_preflight_timeout_seconds
+                )
+            except Exception:
+                result = GmailSignupPreflight(
+                    status="unavailable",
+                    reason_code="gmail_signup_preflight_failed",
+                    provider_read_attempted=False,
+                )
+            ttl_seconds = 60 if result.ready else 10
+            checked = datetime.now(UTC)
+            entry = _CachedGmailSignupPreflight(
+                result=result,
+                expires_monotonic=time.monotonic() + ttl_seconds,
+                checked_at=checked.isoformat(),
+                expires_at=(checked + timedelta(seconds=ttl_seconds)).isoformat(),
+            )
+            self._gmail_preflight_cache = entry
+            return entry
+
+    def _provider_states(
+        self,
+        *,
+        gmail_preflight: _CachedGmailSignupPreflight | None = None,
+        browser_health: BrowserServiceHealth | None = None,
+    ) -> list[ProviderState]:
         settings = self._settings
 
         def state(
@@ -323,6 +448,9 @@ class LocalRunService:
             enabled: bool = True,
             ready: bool = False,
             detail: str,
+            reason_code: str | None = None,
+            checked_at: str | None = None,
+            expires_at: str | None = None,
         ) -> ProviderState:
             if not enabled:
                 status = "disabled"
@@ -332,20 +460,71 @@ class LocalRunService:
                 status = "configured_not_verified"
             else:
                 status = "not_configured"
-            return ProviderState(provider=provider, status=status, detail=detail)  # type: ignore[arg-type]
+            return ProviderState.model_validate(
+                {
+                    "provider": provider,
+                    "status": status,
+                    "detail": detail,
+                    "reason_code": reason_code,
+                    "checked_at": checked_at,
+                    "expires_at": expires_at,
+                }
+            )
 
         live_browser_enabled = bool(getattr(settings, "allow_live_browser", False))
-        gmail_configured = bool(
-            settings.composio_api_key is not None
+        gmail_inbox_configured = bool(
+            settings.composio_gmail_api_key is not None
             and settings.composio_gmail_connected_account_id
-            and settings.outreach_recipient_override
         )
-        managed_configured = bool(
-            settings.composio_api_key is not None and settings.managed_auth_callback_base_url
+        gmail_outreach_configured = bool(
+            gmail_inbox_configured and settings.outreach_recipient_override
         )
+        if gmail_preflight is None:
+            gmail_preflight = self._cached_gmail_preflight(refresh=False)
+        gmail_signup_ready = bool(
+            gmail_preflight is not None
+            and gmail_preflight.result.ready
+            and settings.gmail_signup_address is not None
+        )
+        managed_configured = managed_auth_configuration_is_valid(settings)
         browser_use_enabled = bool(
             live_browser_enabled and settings.browser_use_compatibility_enabled
         )
+        playwright_configured = browser_configuration_state(settings, "playwright")
+        if browser_health is None:
+            playwright_state = state(
+                "playwright",
+                configured=playwright_configured,
+                enabled=live_browser_enabled,
+                detail=self._browser_provider_detail(
+                    provider="playwright",
+                    settings=settings,
+                    live_enabled=live_browser_enabled,
+                ),
+            )
+        else:
+            browser_ready = bool(
+                browser_health.state in {"ready", "capacity_exhausted"}
+                and browser_health.chromium_installed
+                and browser_health.context_launch_ok
+                and browser_health.janitor_running
+            )
+            playwright_state = ProviderState.model_validate(
+                {
+                    "provider": "playwright",
+                    "status": "ready" if browser_ready else "configured_not_verified",
+                    "detail": (
+                        f"Cached browser service state={browser_health.state}; "
+                        f"version={browser_health.version}; "
+                        f"chromium_installed={str(browser_health.chromium_installed).lower()}; "
+                        f"context_launch_ok={str(browser_health.context_launch_ok).lower()}; "
+                        f"janitor_running={str(browser_health.janitor_running).lower()}; "
+                        f"capacity={browser_health.capacity_in_use}/"
+                        f"{browser_health.capacity_total}."
+                    ),
+                    "reason_code": browser_health.reason_code,
+                }
+            )
         return [
             state(
                 "recipes",
@@ -364,29 +543,41 @@ class LocalRunService:
                 detail=(
                     "Managed connection links are configured; live status is checked only on an owner action."
                     if managed_configured
-                    else "Managed auth requires COMPOSIO_API_KEY and MANAGED_AUTH_CALLBACK_BASE_URL."
+                    else "Managed auth requires COMPOSIO_API_KEY and a valid public HTTPS "
+                    "MANAGED_AUTH_CALLBACK_BASE_URL origin."
                 ),
             ),
             state(
                 "gmail",
-                configured=gmail_configured,
-                enabled=gmail_configured,
+                configured=gmail_inbox_configured,
+                enabled=gmail_inbox_configured,
+                ready=gmail_signup_ready,
                 detail=(
-                    "Controlled-sink Gmail is configured; live vendor delivery remains disabled."
-                    if gmail_configured
-                    else "Controlled outreach requires Composio Gmail and OUTREACH_RECIPIENT_OVERRIDE."
+                    "A bounded inbox read succeeded; Gmail signup verification is ready."
+                    if gmail_signup_ready
+                    else "Gmail signup inbox verification failed its latest bounded read."
+                    if gmail_preflight is not None
+                    else "Gmail inbox verification and controlled outreach are configured but not yet verified."
+                    if gmail_outreach_configured and settings.gmail_signup_address
+                    else "Gmail inbox verification is configured; new-account signup still needs GMAIL_SIGNUP_ADDRESS."
+                    if gmail_inbox_configured and not settings.gmail_signup_address
+                    else "Gmail inbox verification is configured; outreach remains disabled."
+                    if gmail_inbox_configured
+                    else "Gmail verification requires Composio and a connected Gmail account."
                 ),
-            ),
-            state(
-                "playwright",
-                configured=browser_configuration_state(settings, "playwright"),
-                enabled=live_browser_enabled,
-                detail=self._browser_provider_detail(
-                    provider="playwright",
-                    settings=settings,
-                    live_enabled=live_browser_enabled,
+                reason_code=(
+                    gmail_preflight.result.reason_code
+                    if gmail_preflight is not None
+                    else "gmail_signup_address_missing"
+                    if gmail_inbox_configured and settings.gmail_signup_address is None
+                    else "gmail_signup_preflight_not_run"
+                    if gmail_inbox_configured
+                    else "gmail_signup_not_configured"
                 ),
+                checked_at=(gmail_preflight.checked_at if gmail_preflight is not None else None),
+                expires_at=(gmail_preflight.expires_at if gmail_preflight is not None else None),
             ),
+            playwright_state,
             state(
                 "browser_use",
                 configured=(
@@ -492,10 +683,12 @@ class LocalRunService:
         browser_detail = self._browser_phase_detail(
             provider=browser_provider, configured=has_browser_configuration
         )
-        has_email_configuration = bool(
-            self._settings.composio_api_key is not None
+        has_email_inbox_configuration = bool(
+            self._settings.composio_gmail_api_key is not None
             and self._settings.composio_gmail_connected_account_id
-            and self._settings.outreach_recipient_override
+        )
+        has_outreach_configuration = bool(
+            has_email_inbox_configuration and self._settings.outreach_recipient_override
         )
         bundle_ready = record.get("integrator_bundle") is not None
 
@@ -557,7 +750,37 @@ class LocalRunService:
                 available=has_browser_configuration,
             )
 
-        if route_kind != "gated":
+        hitl_request = record.get("hitl_request")
+        waiting_for_email_verification = bool(
+            run_status == "waiting_for_hitl"
+            and isinstance(hitl_request, dict)
+            and (
+                hitl_request.get("type") == "email_otp"
+                or hitl_request.get("action_type") == "email_otp"
+            )
+        )
+        if route_kind == "playwright":
+            email_phase = PhaseState(
+                key="email",
+                name="Email verification",
+                phase="verification",
+                status=(
+                    "waiting"
+                    if waiting_for_email_verification
+                    else "ready"
+                    if has_email_inbox_configuration
+                    else "configuration_required"
+                ),
+                detail=(
+                    "Waiting for a fresh, correctly addressed code or verification link."
+                    if waiting_for_email_verification
+                    else "The connected Gmail inbox can resolve signup and login verification."
+                    if has_email_inbox_configuration
+                    else "Connect Gmail to enable automatic signup and login verification."
+                ),
+                available=has_email_inbox_configuration,
+            )
+        elif route_kind != "gated":
             email_phase = PhaseState(
                 key="email",
                 name="Email",
@@ -584,11 +807,11 @@ class LocalRunService:
                     "waiting"
                     if run_status in {"outreach_sent", "waiting_for_reply"}
                     else "ready"
-                    if has_email_configuration
+                    if has_outreach_configuration
                     else "configuration_required"
                 ),
                 detail="Outreach is bounded to the configured controlled sink.",
-                available=has_email_configuration,
+                available=has_outreach_configuration,
             )
         return [
             research_phase,
@@ -688,9 +911,7 @@ class LocalRunService:
                     else "not_configured"
                 ),
                 owner_only_storage=("verified_owner_only" if owner_only else "verification_failed"),
-                checkpoint_encryption=(
-                    "ready" if self._settings.langgraph_aes_key is not None else "not_configured"
-                ),
+                operational_state_storage="sqlite_not_app_encrypted",
                 live_vendor_email=(
                     "enabled" if self._settings.allow_live_vendor_email else "disabled"
                 ),
@@ -703,6 +924,12 @@ class LocalRunService:
                 notes=[
                     "API responses exclude provider sessions and raw audit payloads.",
                     "Vault values and provider capability URLs are never exposed by this API.",
+                    (
+                        "Canonical run state and effect receipts use ordinary SQLite; they are "
+                        "not application-layer encrypted. Owner-only permissions are reported "
+                        "separately."
+                    ),
+                    "Reusable credential payloads are separately Fernet-encrypted in the vault.",
                 ],
             ),
             route_decision=(
@@ -798,7 +1025,12 @@ class LocalRunService:
             return False
         return count >= len(sample)
 
-    def _health_sync(self) -> HealthResponse:
+    def _health_sync(
+        self,
+        *,
+        browser_health: BrowserServiceHealth | None = None,
+        browser_service_expected: bool = False,
+    ) -> HealthResponse:
         storage_readable = self._storage_is_readable()
         storage_owner_only = self._storage_permissions_are_owner_only()
         try:
@@ -830,11 +1062,44 @@ class LocalRunService:
                 status="pass" if snapshot_verified else "fail",
             ),
         ]
+        browser_service_healthy = bool(
+            browser_health is not None
+            and browser_health.state in {"ready", "capacity_exhausted"}
+            and browser_health.chromium_installed
+            and browser_health.context_launch_ok
+            and browser_health.janitor_running
+            and browser_health.capacity_total >= 1
+        )
+        if browser_service_expected:
+            checks.append(
+                HealthCheck(
+                    name="browser_service_cached_readiness",
+                    status="pass" if browser_service_healthy else "fail",
+                )
+            )
+        browser_view = (
+            BrowserServiceHealthView(
+                state=browser_health.state,
+                reason_code=browser_health.reason_code,
+                version=browser_health.version,
+                chromium_installed=browser_health.chromium_installed,
+                context_launch_ok=browser_health.context_launch_ok,
+                capacity_total=browser_health.capacity_total,
+                capacity_in_use=browser_health.capacity_in_use,
+                janitor_running=browser_health.janitor_running,
+            )
+            if browser_health is not None
+            else None
+        )
         return HealthResponse(
             status="healthy" if all(check.status == "pass" for check in checks) else "degraded",
             snapshot=snapshot,
             checks=checks,
-            providers=self._provider_states(),
+            # Liveness is intentionally provider-I/O-free. A cached readiness
+            # result may be projected, but only the dedicated owner-facing
+            # endpoint refreshes Gmail.
+            providers=self._provider_states(browser_health=browser_health),
+            browser_service=browser_view,
         )
 
     def _search_apps_sync(self, query: str) -> AppSearchResponse:
@@ -846,10 +1111,17 @@ class LocalRunService:
         return AppCatalogResponse(items=items, total=len(items))
 
     def _get_app_research_sync(self, app_slug: str) -> AppResearchResponse:
+        recipe = get_app_recipe(app_slug)
+        if recipe is None:
+            raise AppNotFoundError(app_slug)
         result = self._service.get_app_research(app_slug)
         if result is None:
             raise AppNotFoundError(app_slug)
-        summary, research = result
+        summary, _snapshot_research = result
+        # Runtime capabilities must come from the reviewed recipe, not from a
+        # broader evidence snapshot. In particular, only a recipe-owned signup
+        # URL may enable account creation in the operator UI.
+        research = recipe_to_operational_research(recipe)
         provenance = self._service.snapshot_provenance()
         return AppResearchResponse(
             app=AppSummary.model_validate(summary),
@@ -871,10 +1143,19 @@ class LocalRunService:
         idempotency_key: str | None = None,
     ) -> RunDetailResponse:
         self._require_started()
+        recipe = get_app_recipe_for_name(request.app_name) or get_app_recipe(
+            request.app_name.strip().casefold()
+        )
+        if recipe is None:
+            # Canonical runs are bound to the reviewed recipe matrix. Reject an
+            # unknown display name at the API boundary instead of letting a
+            # KeyError escape as a misleading 500 after the operator submits.
+            raise AppNotFoundError("unknown")
+        work_email_ref = request.company.work_email_ref or _work_email_ref_for_app(request.app_name)
         company = CompanyProfile(
             legal_name=request.company.legal_name,
             website=request.company.website,
-            work_email_ref=request.company.work_email_ref,
+            work_email_ref=work_email_ref,
             use_case=request.company.use_case,
             expected_volume=request.company.expected_volume,
             callback_urls=request.company.callback_urls,
@@ -882,15 +1163,17 @@ class LocalRunService:
         operation = OperationsRequest(
             app_name=request.app_name,
             company=company,
+            account_mode=request.account_mode,
             requested_scope_policy=request.requested_scope_policy,
             browser_provider=request.browser_provider,
             credential_creation_policy=request.credential_creation_policy,
             dry_run=True,
-            outreach_recipient_override=request.outreach_recipient_override,
+            account_creation_requested=request.account_mode == "create_account",
         )
         # Autonomous sign-in credentials (if provided) are mapped to the Browser
         # Use secure-placeholder key names and injected at session creation. The
-        # raw values never enter run state, checkpoints, the ledger, or logs.
+        # raw values never enter run state, checkpoints, or logs. Reusable pairs
+        # may be retained only in the encrypted account-scoped vault.
         browser_login: dict[str, SecretStr] | None = None
         if request.browser_login is not None:
             browser_login = {
@@ -910,10 +1193,31 @@ class LocalRunService:
         run_id: str,
         request: CredentialSubmissionRequest,
     ) -> RunDetailResponse:
+        record = self._service.storage.get_run(run_id)
+        if record is None:
+            raise RunNotFoundError(run_id)
+        work_email_ref = request.company.work_email_ref
+        if work_email_ref is None:
+            stored_request = record.get("request")
+            stored_company = (
+                stored_request.get("company") if isinstance(stored_request, Mapping) else None
+            )
+            stored_ref = (
+                stored_company.get("work_email_ref")
+                if isinstance(stored_company, Mapping)
+                else None
+            )
+            if isinstance(stored_ref, str):
+                work_email_ref = stored_ref
+            else:
+                work_email_ref = _work_email_ref_for_app(
+                    str(record.get("app_name") or "app"),
+                    app_slug=(str(record["app_slug"]) if record.get("app_slug") else None),
+                )
         company = CompanyProfile(
             legal_name=request.company.legal_name,
             website=request.company.website,
-            work_email_ref=request.company.work_email_ref,
+            work_email_ref=work_email_ref,
             use_case=request.company.use_case,
             expected_volume=request.company.expected_volume,
             callback_urls=request.company.callback_urls,
@@ -968,12 +1272,16 @@ class LocalRunService:
                 detail="Run is not waiting for a human action.",
             )
         status = str(record.get("status"))
-        logged_in = browser_login is not None
+        injected_fields = frozenset(browser_login or {})
+        logged_in = bool({"login_email", "login_password"} & injected_fields)
+        verification_submitted = bool({"login_otp", "login_verification_url"} & injected_fields)
         detail = (
             (
                 "Logged in autonomously with the submitted credentials; the credential page "
                 "is ready."
                 if logged_in
+                else "Submitted the one-time email verification; the credential page is ready."
+                if verification_submitted
                 else "Resumed on the same browser session; the credential page is ready."
             )
             if status == "browser_running"
@@ -988,6 +1296,7 @@ class LocalRunService:
         run_id: str,
         *,
         browser_login: BrowserLoginInput | None = None,
+        browser_verification: BrowserVerificationInput | None = None,
         signal: str = "completed",
     ) -> ActionReceipt:
         detail = await self.get_run(run_id)
@@ -1006,6 +1315,16 @@ class LocalRunService:
                 error="phase_unavailable",
                 message="Resume is available only while a canonical run is waiting for HITL.",
             )
+        if browser_verification is not None and (
+            detail.hitl_request is None or detail.hitl_request.action_type != "email_otp"
+        ):
+            raise PhaseUnavailableError(
+                run_id=run_id,
+                action="resume",
+                available_in=("email_otp",),
+                error="phase_unavailable",
+                message="Email verification can be submitted only at its matching gate.",
+            )
         # Map owner input onto the provider-neutral secret boundary names.
         # SecretStr keeps values wrapped until the core service resolves them in
         # memory for the single resume call.
@@ -1015,6 +1334,13 @@ class LocalRunService:
                 "login_email": browser_login.email,
                 "login_password": browser_login.password,
             }
+        elif browser_verification is not None:
+            if browser_verification.code is not None:
+                login_map = {"login_otp": browser_verification.code}
+            elif browser_verification.url is not None:
+                login_map = {
+                    "login_verification_url": browser_verification.url,
+                }
         return await run_in_threadpool(
             self._resume_sync, run_id, browser_login=login_map, signal=signal
         )
@@ -1105,6 +1431,40 @@ class LocalRunService:
 
     async def poll_email(self, run_id: str) -> ActionReceipt:
         detail = await self.get_run(run_id)
+        verification_wait = bool(
+            detail.run.status == "waiting_for_hitl"
+            and detail.hitl_request is not None
+            and detail.hitl_request.action_type == "email_otp"
+        )
+        outreach_wait = bool(
+            detail.run.route_kind == "gated"
+            and detail.run.status
+            in {
+                "outreach_sent",
+                "waiting_for_reply",
+            }
+        )
+        if not verification_wait and not outreach_wait:
+            raise PhaseUnavailableError(
+                run_id=run_id,
+                action="poll_email",
+                available_in=("waiting_for_hitl", "outreach_sent", "waiting_for_reply"),
+                error="phase_unavailable",
+                message="Email checking is available for a pending verification or outreach reply.",
+            )
+        if verification_wait:
+            if not (
+                self._settings.composio_gmail_api_key
+                and self._settings.composio_gmail_connected_account_id
+            ):
+                raise PhaseUnavailableError(
+                    run_id=run_id,
+                    action="poll_email",
+                    available_in=("waiting_for_hitl",),
+                    error="configuration_required",
+                    message="Gmail verification is not configured.",
+                )
+            return await run_in_threadpool(self._poll_verification_sync, run_id)
         if detail.run.route_kind != "gated" or detail.run.status not in {
             "outreach_sent",
             "waiting_for_reply",
@@ -1117,7 +1477,7 @@ class LocalRunService:
                 message="Email polling is available only after controlled outreach.",
             )
         if not (
-            self._settings.composio_api_key
+            self._settings.composio_gmail_api_key
             and self._settings.composio_gmail_connected_account_id
             and self._settings.outreach_recipient_override
         ):
@@ -1128,6 +1488,25 @@ class LocalRunService:
                 error="configuration_required",
             )
         return await run_in_threadpool(self._poll_email_sync, run_id)
+
+    def _poll_verification_sync(self, run_id: str) -> ActionReceipt:
+        try:
+            record = self._service.resolve_email_otp(run_id)
+        except KeyError:
+            raise RunNotFoundError(run_id) from None
+        if record is None:
+            return ActionReceipt(
+                run_id=run_id,
+                action="poll_email",
+                status="no_change",
+                detail="No fresh, correctly addressed verification email was found yet.",
+            )
+        return ActionReceipt(
+            run_id=run_id,
+            action="poll_email",
+            status="accepted",
+            detail="Verification email accepted and the same browser session resumed.",
+        )
 
     def _poll_email_sync(self, run_id: str) -> ActionReceipt:
         try:
@@ -1242,7 +1621,7 @@ class LocalRunService:
                 action="retry",
                 status="accepted",
                 detail=(
-                    "A new Playwright attempt started without reusing login values "
+                    "A new Playwright attempt started with the run's approved account policy "
                     f"(attempt {int(retried.get('attempt', 0) or 0)})."
                 ),
             )
@@ -1256,7 +1635,7 @@ class LocalRunService:
                 detail.run.browser_provider,
             ),
             "email": bool(
-                self._settings.composio_api_key
+                self._settings.composio_gmail_api_key
                 and self._settings.composio_gmail_connected_account_id
                 and self._settings.allow_live_vendor_email
             ),
@@ -1288,6 +1667,18 @@ class LocalRunService:
         self._require_started()
         return await run_in_threadpool(self._get_app_research_sync, app_slug)
 
+    def _signup_readiness_sync(self) -> ProviderState:
+        gmail_preflight = self._cached_gmail_preflight(refresh=True)
+        return next(
+            state
+            for state in self._provider_states(gmail_preflight=gmail_preflight)
+            if state.provider == "gmail"
+        )
+
+    async def signup_readiness(self) -> ProviderState:
+        self._require_started()
+        return await run_in_threadpool(self._signup_readiness_sync)
+
     async def get_output(self, run_id: str) -> RunOutputResponse:
         await self.get_run(run_id)
         output = await run_in_threadpool(self._service.get_output, run_id)
@@ -1299,6 +1690,46 @@ class LocalRunService:
             available_in=("output",),
         )
 
+    def _expects_browser_service_health(self) -> bool:
+        settings = self._settings
+        return bool(
+            settings.allow_live_browser
+            and not settings.playwright_in_process_sandbox
+            and browser_configuration_state(settings, "playwright")
+        )
+
+    async def _cached_browser_service_health(self) -> BrowserServiceHealth | None:
+        """Fetch the worker's cache-only endpoint within the API health budget."""
+
+        if not self._expects_browser_service_health():
+            return None
+        settings = self._settings
+        if (
+            not settings.browser_service_url
+            or settings.browser_service_token is None
+            or settings.browser_session_capability_key is None
+        ):
+            return BrowserServiceHealth(
+                state="not_configured",
+                reason_code="browser_service_configuration_required",
+            )
+        client = BrowserServiceClient(
+            base_url=settings.browser_service_url,
+            token=settings.browser_service_token,
+            owner=settings.browser_service_owner,
+            capability_key=settings.browser_session_capability_key,
+            # Operations may run for minutes; health must never inherit that
+            # budget. BrowserServiceClient.health applies its own <=5s cap.
+            timeout_seconds=2.0,
+        )
+        return await client.health(timeout_seconds=2.0)
+
     async def health(self) -> HealthResponse:
         self._require_started()
-        return await run_in_threadpool(self._health_sync)
+        browser_service_expected = self._expects_browser_service_health()
+        browser_health = await self._cached_browser_service_health()
+        return await run_in_threadpool(
+            self._health_sync,
+            browser_health=browser_health,
+            browser_service_expected=browser_service_expected,
+        )

@@ -41,16 +41,16 @@ export default async function DashboardPage() {
       <header className="flex flex-col gap-5 border-b border-border pb-7 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <div className="flex flex-wrap items-center gap-3">
-            <p className="eyebrow">Operations overview</p>
+            <p className="eyebrow">Integration workspace</p>
             <StatusBadge status={health?.status ?? "unavailable"} />
           </div>
-          <h1 className="mt-3 text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">Toolkit access control plane</h1>
+          <h1 className="mt-3 text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">Set up apps without the busywork</h1>
           <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground">
-            Coordinate verified research, deterministic access routing, human gates, and reference-only integrator output.
+            Start an integration, watch the agent work in real time, and step in only when a website needs you.
           </p>
         </div>
         <Button asChild className="h-10 w-fit rounded-md bg-primary px-4 text-primary-foreground">
-          <Link href="/runs/new">Create operations plan <ArrowRight aria-hidden="true" /></Link>
+          <Link href="/runs/new">Start an integration <ArrowRight aria-hidden="true" /></Link>
         </Button>
       </header>
 
@@ -70,10 +70,10 @@ export default async function DashboardPage() {
           <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.12em]">Backend reported</Badge>
         </div>
         <div className="grid overflow-hidden rounded-md border border-border bg-border sm:grid-cols-2 xl:grid-cols-4">
-          <Metric icon={Database} label="Run records" value={runs ? String(runs.total) : "—"} note="Persisted ledger" />
+          <Metric icon={Database} label="Integrations" value={runs ? String(runs.total) : "—"} note="Saved runs" />
           <Metric icon={Activity} label="System" value={health ? humanize(health.status) : "Unavailable"} note={health ? `API ${health.version}` : "No response"} />
-          <Metric icon={ShieldCheck} label="Checks passing" value={passedChecks == null ? "—" : `${passedChecks}/${health?.checks.length ?? 0}`} note="Security and integrity" />
-          <Metric icon={waitingRuns === 0 ? CheckCircle2 : CircleOff} label="Attention queue" value={waitingRuns == null ? "—" : String(waitingRuns)} note={externalActionCount == null ? "External state unavailable" : `${externalActionCount} with external actions`} />
+          <Metric icon={ShieldCheck} label="Ready checks" value={passedChecks == null ? "—" : `${passedChecks}/${health?.checks.length ?? 0}`} note="Security and connections" />
+          <Metric icon={waitingRuns === 0 ? CheckCircle2 : CircleOff} label="Needs attention" value={waitingRuns == null ? "—" : String(waitingRuns)} note={externalActionCount == null ? "Live state unavailable" : `${externalActionCount} live runs`} />
         </div>
       </section>
 
@@ -91,11 +91,11 @@ export default async function DashboardPage() {
       <section aria-labelledby="recent-runs">
         <div className="mb-3 flex items-end justify-between gap-4">
           <div>
-            <p className="eyebrow">Durable ledger</p>
-            <h2 id="recent-runs" className="mt-1 text-xl font-semibold tracking-[-0.02em]">Recent runs</h2>
+            <p className="eyebrow">Recent activity</p>
+            <h2 id="recent-runs" className="mt-1 text-xl font-semibold tracking-[-0.02em]">Integration runs</h2>
           </div>
           <Button asChild variant="ghost" size="sm" className="font-mono text-[10px] uppercase tracking-[0.1em]">
-            <Link href="/runs/new">New run <ArrowRight aria-hidden="true" /></Link>
+            <Link href="/runs/new">New integration <ArrowRight aria-hidden="true" /></Link>
           </Button>
         </div>
         {runs ? <RunTable runs={runs.items} /> : <EmptyState title="Run register unavailable" description="The backend could not return the run list. No run data is inferred or fabricated." />}

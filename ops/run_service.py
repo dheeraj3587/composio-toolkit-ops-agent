@@ -24,7 +24,10 @@ from ops.app_recipes import AppRecipe, get_app_validation_policy, load_app_recip
 from ops.browser_worker import BrowserWorker
 from ops.canonical_runtime import CanonicalRuntime
 from ops.composio_capability import ComposioCapabilityPreflight, ComposioCapabilityReport
-from ops.composio_managed_auth import ComposioManagedAuthProvider
+from ops.composio_managed_auth import (
+    ComposioManagedAuthProvider,
+    managed_auth_configuration_is_valid,
+)
 from ops.config import Settings
 from ops.credential_validator import (
     CredentialValidationResult,
@@ -36,7 +39,7 @@ from ops.email_verification import (
     VerificationDecision,
     VerificationPurpose,
 )
-from ops.gmail_worker import GmailWorker
+from ops.gmail_worker import GmailSignupPreflight, GmailWorker
 from ops.graph import (
     DurableOperationsWorkflow,
     WorkflowDependencies,
@@ -223,9 +226,6 @@ class RunService:
         # operations always resolve from _browser_workers using the persisted run.
         self._browser_worker: BrowserWorker | None = None
         self._gmail_worker: GmailWorker | None = None
-        # In-memory marker of the last inbound reply id handled per run, so the
-        # autonomous poller acts once per new reply (no reprocessing/resend).
-        self._last_processed_reply: dict[str, str] = {}
         # Bounded per-run count of autonomous email-OTP resume attempts.
         self._otp_attempts: dict[str, int] = {}
         # Background email poller (autonomous "listen for replies").
@@ -417,6 +417,32 @@ class RunService:
             configured=you_enabled,
         )
 
+        # Build the vault before any dependency that consumes it. A malformed
+        # Fernet key must disable the entire vault boundary atomically; letting
+        # the credential validator construct the store first would raise before
+        # this fail-closed handling could run.
+        if self._secret_store is None and settings.secret_vault_key is not None:
+            try:
+                self._secret_store = SQLiteSecretStore(
+                    settings.secret_vault_db_path,
+                    settings.secret_vault_key.get_secret_value(),
+                )
+            except (ValueError, TypeError) as exc:
+                # Keep the diagnostic value-free. Production deployment performs
+                # a stricter key preflight, while non-production startup remains
+                # available for plan-only and configuration-repair workflows.
+                LOGGER.error(
+                    "SECRET_VAULT_KEY is invalid (%s); the credential vault is "
+                    "disabled. Expected a url-safe base64 Fernet key.",
+                    type(exc).__name__,
+                )
+                self._secret_store = None
+        self._record_wiring(
+            "secret_store",
+            self._secret_store,
+            configured=settings.secret_vault_key is not None,
+        )
+
         # Read-only credential validator (HubSpot bearer, current endpoint).
         if self._credential_validator is None:
             self._credential_validator = self._build_credential_validator(settings)
@@ -426,27 +452,9 @@ class RunService:
             configured=self._credential_validator is not None,
         )
 
-        # Owner-only vault. Credential capture is intentionally NOT auto-injected
-        # at startup: raw credentials are submitted explicitly by the owner, never
-        # scraped from the browser.
-        if self._secret_store is None and settings.secret_vault_key is not None:
-            try:
-                self._secret_store = SQLiteSecretStore(
-                    settings.secret_vault_db_path,
-                    settings.secret_vault_key.get_secret_value(),
-                )
-            except (ValueError, TypeError) as exc:
-                # A malformed vault key must not crash-loop the container. Fail
-                # closed (no vault) and log a clear, value-free diagnostic.
-                LOGGER.error(
-                    "SECRET_VAULT_KEY is invalid (%s); the credential vault is "
-                    "disabled. Expected a url-safe base64 Fernet key.",
-                    type(exc).__name__,
-                )
-                self._secret_store = None
-        self._record_wiring(
-            "secret_store", self._secret_store, configured=settings.secret_vault_key is not None
-        )
+        # Credential capture is intentionally NOT auto-injected at startup: raw
+        # credentials are submitted explicitly by the owner, never scraped from
+        # the browser.
         self._record_wiring(
             "credential_capturer",
             self._credential_capturer,
@@ -458,7 +466,8 @@ class RunService:
         # retained only so pre-migration runs can still be inspected by a temporary
         # legacy adapter.
         self._build_workflow_dependencies(settings)
-        if self._managed_auth_provider is None and settings.composio_api_key is not None:
+        managed_auth_configured = managed_auth_configuration_is_valid(settings)
+        if self._managed_auth_provider is None and managed_auth_configured:
             try:
                 self._managed_auth_provider = ComposioManagedAuthProvider.from_settings(
                     settings,
@@ -469,7 +478,8 @@ class RunService:
         self._record_wiring(
             "composio_managed_auth",
             self._managed_auth_provider,
-            configured=settings.composio_api_key is not None,
+            configured=managed_auth_configured,
+            wired=managed_auth_configured and self._managed_auth_provider is not None,
         )
         self._record_wiring(
             "legacy_workflow",
@@ -477,16 +487,38 @@ class RunService:
             configured=self._workflow is not None,
             wired=self._workflow is not None,
         )
-        # Recover any runs stranded by the previous shutdown before serving.
-        self._reconcile_stranded_runs()
-        # Start the autonomous email poller so the agent listens for and answers
-        # provider replies on its own, with no manual polling.
-        self._start_email_poller()
+        # Startup remains provider-I/O-free. When automation is enabled, these
+        # methods only create threads whose first sweep waits for the configured
+        # grace period. That preserves observational process startup while still
+        # giving an accepted production revision autonomous OTP/reply polling and
+        # restart reconciliation.
+        self._record_wiring(
+            "startup_automation",
+            self if settings.ops_startup_automation_enabled else None,
+            configured=settings.ops_startup_automation_enabled,
+            wired=settings.ops_startup_automation_enabled,
+        )
+        if settings.ops_startup_automation_enabled:
+            # Independent maintenance handles reconciliation even when Gmail is
+            # unavailable; the email worker handles only bounded inbox work.
+            self._start_autonomous_advancer()
+            self._start_email_poller()
 
     def _reconcile_stranded_runs(self) -> None:
         """Recover runs stranded by the previous shutdown."""
 
         self._reconciliation.reconcile_stranded_runs()
+
+    def _continue_pristine_playwright_run(
+        self,
+        record: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Resume one committed attempt-zero browser run after the startup grace."""
+
+        return self._canonical._continue_pristine_playwright_run(
+            record,
+            browser_login=None,
+        )
 
     def _browser_session_is_live(self, record: Mapping[str, Any]) -> bool | None:
         """Ask the browser service whether a persisted session id still exists."""
@@ -547,15 +579,31 @@ class RunService:
 
         return self._advance.advance_autonomous_runs(limit=limit)
 
-    def resolve_pending_otps(self, *, limit: int = 100) -> int:
+    def resolve_pending_otps(
+        self,
+        *,
+        limit: int = 1_000,
+        max_attempts_per_run: int | None = None,
+    ) -> int:
         """Autonomously resolve every run waiting on an emailed login code."""
 
-        return self._verification.resolve_pending_otps(limit=limit)
+        return self._verification.resolve_pending_otps(
+            limit=limit,
+            max_attempts_per_run=max_attempts_per_run,
+        )
 
-    def resolve_email_otp(self, run_id: str) -> dict[str, Any] | None:
+    def resolve_email_otp(
+        self,
+        run_id: str,
+        *,
+        max_attempts: int | None = None,
+    ) -> dict[str, Any] | None:
         """Resolve an emailed LOGIN verification and resume the browser with it."""
 
-        return self._verification.resolve_email_otp(run_id)
+        return self._verification.resolve_email_otp(
+            run_id,
+            max_attempts=max_attempts,
+        )
 
     def resolve_email_verification(
         self,
@@ -563,6 +611,7 @@ class RunService:
         *,
         purpose: VerificationPurpose = "login_verification",
         expected_recipient: str | None = None,
+        max_attempts: int | None = None,
     ) -> dict[str, Any] | None:
         """Read the verification email for a waiting run and resume the browser."""
 
@@ -570,18 +619,38 @@ class RunService:
             run_id,
             purpose=purpose,
             expected_recipient=expected_recipient,
+            max_attempts=max_attempts,
         )
+
+    def gmail_signup_preflight(
+        self,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> GmailSignupPreflight:
+        """Run the real, read-only Gmail capability probe used before signup."""
+
+        worker = self._gmail_worker
+        if worker is None:
+            return GmailSignupPreflight(
+                status="configuration_required",
+                reason_code="gmail_signup_worker_not_configured",
+                provider_read_attempted=False,
+            )
+        return asyncio.run(worker.preflight_signup_inbox(timeout_seconds=timeout_seconds))
 
     def _verification_binding(
         self,
         app_slug: str,
         *,
         expected_recipient: str | None = None,
+        account_ref: str | None = None,
     ) -> _VerificationBinding | None:
         """Resolve the bindings available for an emailed verification."""
 
         return self._verification.verification_binding(
-            app_slug, expected_recipient=expected_recipient
+            app_slug,
+            expected_recipient=expected_recipient,
+            account_ref=account_ref,
         )
 
     def _fetch_bound_verification(
@@ -590,11 +659,15 @@ class RunService:
         run_id: str,
         purpose: str,
         binding: _VerificationBinding | None,
+        verification_requested_at_ms: int,
     ) -> VerificationDecision | None:
         """Read one verification message, preferring the fully bound path."""
 
         return self._verification.fetch_bound_verification(
-            run_id=run_id, purpose=purpose, binding=binding
+            run_id=run_id,
+            purpose=purpose,
+            binding=binding,
+            verification_requested_at_ms=verification_requested_at_ms,
         )
 
     def _legacy_verification_read(
@@ -603,6 +676,7 @@ class RunService:
         *,
         run_id: str,
         purpose: str,
+        verification_requested_at_ms: int,
         allowed_link_host_patterns: tuple[str, ...] = (),
         max_age_seconds: int = 900,
     ) -> VerificationDecision | None:
@@ -612,6 +686,7 @@ class RunService:
             worker,
             run_id=run_id,
             purpose=purpose,
+            verification_requested_at_ms=verification_requested_at_ms,
             allowed_link_host_patterns=allowed_link_host_patterns,
             max_age_seconds=max_age_seconds,
         )
@@ -762,15 +837,10 @@ class RunService:
     def _build_credential_validator(
         self, settings: Settings
     ) -> PolicyBoundCredentialValidator | None:
-        """Build the read-only HubSpot validator when the vault key is present."""
+        """Build the read-only validator only from an initialized vault."""
 
-        if settings.secret_vault_key is None:
+        if settings.secret_vault_key is None or self._secret_store is None:
             return None
-        if self._secret_store is None:
-            self._secret_store = SQLiteSecretStore(
-                settings.secret_vault_db_path,
-                settings.secret_vault_key.get_secret_value(),
-            )
         client = httpx.AsyncClient(
             timeout=httpx.Timeout(10.0, connect=5.0),
             follow_redirects=False,
@@ -792,10 +862,12 @@ class RunService:
     def _build_workflow_dependencies(self, settings: Settings) -> WorkflowDependencies:
         """Inject controlled Gmail and every configured browser adapter.
 
-        Gmail outreach requires Composio configuration AND a configured
-        OUTREACH_RECIPIENT_OVERRIDE so every send is delivered to the controlled
-        recipient, never the discovered vendor address. Browser adapters are
-        evaluated independently and registered under their canonical identities.
+        Gmail inbox reads require only the Composio Gmail connection. Outreach is
+        a separate capability and still requires a controlled recipient override
+        (or the explicit live-send policy inside GmailWorker). Keeping these facts
+        separate lets signup/login verification work without enabling email sends.
+        Browser adapters are evaluated independently and registered under their
+        canonical identities.
         """
 
         # Build the effect ledger up front so the Gmail worker can share it for
@@ -805,9 +877,8 @@ class RunService:
 
         gmail: GmailWorker | None = None
         if (
-            settings.composio_api_key is not None
+            settings.composio_gmail_api_key is not None
             and settings.composio_gmail_connected_account_id is not None
-            and settings.outreach_recipient_override is not None
         ):
             # Wire the encrypted vault + effect ledger: a reply that carries a
             # credential is then stored as a vault:// reference instead of raising
@@ -819,9 +890,15 @@ class RunService:
                 effect_store=self._effect_store,
             )
             # Retain the Gmail worker so the poll-email action can fetch and
-            # classify replies on the same controlled account.
+            # classify replies and resolve signup/login verification on the same
+            # scoped account. Sending remains independently policy-gated.
             self._gmail_worker = gmail
-        self._record_wiring("gmail", gmail, configured=gmail is not None)
+        self._record_wiring("gmail:inbox", gmail, configured=gmail is not None)
+        self._record_wiring(
+            "gmail:outreach",
+            gmail if settings.outreach_recipient_override is not None else None,
+            configured=bool(gmail is not None and settings.outreach_recipient_override),
+        )
 
         browsers: dict[BrowserProvider, BrowserWorker] = {}
         for provider_name in ("browser_use", "playwright"):
@@ -918,16 +995,71 @@ class RunService:
         )
 
     def _remember_reusable_login(
-        self, *, app_slug: str, values: Mapping[str, SecretStr]
+        self,
+        *,
+        app_slug: str,
+        account_ref: str,
+        values: Mapping[str, SecretStr],
     ) -> tuple[str, ...]:
-        """Persist the owner's reusable sign-in credentials for this app."""
+        """Persist reusable sign-in credentials for one opaque account binding."""
 
-        return self._login_secrets.remember_reusable_login(app_slug=app_slug, values=values)
+        return self._login_secrets.remember_reusable_login(
+            app_slug=app_slug,
+            account_ref=account_ref,
+            values=values,
+        )
 
-    def _reusable_login_values(self, app_slug: str) -> dict[str, SecretStr]:
-        """Load the remembered sign-in credentials for an app, if complete."""
+    def _reusable_login_values(self, app_slug: str, account_ref: str) -> dict[str, SecretStr]:
+        """Load remembered sign-in credentials for one bound account."""
 
-        return self._login_secrets.reusable_login_values(app_slug)
+        return self._login_secrets.reusable_login_values(app_slug, account_ref)
+
+    def _stage_signup_login(
+        self,
+        *,
+        app_slug: str,
+        account_ref: str,
+        run_id: str,
+        values: Mapping[str, SecretStr],
+    ) -> dict[str, SecretStr]:
+        """Stage one generated signup pair without changing reusable login."""
+
+        return self._login_secrets.stage_signup_login(
+            app_slug=app_slug,
+            account_ref=account_ref,
+            run_id=run_id,
+            values=values,
+        )
+
+    def _staged_signup_login_values(
+        self,
+        *,
+        app_slug: str,
+        account_ref: str,
+        run_id: str,
+    ) -> dict[str, SecretStr]:
+        """Load only this run's staged signup credentials."""
+
+        return self._login_secrets.staged_signup_login_values(
+            app_slug=app_slug,
+            account_ref=account_ref,
+            run_id=run_id,
+        )
+
+    def _promote_staged_signup_login(
+        self,
+        *,
+        app_slug: str,
+        account_ref: str,
+        run_id: str,
+    ) -> tuple[str, ...]:
+        """Promote a staged pair after the browser proves authentication."""
+
+        return self._login_secrets.promote_staged_signup_login(
+            app_slug=app_slug,
+            account_ref=account_ref,
+            run_id=run_id,
+        )
 
     def _store_transient_browser_secrets(
         self, *, app_slug: str, scope_id: str, values: Mapping[str, str]
@@ -972,7 +1104,11 @@ class RunService:
                     ) from None
                 return cast("BrowserWorker", PlaywrightBrowserWorker(settings=settings))
 
-            if not settings.browser_service_url or settings.browser_service_token is None:
+            if (
+                not settings.browser_service_url
+                or settings.browser_service_token is None
+                or settings.browser_session_capability_key is None
+            ):
                 # Fail closed with an actionable reason rather than quietly starting
                 # a browser in the control plane.
                 raise ConfigurationRequiredError(
@@ -988,6 +1124,8 @@ class RunService:
                     base_url=settings.browser_service_url,
                     token=settings.browser_service_token,
                     owner=settings.browser_service_owner,
+                    capability_key=settings.browser_session_capability_key,
+                    timeout_seconds=settings.browser_service_client_timeout_seconds,
                 ),
             )
         return BrowserWorker(settings=settings)
@@ -1047,6 +1185,12 @@ class RunService:
             except Exception:  # pragma: no cover - best-effort cleanup
                 pass
             self._research_cache = None
+        if self._gmail_worker is not None:
+            try:
+                asyncio.run(self._gmail_worker.close())
+            except Exception:  # pragma: no cover - best-effort provider cleanup
+                pass
+            self._gmail_worker = None
         for worker in dict.fromkeys(self._browser_workers.values()):
             try:
                 asyncio.run(worker.close())

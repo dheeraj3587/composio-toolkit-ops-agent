@@ -41,6 +41,15 @@ class EffectStore(Protocol):
         receipt: Mapping[str, str],
     ) -> None: ...
 
+    def reconcile_completed(
+        self,
+        *,
+        provider: str,
+        action: str,
+        idempotency_key: str,
+        receipt: Mapping[str, str],
+    ) -> None: ...
+
     def mark_outcome_unknown(
         self,
         *,
@@ -136,6 +145,54 @@ class SQLiteEffectStore:
             to_status="completed",
             receipt_json=serialized,
         )
+
+    def reconcile_completed(
+        self,
+        *,
+        provider: str,
+        action: str,
+        idempotency_key: str,
+        receipt: Mapping[str, str],
+    ) -> None:
+        """Record an effect that a provider read proved already happened.
+
+        Reconciliation is allowed from ``pending`` as well as
+        ``outcome_unknown``. A second process can observe the provider object
+        after the external write but before the first process records its
+        receipt; accepting that exact, validated receipt closes the crash
+        window without issuing the mutation again.
+        """
+
+        serialized = self._serialize_receipt(receipt)
+        effect_key = self._key(provider, action, idempotency_key)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, receipt_json FROM external_effects WHERE effect_key = ?",
+                (effect_key,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise RuntimeError("external effect was not reserved")
+            status = str(row[0])
+            if status == "completed" and row[1] == serialized:
+                connection.commit()
+                return
+            if status not in {"pending", "outcome_unknown"}:
+                connection.rollback()
+                raise RuntimeError("external effect cannot be reconciled")
+            connection.execute(
+                """
+                UPDATE external_effects
+                SET status = 'completed', receipt_json = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE effect_key = ? AND status IN ('pending', 'outcome_unknown')
+                """,
+                (serialized, effect_key),
+            )
+            if connection.total_changes != 1:
+                connection.rollback()
+                raise RuntimeError("external effect reconciliation raced")
+            connection.commit()
 
     def mark_outcome_unknown(
         self,

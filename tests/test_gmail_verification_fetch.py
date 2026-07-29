@@ -21,7 +21,7 @@ from ops.effect_ledger import SQLiteEffectStore
 from ops.gmail_worker import GmailWorker
 
 _IDENTITY = "ops.signup+hubspot@gmail.com"
-_REVIEWED = ("app.hubspot.com", "*.hubspot.com")
+_REVIEWED = ("hubspot.com", "app.hubspot.com", "*.hubspot.com")
 
 
 def _now_ms() -> int:
@@ -36,8 +36,13 @@ def _message(
     age_seconds: int = 60,
     subject: str = "Verify your email",
     body: str = "Confirm: https://app.hubspot.com/verify-email?token=secrettoken",
+    authentication_results: str | None = (
+        "mx.google.com; dkim=pass header.i=@hubspot.com; "
+        "spf=pass smtp.mailfrom=hubspot.com; "
+        "dmarc=pass header.from=hubspot.com"
+    ),
 ) -> dict[str, object]:
-    return {
+    message: dict[str, object] = {
         "id": message_id,
         "from": sender,
         "to": to,
@@ -45,6 +50,9 @@ def _message(
         "messageText": body,
         "internalDate": str(_now_ms() - age_seconds * 1000),
     }
+    if authentication_results is not None:
+        message["Authentication-Results"] = authentication_results
+    return message
 
 
 class _Resp:
@@ -97,10 +105,16 @@ def _fake_composio_module(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "composio", module)
 
 
-def _worker(messages: list[dict[str, object]], tmp_path: Path) -> tuple[GmailWorker, _FakeComposio]:
+def _worker(
+    messages: list[dict[str, object]],
+    tmp_path: Path,
+    *,
+    connected_account_id: str = "gmail-acct-1",
+    effect_store: SQLiteEffectStore | None = None,
+) -> tuple[GmailWorker, _FakeComposio]:
     settings = Settings(
-        composio_api_key=SecretStr("test-key"),  # pragma: allowlist secret
-        composio_gmail_connected_account_id="gmail-acct-1",
+        composio_gmail_api_key=SecretStr("test-key"),  # pragma: allowlist secret
+        composio_gmail_connected_account_id=connected_account_id,
         outreach_recipient_override="controlled@example.test",
         gmail_retry_max_attempts=1,
         gmail_retry_base_delay_seconds=0.0,
@@ -109,7 +123,7 @@ def _worker(messages: list[dict[str, object]], tmp_path: Path) -> tuple[GmailWor
     worker = GmailWorker(
         settings=settings,
         sdk_client=client,
-        effect_store=SQLiteEffectStore(tmp_path / "effects.db"),
+        effect_store=effect_store or SQLiteEffectStore(tmp_path / "effects.db"),
     )
     return worker, client
 
@@ -121,6 +135,7 @@ def _fetch(worker: GmailWorker, **overrides: object):
         "reviewed_sender_patterns": _REVIEWED,
         "allowed_link_host_patterns": _REVIEWED,
         "run_id": "run_verify_1",
+        "verification_requested_at_ms": _now_ms() - 120_000,
     }
     kwargs.update(overrides)
     return asyncio.run(worker.fetch_verification(**kwargs))  # type: ignore[arg-type]
@@ -148,7 +163,7 @@ def test_server_query_uses_a_valid_gmail_operator(tmp_path: Path) -> None:
     # Gmail has no hour unit, so an hour-scale bound must not be expressed here.
     assert "newer_than" not in query
     assert query.startswith("after:")
-    assert f"to:{_IDENTITY}" in query
+    assert f'to:"{_IDENTITY}"' in query
 
 
 def test_same_message_is_claimed_only_once(tmp_path: Path) -> None:
@@ -160,6 +175,43 @@ def test_same_message_is_claimed_only_once(tmp_path: Path) -> None:
     # The second poll finds only the message it already spent, and says so
     # explicitly rather than silently re-injecting an expired code.
     assert second.reason_code == "verification_already_consumed"
+
+
+def test_claim_uses_the_complete_bounded_immutable_message_id(tmp_path: Path) -> None:
+    first_id = f"{'a' * 900}1"
+    second_id = f"{'a' * 900}2"
+    worker, client = _worker([_message(message_id=first_id)], tmp_path)
+    first = _fetch(worker, run_id="run_a")
+    assert first.resolved is not None
+    assert first.resolved.evidence.message_id == first_id
+
+    client.messages = [_message(message_id=second_id)]
+    second = _fetch(worker, run_id="run_b")
+    assert second.resolved is not None
+    assert second.resolved.evidence.message_id == second_id
+
+
+def test_claim_is_retriable_only_after_definite_pre_use_release(tmp_path: Path) -> None:
+    worker, _client = _worker([_message()], tmp_path)
+    first = _fetch(worker)
+    assert first.resolved is not None
+
+    assert worker.release_verification_claim(
+        run_id="run_verify_1",
+        purpose="signup_confirmation",
+        evidence=first.resolved.evidence,
+    )
+    retry = _fetch(worker)
+    assert retry.resolved is not None
+    assert worker.complete_verification_claim(
+        run_id="run_verify_1",
+        purpose="signup_confirmation",
+        evidence=retry.resolved.evidence,
+    )
+
+    consumed = _fetch(worker)
+    assert consumed.resolved is None
+    assert consumed.reason_code == "verification_already_consumed"
 
 
 def test_claim_skips_a_used_message_and_falls_back_to_an_older_one(
@@ -182,13 +234,33 @@ def test_claim_skips_a_used_message_and_falls_back_to_an_older_one(
     assert second.resolved is not None and second.resolved.evidence.message_id == "older"
 
 
-def test_claim_is_scoped_per_run(tmp_path: Path) -> None:
+def test_claim_is_global_across_runs_for_the_connected_account(tmp_path: Path) -> None:
     worker, _client = _worker([_message()], tmp_path)
     first = _fetch(worker, run_id="run_a")
     second = _fetch(worker, run_id="run_b")
-    # A different run has its own reservation, so it may still consume the message.
+    # The immutable provider message belongs to the connected Gmail account, not
+    # to whichever run happened to poll it. A second run cannot replay it.
     assert first.resolved is not None
-    assert second.resolved is not None
+    assert second.resolved is None
+    assert second.reason_code == "verification_already_consumed"
+
+
+def test_claim_scope_isolated_between_connected_gmail_accounts(tmp_path: Path) -> None:
+    effects = SQLiteEffectStore(tmp_path / "effects.db")
+    first_worker, _ = _worker(
+        [_message()],
+        tmp_path,
+        connected_account_id="gmail-acct-1",
+        effect_store=effects,
+    )
+    second_worker, _ = _worker(
+        [_message()],
+        tmp_path,
+        connected_account_id="gmail-acct-2",
+        effect_store=effects,
+    )
+    assert _fetch(first_worker, run_id="run_a").resolved is not None
+    assert _fetch(second_worker, run_id="run_b").resolved is not None
 
 
 def test_stale_message_is_refused_even_though_the_query_returned_it(
@@ -197,9 +269,23 @@ def test_stale_message_is_refused_even_though_the_query_returned_it(
     # The coarse day-granularity server query legitimately returns yesterday's
     # mail; the in-code bound is what protects the one-time secret.
     worker, _client = _worker([_message(age_seconds=7_200)], tmp_path)
-    decision = _fetch(worker, max_age_seconds=900)
+    decision = _fetch(
+        worker,
+        max_age_seconds=900,
+        verification_requested_at_ms=_now_ms() - 8_000_000,
+    )
     assert decision.resolved is None
     assert decision.reason_code == "verification_message_stale"
+
+
+def test_message_before_current_challenge_is_refused(tmp_path: Path) -> None:
+    worker, _client = _worker([_message(age_seconds=180)], tmp_path)
+    decision = _fetch(
+        worker,
+        verification_requested_at_ms=_now_ms() - 60_000,
+    )
+    assert decision.resolved is None
+    assert decision.reason_code == "verification_precedes_current_challenge"
 
 
 def test_message_for_another_signup_tag_is_refused(tmp_path: Path) -> None:
@@ -209,11 +295,48 @@ def test_message_for_another_signup_tag_is_refused(tmp_path: Path) -> None:
     assert decision.reason_code == "verification_recipient_tag_conflict"
 
 
+def test_untagged_delivery_cannot_be_claimed_by_a_tagged_signup(
+    tmp_path: Path,
+) -> None:
+    worker, _client = _worker([_message(to="ops.signup@gmail.com")], tmp_path)
+    decision = _fetch(worker)
+    assert decision.resolved is None
+    assert decision.reason_code == "verification_recipient_tag_missing"
+
+
 def test_spoofed_sender_is_refused(tmp_path: Path) -> None:
     worker, _client = _worker([_message(sender="noreply@hubsp0t-security.test")], tmp_path)
     decision = _fetch(worker)
     assert decision.resolved is None
     assert decision.reason_code == "verification_sender_not_reviewed"
+
+
+def test_missing_sender_authentication_evidence_fails_closed(tmp_path: Path) -> None:
+    worker, _client = _worker(
+        [_message(authentication_results=None)],
+        tmp_path,
+    )
+    decision = _fetch(worker)
+    assert decision.resolved is None
+    assert decision.reason_code == "verification_sender_authentication_missing"
+
+
+def test_failed_or_unaligned_sender_authentication_fails_closed(tmp_path: Path) -> None:
+    worker, _client = _worker(
+        [
+            _message(
+                authentication_results=(
+                    "mx.google.com; dkim=fail header.d=hubspot.com; "
+                    "spf=pass smtp.mailfrom=attacker.example; "
+                    "dmarc=fail header.from=hubspot.com"
+                )
+            )
+        ],
+        tmp_path,
+    )
+    decision = _fetch(worker)
+    assert decision.resolved is None
+    assert decision.reason_code == "verification_sender_authentication_failed"
 
 
 def test_link_to_an_unreviewed_host_is_refused(tmp_path: Path) -> None:

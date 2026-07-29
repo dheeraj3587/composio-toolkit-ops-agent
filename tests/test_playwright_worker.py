@@ -10,6 +10,8 @@ single event loop.
 from __future__ import annotations
 
 import asyncio
+import os
+from unittest.mock import patch
 
 import pytest
 
@@ -98,6 +100,53 @@ def test_blocked_observation_is_bounded_and_named() -> None:
     assert "evil.example" in obs.page_title
 
 
+def test_chromium_child_environment_excludes_worker_secrets_in_every_launch_mode() -> None:
+    safe_environment = {
+        "HOME": "/tmp/browser-home",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+        "TMPDIR": "/tmp",
+        "TZ": "UTC",
+        "XDG_CACHE_HOME": "/tmp/browser-home/.cache",
+        "XDG_CONFIG_HOME": "/tmp/browser-home/.config",
+        "XDG_RUNTIME_DIR": "/tmp/browser-home/run",
+    }
+    secret_names = {
+        "BROWSER_SECRET_BROKER_TOKEN",
+        "BROWSER_SERVICE_TOKEN",
+        "BROWSER_SESSION_CAPABILITY_KEY",
+        "BROWSER_STORAGE_STATE_KEY",
+        "CEREBRAS_API_KEY",
+        "COMPOSIO_API_KEY",
+        "GOOGLE_GENAI_API_KEY",
+        "GROQ_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OPS_INTERNAL_API_TOKEN",
+        "SECRET_VAULT_KEY",
+    }
+    process_environment = {
+        **safe_environment,
+        **{name: f"sentinel-{index}" for index, name in enumerate(sorted(secret_names))},
+        # A prefix match would be too broad: only real locale categories are safe.
+        "LC_SECRET_SENTINEL": "must-not-escape",  # pragma: allowlist secret
+        "DISPLAY": ":77",
+    }
+
+    with patch.dict(os.environ, process_environment, clear=True):
+        headless = PlaywrightBrowserWorker._launch_env(None, headless=True)
+        local_headed = PlaywrightBrowserWorker._launch_env(None, headless=False)
+        leased_headed = PlaywrightBrowserWorker._launch_env(":108", headless=False)
+
+    assert headless == safe_environment
+    assert local_headed == {**safe_environment, "DISPLAY": ":77"}
+    assert leased_headed == {**safe_environment, "DISPLAY": ":108"}
+    for name in (*secret_names, "LC_SECRET_SENTINEL"):
+        assert name not in headless
+        assert name not in local_headed
+        assert name not in leased_headed
+
+
 # --- live: real Chromium lifecycle + injection (skips if not launchable) ------
 def _worker() -> PlaywrightBrowserWorker:
     return PlaywrightBrowserWorker(settings=Settings(allow_live_browser=True))
@@ -176,6 +225,7 @@ def test_factory_selects_the_browser_service_for_playwright(tmp_path: object) ->
         update={
             "browser_service_url": "http://browser-worker:8081",
             "browser_service_token": SecretStr("test-token"),
+            "browser_session_capability_key": SecretStr("c" * 32),
         }
     )
     client = svc._build_browser_worker(service_settings)

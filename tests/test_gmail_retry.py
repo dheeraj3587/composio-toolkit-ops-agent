@@ -91,7 +91,7 @@ def _fake_composio_module(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _worker(*, fail_times: int, mode: str, attempts: int = 3) -> tuple[GmailWorker, _FakeComposio]:
     settings = Settings(
-        composio_api_key=SecretStr("test-key"),  # pragma: allowlist secret
+        composio_gmail_api_key=SecretStr("test-key"),  # pragma: allowlist secret
         composio_gmail_connected_account_id="gmail-acct-1",
         outreach_recipient_override="controlled@example.test",
         gmail_retry_max_attempts=attempts,

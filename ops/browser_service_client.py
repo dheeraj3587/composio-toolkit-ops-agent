@@ -11,8 +11,8 @@ QUERYING the service: a persisted session id is never trusted on its own
 session).
 
 The shared token travels in a header, never a query string, and is never logged
-or returned. Credential VALUES never cross this boundary — only ``vault://``
-references, which the service resolves internally.
+or returned. Credential VALUES never cross this control RPC — only ``vault://``
+references, which the service redeems through a separate private broker.
 """
 
 from __future__ import annotations
@@ -27,6 +27,12 @@ from typing import Any, Literal
 import httpx
 from pydantic import SecretStr
 
+from ops.browser_session_capability import (
+    CAPABILITY_HEADER,
+    BrowserSessionCapabilityError,
+    derive_browser_session_capability,
+)
+from ops.browser_signup import normalize_signup_fields
 from ops.browser_worker import BrowserObservation, BrowserSessionContext
 from ops.models import validate_vault_reference
 from ops.provider_errors import ConfigurationRequiredError, ProviderOperationError
@@ -62,6 +68,19 @@ ProviderHealthState = Literal[
 
 # The RPC contract version this client speaks; a mismatch is reported, not guessed.
 SUPPORTED_SERVICE_MAJOR = 1
+_HEALTH_TIMEOUT_SECONDS = 2.0
+_HEALTH_STATES = frozenset(
+    {
+        "disabled",
+        "not_configured",
+        "configured_not_verified",
+        "ready",
+        "degraded",
+        "capacity_exhausted",
+        "unreachable",
+        "version_mismatch",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +108,12 @@ class BrowserServiceClient:
     # Chromium is in its OWN process now: an API restart cannot kill it, and
     # reattachment is verified against the service before being claimed.
     supports_restart_reattach = True
+    # Generic orchestration adapters use this marker to pass the run scope only to
+    # the isolated RPC client, without changing in-process/hosted provider contracts.
+    requires_session_capability_scope = True
+    # Canonical runtime uses this explicit marker to reserve and pass durable
+    # one-operation broker grants. In-process providers never receive them.
+    requires_secret_broker_grants = True
 
     def __init__(
         self,
@@ -96,7 +121,8 @@ class BrowserServiceClient:
         base_url: str,
         token: SecretStr | str,
         owner: str,
-        timeout_seconds: float = 150.0,
+        capability_key: SecretStr | str | None = None,
+        timeout_seconds: float = 315.0,
         client: httpx.AsyncClient | None = None,
         sync_client: httpx.Client | None = None,
     ) -> None:
@@ -106,6 +132,13 @@ class BrowserServiceClient:
             )
         self._base_url = base_url.rstrip("/")
         self._token = token if isinstance(token, SecretStr) else SecretStr(token)
+        self._capability_key = (
+            capability_key
+            if isinstance(capability_key, SecretStr)
+            else SecretStr(capability_key)
+            if capability_key is not None
+            else None
+        )
         self._owner = owner
         self._timeout = timeout_seconds
         self._client = client
@@ -114,13 +147,35 @@ class BrowserServiceClient:
         self._sessions: dict[str, str] = {}
 
     # --- transport ------------------------------------------------------------
-    def _headers(self) -> dict[str, str]:
+    def _derive_capability(self, scope: str) -> str:
+        if self._capability_key is None:
+            raise ConfigurationRequiredError(
+                phase=3,
+                capability="browser session authorization",
+                reason_code="browser_session_capability_key_missing",
+            )
+        try:
+            return derive_browser_session_capability(
+                key=self._capability_key.get_secret_value(),
+                owner=self._owner,
+                scope=scope,
+            )
+        except BrowserSessionCapabilityError as exc:
+            raise ProviderOperationError(
+                capability="browser session authorization",
+                reason_code=exc.reason_code,
+            ) from None
+
+    def _headers(self, *, capability_scope: str | None = None) -> dict[str, str]:
         # Token in a HEADER, never a query string (those land in access logs).
-        return {
+        headers = {
             TOKEN_HEADER: self._token.get_secret_value(),
             OWNER_HEADER: self._owner,
             "Content-Type": "application/json",
         }
+        if capability_scope is not None:
+            headers[CAPABILITY_HEADER] = self._derive_capability(capability_scope)
+        return headers
 
     async def _request(
         self,
@@ -129,6 +184,7 @@ class BrowserServiceClient:
         *,
         json_body: Mapping[str, object] | None = None,
         timeout: float | None = None,
+        capability_scope: str | None = None,
     ) -> httpx.Response:
         url = f"{self._base_url}{path}"
         client = self._client
@@ -143,7 +199,7 @@ class BrowserServiceClient:
                 method,
                 url,
                 json=json_body,
-                headers=self._headers(),
+                headers=self._headers(capability_scope=capability_scope),
                 timeout=timeout or self._timeout,
             )
         finally:
@@ -189,7 +245,12 @@ class BrowserServiceClient:
                 recipe.model_dump(mode="json") if hasattr(recipe, "model_dump") else recipe
             )
         try:
-            response = await self._request("POST", "/internal/browser/sessions", json_body=body)
+            response = await self._request(
+                "POST",
+                "/internal/browser/sessions",
+                json_body=body,
+                capability_scope=secret_scope or "",
+            )
         except httpx.RequestError:
             raise ProviderOperationError(
                 capability="browser service", reason_code="browser_service_unreachable"
@@ -214,6 +275,7 @@ class BrowserServiceClient:
             created_at=str(payload.get("created_at") or now.isoformat()),
             inactivity_expires_at=str(payload.get("maximum_expires_at") or now.isoformat()),
             maximum_expires_at=str(payload.get("maximum_expires_at") or now.isoformat()),
+            capability_scope=secret_scope or "",
         )
 
     async def navigate_onboarding(
@@ -223,7 +285,9 @@ class BrowserServiceClient:
         *,
         recipe: Any = None,
         sensitive_data: Mapping[str, str] | None = None,
+        secret_grants: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
+        signup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
         return await self._drive(
@@ -231,9 +295,11 @@ class BrowserServiceClient:
             research,
             path="navigate",
             credential_refs=sensitive_data,
+            secret_grants=secret_grants,
             recipe=recipe,
             signal=None,
             account_creation_requested=account_creation_requested,
+            signup_fields=signup_fields,
             credential_creation_policy=credential_creation_policy,
         )
 
@@ -245,6 +311,9 @@ class BrowserServiceClient:
         *,
         recipe: Any = None,
         sensitive_data: Mapping[str, str] | None = None,
+        secret_grants: Mapping[str, str] | None = None,
+        account_creation_requested: bool = False,
+        signup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
@@ -254,8 +323,11 @@ class BrowserServiceClient:
             research,
             path="resume",
             credential_refs=sensitive_data,
+            secret_grants=secret_grants,
             recipe=recipe,
             signal=signal,
+            account_creation_requested=account_creation_requested,
+            signup_fields=signup_fields,
             credential_creation_policy=credential_creation_policy,
         )
 
@@ -266,19 +338,32 @@ class BrowserServiceClient:
         *,
         path: str,
         credential_refs: Mapping[str, str] | None,
+        secret_grants: Mapping[str, str] | None,
         recipe: Any = None,
         signal: str | None,
         account_creation_requested: bool = False,
+        signup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
         refs = _vault_references_only(credential_refs)
-        body: dict[str, object] = {"credential_refs": refs}
+        grants = _exact_broker_grants(refs, secret_grants)
+        body: dict[str, object] = {
+            "credential_refs": refs,
+            "secret_grants": grants,
+        }
         if recipe is not None:
             body["recipe_snapshot"] = (
                 recipe.model_dump(mode="json") if hasattr(recipe, "model_dump") else recipe
             )
         if account_creation_requested:
             body["account_creation_requested"] = True
+            try:
+                body["signup_fields"] = normalize_signup_fields(signup_fields)
+            except ValueError:
+                raise ProviderOperationError(
+                    capability="browser service",
+                    reason_code="signup_fields_invalid",
+                ) from None
         body["credential_creation_policy"] = credential_creation_policy
         if research is not None:
             body["research"] = (
@@ -292,7 +377,10 @@ class BrowserServiceClient:
             body["signal"] = signal
         try:
             response = await self._request(
-                "POST", f"/internal/browser/sessions/{context.session_id}/{path}", json_body=body
+                "POST",
+                f"/internal/browser/sessions/{context.session_id}/{path}",
+                json_body=body,
+                capability_scope=context.capability_scope,
             )
         except httpx.RequestError:
             raise ProviderOperationError(
@@ -322,10 +410,12 @@ class BrowserServiceClient:
         secret_store: object | None = None,
         *,
         recipe: Any = None,
+        capability_scope: str,
+        broker_grant: str,
     ) -> dict[str, str] | None:
         """Ask the service to capture into its vault; accept references only."""
 
-        del secret_store  # the service owns the shared vault boundary
+        del secret_store  # the service uses its narrow API broker boundary
         known_slug = self._sessions.get(handle)
         if known_slug and known_slug != app_slug:
             raise ProviderOperationError(
@@ -337,12 +427,12 @@ class BrowserServiceClient:
                 "POST",
                 f"/internal/browser/sessions/{handle}/capture-credentials",
                 json_body={
+                    "broker_grant": _validate_broker_grant(broker_grant),
                     "recipe_snapshot": (
-                        recipe.model_dump(mode="json")
-                        if hasattr(recipe, "model_dump")
-                        else recipe
-                    )
+                        recipe.model_dump(mode="json") if hasattr(recipe, "model_dump") else recipe
+                    ),
                 },
+                capability_scope=capability_scope,
             )
         except httpx.RequestError:
             raise ProviderOperationError(
@@ -381,12 +471,15 @@ class BrowserServiceClient:
             ) from None
         return refs or None
 
-    async def session_status(self, session_id: str) -> tuple[bool, str]:
+    async def session_status(self, session_id: str, *, capability_scope: str) -> tuple[bool, str]:
         """(exists, reason_code) straight from the service — never inferred."""
 
         try:
             response = await self._request(
-                "GET", f"/internal/browser/sessions/{session_id}/status", timeout=15.0
+                "GET",
+                f"/internal/browser/sessions/{session_id}/status",
+                timeout=15.0,
+                capability_scope=capability_scope,
             )
         except httpx.RequestError:
             return False, "browser_service_unreachable"
@@ -398,7 +491,9 @@ class BrowserServiceClient:
         lifecycle = str(payload.get("lifecycle") or "")
         return lifecycle == "ACTIVE", lifecycle.casefold() or "unknown"
 
-    async def reconcile_session(self, session_id: str | None) -> ReconcileOutcome:
+    async def reconcile_session(
+        self, session_id: str | None, *, capability_scope: str
+    ) -> ReconcileOutcome:
         """Decide whether a PERSISTED session id is still usable after a restart.
 
         A stored id is never trusted on its own: the service is queried, and only
@@ -407,17 +502,76 @@ class BrowserServiceClient:
 
         if not session_id:
             return "session_lost"
-        exists, reason = await self.session_status(session_id)
+        exists, reason = await self.session_status(session_id, capability_scope=capability_scope)
         if exists:
             return "resumable"
         if reason == "browser_service_unreachable":
             return "unreachable"
         return "session_lost"
 
-    async def screenshot(self, session_id: str) -> bytes | None:
+    async def reconcile_bound_sessions(
+        self,
+        *,
+        app_slug: str,
+        secret_scope: str,
+        account_ref: str,
+    ) -> tuple[str, ...]:
+        """Find only sessions bound to this exact run-start authority.
+
+        This closes the response-loss gap after create: the API can re-derive the
+        run capability and discover its own orphan without enumerating another
+        run's sessions.
+        """
+
         try:
             response = await self._request(
-                "GET", f"/internal/browser/sessions/{session_id}/screenshot", timeout=30.0
+                "POST",
+                "/internal/browser/sessions/reconcile",
+                json_body={
+                    "app_slug": app_slug,
+                    "secret_scope": secret_scope,
+                    "account_ref": account_ref,
+                },
+                timeout=15.0,
+                capability_scope=secret_scope,
+            )
+        except httpx.RequestError:
+            raise ProviderOperationError(
+                capability="browser service reconciliation",
+                reason_code="browser_service_unreachable",
+            ) from None
+        if response.status_code >= 400:
+            raise ProviderOperationError(
+                capability="browser service reconciliation",
+                reason_code=self._reason(response),
+            )
+        payload = response.json()
+        session_ids = payload.get("session_ids") if isinstance(payload, dict) else None
+        if not isinstance(session_ids, list):
+            raise ProviderOperationError(
+                capability="browser service reconciliation",
+                reason_code="invalid_reconcile_response",
+            )
+        normalized: list[str] = []
+        for session_id in session_ids:
+            if (
+                not isinstance(session_id, str)
+                or re.fullmatch(r"[A-Za-z0-9_-]{1,180}", session_id) is None
+            ):
+                raise ProviderOperationError(
+                    capability="browser service reconciliation",
+                    reason_code="invalid_reconcile_response",
+                )
+            normalized.append(session_id)
+        return tuple(normalized)
+
+    async def screenshot(self, session_id: str, *, capability_scope: str) -> bytes | None:
+        try:
+            response = await self._request(
+                "GET",
+                f"/internal/browser/sessions/{session_id}/screenshot",
+                timeout=30.0,
+                capability_scope=capability_scope,
             )
         except httpx.RequestError:
             return None
@@ -426,7 +580,9 @@ class BrowserServiceClient:
         data = response.content
         return data if isinstance(data, bytes) and data else None
 
-    def latest_screenshot(self, session_id: str) -> tuple[bytes, str] | None:
+    def latest_screenshot(
+        self, session_id: str, *, capability_scope: str
+    ) -> tuple[bytes, str] | None:
         """Fetch one current masked frame through the isolated-service RPC.
 
         ``RunService`` exposes a synchronous projection surface, so the production
@@ -446,7 +602,11 @@ class BrowserServiceClient:
                 follow_redirects=False,
             )
         try:
-            response = client.get(url, headers=self._headers(), timeout=30.0)
+            response = client.get(
+                url,
+                headers=self._headers(capability_scope=capability_scope),
+                timeout=30.0,
+            )
         except httpx.RequestError:
             return None
         finally:
@@ -459,7 +619,9 @@ class BrowserServiceClient:
             return None
         return data, datetime.now(UTC).isoformat()
 
-    async def request_live_view(self, session_id: str) -> tuple[str, str | None, str, bool]:
+    async def request_live_view(
+        self, session_id: str, *, capability_scope: str
+    ) -> tuple[str, str | None, str, bool]:
         """Request a live grant: (mode, url_or_None, expires_at, control_allowed).
 
         The URL is for IMMEDIATE operator use and must never be persisted to run
@@ -468,7 +630,10 @@ class BrowserServiceClient:
 
         try:
             response = await self._request(
-                "POST", f"/internal/browser/sessions/{session_id}/live-view", timeout=20.0
+                "POST",
+                f"/internal/browser/sessions/{session_id}/live-view",
+                timeout=20.0,
+                capability_scope=capability_scope,
             )
         except httpx.RequestError:
             return "screenshot", None, "", False
@@ -482,7 +647,9 @@ class BrowserServiceClient:
             payload.get("control_allowed") is True,
         )
 
-    def request_live_view_sync(self, session_id: str) -> tuple[str, str, str, bool] | None:
+    def request_live_view_sync(
+        self, session_id: str, *, capability_scope: str
+    ) -> tuple[str, str, str, bool] | None:
         """Mint one fresh view/control grant for immediate server-side projection.
 
         The returned URL is intentionally not cached on this client. Its only
@@ -498,7 +665,11 @@ class BrowserServiceClient:
                 follow_redirects=False,
             )
         try:
-            response = client.post(url, headers=self._headers(), timeout=20.0)
+            response = client.post(
+                url,
+                headers=self._headers(capability_scope=capability_scope),
+                timeout=20.0,
+            )
         except httpx.RequestError:
             return None
         finally:
@@ -520,7 +691,10 @@ class BrowserServiceClient:
     async def stop(self, context: BrowserSessionContext) -> None:
         try:
             response = await self._request(
-                "DELETE", f"/internal/browser/sessions/{context.session_id}", timeout=60.0
+                "DELETE",
+                f"/internal/browser/sessions/{context.session_id}",
+                timeout=60.0,
+                capability_scope=context.capability_scope,
             )
         except httpx.RequestError:
             LOGGER.warning("browser service unreachable while stopping a session")
@@ -557,36 +731,84 @@ class BrowserServiceClient:
         del session_id
         return None
 
-    async def health(self) -> BrowserServiceHealth:
-        """Provider-aware health, including RPC version compatibility."""
+    async def health(
+        self, *, timeout_seconds: float = _HEALTH_TIMEOUT_SECONDS
+    ) -> BrowserServiceHealth:
+        """Fast cached health, including strict RPC version compatibility."""
 
         try:
-            response = await self._request("GET", "/internal/health", timeout=30.0)
+            response = await self._request(
+                "GET",
+                "/internal/health",
+                timeout=max(0.25, min(float(timeout_seconds), 5.0)),
+            )
         except httpx.RequestError:
             return BrowserServiceHealth(
                 state="unreachable", reason_code="browser_service_unreachable"
             )
         if response.status_code >= 400:
             return BrowserServiceHealth(state="degraded", reason_code=self._reason(response))
-        payload = response.json()
-        version = str(payload.get("version") or "")
+        try:
+            payload = response.json()
+        except ValueError:
+            return BrowserServiceHealth(
+                state="degraded", reason_code="browser_service_health_invalid"
+            )
+        if not isinstance(payload, dict):
+            return BrowserServiceHealth(
+                state="degraded", reason_code="browser_service_health_invalid"
+            )
+        version_value = payload.get("version")
+        version = version_value if isinstance(version_value, str) else ""
+        reason_value = payload.get("reason_code")
+        reason_code = reason_value if isinstance(reason_value, str) else ""
+        if len(version) > 64 or re.fullmatch(r"[a-z0-9][a-z0-9_:-]{0,63}", reason_code) is None:
+            return BrowserServiceHealth(
+                state="degraded", reason_code="browser_service_health_invalid"
+            )
         major = version.split(".", 1)[0] if version else ""
-        if major and major.isdigit() and int(major) != SUPPORTED_SERVICE_MAJOR:
+        if not major.isdigit():
+            return BrowserServiceHealth(
+                state="version_mismatch",
+                reason_code="service_version_invalid",
+                version=version,
+            )
+        if int(major) != SUPPORTED_SERVICE_MAJOR:
             return BrowserServiceHealth(
                 state="version_mismatch",
                 reason_code=f"service_major_{major}_client_major_{SUPPORTED_SERVICE_MAJOR}",
                 version=version,
             )
         state = str(payload.get("state") or "configured_not_verified")
+        boolean_fields = (
+            "chromium_installed",
+            "context_launch_ok",
+            "janitor_running",
+        )
+        capacity_fields = ("capacity_total", "capacity_in_use")
+        if (
+            state not in _HEALTH_STATES
+            or any(type(payload.get(name)) is not bool for name in boolean_fields)
+            or any(
+                type(payload.get(name)) is not int or int(payload[name]) < 0
+                for name in capacity_fields
+            )
+            or int(payload["capacity_in_use"]) > int(payload["capacity_total"])
+        ):
+            return BrowserServiceHealth(
+                state="degraded",
+                reason_code="browser_service_health_invalid",
+                version=version,
+            )
         return BrowserServiceHealth(
             state=state,  # type: ignore[arg-type]
-            reason_code=str(payload.get("reason_code") or ""),
+            reason_code=reason_code,
             version=version,
-            chromium_installed=bool(payload.get("chromium_installed")),
-            context_launch_ok=bool(payload.get("context_launch_ok")),
-            capacity_total=int(payload.get("capacity_total") or 0),
-            capacity_in_use=int(payload.get("capacity_in_use") or 0),
-            janitor_running=bool(payload.get("janitor_running")),
+            chromium_installed=payload["chromium_installed"],
+            context_launch_ok=payload["context_launch_ok"],
+            capacity_total=payload["capacity_total"],
+            capacity_in_use=payload["capacity_in_use"],
+            janitor_running=payload["janitor_running"],
         )
 
 
@@ -595,6 +817,29 @@ class BrowserServiceClient:
 _ALLOWED_BROWSER_SECRET_FIELDS: frozenset[str] = frozenset(
     {"login_email", "login_password", "login_otp", "login_verification_url"}
 )
+_BROKER_GRANT = re.compile(r"^bsg_[A-Za-z0-9_-]{43}$")
+
+
+def _validate_broker_grant(value: str) -> str:
+    if not isinstance(value, str) or _BROKER_GRANT.fullmatch(value) is None:
+        raise ProviderOperationError(
+            capability="browser secret broker",
+            reason_code="browser_secret_grant_invalid",
+        )
+    return value
+
+
+def _exact_broker_grants(
+    references: Mapping[str, str],
+    values: Mapping[str, str] | None,
+) -> dict[str, str]:
+    grants = dict(values or {})
+    if set(grants) != set(references):
+        raise ProviderOperationError(
+            capability="browser secret broker",
+            reason_code="browser_secret_grant_invalid",
+        )
+    return {name: _validate_broker_grant(grant) for name, grant in grants.items()}
 
 
 def _vault_references_only(values: Mapping[str, str] | None) -> dict[str, str]:
@@ -635,6 +880,7 @@ def _vault_references_only(values: Mapping[str, str] | None) -> dict[str, str]:
 
 __all__ = [
     "ALLOWED_BROWSER_SECRET_FIELDS",
+    "CAPABILITY_HEADER",
     "OWNER_HEADER",
     "SUPPORTED_SERVICE_MAJOR",
     "TOKEN_HEADER",

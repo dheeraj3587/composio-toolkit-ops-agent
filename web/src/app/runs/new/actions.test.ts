@@ -30,13 +30,12 @@ const initialState: CreateRunFormState = {
 function validForm(executionMode: string): FormData {
   const form = new FormData()
   form.set("app_name", "Linear")
+  form.set("account_mode", "existing_account")
   form.set("legal_name", "Example Labs, Inc.")
   form.set("website", "https://example.com")
-  form.set("work_email_ref", "vault://company/work_email/profile_1")
   form.set("use_case", "Synchronize authorized customer issues.")
   form.set("expected_volume", "1,000 requests per month")
   form.set("callback_urls", "https://example.com/oauth/callback")
-  form.set("outreach_recipient_override", "")
   form.set("requested_scope_policy", "minimum")
   form.set("execution_mode", executionMode)
   form.set("browser_provider", "playwright")
@@ -61,6 +60,7 @@ describe("createRunAction", () => {
     const request = mocks.createRun.mock.calls[0]?.[0]
     expect(request).toMatchObject({
       app_name: "Linear",
+      account_mode: "existing_account",
       execution_mode: "execute_when_configured",
       browser_provider: "playwright",
       credential_creation_policy: "create_if_missing",
@@ -71,6 +71,8 @@ describe("createRunAction", () => {
       },
     })
     expect(request).not.toHaveProperty("dry_run")
+    expect(request).not.toHaveProperty("outreach_recipient_override")
+    expect(request.company).not.toHaveProperty("work_email_ref")
   })
 
   it("fails closed to plan_only when the submitted mode is not supported", async () => {
@@ -111,6 +113,16 @@ describe("createRunAction", () => {
 
     expect(mocks.createRun).not.toHaveBeenCalled()
     expect(state.fields).toEqual(["browser_provider"])
+  })
+
+  it("rejects an invalid scope instead of silently escalating access", async () => {
+    const form = validForm("execute_when_configured")
+    form.set("requested_scope_policy", "all_admin_permissions")
+
+    const state = await createRunAction(initialState, form)
+
+    expect(mocks.createRun).not.toHaveBeenCalled()
+    expect(state.fields).toEqual(["requested_scope_policy"])
   })
 
   it("rejects an invalid credential creation policy before calling the API", async () => {

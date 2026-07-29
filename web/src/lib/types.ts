@@ -22,6 +22,7 @@ export type RunStatus =
   | "completed"
 
 export type ExecutionMode = "plan_only" | "execute_when_configured"
+export type AccountMode = "existing_account" | "create_account"
 export type CredentialCreationPolicy = "reuse_only" | "create_if_missing"
 export type RouteKind = "managed_auth" | "playwright" | "gated"
 export type ReadinessTier =
@@ -64,6 +65,7 @@ export interface RunSummary {
   reason_code: string | null
   state_engine: StateEngine
   external_actions: boolean
+  account_mode?: AccountMode | null
   created_at: string
   updated_at: string
 }
@@ -157,7 +159,7 @@ export type PhaseCollection = PhaseState[] | Record<string, PhaseState | string 
 export interface SecurityState {
   redaction?: string
   secret_vault?: string
-  checkpoint_encryption?: string
+  operational_state_storage?: string
   owner_only_storage?: string
   live_vendor_email?: string
   live_browser?: string
@@ -266,6 +268,9 @@ export interface ProviderStatus {
   // backend-reported status without silently dropping unmapped values.
   status: string
   detail: string
+  reason_code?: string | null
+  checked_at?: string | null
+  expires_at?: string | null
 }
 
 export interface HealthResponse {
@@ -280,7 +285,7 @@ export interface HealthResponse {
 export interface CompanyProfileInput {
   legal_name: string
   website: string
-  work_email_ref: string
+  work_email_ref?: string | null
   use_case: string
   expected_volume: string | null
   callback_urls: string[]
@@ -288,12 +293,12 @@ export interface CompanyProfileInput {
 
 export interface OperationsRequestInput {
   app_name: string
+  account_mode: AccountMode
   company: CompanyProfileInput
   requested_scope_policy: "minimum" | "recommended" | "maximum"
   execution_mode: ExecutionMode
   browser_provider: BrowserProvider
   credential_creation_policy: CredentialCreationPolicy
-  outreach_recipient_override: string | null
   // Optional app sign-in credentials for autonomous login. Injected into
   // the selected provider's secret boundary at session creation; never persisted.
   browser_login?: { email: string; password: string } | null
@@ -367,6 +372,9 @@ export interface LiveViewResponse {
 
 export type RunPhaseAction = "resume" | "poll-email" | "retry"
 export type RetryCapability = "research" | "browser" | "email" | "validation"
+export type BrowserVerificationInput =
+  | { code: string; url?: never }
+  | { code?: never; url: string }
 
 export interface ActionReceipt {
   run_id: string
@@ -405,6 +413,12 @@ export interface AppSearchResponse {
 export interface AppCatalogResponse {
   items: AppSearchItem[]
   total: number
+}
+
+export interface AppCapabilitiesResponse {
+  app_slug: string
+  account_creation_supported: boolean
+  reason_code: "reviewed_signup_route" | "signup_route_unavailable"
 }
 
 export interface AppResearchResponse {

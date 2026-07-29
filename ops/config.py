@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import hmac
 import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from ops.browser_session_capability import (
+    BrowserSessionCapabilityError,
+    validate_capability_owner,
+)
 from ops.models import validate_vault_reference
 
 
@@ -97,14 +102,27 @@ class Settings(BaseModel):
     groq_api_key: SecretStr | None = Field(default=None, repr=False)
     cerebras_api_key: SecretStr | None = Field(default=None, repr=False)
     composio_api_key: SecretStr | None = Field(default=None, repr=False)
+    # Gmail can belong to a different Composio project than managed-auth/toolkit
+    # discovery. It falls back to COMPOSIO_API_KEY for existing deployments.
+    composio_gmail_api_key: SecretStr | None = Field(default=None, repr=False)
     browser_use_api_key: SecretStr | None = Field(default=None, repr=False)
     langgraph_aes_key: SecretStr | None = Field(default=None, repr=False)
     secret_vault_key: SecretStr | None = Field(default=None, repr=False)
     ops_internal_api_token: SecretStr | None = Field(default=None, repr=False)
+    browser_secret_broker_token: SecretStr | None = Field(default=None, repr=False)
 
     langgraph_strict_msgpack: bool = True
     composio_user_id: str = "ops-owner"
+    # Gmail connections may live under a different Composio project and external
+    # user than the managed-auth/toolkit runtime. It falls back to the generic
+    # user id so existing single-project deployments continue to work.
+    composio_gmail_user_id: str = "ops-owner"
     composio_gmail_connected_account_id: str | None = None
+    # Exact mailbox address used when a run creates a vendor account. The
+    # connected-account id selects the Gmail connection; it does not reliably
+    # expose the mailbox address to the browser workflow, so the address is an
+    # explicit private deployment input and is never requested in the UI.
+    gmail_signup_address: SecretStr | None = Field(default=None, repr=False)
     # Public, same-origin return location for managed OAuth. The adapter validates
     # it as a stable HTTPS URL and never persists the provider redirect URL.
     managed_auth_callback_base_url: str | None = None
@@ -156,7 +174,13 @@ class Settings(BaseModel):
     # restart.
     browser_service_url: str | None = None
     browser_service_token: SecretStr | None = Field(default=None, repr=False)
+    # API-only master key used to derive a distinct browser-session capability for
+    # each run. The derived value crosses the private RPC; this master key never does.
+    browser_session_capability_key: SecretStr | None = Field(default=None, repr=False)
+    # Stable tenant/storage namespace. This is deliberately NOT run authorization:
+    # encrypted storage state is reused across runs for the same app/account.
     browser_service_owner: str = "ops-owner"
+    browser_service_client_timeout_seconds: float = Field(default=315.0, ge=5.0, le=600.0)
     # Explicit capability switch for the one-session headed/noVNC assignment path.
     # The browser service independently enforces max_sessions=1 when this is true.
     browser_interactive_hitl_enabled: bool = False
@@ -241,10 +265,25 @@ class Settings(BaseModel):
     outreach_recipient_override: str | None = None
     allow_live_vendor_email: bool = False
     allow_live_browser: bool = False
+    # Startup must be observational by default. When enabled, startup creates
+    # delayed maintenance threads but performs no provider call in the startup
+    # call path. Production uses a grace period so the API can become healthy
+    # before reconciliation or Gmail reads begin.
+    ops_startup_automation_enabled: bool = False
+    ops_automation_start_delay_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
+    # Autonomous startup also requires a deploy-owned marker matching BOTH this
+    # immutable revision and a fresh per-deploy nonce. The delay is only load
+    # smoothing; this marker is the release-acceptance authority.
+    app_revision: str = "local-uncommitted"
+    ops_deploy_acceptance_nonce: SecretStr | None = Field(default=None, repr=False)
+    ops_deploy_acceptance_marker_path: Path = Path("./private/deploy-acceptance.json")
     max_outreach_rounds: int = Field(default=5, ge=1)
     # Autonomous email poller cadence (seconds). The agent checks every
     # waiting_for_reply run for new provider replies on this interval.
-    email_poll_interval_seconds: int = Field(default=45, ge=10)
+    email_poll_interval_seconds: int = Field(default=45, ge=10, le=900)
+    # Bound shared-mailbox work per cycle so one large backlog cannot starve the
+    # API or monopolize the connected Gmail account.
+    email_poll_max_runs_per_cycle: int = Field(default=25, ge=1, le=100)
     max_unclear_retries: int = Field(default=1, ge=0)
     max_browser_attempts: int = Field(default=2, ge=1)
     max_hitl_count: int = Field(default=3, ge=0)
@@ -265,6 +304,7 @@ class Settings(BaseModel):
     # grows exponentially from the base; set the base to 0 to disable waiting.
     gmail_retry_max_attempts: int = Field(default=3, ge=1, le=6)
     gmail_retry_base_delay_seconds: float = Field(default=0.5, ge=0.0, le=10.0)
+    gmail_signup_preflight_timeout_seconds: float = Field(default=10.0, ge=1.0, le=30.0)
     # Emailed verification (signup confirmation / login code or magic link). The
     # freshness window is enforced in code against each message's own receive
     # timestamp because Gmail's relative age operators have no hour unit, so a
@@ -277,9 +317,14 @@ class Settings(BaseModel):
     gmail_verification_poll_seconds: float = Field(default=5.0, ge=0.0, le=60.0)
     # When true, a verification secret may be consumed ONLY when the message can be
     # bound to this run's exact signup/login recipient and a reviewed sender. The
-    # default preserves existing deployments (which may hold no remembered login
-    # email yet) while still restricting magic-link hosts to the reviewed set.
-    gmail_verification_require_binding: bool = False
+    # Production defaults fail closed: a message without an exact run recipient
+    # binding is never injected into a browser. Legacy deployments can opt out
+    # explicitly while migrating their stored login identities.
+    gmail_verification_require_binding: bool = True
+    # A reviewed From domain is not proof of sender identity. Production accepts
+    # an OTP/link only when Gmail supplies aligned DMARC, DKIM, or SPF evidence
+    # in Authentication-Results (or a validated ARC chain).
+    gmail_verification_require_authenticated_sender: bool = True
 
     ops_db_path: Path = Path("./private/ops.db")
     checkpoint_db_path: Path = Path("./private/checkpoints.db")
@@ -290,6 +335,104 @@ class Settings(BaseModel):
     @classmethod
     def validate_company_work_email_ref(cls, value: str | None) -> str | None:
         return validate_vault_reference(value) if value is not None else None
+
+    @field_validator("gmail_signup_address")
+    @classmethod
+    def validate_gmail_signup_address(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        address = value.get_secret_value()
+        if (
+            len(address) > 320
+            or address.count("@") != 1
+            or any(character.isspace() for character in address)
+            or any(character in address for character in "<>,;\r\n")
+        ):
+            raise ValueError("GMAIL_SIGNUP_ADDRESS must be one email address")
+        local_part, domain = address.rsplit("@", 1)
+        if not local_part or "." not in domain or domain.startswith(".") or domain.endswith("."):
+            raise ValueError("GMAIL_SIGNUP_ADDRESS must be one email address")
+        return value
+
+    @field_validator("browser_session_capability_key")
+    @classmethod
+    def validate_browser_session_capability_key(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        secret = value.get_secret_value()
+        if len(secret) < 32:
+            raise ValueError("BROWSER_SESSION_CAPABILITY_KEY must be at least 32 characters")
+        lowered = secret.casefold()
+        if any(marker in lowered for marker in ("replace-with", "change-me", "example")):
+            raise ValueError("BROWSER_SESSION_CAPABILITY_KEY contains a placeholder")
+        return value
+
+    @field_validator("ops_internal_api_token")
+    @classmethod
+    def validate_ops_internal_api_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        token = value.get_secret_value()
+        if len(token) < 32:
+            raise ValueError("OPS_INTERNAL_API_TOKEN must be at least 32 characters")
+        if any(marker in token.casefold() for marker in ("replace-with", "change-me", "example")):
+            raise ValueError("OPS_INTERNAL_API_TOKEN contains a placeholder")
+        return value
+
+    @field_validator("browser_secret_broker_token")
+    @classmethod
+    def validate_browser_secret_broker_token(
+        cls,
+        value: SecretStr | None,
+    ) -> SecretStr | None:
+        if value is None:
+            return None
+        token = value.get_secret_value()
+        if len(token) < 32:
+            raise ValueError("BROWSER_SECRET_BROKER_TOKEN must be at least 32 characters")
+        if any(marker in token.casefold() for marker in ("replace-with", "change-me", "example")):
+            raise ValueError("BROWSER_SECRET_BROKER_TOKEN contains a placeholder")
+        return value
+
+    @field_validator("browser_service_token")
+    @classmethod
+    def validate_browser_service_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        token = value.get_secret_value()
+        if len(token) < 32:
+            raise ValueError("BROWSER_SERVICE_TOKEN must be at least 32 characters")
+        if any(marker in token.casefold() for marker in ("replace-with", "change-me", "example")):
+            raise ValueError("BROWSER_SERVICE_TOKEN contains a placeholder")
+        return value
+
+    @field_validator("browser_service_owner")
+    @classmethod
+    def validate_browser_service_owner(cls, value: str) -> str:
+        try:
+            return validate_capability_owner(value)
+        except BrowserSessionCapabilityError:
+            raise ValueError(
+                "BROWSER_SERVICE_OWNER must be an HTTP-safe ASCII identifier"
+            ) from None
+
+    @model_validator(mode="after")
+    def control_plane_tokens_are_independent(self) -> Settings:
+        configured = [
+            (name, value.get_secret_value())
+            for name, value in (
+                ("OPS_INTERNAL_API_TOKEN", self.ops_internal_api_token),
+                ("BROWSER_SERVICE_TOKEN", self.browser_service_token),
+                ("BROWSER_SESSION_CAPABILITY_KEY", self.browser_session_capability_key),
+                ("BROWSER_SECRET_BROKER_TOKEN", self.browser_secret_broker_token),
+            )
+            if value is not None
+        ]
+        for index, (left_name, left_value) in enumerate(configured):
+            for right_name, right_value in configured[index + 1 :]:
+                if hmac.compare_digest(left_value, right_value):
+                    raise ValueError(f"{left_name} must differ from {right_name}")
+        return self
 
     @classmethod
     def from_env(
@@ -323,21 +466,30 @@ class Settings(BaseModel):
             "openrouter_model": _optional(source.get("OPENROUTER_MODEL"))
             or "nvidia/nemotron-3-ultra-550b-a55b:free",
             "composio_api_key": _secret(source.get("COMPOSIO_API_KEY")),
+            "composio_gmail_api_key": _secret(
+                source.get("COMPOSIO_GMAIL_API_KEY") or source.get("COMPOSIO_API_KEY")
+            ),
             "browser_use_api_key": _secret(source.get("BROWSER_USE_API_KEY")),
             "langgraph_aes_key": _secret(source.get("LANGGRAPH_AES_KEY")),
             "secret_vault_key": _secret(source.get("SECRET_VAULT_KEY")),
             "ops_internal_api_token": _secret(source.get("OPS_INTERNAL_API_TOKEN")),
+            "browser_secret_broker_token": _secret(source.get("BROWSER_SECRET_BROKER_TOKEN")),
             "langgraph_strict_msgpack": _boolean(
                 source.get("LANGGRAPH_STRICT_MSGPACK"), default=True
             ),
             "composio_user_id": _optional(source.get("COMPOSIO_USER_ID")) or "ops-owner",
+            "composio_gmail_user_id": _optional(source.get("COMPOSIO_GMAIL_USER_ID"))
+            or _optional(source.get("COMPOSIO_USER_ID"))
+            or "ops-owner",
             "composio_gmail_connected_account_id": _optional(
-                source.get("COMPOSIO_GMAIL_CONNECTED_ACCOUNT_ID")
+                source.get("COMPOSIO_GMAIL_SIGNUP_CONNECTED_ACCOUNT_ID")
+                or source.get("COMPOSIO_GMAIL_CONNECTED_ACCOUNT_ID")
             ),
+            "gmail_signup_address": _secret(source.get("GMAIL_SIGNUP_ADDRESS")),
             "managed_auth_callback_base_url": _optional(
                 source.get("MANAGED_AUTH_CALLBACK_BASE_URL")
             ),
-            "gemini_model": _optional(source.get("GEMINI_MODEL")) or "gemini-3.5-flash",
+            "gemini_model": _optional(source.get("GEMINI_MODEL")) or "gemini-3.6-flash",
             "browser_use_model": _optional(source.get("BROWSER_USE_MODEL")) or "claude-opus-4.7",
             "browser_use_max_cost_usd": _float(
                 source.get("BROWSER_USE_MAX_COST_USD"), default=50.0
@@ -359,8 +511,12 @@ class Settings(BaseModel):
             ),
             "browser_service_url": _optional(source.get("BROWSER_SERVICE_URL")),
             "browser_service_token": _secret(source.get("BROWSER_SERVICE_TOKEN")),
+            "browser_session_capability_key": _secret(source.get("BROWSER_SESSION_CAPABILITY_KEY")),
             "browser_service_owner": (
                 _optional(source.get("BROWSER_SERVICE_OWNER")) or "ops-owner"
+            ),
+            "browser_service_client_timeout_seconds": _float(
+                source.get("BROWSER_SERVICE_CLIENT_TIMEOUT_SECONDS"), default=315.0
             ),
             "browser_interactive_hitl_enabled": _boolean(
                 source.get("BROWSER_INTERACTIVE_HITL_ENABLED"), default=False
@@ -407,9 +563,26 @@ class Settings(BaseModel):
                 source.get("ALLOW_LIVE_VENDOR_EMAIL"), default=False
             ),
             "allow_live_browser": _boolean(source.get("ALLOW_LIVE_BROWSER"), default=False),
+            "ops_startup_automation_enabled": _boolean(
+                source.get("OPS_STARTUP_AUTOMATION_ENABLED"), default=False
+            ),
+            "ops_automation_start_delay_seconds": _float(
+                source.get("OPS_AUTOMATION_START_DELAY_SECONDS"), default=30.0
+            ),
+            "app_revision": _optional(source.get("APP_REVISION")) or "local-uncommitted",
+            "ops_deploy_acceptance_nonce": _secret(source.get("OPS_DEPLOY_ACCEPTANCE_NONCE")),
+            "ops_deploy_acceptance_marker_path": Path(
+                source.get(
+                    "OPS_DEPLOY_ACCEPTANCE_MARKER_PATH",
+                    "./private/deploy-acceptance.json",
+                )
+            ),
             "max_outreach_rounds": _integer(source.get("MAX_OUTREACH_ROUNDS"), default=5),
             "email_poll_interval_seconds": _integer(
                 source.get("EMAIL_POLL_INTERVAL_SECONDS"), default=45
+            ),
+            "email_poll_max_runs_per_cycle": _integer(
+                source.get("EMAIL_POLL_MAX_RUNS_PER_CYCLE"), default=25
             ),
             "max_unclear_retries": _integer(source.get("MAX_UNCLEAR_RETRIES"), default=1),
             "browser_login_credential_reuse": _boolean(
@@ -425,6 +598,9 @@ class Settings(BaseModel):
             "gmail_retry_base_delay_seconds": _float(
                 source.get("GMAIL_RETRY_BASE_DELAY_SECONDS"), default=0.5
             ),
+            "gmail_signup_preflight_timeout_seconds": _float(
+                source.get("GMAIL_SIGNUP_PREFLIGHT_TIMEOUT_SECONDS"), default=10.0
+            ),
             "gmail_verification_max_age_seconds": _integer(
                 source.get("GMAIL_VERIFICATION_MAX_AGE_SECONDS"), default=900
             ),
@@ -435,7 +611,11 @@ class Settings(BaseModel):
                 source.get("GMAIL_VERIFICATION_POLL_SECONDS"), default=5.0
             ),
             "gmail_verification_require_binding": _boolean(
-                source.get("GMAIL_VERIFICATION_REQUIRE_BINDING"), default=False
+                source.get("GMAIL_VERIFICATION_REQUIRE_BINDING"), default=True
+            ),
+            "gmail_verification_require_authenticated_sender": _boolean(
+                source.get("GMAIL_VERIFICATION_REQUIRE_AUTHENTICATED_SENDER"),
+                default=True,
             ),
             "ops_db_path": Path(source.get("OPS_DB_PATH", "./private/ops.db")),
             "checkpoint_db_path": Path(

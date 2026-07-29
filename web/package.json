@@ -4,8 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
-    "postbuild": "node scripts/prepare-standalone.mjs",
+    "build": "next build && node scripts/prepare-standalone.mjs",
     "start": "node .next/standalone/server.js",
     "lint": "eslint . --max-warnings=0",
     "typecheck": "tsc --noEmit",
@@ -54,9 +53,5 @@
   "overrides": {
     "postcss": "8.5.22",
     "sharp": "0.35.3"
-  },
-  "allowScripts": {
-    "unrs-resolver@1.12.2": true,
-    "fsevents@2.3.3": false
   }
 }

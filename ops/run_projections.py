@@ -173,6 +173,11 @@ def _public_run(record: Mapping[str, object]) -> dict[str, Any]:
     public = {
         field: record.get(field) for field in _PUBLIC_RUN_FIELDS if record.get(field) is not None
     }
+    stored_request = record.get("request")
+    if isinstance(stored_request, Mapping):
+        account_mode = stored_request.get("account_mode")
+        if account_mode in {"existing_account", "create_account"}:
+            public["account_mode"] = account_mode
     persisted_execution_mode = str(record.get("execution_mode") or "local_dry_run")
     public["execution_mode"] = _LOGICAL_EXECUTION_MODE.get(persisted_execution_mode, "plan_only")
     public["external_actions"] = bool(record.get("external_actions", False))

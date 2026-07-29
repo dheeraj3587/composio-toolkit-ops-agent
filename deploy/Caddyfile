@@ -49,6 +49,9 @@ http://127.0.0.1:8080 {
 
 	# Remove server fingerprinting.
 	header -Server
+	# One-year HTTPS pin after the first successful TLS visit. This is ignored by
+	# browsers in the documented plain-HTTP/IP-only fallback.
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
 
 	# The signed live-view grant is necessarily a WebSocket query parameter.
 	# Keep this path out of access logs even if site logging is enabled later.
@@ -59,10 +62,12 @@ http://127.0.0.1:8080 {
 
 	# Ordered routing (a `route` block preserves written order; first match wins):
 	#   1. /healthz is an unauthenticated load-balancer probe.
-	#   2. The one reviewed Playwright live-view WebSocket path is protected by
-	#      Basic Auth and relayed directly to the private browser service.
-	#   3. Every other browser route is protected by Basic Auth and sent only to
-	#      Next.js. FastAPI is intentionally not exposed through Caddy.
+	#   2. The one reviewed Playwright live-view WebSocket path is authorized by
+	#      its short-lived, session-bound signed grant and relayed directly to the
+	#      private browser service.
+	#   3. Every other browser route goes only to Next.js, whose signed HTTP-only
+	#      application session protects the UI and server actions. FastAPI is
+	#      intentionally not exposed through Caddy.
 	#
 	# Caddy's reverse_proxy automatically sets X-Forwarded-For, X-Forwarded-Proto
 	# and X-Forwarded-Host, and forwards the original Host header upstream.
@@ -72,14 +77,9 @@ http://127.0.0.1:8080 {
 		}
 
 		handle @playwright_live_view {
-			basic_auth {
-				{$OPS_BASIC_AUTH_USER} {$OPS_BASIC_AUTH_HASH}
-			}
-
 			reverse_proxy browser-worker:8081 {
-				# Basic Auth terminates at Caddy. The browser service receives only
-				# its fixed operator identity plus the signed, session-bound grant
-				# carried by the WebSocket query string.
+				# The browser service receives only its fixed operator identity plus
+				# the signed, session-bound grant carried by the WebSocket query.
 				header_up -Authorization
 				header_up X-Browser-Session-Owner {$BROWSER_SERVICE_OWNER:production-owner}
 
@@ -89,19 +89,15 @@ http://127.0.0.1:8080 {
 		}
 
 		handle {
-			basic_auth {
-				{$OPS_BASIC_AUTH_USER} {$OPS_BASIC_AUTH_HASH}
-			}
-
 			reverse_proxy web:3000 {
 				header_up -Authorization
 				transport http {
 					dial_timeout 5s
-					# Run actions and same-session resume can drive a bounded
-					# Playwright step on the backend. Match the Next.js API client's
-					# 180s run-action budget (plus headroom) so the browser receives
-					# the real result instead of a premature 504.
-					response_header_timeout 200s
+					# Timeout order is deliberate: browser worker 300s, API RPC
+					# client 315s, Next.js action 330s, edge 345s. The inner layer
+					# therefore returns a structured result before an outer
+					# transport gives up.
+					response_header_timeout 345s
 				}
 			}
 		}

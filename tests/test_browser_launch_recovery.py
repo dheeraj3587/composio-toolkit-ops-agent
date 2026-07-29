@@ -13,6 +13,7 @@ Two defects made a Pipedrive Playwright run impossible to create:
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 from types import MethodType
 from typing import Any
@@ -63,6 +64,62 @@ def test_browser_home_is_not_the_read_only_workdir() -> None:
     script = _ENTRYPOINT.read_text(encoding="utf-8")
     # /app is on the read-only rootfs; HOME must not point there.
     assert f'HOME="{workdir.group(1)}"' not in script
+
+
+def test_display_helpers_receive_only_the_safe_environment() -> None:
+    script = _ENTRYPOINT.read_text(encoding="utf-8")
+    safe_block_start = script.index('SAFE_PROCESS_PATH="')
+    safe_block_end = script.index("\n}\n", safe_block_start) + len("\n}\n")
+    safe_block = script[safe_block_start:safe_block_end]
+    secret_names = {
+        "BROWSER_SECRET_BROKER_TOKEN",
+        "BROWSER_SERVICE_TOKEN",
+        "BROWSER_STORAGE_STATE_KEY",
+        "GROQ_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OPS_INTERNAL_API_TOKEN",
+    }
+    outer_environment = {
+        "HOME": "/tmp/browser-home",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+        "TMPDIR": "/tmp",
+        "TZ": "UTC",
+        "XDG_CACHE_HOME": "/tmp/browser-home/.cache",
+        "XDG_CONFIG_HOME": "/tmp/browser-home/.config",
+        "XDG_RUNTIME_DIR": "/tmp/browser-home/run",
+        **{name: f"helper-sentinel-{index}" for index, name in enumerate(sorted(secret_names))},
+    }
+    result = subprocess.run(
+        ["/bin/sh"],
+        input=f"{safe_block}\nrun_display_helper /usr/bin/env\n",
+        env=outer_environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    child_environment = dict(
+        line.split("=", maxsplit=1) for line in result.stdout.splitlines() if "=" in line
+    )
+    assert set(child_environment) == {
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "TMPDIR",
+        "TZ",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_RUNTIME_DIR",
+    }
+    assert secret_names.isdisjoint(child_environment)
+    assert "run_display_helper" in script
+    assert re.search(r"run_display_helper\s+\\\s+Xvfb\b", script)
+    assert 'run_display_helper DISPLAY=":${slot_display}" fluxbox' in script
+    assert script.count("run_display_helper x11vnc") == 2
 
 
 # --- 2. a failed pre-created session must still persist the run ---------------

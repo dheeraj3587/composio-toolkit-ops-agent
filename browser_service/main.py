@@ -20,21 +20,29 @@ import asyncio
 import contextlib
 import logging
 import re
+import socket
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, status
 from fastapi.responses import JSONResponse
 
 from browser_service import __version__
-from browser_service.auth import AuthContext, assert_session_owner, token_dependency
+from browser_service.auth import (
+    AuthContext,
+    assert_session_access,
+    require_session_capability,
+    require_session_capability_value,
+    token_dependency,
+)
 from browser_service.display_pool import DisplayPool, DisplayUnavailable
 from browser_service.models import (
     CaptureCredentialsRequest,
     CaptureCredentialsResponse,
     CreateSessionRequest,
+    DrainStatus,
     HealthResponse,
     LiveViewGrant,
     NavigateRequest,
@@ -46,9 +54,12 @@ from browser_service.models import (
     SessionSummary,
 )
 from browser_service.novnc import LiveViewDenied, VncTarget, authorize_live_view
+from browser_service.secret_broker import BrokerCaptureStore, BrowserSecretBrokerClient
 from browser_service.session_manager import ManagedSession, SessionManager, SessionUnavailable
 from browser_service.settings import BrowserServiceSettings
+from ops.browser_process_hardening import harden_browser_service_process
 from ops.provider_errors import ProviderOperationError
+from ops.redaction import install_redacting_filter
 
 LOGGER = logging.getLogger("browser_service")
 
@@ -112,9 +123,31 @@ def install_uvicorn_websocket_log_filter() -> UvicornWebSocketLogFilter:
     return redacting_filter
 
 
+def install_browser_service_log_filters() -> None:
+    """Install general value redaction plus the live-view query scrubber.
+
+    Uvicorn owns several non-propagating loggers and may attach its handlers after
+    application modules are first imported. Calling this at import and again from
+    lifespan is therefore intentional and idempotent: the latter is the
+    after-Uvicorn-configuration enforcement point.
+    """
+
+    for logger in (
+        logging.getLogger(),
+        LOGGER,
+        logging.getLogger("browser_service.novnc"),
+        logging.getLogger("uvicorn"),
+        logging.getLogger("uvicorn.error"),
+        logging.getLogger("uvicorn.access"),
+    ):
+        install_redacting_filter(logger)
+    install_uvicorn_websocket_log_filter()
+
+
 # Uvicorn configures its loggers before importing ``browser_service.main:app``.
-# Installing at module import therefore protects websocket accept/deny records.
-_UVICORN_WEBSOCKET_LOG_FILTER = install_uvicorn_websocket_log_filter()
+# Install immediately for websocket accept/deny records, then again from lifespan
+# in case an embedding server attached or replaced handlers after this import.
+install_browser_service_log_filters()
 
 _JANITOR_INTERVAL_SECONDS = 60.0
 
@@ -135,6 +168,7 @@ def _sanitized_error(exc: SessionUnavailable) -> HTTPException:
         "session_not_found": status.HTTP_404_NOT_FOUND,
         "session_closing": status.HTTP_409_CONFLICT,
         "capacity_exhausted": status.HTTP_429_TOO_MANY_REQUESTS,
+        "service_draining": status.HTTP_503_SERVICE_UNAVAILABLE,
     }.get(exc.reason_code, status.HTTP_400_BAD_REQUEST)
     return HTTPException(status_code=code, detail=exc.reason_code)
 
@@ -142,6 +176,19 @@ def _sanitized_error(exc: SessionUnavailable) -> HTTPException:
 # How long a cached Chromium readiness result stays fresh. The probe launches a
 # browser, so it must not run per request.
 _READINESS_TTL_SECONDS = 300.0
+
+
+def _interactive_stack_ready(display_pool: DisplayPool) -> bool:
+    """Verify every configured control/view VNC listener is reachable locally."""
+
+    for slot in display_pool.slots():
+        for port in (slot.vnc_port, slot.view_vnc_port):
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+                    pass
+            except OSError:
+                return False
+    return True
 
 
 @dataclass
@@ -232,7 +279,7 @@ def make_session_closer(
     async def _close(session: ManagedSession) -> None:
         # Revoke grants first, then stop every relay before Chromium is closed or
         # this session's display slot can be leased by another run.
-        session.hitl_pending = False
+        _set_hitl_pending(session, False)
         if attachment_drainer is not None and not await attachment_drainer(session.session_id):
             raise RuntimeError("live_attachment_drain_failed")
         context = session.worker_context
@@ -262,6 +309,14 @@ def make_session_closer(
     return _close
 
 
+def _set_hitl_pending(session: ManagedSession, pending: bool) -> None:
+    """Cross a HITL boundary while revoking grants from earlier pauses."""
+
+    if pending and not session.hitl_pending:
+        session.hitl_generation += 1
+    session.hitl_pending = pending
+
+
 def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
     """Build the browser-service app (factory so tests can inject settings)."""
 
@@ -284,6 +339,8 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
 
     @contextlib.asynccontextmanager
     async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+        harden_browser_service_process()
+        install_browser_service_log_filters()
         janitor = asyncio.create_task(manager.run_janitor(_JANITOR_INTERVAL_SECONDS))
         app.state.janitor_task = janitor
         # One readiness probe at startup, so the first health call is already
@@ -297,6 +354,9 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             with contextlib.suppress(asyncio.CancelledError):
                 await janitor
             await manager.close_all()
+            broker = app.state.secret_broker
+            if broker is not None:
+                broker.close()
 
     app = FastAPI(
         title="Composio Ops browser service",
@@ -313,6 +373,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
     # The worker is created lazily: importing Playwright must not be required for
     # /internal/health to answer "chromium not installed".
     app.state.worker = None
+    app.state.secret_broker = None
     app.state.readiness = _ReadinessCache()
     # Open interactive attachments are process-local and deliberately never
     # persisted. Resume drains this registry before autonomous browser work starts.
@@ -325,10 +386,10 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         attached = list(live_attachments.get(session_id, {}).items())
         if not attached:
             return True
-        for _task, socket in attached:
+        for _task, attached_socket in attached:
             with contextlib.suppress(Exception):
-                await socket.close(code=1001, reason=close_reason)
-        tasks = [task for task, _socket in attached if not task.done()]
+                await attached_socket.close(code=1001, reason=close_reason)
+        tasks = [task for task, _attached_socket in attached if not task.done()]
         if tasks:
             _done, pending = await asyncio.wait(
                 tasks,
@@ -354,7 +415,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         # Revoke FIRST. A socket racing the drain now fails authorization, and the
         # screenshot endpoint also consults this monotonic flag.
         session.live_view_allowed = False
-        session.hitl_pending = False
+        _set_hitl_pending(session, False)
         session.screenshot_available = False
         if not session.live_pixel_mask_installed:
             raise HTTPException(
@@ -388,6 +449,21 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             )
         return app.state.worker
 
+    def _secret_broker() -> BrowserSecretBrokerClient:
+        if app.state.secret_broker is not None:
+            return cast(BrowserSecretBrokerClient, app.state.secret_broker)
+        if resolved.secret_broker_token is None:
+            raise ProviderOperationError(
+                capability="browser secret broker",
+                reason_code="browser_secret_broker_unavailable",
+            )
+        app.state.secret_broker = BrowserSecretBrokerClient(
+            base_url=resolved.secret_broker_url,
+            token=resolved.secret_broker_token,
+            timeout_seconds=resolved.secret_broker_timeout_seconds,
+        )
+        return cast(BrowserSecretBrokerClient, app.state.secret_broker)
+
     # The idle sweep must be able to see a human attached to the interactive
     # relay; without this a waiting_for_hitl session is "idle" by definition and
     # could be reaped while someone is using it.
@@ -404,6 +480,35 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         )
     )
 
+    # ------------------------------------------------------------ release drain
+    def _drain_status() -> DrainStatus:
+        accepting, in_use, total = manager.drain_status()
+        return DrainStatus(
+            accepting_new_sessions=accepting,
+            capacity_in_use=in_use,
+            capacity_total=total,
+        )
+
+    @app.get("/internal/drain", response_model=DrainStatus)
+    async def drain_status(auth: AuthContext = _AUTH) -> DrainStatus:
+        # The regular token+owner dependency authenticates release tooling. A
+        # run capability is intentionally irrelevant: drain is service-wide and
+        # never grants access to any session.
+        del auth
+        return _drain_status()
+
+    @app.post("/internal/drain", response_model=DrainStatus)
+    async def begin_drain(auth: AuthContext = _AUTH) -> DrainStatus:
+        del auth
+        manager.begin_drain()
+        return _drain_status()
+
+    @app.delete("/internal/drain", response_model=DrainStatus)
+    async def undrain(auth: AuthContext = _AUTH) -> DrainStatus:
+        del auth
+        manager.undrain()
+        return _drain_status()
+
     # ---------------------------------------------------------------- sessions
     @app.post(
         "/internal/browser/sessions",
@@ -413,6 +518,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
     async def create_session(
         payload: CreateSessionRequest, auth: AuthContext = _AUTH
     ) -> SessionSummary:
+        session_capability_digest = require_session_capability(auth)
         recipe = _validated_recipe_snapshot(
             payload.recipe_snapshot,
             expected_app_slug=payload.app_slug,
@@ -427,6 +533,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 owner=auth.owner,
                 app_slug=payload.app_slug,
                 live_view_mode=payload.live_view_mode,
+                session_capability_digest=session_capability_digest,
                 secret_scope=payload.secret_scope,
                 account_ref=payload.account_ref,
             )
@@ -512,9 +619,11 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         payload: ReconcileSessionsRequest,
         auth: AuthContext = _AUTH,
     ) -> ReconcileSessionsResponse:
+        session_capability_digest = require_session_capability(auth)
         return ReconcileSessionsResponse(
             session_ids=manager.find_bound_sessions(
                 owner=auth.owner,
+                session_capability_digest=session_capability_digest,
                 app_slug=payload.app_slug,
                 secret_scope=payload.secret_scope,
                 account_ref=payload.account_ref,
@@ -523,12 +632,18 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
 
     @app.get("/internal/browser/sessions/{session_id}/status", response_model=SessionSummary)
     async def session_status(session_id: str, auth: AuthContext = _AUTH) -> SessionSummary:
+        caller_capability_digest = require_session_capability(auth)
         session = manager.get_if_present(session_id)
         if session is None:
             # 404 is the authoritative answer the API's restart reconciliation
             # relies on: a persisted id is NEVER trusted without this check.
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
-        assert_session_owner(session_owner=session.owner, caller_owner=auth.owner)
+        assert_session_access(
+            session_owner=session.owner,
+            caller_owner=auth.owner,
+            session_capability_digest=session.session_capability_digest,
+            caller_capability_digest=caller_capability_digest,
+        )
         return session.summary()
 
     @app.post(
@@ -539,10 +654,17 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         payload: NavigateRequest,
         auth: AuthContext = _AUTH,
     ) -> ObservationResponse:
+        caller_capability_digest = require_session_capability(auth)
         session = manager.get_if_present(session_id)
         if session is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
-        assert_session_owner(session_owner=session.owner, caller_owner=auth.owner)
+        assert_session_access(
+            session_owner=session.owner,
+            caller_owner=auth.owner,
+            session_capability_digest=session.session_capability_digest,
+            caller_capability_digest=caller_capability_digest,
+        )
+        caller_capability = require_session_capability_value(auth)
         try:
             with manager.lease(session_id) as leased:
                 observation = await _drive(
@@ -551,9 +673,14 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                     payload.research,
                     payload.recipe_snapshot,
                     payload.credential_refs,
+                    payload.secret_grants,
                     resolved,
+                    secret_broker_factory=_secret_broker,
+                    broker_owner=auth.owner,
+                    broker_capability=caller_capability,
                     resume_signal=None,
                     account_creation_requested=payload.account_creation_requested,
+                    signup_fields=payload.signup_fields,
                     credential_creation_policy=payload.credential_creation_policy,
                 )
                 if observation.status == "credential_page_ready":
@@ -570,19 +697,26 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         payload: ResumeRequest,
         auth: AuthContext = _AUTH,
     ) -> ObservationResponse:
+        caller_capability_digest = require_session_capability(auth)
         session = manager.get_if_present(session_id)
         if session is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
-        assert_session_owner(session_owner=session.owner, caller_owner=auth.owner)
+        assert_session_access(
+            session_owner=session.owner,
+            caller_owner=auth.owner,
+            session_capability_digest=session.session_capability_digest,
+            caller_capability_digest=caller_capability_digest,
+        )
+        caller_capability = require_session_capability_value(auth)
         if not session.hitl_pending:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="hitl_not_pending")
         # Revoke stale grants before closing attachments. A socket racing this
         # transition will fail its handshake because HITL is no longer pending.
-        session.hitl_pending = False
+        _set_hitl_pending(session, False)
         if not await _drain_live_attachments(session_id):
             # The operator must be able to retry Resume after the stale socket
             # finally closes. Leaving this false would strand the run forever.
-            session.hitl_pending = True
+            _set_hitl_pending(session, True)
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="live_attachment_drain_failed",
@@ -595,8 +729,14 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                     payload.research or {},
                     payload.recipe_snapshot,
                     payload.credential_refs,
+                    payload.secret_grants,
                     resolved,
+                    secret_broker_factory=_secret_broker,
+                    broker_owner=auth.owner,
+                    broker_capability=caller_capability,
                     resume_signal=payload.signal,
+                    account_creation_requested=payload.account_creation_requested,
+                    signup_fields=payload.signup_fields,
                     credential_creation_policy=payload.credential_creation_policy,
                 )
                 if observation.status == "credential_page_ready":
@@ -604,7 +744,28 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                     await _enter_secret_capture_boundary(leased)
                     observation = observation.model_copy(update={"session": leased.summary()})
                 return observation
+        except HTTPException as exc:
+            detail = str(exc.detail)
+            definite_pre_action = bool(
+                exc.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+                or detail.startswith("browser_secret_")
+            )
+            if definite_pre_action and session.lifecycle == "ACTIVE":
+                # No Playwright action ran, so the owner may safely retry this
+                # same gate after correcting the transient/broker condition.
+                _set_hitl_pending(session, True)
+            else:
+                # The operation may have clicked or submitted before its response
+                # was lost. Never turn that ambiguity into an automatic replay.
+                session.reason_code = "browser_resume_outcome_unknown"
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="browser_resume_outcome_unknown",
+                ) from None
+            raise
         except SessionUnavailable as exc:
+            if session.lifecycle == "ACTIVE":
+                _set_hitl_pending(session, True)
             raise _sanitized_error(exc) from None
 
     @app.post(
@@ -616,19 +777,19 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         payload: CaptureCredentialsRequest,
         auth: AuthContext = _AUTH,
     ) -> CaptureCredentialsResponse:
-        """Capture a reviewed credential into the shared vault, returning refs only."""
+        """Write a reviewed credential through the broker, returning refs only."""
 
+        caller_capability_digest = require_session_capability(auth)
         session = manager.get_if_present(session_id)
         if session is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
-        assert_session_owner(session_owner=session.owner, caller_owner=auth.owner)
-        try:
-            store = _credential_capture_store()
-        except ProviderOperationError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=exc.reason_code,
-            ) from None
+        assert_session_access(
+            session_owner=session.owner,
+            caller_owner=auth.owner,
+            session_capability_digest=session.session_capability_digest,
+            caller_capability_digest=caller_capability_digest,
+        )
+        caller_capability = require_session_capability_value(auth)
         try:
             with manager.lease(session_id) as leased:
                 if not leased.credential_surface_ready:
@@ -643,6 +804,13 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 recipe = _validated_recipe_snapshot(
                     payload.recipe_snapshot,
                     expected_app_slug=leased.app_slug,
+                )
+                store = _credential_capture_store(
+                    session=leased,
+                    broker=_secret_broker(),
+                    grant=payload.broker_grant,
+                    owner=auth.owner,
+                    capability=caller_capability,
                 )
                 capture_kwargs: dict[str, object] = {}
                 if recipe is not None:
@@ -666,6 +834,19 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             raise _sanitized_error(exc) from None
         except HTTPException:
             raise
+        except ProviderOperationError as exc:
+            broker_unavailable = exc.reason_code in {
+                "browser_secret_broker_unavailable",
+                "browser_secret_broker_unreachable",
+            }
+            raise HTTPException(
+                status_code=(
+                    status.HTTP_503_SERVICE_UNAVAILABLE
+                    if broker_unavailable
+                    else status.HTTP_502_BAD_GATEWAY
+                ),
+                detail=exc.reason_code,
+            ) from None
         except (TypeError, AttributeError, AssertionError, NameError):
             raise
         except Exception:
@@ -678,10 +859,16 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
 
     @app.get("/internal/browser/sessions/{session_id}/screenshot")
     async def screenshot(session_id: str, auth: AuthContext = _AUTH) -> Response:
+        caller_capability_digest = require_session_capability(auth)
         session = manager.get_if_present(session_id)
         if session is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
-        assert_session_owner(session_owner=session.owner, caller_owner=auth.owner)
+        assert_session_access(
+            session_owner=session.owner,
+            caller_owner=auth.owner,
+            session_capability_digest=session.session_capability_digest,
+            caller_capability_digest=caller_capability_digest,
+        )
         if not session.live_view_allowed:
             session.screenshot_available = False
             raise HTTPException(
@@ -713,10 +900,16 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         relay independently chooses a server-side view-only/control VNC listener.
         """
 
+        caller_capability_digest = require_session_capability(auth)
         session = manager.get_if_present(session_id)
         if session is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
-        assert_session_owner(session_owner=session.owner, caller_owner=auth.owner)
+        assert_session_access(
+            session_owner=session.owner,
+            caller_owner=auth.owner,
+            session_capability_digest=session.session_capability_digest,
+            caller_capability_digest=caller_capability_digest,
+        )
         if (
             not resolved.interactive_hitl_enabled
             or not session.interactive_ready
@@ -736,12 +929,13 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         )
 
         secret = resolved.service_token.get_secret_value() if resolved.service_token else ""
-        access = "control" if session.hitl_pending else "view"
+        access: Literal["view", "control"] = "control" if session.hitl_pending else "view"
         token, expires_at = issue_live_view_token(
             session_id=session_id,
             owner=auth.owner,
             secret=secret,
             access=access,
+            hitl_generation=session.hitl_generation,
             ttl_seconds=resolved.live_view_token_seconds,
         )
         # The noVNC page is served by THIS service on the private network, so the
@@ -806,6 +1000,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                     session.interactive_ready and session.live_view_allowed if session else False
                 ),
                 hitl_pending=session.hitl_pending if session else False,
+                hitl_generation=session.hitl_generation if session else 0,
             )
         except LiveViewDenied as exc:
             # Refuse BEFORE accepting: an unauthorized client never gets a socket.
@@ -894,11 +1089,17 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
 
     @app.delete("/internal/browser/sessions/{session_id}")
     async def delete_session(session_id: str, auth: AuthContext = _AUTH) -> JSONResponse:
+        caller_capability_digest = require_session_capability(auth)
         session = manager.get_if_present(session_id)
         if session is None:
             # Idempotent delete: already gone is success.
             return JSONResponse({"reason_code": "session_not_found"})
-        assert_session_owner(session_owner=session.owner, caller_owner=auth.owner)
+        assert_session_access(
+            session_owner=session.owner,
+            caller_owner=auth.owner,
+            session_capability_digest=session.session_capability_digest,
+            caller_capability_digest=caller_capability_digest,
+        )
         # ONE teardown path: manager.close() runs the worker-backed closer, which
         # stops the real session. This endpoint used to stop the browser itself AND
         # then close the manager session, so with a working closer the browser was
@@ -916,6 +1117,11 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         """
 
         cache: _ReadinessCache = app.state.readiness
+        # A headed probe uses the same display stack as real sessions. Never
+        # introduce a probe window onto an operator's active private desktop;
+        # retain the last verified cache until capacity is idle.
+        if not force and manager.capacity_in_use:
+            return
         if not force and not cache.is_stale():
             return
         async with cache.lock:
@@ -925,13 +1131,25 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 from ops.browser_readiness import probe_playwright
 
                 readiness = await probe_playwright(timeout_seconds=25.0)
+                interactive_ready = _interactive_stack_ready(display_pool)
+                launch_ok = readiness.ok and interactive_ready
                 cache.update(
                     chromium_installed=readiness.reason_code != "playwright_not_installed",
-                    context_launch_ok=readiness.ok,
+                    context_launch_ok=launch_ok,
                     reason_code=(
-                        "chromium_launch_verified" if readiness.ok else readiness.reason_code
+                        "chromium_launch_verified"
+                        if launch_ok
+                        else "interactive_display_stack_unavailable"
+                        if readiness.ok
+                        else readiness.reason_code
                     ),
-                    detail=readiness.detail[:200] if not readiness.ok else "",
+                    detail=(
+                        "An interactive display listener is unavailable."
+                        if readiness.ok and not interactive_ready
+                        else readiness.detail[:200]
+                        if not readiness.ok
+                        else ""
+                    ),
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 cache.update(
@@ -988,15 +1206,15 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
 
     @app.get("/internal/health", response_model=HealthResponse)
     async def health(request: Request) -> HealthResponse:
-        """Provider-aware health. Deliberately UNAUTHENTICATED but secret-free.
+        """Fast cache-only provider health; unauthenticated but secret-free.
 
         Reports only capability state (never a session id, URL, or token) so a
-        container healthcheck can call it without holding the RPC token. Backed by
-        the CACHED readiness result rather than a fresh Chromium launch.
+        caller can inspect it without holding the RPC token. This endpoint never
+        acquires the readiness lock or launches Chromium; ``/internal/ready`` is
+        the sole HTTP refresh owner.
         """
 
         del request
-        await _refresh_readiness()
         return _health_from_cache()
 
     return app
@@ -1053,17 +1271,22 @@ async def _drive(
     research_payload: dict[str, object],
     recipe_payload: dict[str, object] | None,
     credential_refs: dict[str, str],
+    secret_grants: dict[str, str],
     settings: BrowserServiceSettings,
+    secret_broker_factory: Callable[[], BrowserSecretBrokerClient],
+    broker_owner: str,
+    broker_capability: str,
     *,
     resume_signal: str | None,
     account_creation_requested: bool = False,
+    signup_fields: dict[str, str] | None = None,
     credential_creation_policy: str = "reuse_only",
 ) -> ObservationResponse:
     """Run one navigate/resume operation and project a sanitized observation.
 
-    Credential REFERENCES are resolved to values inside this service (never sent
-    over RPC and never returned), so a value cannot cross a process boundary in
-    either direction.
+    The control-plane RPC carries references only. This process redeems each
+    exact transient reference through the private broker immediately before use;
+    the value is never returned on the control RPC or persisted by this service.
     """
 
     from ops.browser_worker import BrowserSessionContext
@@ -1097,7 +1320,12 @@ async def _drive(
     )
     try:
         sensitive = _resolve_credential_refs(
-            session=session, credential_refs=credential_refs, settings=settings
+            session=session,
+            credential_refs=credential_refs,
+            secret_grants=secret_grants,
+            broker=(secret_broker_factory() if credential_refs else None),
+            owner=broker_owner,
+            capability=broker_capability,
         )
     except ProviderOperationError as exc:
         # A shared-vault misconfiguration is a deployment error, surfaced as a
@@ -1116,6 +1344,7 @@ async def _drive(
                 navigate_kwargs["recipe"] = recipe
             if account_creation_requested:
                 navigate_kwargs["account_creation_requested"] = True
+                navigate_kwargs["signup_fields"] = signup_fields or {}
             observation = await asyncio.wait_for(
                 worker.navigate_onboarding(context, research, **navigate_kwargs),
                 timeout=settings.operation_timeout_seconds,
@@ -1127,6 +1356,9 @@ async def _drive(
             }
             if recipe is not None:
                 resume_kwargs["recipe"] = recipe
+            if account_creation_requested:
+                resume_kwargs["account_creation_requested"] = True
+                resume_kwargs["signup_fields"] = signup_fields or {}
             observation = await asyncio.wait_for(
                 worker.resume_after_hitl(context, resume_signal, research, **resume_kwargs),
                 timeout=settings.operation_timeout_seconds,
@@ -1146,16 +1378,26 @@ async def _drive(
     finally:
         sensitive.clear()  # drop credential values immediately
 
-    session.hitl_pending = observation.status == "human_action_required"
+    _set_hitl_pending(session, observation.status == "human_action_required")
     session.current_url_path = _url_path(observation.current_url)
     session.touch()
 
-    # Persist authenticated state ONLY after a reviewed success, and invalidate it
-    # the moment authentication fails. Storage state is bearer credential material,
-    # so it is encrypted at rest and never logged.
+    # Persist encrypted state at reviewed authentication checkpoints, not just the
+    # final credential page. An email-verification or account-selection handoff
+    # often happens after the vendor has already issued short-lived signup/session
+    # cookies; retaining them is what lets an API restart continue the same flow.
+    # CAPTCHA and generic human gates are excluded because they do not prove any
+    # authentication progress.
     if session.storage_binding is not None:
         store = _state_store(settings)
-        if observation.status == "credential_page_ready":
+        authenticated_checkpoint = bool(
+            observation.status == "credential_page_ready"
+            or (
+                observation.status == "human_action_required"
+                and observation.human_action_type in {"email_otp", "account_selection"}
+            )
+        )
+        if authenticated_checkpoint:
             await _save_storage_state(worker, session, store)
         elif observation.reason_code in _AUTH_STATE_INVALIDATION_REASONS:
             # Invalidate saved authentication state ONLY for explicit auth reasons.
@@ -1178,21 +1420,24 @@ async def _drive(
     )
 
 
-def _credential_capture_store() -> Any:
-    """Build the service-local view of the shared encrypted credential vault."""
+def _credential_capture_store(
+    *,
+    session: ManagedSession,
+    broker: BrowserSecretBrokerClient,
+    grant: str,
+    owner: str,
+    capability: str,
+) -> BrokerCaptureStore:
+    """Return a write-only broker adapter bound to one leased browser session."""
 
-    from ops.config import Settings
-    from ops.secret_store import SQLiteSecretStore
-
-    app_settings = Settings.from_env(dotenv_path=None)
-    if app_settings.secret_vault_key is None:
-        raise ProviderOperationError(
-            capability="browser service vault",
-            reason_code="secret_vault_not_configured",
-        )
-    return SQLiteSecretStore(
-        app_settings.secret_vault_db_path,
-        app_settings.secret_vault_key.get_secret_value(),
+    return BrokerCaptureStore(
+        broker=broker,
+        grant=grant,
+        app_slug=session.app_slug,
+        scope_id=session.secret_scope,
+        session_id=session.session_id,
+        owner=owner,
+        capability=capability,
     )
 
 
@@ -1200,51 +1445,58 @@ def _resolve_credential_refs(
     *,
     session: ManagedSession,
     credential_refs: dict[str, str],
-    settings: BrowserServiceSettings,
+    secret_grants: dict[str, str],
+    broker: BrowserSecretBrokerClient | None,
+    owner: str,
+    capability: str,
 ) -> dict[str, str]:
-    """Consume the run's ONE-TIME vault references to values INSIDE this service.
+    """Consume exact ONE-TIME references through the API-owned broker.
 
-    A raw credential value never crosses the RPC boundary; the API sends only
-    ``vault://`` references and the service consumes them here, bound to this
-    session's app and run scope. A missing shared vault is an EXPLICIT error
-    (secret_vault_not_configured) rather than a silent empty mapping, because the
-    latter turned a deployment mistake into an unexplained login failure.
+    The browser process has no vault database or encryption key.  The only raw
+    value it can receive is the transient value whose app/kind/scope all match
+    this session; the API atomically deletes that row during the handoff.
     """
 
-    del settings
     if not credential_refs:
+        if secret_grants:
+            raise ProviderOperationError(
+                capability="browser secret broker",
+                reason_code="browser_secret_grant_invalid",
+            )
         return {}
-
-    from ops.config import Settings
-    from ops.secret_store import SQLiteSecretStore, TransientSecretError
-
-    app_settings = Settings.from_env(dotenv_path=None)
-    if app_settings.secret_vault_key is None:
+    if set(secret_grants) != set(credential_refs):
         raise ProviderOperationError(
-            capability="browser service vault",
-            reason_code="secret_vault_not_configured",
+            capability="browser secret broker",
+            reason_code="browser_secret_grant_invalid",
         )
-    store = SQLiteSecretStore(
-        app_settings.secret_vault_db_path,
-        app_settings.secret_vault_key.get_secret_value(),
-    )
+    if broker is None:
+        raise ProviderOperationError(
+            capability="browser secret broker",
+            reason_code="browser_secret_broker_unavailable",
+        )
     resolved: dict[str, str] = {}
     for field_name, reference in credential_refs.items():
         if not isinstance(reference, str) or not reference.startswith("vault://"):
-            continue
-        expected_kind = f"browser_login_{field_name}"
-        try:
-            # Consume once, bound to this session's app and this run's scope. A
-            # mismatch or expiry is a typed reason, never a raw value or a probe of
-            # another app's secrets.
-            value = store.consume_transient(
-                reference,
-                expected_app_slug=session.app_slug,
-                expected_kind=expected_kind,
-                expected_scope_id=session.secret_scope,
+            raise ProviderOperationError(
+                capability="browser secret broker",
+                reason_code="browser_secret_reference_invalid",
             )
-        except TransientSecretError:
-            continue
+        expected_kind = f"browser_login_{field_name}"
+        # Every advertised reference is part of one exact handoff. Continuing
+        # after one consume fails could type a partial login and turn a definite
+        # pre-action broker failure into an ambiguous vendor-side effect. Surface
+        # the typed error instead; resume restores HITL and canonical retry can
+        # mint a fresh run-scoped transient from its encrypted stage.
+        value = broker.consume(
+            grant=secret_grants[field_name],
+            reference=reference,
+            app_slug=session.app_slug,
+            kind=expected_kind,
+            scope_id=session.secret_scope,
+            session_id=session.session_id,
+            owner=owner,
+            capability=capability,
+        )
         if isinstance(value, str) and value:
             resolved[field_name] = value
     return resolved

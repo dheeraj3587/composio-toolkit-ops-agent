@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
   connectManagedRun: vi.fn(),
   getLiveView: vi.fn(),
   pollManagedConnection: vi.fn(),
+  resumeWithBrowserVerification: vi.fn(),
   redirect: vi.fn(),
   revalidatePath: vi.fn(),
 }))
@@ -29,6 +30,7 @@ vi.mock("@/lib/api", () => {
     pollManagedConnection: mocks.pollManagedConnection,
     performPhaseAction: vi.fn(),
     resumeWithBrowserLogin: vi.fn(),
+    resumeWithBrowserVerification: mocks.resumeWithBrowserVerification,
     submitCredentials: vi.fn(),
   }
 })
@@ -36,6 +38,8 @@ vi.mock("@/lib/api", () => {
 import {
   openLiveView,
   runManagedConnectionAction,
+  submitBrowserVerificationAction,
+  type BrowserVerificationState,
   type LiveViewState,
   type ManagedConnectionActionState,
 } from "@/app/runs/[runId]/actions"
@@ -63,6 +67,11 @@ const initialManagedState: ManagedConnectionActionState = {
   message: null,
   tone: "neutral",
   state: null,
+}
+
+const initialVerificationState: BrowserVerificationState = {
+  message: null,
+  tone: "neutral",
 }
 
 function managedForm(operation: "connect" | "poll"): FormData {
@@ -183,5 +192,50 @@ describe("openLiveView", () => {
     expect(result.mode).toBe("unavailable")
     expect(result.interactivePath).toBeNull()
     expect(result.message).toBe("The live browser view could not be retrieved.")
+  })
+})
+
+describe("manual browser verification", () => {
+  beforeEach(() => {
+    mocks.resumeWithBrowserVerification.mockReset()
+    mocks.revalidatePath.mockReset()
+    mocks.resumeWithBrowserVerification.mockResolvedValue({
+      run_id: RUN_ID,
+      action: "resume",
+      status: "accepted",
+      detail: "Never render the submitted value 123456.",
+    })
+  })
+
+  it("normalizes and submits exactly one verification code", async () => {
+    const form = runForm()
+    form.set("verification_code", "12 34-56")
+
+    const result = await submitBrowserVerificationAction(initialVerificationState, form)
+
+    expect(mocks.resumeWithBrowserVerification).toHaveBeenCalledWith(
+      RUN_ID,
+      { code: "123456" },
+    )
+    expect(result.tone).toBe("neutral")
+    expect(JSON.stringify(result)).not.toContain("123456")
+  })
+
+  it("submits an HTTPS magic link but rejects mixed secret sources", async () => {
+    const linkForm = runForm()
+    linkForm.set("verification_url", "https://provider.example/verify?token=opaque")
+
+    await submitBrowserVerificationAction(initialVerificationState, linkForm)
+    expect(mocks.resumeWithBrowserVerification).toHaveBeenLastCalledWith(
+      RUN_ID,
+      { url: "https://provider.example/verify?token=opaque" },
+    )
+
+    const mixed = runForm()
+    mixed.set("verification_code", "123456")
+    mixed.set("verification_url", "https://provider.example/verify?token=opaque")
+    const result = await submitBrowserVerificationAction(initialVerificationState, mixed)
+    expect(result.tone).toBe("error")
+    expect(mocks.resumeWithBrowserVerification).toHaveBeenCalledTimes(1)
   })
 })

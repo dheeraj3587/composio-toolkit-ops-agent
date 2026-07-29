@@ -98,7 +98,7 @@ export function AppSearch() {
           <CatalogMessage
             icon={Search}
             title="No verified match"
-            copy={`No P1 record matched “${deferredQuery}”. Clear the filter to browse every app, or create a run for bounded enrichment.`}
+            copy={`No reviewed app matched “${deferredQuery}”. Clear the filter to browse the supported catalog.`}
           />
         ) : (
           <div className="space-y-6">

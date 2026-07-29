@@ -54,6 +54,20 @@ describe("ProviderStateCard", () => {
     expect(html).not.toMatch(/live.?verified/i)
   })
 
+  it("does not turn a LangGraph key into legacy-reader readiness", () => {
+    const html = renderProvider({
+      provider: "langgraph",
+      status: "ready",
+      detail: "A legacy encryption key is configured.",
+    })
+
+    expect(html).toContain("Legacy checkpoint configuration")
+    expect(html).toContain("Not part of canonical runtime")
+    expect(html).toContain("Key presence only; reader wiring not reported")
+    expect(html).not.toContain("Runtime initialized")
+    expect(html).not.toContain("Encrypted checkpoint compatibility")
+  })
+
   it("displays disabled status as policy-disabled, not as a failure", () => {
     const html = renderProvider({
       provider: "browser_use",

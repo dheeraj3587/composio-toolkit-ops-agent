@@ -133,8 +133,8 @@ export function ResearchPanel({ research }: { research: OperationalResearch | nu
 export function SecurityPanel({ security }: { security: SecurityState | null }) {
   const safeguards = [
     { label: "Recursive redaction", value: security?.redaction, icon: Fingerprint },
-    { label: "Secret vault", value: security?.secret_vault, icon: KeyRound }, // pragma: allowlist secret
-    { label: "Checkpoint encryption", value: security?.checkpoint_encryption, icon: ShieldCheck },
+    { label: "Fernet credential vault", value: security?.secret_vault, icon: KeyRound }, // pragma: allowlist secret
+    { label: "Canonical + effect state", value: security?.operational_state_storage, icon: ShieldCheck },
     { label: "Owner-only storage", value: security?.owner_only_storage, icon: ShieldCheck },
     { label: "Live vendor email", value: security?.live_vendor_email, icon: Mail },
     { label: "Live browser", value: security?.live_browser, icon: Globe2 },
@@ -161,6 +161,7 @@ export function SecurityPanel({ security }: { security: SecurityState | null }) 
 
 function controlValue(value: string | boolean | null | undefined): string {
   if (typeof value === "boolean") return value ? "Enabled" : "Disabled"
+  if (value === "sqlite_not_app_encrypted") return "SQLite · not app-encrypted"
   return typeof value === "string" && /^[a-z0-9 _-]{1,60}$/i.test(value) ? humanize(value) : "Not reported"
 }
 

@@ -225,10 +225,13 @@ def test_screenshot_masks_credential_fields() -> None:
 def test_no_sandbox_is_opt_in() -> None:
     default = PlaywrightBrowserWorker(settings=Settings(allow_live_browser=True))
     assert "--no-sandbox" not in default._launch_args()
+    assert "--disable-dev-shm-usage" not in default._launch_args()
+    assert default._chromium_sandbox_enabled() is True
     opted = PlaywrightBrowserWorker(
         settings=Settings(allow_live_browser=True, playwright_disable_sandbox=True)
     )
     assert "--no-sandbox" in opted._launch_args()
+    assert opted._chromium_sandbox_enabled() is False
 
 
 # --- A8: the loop timeout is enforced ------------------------------------------
@@ -294,7 +297,8 @@ def test_configuration_state_is_provider_aware() -> None:
                 allow_live_browser=True,
                 browser_provider="playwright",
                 browser_service_url="http://browser-worker:8081",
-                browser_service_token=SecretStr("service-token"),
+                browser_service_token=SecretStr("service-token-" + ("s" * 32)),
+                browser_session_capability_key=SecretStr("c" * 32),
             )
         )
         is True

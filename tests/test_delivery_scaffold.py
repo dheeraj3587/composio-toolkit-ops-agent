@@ -72,9 +72,10 @@ def test_container_defaults_disable_live_actions_and_bind_host_ports_to_loopback
     assert 'YOU_SEARCH_ENABLED: "false"' in production
     assert 'YOU_CONTENTS_ENABLED: "false"' in production
     assert 'YOU_RESEARCH_ENABLED: "false"' in production
-    assert 'PLAYWRIGHT_MAX_SESSIONS: "1"' in production
-    assert 'BROWSER_DISPLAY_SLOTS: "1"' in production
-    assert "${PLAYWRIGHT_MAX_SESSIONS" not in production
+    assert 'PLAYWRIGHT_MAX_SESSIONS: "${PLAYWRIGHT_MAX_SESSIONS:-2}"' in production
+    assert "BROWSER_DISPLAY_SLOTS:" not in production
+    assert "PLAYWRIGHT_DISABLE_SANDBOX: ${PLAYWRIGHT_DISABLE_SANDBOX:-false}" in production
+    assert "ipc: host" not in production
     assert 'OPS_ENABLE_API_DOCS: "false"' in production
     assert 'RUN_LIVE_TESTS: "0"' in production
     assert '"127.0.0.1:${OPS_API_PORT:-8000}:8000"' in local
@@ -92,7 +93,11 @@ def test_container_defaults_disable_live_actions_and_bind_host_ports_to_loopback
             for line in production.splitlines()
             if line.strip().startswith(f"{secret_name}:")
         ]
-        assert all(value.startswith("${") for value in assignments)
+        # A service may deliberately receive an empty value when a secret is
+        # outside its trust boundary (for example, browser credentials on the
+        # API container). Every non-empty assignment must still be sourced from
+        # the deployment environment rather than embedded in Compose.
+        assert all(value in {"", '""', "''"} or value.startswith("${") for value in assignments)
     for private_pattern in {
         ".env",
         "*.db",
@@ -119,10 +124,12 @@ def test_production_proxy_keeps_fastapi_private_and_requires_internal_token() ->
     assert "3000:3000" not in compose
 
     assert "handle /healthz" in caddyfile
-    assert "basic_auth" in caddyfile
+    assert "Strict-Transport-Security" in caddyfile
     assert "reverse_proxy web:3000" in caddyfile
     assert "reverse_proxy /api/* api:8000" not in caddyfile
     assert "reverse_proxy api:8000" not in caddyfile
+    assert "OPS_AUTH_SESSION_SECRET:" in compose
+    assert "OPS_AUTH_TOTP_SECRET:" in compose
 
 
 def test_security_gate_shell_is_syntactically_valid() -> None:
@@ -143,16 +150,19 @@ def test_security_gate_shell_is_syntactically_valid() -> None:
 def test_release_utilities_capture_and_verify_deployment_truth() -> None:
     deploy = (ROOT / "scripts" / "deploy-droplet.sh").read_text(encoding="utf-8")
     backup = (ROOT / "scripts" / "backup-production-data.sh").read_text(encoding="utf-8")
+    entrypoint = (ROOT / "docker" / "browser-entrypoint.sh").read_text(encoding="utf-8")
 
     assert "PLAYWRIGHT_MAX_SESSIONS" in deploy
-    assert "BROWSER_DISPLAY_SLOTS" in deploy
-    assert '"${PUBLIC_ORIGIN}/healthz"' in deploy
-    assert '"${PUBLIC_ORIGIN}/system"' in deploy
-    assert 'unauthenticated_status" = "401"' in deploy
+    assert 'DISPLAY_SLOTS="${BROWSER_DISPLAY_SLOTS:-${PLAYWRIGHT_MAX_SESSIONS:-1}}"' in entrypoint
+    assert '"${origin}/healthz"' in deploy
+    assert '"${origin}/system"' in deploy
+    assert 'public_probes "$ROLLBACK_PUBLIC_ORIGIN"' in deploy
+    assert "302|303|307|308" in deploy
     assert "/api/system/health" not in deploy
 
     assert "org.opencontainers.image.revision" in backup
     assert "runtime_config/deployed-sha.txt" in backup
     assert "runtime_config/compose.prod.yaml" in backup
     assert "runtime_config/deploy/Caddyfile" in backup
+    assert "browser_profiles" in backup
     assert ".env.production" not in backup.split("tar czf", maxsplit=1)[1]

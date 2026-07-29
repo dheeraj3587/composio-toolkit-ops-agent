@@ -29,6 +29,9 @@ web/.env*
 !web/.env.example
 private
 secrets
+backups
+restore-safety-backups
+restore-evidence
 *.db
 *.db-*
 *.sqlite
@@ -40,6 +43,7 @@ storage_state.json
 cookies.json
 recordings
 screenshots
+*.log
 tests
 fixtures
 Makefile

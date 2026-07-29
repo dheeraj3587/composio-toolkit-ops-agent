@@ -10,6 +10,7 @@ import {
   healthResponseSchema,
   liveViewResponseSchema,
   managedConnectionResponseSchema,
+  providerStatusSchema,
   runDetailResponseSchema,
   runListResponseSchema,
   runOutputResponseSchema,
@@ -20,6 +21,7 @@ import type {
   AppCatalogResponse,
   AppResearchResponse,
   AppSearchResponse,
+  BrowserVerificationInput,
   CompanyProfileInput,
   HealthResponse,
   IntegratorOutput,
@@ -27,6 +29,7 @@ import type {
   ManagedConnectionResponse,
   OperationsRequestInput,
   PhaseConflict,
+  ProviderStatus,
   RunDetailResponse,
   RunListResponse,
   RunPhaseAction,
@@ -41,8 +44,15 @@ const DEFAULT_API_ORIGIN = "http://127.0.0.1:8000"
 const REQUEST_TIMEOUT_MS = 8_000
 // execute_when_configured runs (and same-session resume) can drive a real
 // browser task on the backend, which routinely exceeds the normal API bound.
-const RUN_ACTION_TIMEOUT_MS = 180_000
+function runActionTimeoutMs(): number {
+  const parsed = Number.parseInt(process.env.OPS_RUN_ACTION_TIMEOUT_MS ?? "", 10)
+  return Number.isFinite(parsed) && parsed >= 30_000 && parsed <= 600_000
+    ? parsed
+    : 330_000
+}
+const RUN_ACTION_TIMEOUT_MS = runActionTimeoutMs()
 const CREDENTIAL_TIMEOUT_MS = 30_000
+const PROVIDER_READINESS_TIMEOUT_MS = 35_000
 const SCREENSHOT_TIMEOUT_MS = 10_000
 const MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024
 const IDEMPOTENCY_KEY_PATTERN = /^idem_[0-9a-f]{32}$/
@@ -187,6 +197,15 @@ export function getHealth(): Promise<HealthResponse> {
   return apiRequest("/api/system/health", healthResponseSchema)
 }
 
+export function getSignupReadiness(): Promise<ProviderStatus> {
+  return apiRequest(
+    "/api/system/signup-readiness",
+    providerStatusSchema,
+    undefined,
+    PROVIDER_READINESS_TIMEOUT_MS,
+  )
+}
+
 export function searchApps(query: string): Promise<AppSearchResponse> {
   const normalized = query.trim().slice(0, 120)
   const search = new URLSearchParams({ q: normalized })
@@ -266,8 +285,10 @@ export function performPhaseAction(
   capability?: RetryCapability,
 ): Promise<ActionReceipt> {
   const suffix = action === "poll-email" ? "/poll-email" : action === "retry" ? "/retry" : "/resume"
-  // Resume drives a same-session browser task synchronously; allow the longer bound.
-  const timeout = action === "resume" ? RUN_ACTION_TIMEOUT_MS : REQUEST_TIMEOUT_MS
+  // Resume drives a same-session browser task synchronously. Inbox verification
+  // also performs bounded exponential polling on the API, so both need the
+  // production action timeout rather than the short metadata-request timeout.
+  const timeout = action === "retry" ? REQUEST_TIMEOUT_MS : RUN_ACTION_TIMEOUT_MS
   return apiRequest(
     runPath(runId, suffix),
     actionReceiptSchema,
@@ -359,6 +380,27 @@ export function resumeWithBrowserLogin(
     {
       method: "POST",
       body: JSON.stringify({ signal: "completed", browser_login: { email, password } }),
+    },
+    RUN_ACTION_TIMEOUT_MS,
+  )
+}
+
+export function resumeWithBrowserVerification(
+  runId: string,
+  verification: BrowserVerificationInput,
+): Promise<ActionReceipt> {
+  // The one-time value is sent only through this server-side request and is
+  // consumed by the browser provider's transient secret boundary. It is never
+  // returned to client state or included in an action receipt.
+  return apiRequest(
+    runPath(runId, "/resume"),
+    actionReceiptSchema,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        signal: "completed",
+        browser_verification: verification,
+      }),
     },
     RUN_ACTION_TIMEOUT_MS,
   )

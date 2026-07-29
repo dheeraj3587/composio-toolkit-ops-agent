@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1
 
-FROM python:3.11-slim
+# Docker Hub official-image index digest for python:3.11.15-slim-bookworm,
+# reviewed 2026-07-29. Keep the human-readable tag for update tooling, while
+# the digest makes a reviewed build reproducible.
+FROM python:3.11.15-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba
 
 ARG APP_REVISION=local-uncommitted
 LABEL org.opencontainers.image.revision=$APP_REVISION
@@ -23,7 +26,7 @@ RUN addgroup --system ops && adduser --system --ingroup ops --home /app ops
 
 WORKDIR /app
 
-COPY requirements-api.txt requirements-providers.txt ./
+COPY requirements-api.txt requirements-providers.txt requirements-runtime.lock ./
 # The API imports the encrypted vault at startup and can wire configured
 # provider adapters at runtime. Install both the core and provider lock files in
 # the production image so health checks and the selected browser provider never
@@ -34,9 +37,8 @@ COPY requirements-api.txt requirements-providers.txt ./
 # point at the separate browser service (see Dockerfile.browser and
 # compose.prod.yaml). Running a browser inside the control-plane container
 # would let a crash or memory spike take down the API.
-RUN python -m pip install --no-cache-dir \
-    --requirement requirements-api.txt \
-    --requirement requirements-providers.txt
+RUN python -m pip install --no-cache-dir --no-build-isolation --require-hashes \
+    --requirement requirements-runtime.lock
 
 COPY --chown=root:root api ./api
 COPY --chown=root:root ops ./ops
@@ -48,16 +50,16 @@ RUN find /app/api /app/ops /app/data/p1 -type d -exec chmod 0555 {} + \
 
 USER ops
 # /private preserves the development default; /data is the production mount;
-# /vault is the SHARED credential vault the production stack mounts so the browser
-# service can resolve one-time `vault://` references. All are pre-created owned by
-# "ops" with mode 0700 so a first-run named volume inherits that ownership and the
-# application's private-file permission checks (ops/private_files.py) pass under
-# the non-root, read-only container.
+# /vault is API-owned credential storage. The browser service has neither this
+# mount nor its encryption key; it can consume one run-scoped transient value or
+# write one reviewed capture only through the narrow authenticated broker. All
+# directories are pre-created as ops:0700 so a first-run named volume inherits
+# safe ownership under the non-root, read-only container.
 VOLUME ["/private", "/data", "/vault"]
 EXPOSE 8000
 STOPSIGNAL SIGTERM
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD python -c "import os, urllib.request; token=os.environ.get('OPS_INTERNAL_API_TOKEN') or ''; request=urllib.request.Request('http://127.0.0.1:8000/api/system/health', headers={'X-Ops-Internal-Token': token}); urllib.request.urlopen(request, timeout=3)" || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD python -c "import json, os, sys, urllib.request; token=os.environ.get('OPS_INTERNAL_API_TOKEN') or ''; request=urllib.request.Request('http://127.0.0.1:8000/api/system/health', headers={'X-Ops-Internal-Token': token}); payload=json.load(urllib.request.urlopen(request, timeout=3)); sys.exit(0 if payload.get('status') == 'healthy' else 1)"
 
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log"]
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--timeout-graceful-shutdown", "25", "--no-access-log"]

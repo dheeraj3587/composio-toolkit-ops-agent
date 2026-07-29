@@ -62,7 +62,12 @@ class RunLiveViewService:
         getter = getattr(worker, "latest_screenshot", None)
         if not callable(getter):
             return None
-        result = getter(session_id)
+        scope_kwargs = (
+            {"capability_scope": run_id}
+            if bool(getattr(worker, "requires_session_capability_scope", False))
+            else {}
+        )
+        result = getter(session_id, **scope_kwargs)
         if (
             isinstance(result, tuple)
             and len(result) == 2
@@ -99,7 +104,12 @@ class RunLiveViewService:
         requester = getattr(worker, "request_live_view_sync", None)
         if not callable(requester):
             return None
-        result = requester(session_id)
+        scope_kwargs = (
+            {"capability_scope": run_id}
+            if bool(getattr(worker, "requires_session_capability_scope", False))
+            else {}
+        )
+        result = requester(session_id, **scope_kwargs)
         if (
             isinstance(result, tuple)
             and len(result) == 4

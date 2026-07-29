@@ -3,18 +3,22 @@
 The installed Composio 0.18 SDK is synchronous.  This adapter keeps those
 calls off the event loop, exposes only stable provider identifiers, and treats
 the OAuth redirect as an ephemeral response value.  Redirect URLs are never
-written to the effect ledger and the result object deliberately cannot be
-pickled or serialized as a mapping.
+written to the effect ledger; a replay retrieves the still-pending URL from
+Composio only long enough to rebuild the owner response.  The result object
+deliberately cannot be pickled or serialized as a mapping.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
+import ipaddress
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, cast
+from urllib.parse import urlsplit
 
 from pydantic import SecretStr
 
@@ -60,10 +64,20 @@ class _ConnectedAccountsResource(Protocol):
         auth_config_id: str,
         *,
         callback_url: str | None = None,
+        alias: str | None = None,
         allow_multiple: bool = False,
     ) -> object: ...
 
     def get(self, nanoid: str) -> object: ...
+
+    def list(
+        self,
+        *,
+        auth_config_ids: Sequence[str],
+        toolkit_slugs: Sequence[str],
+        user_ids: Sequence[str],
+        limit: float,
+    ) -> object: ...
 
 
 class ManagedAuthSdkClient(Protocol):
@@ -80,8 +94,8 @@ class ManagedConnectionStart:
     """A connection identifier plus a deliberately non-serializable redirect.
 
     ``redirect_url`` is available only to the immediate HTTP response builder.
-    Replaying a completed effect returns the same request identifier with no URL,
-    because persisting a one-time OAuth URL would violate the secret boundary.
+    Replaying a completed effect may retrieve the still-pending redirect from
+    Composio, but it is never copied into a receipt, checkpoint, or audit event.
     """
 
     __slots__ = ("_redirect_url", "connection_request_id", "replayed")
@@ -140,10 +154,12 @@ class ComposioManagedAuthProvider:
         sdk_client: ManagedAuthSdkClient,
         effect_store: EffectStore,
         user_id: str,
+        project_fingerprint: str,
     ) -> None:
         self._client = sdk_client
         self._effects = effect_store
         self._user_id = _validate_identifier(user_id, "user_id")
+        self._project_fingerprint = _validate_fingerprint(project_fingerprint)
 
     @classmethod
     def from_settings(
@@ -160,6 +176,14 @@ class ComposioManagedAuthProvider:
                 capability=_CAPABILITY,
                 reason_code="composio_not_configured",
             )
+        try:
+            validate_managed_auth_callback_base_url(settings.managed_auth_callback_base_url)
+        except (TypeError, ValueError):
+            raise ConfigurationRequiredError(
+                phase=4,
+                capability=_CAPABILITY,
+                reason_code="managed_auth_callback_not_configured",
+            ) from None
         module = importlib.import_module("composio")
         client_type = getattr(module, "Composio", None)
         if not callable(client_type):
@@ -172,10 +196,14 @@ class ComposioManagedAuthProvider:
             api_key=settings.composio_api_key.get_secret_value(),
             allow_tracking=False,
         )
+        project_fingerprint = hashlib.sha256(
+            settings.composio_api_key.get_secret_value().encode("utf-8")
+        ).hexdigest()
         return cls(
             sdk_client=cast(ManagedAuthSdkClient, client),
             effect_store=effect_store or SQLiteEffectStore(settings.provider_effects_db_path),
             user_id=settings.composio_user_id,
+            project_fingerprint=project_fingerprint,
         )
 
     async def start_connection(
@@ -193,10 +221,16 @@ class ComposioManagedAuthProvider:
         """
 
         safe_toolkit = _validate_toolkit_slug(toolkit_slug)
-        safe_callback = validate_operational_url(callback_url)
-        if safe_callback is None:  # pragma: no cover - non-optional public argument
-            raise ValueError("callback_url is required")
+        safe_callback = _validate_callback_url(callback_url)
         safe_effect = _validate_effect_identity(effect_identity)
+        binding_digest = self._binding_digest(
+            toolkit_slug=safe_toolkit,
+            callback_url=safe_callback,
+        )
+        alias = self._connection_alias(
+            effect_identity=safe_effect,
+            binding_digest=binding_digest,
+        )
         reservation = self._effects.reserve(
             provider=MANAGED_AUTH_EFFECT_PROVIDER,
             action=MANAGED_AUTH_LINK_ACTION,
@@ -207,21 +241,28 @@ class ComposioManagedAuthProvider:
             if (
                 reservation.receipt is None
                 or reservation.receipt.get("toolkit_slug") != safe_toolkit
+                or reservation.receipt.get("binding_digest") != binding_digest
             ):
                 raise ProviderContractError(
                     phase=4,
                     capability=_CAPABILITY,
                     reason_code="effect_identity_conflict",
                 )
+            redirect_url = await self._recover_redirect(
+                request_id,
+                toolkit_slug=safe_toolkit,
+            )
             return ManagedConnectionStart(
                 connection_request_id=request_id,
-                redirect_url=None,
+                redirect_url=redirect_url,
                 replayed=True,
             )
         if reservation.status == "reconcile_required":
-            raise ProviderOperationError(
-                capability=_CAPABILITY,
-                reason_code="connection_reconciliation_required",
+            return await self._reconcile_connection(
+                toolkit_slug=safe_toolkit,
+                effect_identity=safe_effect,
+                binding_digest=binding_digest,
+                alias=alias,
             )
 
         try:
@@ -237,6 +278,7 @@ class ComposioManagedAuthProvider:
                 self._user_id,
                 auth_config_id,
                 callback_url=safe_callback,
+                alias=alias,
                 allow_multiple=False,
             )
         except Exception:
@@ -251,7 +293,7 @@ class ComposioManagedAuthProvider:
                 _required_string_field(response, "id"), "connection_request_id"
             )
             raw_redirect = _required_string_field(response, "redirect_url")
-            redirect_url = validate_https_url(raw_redirect)
+            redirect_url = _validate_redirect_url(raw_redirect)
         except (TypeError, ValueError):
             self._mark_outcome_unknown(MANAGED_AUTH_LINK_ACTION, safe_effect)
             raise ProviderContractError(
@@ -263,7 +305,11 @@ class ComposioManagedAuthProvider:
         self._complete_or_fail_closed(
             action=MANAGED_AUTH_LINK_ACTION,
             effect_identity=safe_effect,
-            receipt={"request_id": request_id, "toolkit_slug": safe_toolkit},
+            receipt={
+                "request_id": request_id,
+                "toolkit_slug": safe_toolkit,
+                "binding_digest": binding_digest,
+            },
         )
         return ManagedConnectionStart(
             connection_request_id=request_id,
@@ -271,24 +317,23 @@ class ComposioManagedAuthProvider:
             replayed=False,
         )
 
-    async def poll_connection(self, connection_request_id: str) -> ManagedConnectionPoll:
+    async def poll_connection(
+        self,
+        connection_request_id: str,
+        *,
+        toolkit_slug: str | None = None,
+    ) -> ManagedConnectionPoll:
         """Retrieve one connection and normalize it to pending/active/terminal."""
 
         safe_id = _validate_identifier(connection_request_id, "connection_request_id")
-        try:
-            response = await asyncio.to_thread(self._client.connected_accounts.get, safe_id)
-        except Exception:
-            raise ProviderOperationError(
-                capability=_CAPABILITY,
-                reason_code="connection_poll_failed",
-            ) from None
+        safe_toolkit = _validate_toolkit_slug(toolkit_slug) if toolkit_slug is not None else None
+        response = await self._get_connection(
+            safe_id,
+            toolkit_slug=safe_toolkit,
+            operation_reason_code="connection_poll_failed",
+        )
 
         try:
-            returned_id = _validate_identifier(
-                _required_string_field(response, "id"), "connection_request_id"
-            )
-            if returned_id != safe_id:
-                raise ValueError("connection response identifier mismatch")
             provider_status = _required_string_field(response, "status").upper()
             state, reason_code = _normalize_connection_status(provider_status)
         except (TypeError, ValueError):
@@ -305,19 +350,223 @@ class ComposioManagedAuthProvider:
             reason_code=reason_code,
         )
 
+    async def _reconcile_connection(
+        self,
+        *,
+        toolkit_slug: str,
+        effect_identity: str,
+        binding_digest: str,
+        alias: str,
+    ) -> ManagedConnectionStart:
+        """Recover an ambiguously-created link by its deterministic alias."""
+
+        auth_config_id = await self._resolve_or_create_auth_config(toolkit_slug)
+        request_id = await self._find_connection_request(
+            toolkit_slug=toolkit_slug,
+            auth_config_id=auth_config_id,
+            alias=alias,
+        )
+        if request_id is None:
+            raise ProviderOperationError(
+                capability=_CAPABILITY,
+                reason_code="connection_reconciliation_required",
+            )
+        redirect_url = await self._recover_redirect(
+            request_id,
+            toolkit_slug=toolkit_slug,
+        )
+        receipt = {
+            "request_id": request_id,
+            "toolkit_slug": toolkit_slug,
+            "binding_digest": binding_digest,
+        }
+        try:
+            self._effects.reconcile_completed(
+                provider=MANAGED_AUTH_EFFECT_PROVIDER,
+                action=MANAGED_AUTH_LINK_ACTION,
+                idempotency_key=effect_identity,
+                receipt=receipt,
+            )
+        except Exception:
+            raise ProviderOperationError(
+                capability=_CAPABILITY,
+                reason_code="effect_receipt_persistence_failed",
+            ) from None
+        return ManagedConnectionStart(
+            connection_request_id=request_id,
+            redirect_url=redirect_url,
+            replayed=True,
+        )
+
+    async def _find_connection_request(
+        self,
+        *,
+        toolkit_slug: str,
+        auth_config_id: str,
+        alias: str,
+    ) -> str | None:
+        try:
+            response = await asyncio.to_thread(
+                self._client.connected_accounts.list,
+                auth_config_ids=[auth_config_id],
+                toolkit_slugs=[toolkit_slug],
+                user_ids=[self._user_id],
+                limit=1000,
+            )
+        except Exception:
+            raise ProviderOperationError(
+                capability=_CAPABILITY,
+                reason_code="connection_reconciliation_lookup_failed",
+            ) from None
+        items = _field(response, "items")
+        if not isinstance(items, Sequence) or isinstance(items, (str, bytes, bytearray)):
+            raise ProviderContractError(
+                phase=4,
+                capability=_CAPABILITY,
+                reason_code="connection_reconciliation_response_invalid",
+            )
+        matches = [item for item in items if _optional_string_field(item, "alias") == alias]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise ProviderContractError(
+                phase=4,
+                capability=_CAPABILITY,
+                reason_code="connection_reconciliation_response_invalid",
+            )
+        match = matches[0]
+        try:
+            request_id = _validate_identifier(
+                _required_string_field(match, "id"),
+                "connection_request_id",
+            )
+            returned_user = _validate_identifier(
+                _required_string_field(match, "user_id"),
+                "user_id",
+            )
+            returned_toolkit = _validate_toolkit_slug(
+                _required_string_field(_field(match, "toolkit"), "slug")
+            )
+            returned_config = _validate_identifier(
+                _required_string_field(_field(match, "auth_config"), "id"),
+                "auth_config_id",
+            )
+            if (
+                returned_user != self._user_id
+                or returned_toolkit != toolkit_slug
+                or returned_config != auth_config_id
+            ):
+                raise ValueError("connection ownership mismatch")
+        except (TypeError, ValueError):
+            raise ProviderContractError(
+                phase=4,
+                capability=_CAPABILITY,
+                reason_code="connection_reconciliation_response_invalid",
+            ) from None
+        return request_id
+
+    async def _get_connection(
+        self,
+        connection_request_id: str,
+        *,
+        toolkit_slug: str | None,
+        operation_reason_code: str,
+    ) -> object:
+        try:
+            response = await asyncio.to_thread(
+                self._client.connected_accounts.get,
+                connection_request_id,
+            )
+        except Exception:
+            raise ProviderOperationError(
+                capability=_CAPABILITY,
+                reason_code=operation_reason_code,
+            ) from None
+        try:
+            returned_id = _validate_identifier(
+                _required_string_field(response, "id"),
+                "connection_request_id",
+            )
+            returned_user = _validate_identifier(
+                _required_string_field(response, "user_id"),
+                "user_id",
+            )
+            returned_toolkit = _validate_toolkit_slug(
+                _required_string_field(_field(response, "toolkit"), "slug")
+            )
+            if returned_id != connection_request_id or returned_user != self._user_id:
+                raise ValueError("connection ownership mismatch")
+            if toolkit_slug is not None and returned_toolkit != toolkit_slug:
+                raise ValueError("connection toolkit mismatch")
+        except (TypeError, ValueError):
+            raise ProviderContractError(
+                phase=4,
+                capability=_CAPABILITY,
+                reason_code="connection_ownership_invalid",
+            ) from None
+        return response
+
+    async def _recover_redirect(
+        self,
+        connection_request_id: str,
+        *,
+        toolkit_slug: str,
+    ) -> str | None:
+        response = await self._get_connection(
+            connection_request_id,
+            toolkit_slug=toolkit_slug,
+            operation_reason_code="connection_replay_lookup_failed",
+        )
+        try:
+            provider_status = _required_string_field(response, "status").upper()
+            state, _reason_code = _normalize_connection_status(provider_status)
+            if state != "pending":
+                return None
+            state_value = _field(_field(response, "state"), "val")
+            raw_redirect = _required_string_field(state_value, "redirect_url")
+            return _validate_redirect_url(raw_redirect)
+        except (TypeError, ValueError):
+            raise ProviderContractError(
+                phase=4,
+                capability=_CAPABILITY,
+                reason_code="connection_replay_response_invalid",
+            ) from None
+
+    def _binding_digest(self, *, toolkit_slug: str, callback_url: str) -> str:
+        source = (
+            f"managed-auth-binding:v1\0{self._project_fingerprint}\0"
+            f"{self._user_id}\0{toolkit_slug}\0{callback_url}"
+        )
+        return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _connection_alias(*, effect_identity: str, binding_digest: str) -> str:
+        source = f"managed-auth-alias:v1\0{binding_digest}\0{effect_identity}"
+        return f"ops-{hashlib.sha256(source.encode('utf-8')).hexdigest()[:32]}"
+
     async def _resolve_or_create_auth_config(self, toolkit_slug: str) -> str:
         existing = await self._find_managed_auth_config(toolkit_slug)
         if existing is not None:
             return existing
 
-        effect_identity = f"managed-auth-config:v1:{toolkit_slug}"
+        effect_identity = f"managed-auth-config:v2:{self._project_fingerprint}:{toolkit_slug}"
         reservation = self._effects.reserve(
             provider=MANAGED_AUTH_EFFECT_PROVIDER,
             action=MANAGED_AUTH_CONFIG_ACTION,
             idempotency_key=effect_identity,
         )
         if reservation.status == "completed":
-            return _receipt_identifier(reservation.receipt, "config_id")
+            config_id = _receipt_identifier(reservation.receipt, "config_id")
+            if (
+                reservation.receipt is None
+                or reservation.receipt.get("toolkit_slug") != toolkit_slug
+            ):
+                raise ProviderContractError(
+                    phase=4,
+                    capability=_CAPABILITY,
+                    reason_code="effect_identity_conflict",
+                )
+            return config_id
         if reservation.status == "reconcile_required":
             # The read above is the reconciliation attempt.  If no managed config
             # is visible, creating another one would risk a duplicate.
@@ -411,6 +660,8 @@ class ComposioManagedAuthProvider:
                 continue
             managed = _field(item, "is_composio_managed")
             config_type = _optional_string_field(item, "type")
+            if managed is False:
+                continue
             if managed is not True and config_type != "default":
                 continue
             toolkit = _field(item, "toolkit")
@@ -500,6 +751,105 @@ def _validate_identifier(value: str, name: str) -> str:
     if _SAFE_IDENTIFIER.fullmatch(value) is None:
         raise ValueError(f"{name} is invalid")
     return value
+
+
+def _validate_fingerprint(value: str) -> str:
+    normalized = value.casefold()
+    if re.fullmatch(r"[a-f0-9]{64}", normalized) is None:
+        raise ValueError("project_fingerprint is invalid")
+    return normalized
+
+
+def _validate_strict_https_url(value: str) -> str:
+    if any(ord(character) <= 0x20 or ord(character) == 0x7F for character in value):
+        raise ValueError("URL must not contain whitespace or control characters")
+    validated = validate_https_url(value)
+    parsed = urlsplit(validated)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("URL port is malformed") from exc
+    if parsed.netloc.rsplit("@", 1)[-1].endswith(":"):
+        raise ValueError("URL port is malformed")
+    hostname = parsed.hostname
+    if hostname is None:  # pragma: no cover - validate_https_url enforces it
+        raise ValueError("URL host is missing")
+    normalized_host = hostname.rstrip(".").casefold()
+    if normalized_host == "localhost" or normalized_host.endswith(".localhost"):
+        raise ValueError("loopback URL hosts are not allowed")
+    try:
+        address = ipaddress.ip_address(normalized_host)
+    except ValueError:
+        pass
+    else:
+        if not address.is_global:
+            raise ValueError("non-public URL addresses are not allowed")
+    _ = port
+    return validated
+
+
+def _validate_callback_url(value: str) -> str:
+    validated = validate_operational_url(_validate_strict_https_url(value))
+    if validated is None:  # pragma: no cover - non-optional public argument
+        raise ValueError("callback_url is required")
+    parsed = urlsplit(validated)
+    if parsed.query or parsed.fragment:
+        raise ValueError("callback URL must not contain query data or a fragment")
+    return validated
+
+
+def validate_managed_auth_callback_base_url(value: str | None) -> str:
+    """Validate the public HTTPS origin used to build managed-auth callbacks.
+
+    This is intentionally an offline structural policy. Production deployment
+    additionally binds the hostname to ``DOMAIN`` before starting any service.
+    """
+
+    if not isinstance(value, str) or not value:
+        raise ValueError("managed-auth callback base is required")
+    normalized = value.casefold().rstrip("/")
+    if normalized in {
+        "https://your-domain.example",
+        "https://localhost.invalid",
+    } or any(marker in normalized for marker in ("replace-with", "change-me", "placeholder")):
+        raise ValueError("managed-auth callback base contains a placeholder")
+    validated = _validate_strict_https_url(value)
+    parsed = urlsplit(validated)
+    try:
+        port = parsed.port
+    except ValueError as exc:  # pragma: no cover - strict validator handles it
+        raise ValueError("managed-auth callback port is malformed") from exc
+    hostname = parsed.hostname
+    if hostname is None:  # pragma: no cover - strict validator handles it
+        raise ValueError("managed-auth callback host is missing")
+    normalized_hostname = hostname.casefold()
+    if normalized_hostname in {"example.com", "example.net", "example.org"} or (
+        normalized_hostname == "example" or normalized_hostname.endswith(".example")
+    ):
+        raise ValueError("managed-auth callback base contains a placeholder")
+    if hostname.endswith(".") or "." not in hostname:
+        raise ValueError("managed-auth callback host must be a public DNS name")
+    if port not in {None, 443}:
+        raise ValueError("managed-auth callback must use the standard HTTPS port")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("managed-auth callback base must be an HTTPS origin")
+    return validated.rstrip("/")
+
+
+def managed_auth_configuration_is_valid(settings: Settings) -> bool:
+    """Return whether managed auth has both a key and a safe callback base."""
+
+    if settings.composio_api_key is None:
+        return False
+    try:
+        validate_managed_auth_callback_base_url(settings.managed_auth_callback_base_url)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _validate_redirect_url(value: str) -> str:
+    return _validate_strict_https_url(value)
 
 
 def _validate_toolkit_slug(value: str) -> str:

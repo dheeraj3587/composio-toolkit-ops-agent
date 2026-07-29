@@ -8,8 +8,9 @@ for different content, so both halves belong together in one module.
 Fingerprints are computed over a sorted, separator-normalized JSON dump so the same
 logical request always hashes identically regardless of field order or whitespace.
 The legacy shapes are kept deliberately: older clients and stored rows were
-fingerprinted before ``browser_provider`` and ``credential_creation_policy``
-existed, and dropping them would turn an existing replay into a false conflict.
+fingerprinted before ``browser_provider``, ``credential_creation_policy``, and
+``account_mode`` existed, and dropping them would turn an existing replay into
+a false conflict.
 """
 
 from __future__ import annotations
@@ -48,12 +49,17 @@ def _request_fingerprint(request: OperationsRequest, execution_mode: str) -> str
 def _legacy_request_fingerprints(request: OperationsRequest, execution_mode: str) -> set[str]:
     """Accepted historical fingerprint shapes for compatibility replays."""
 
-    if request.credential_creation_policy != "reuse_only":
-        return set()
     fingerprints: set[str] = set()
-    excluded_sets = [{"credential_creation_policy"}]
+    # Every pre-account-mode request had the worker-facing
+    # account_creation_requested boolean, so this compatibility shape is valid
+    # for either credential policy.
+    excluded_sets = [{"account_mode"}]
+    if request.credential_creation_policy == "reuse_only":
+        excluded_sets.append({"credential_creation_policy", "account_mode"})
     if request.browser_provider == "browser_use":
-        excluded_sets.append({"browser_provider", "credential_creation_policy"})
+        excluded_sets.append({"browser_provider", "account_mode"})
+        if request.credential_creation_policy == "reuse_only":
+            excluded_sets.append({"browser_provider", "credential_creation_policy", "account_mode"})
     for excluded in excluded_sets:
         legacy_request = request.model_dump(mode="json", exclude=excluded)
         canonical = json.dumps(
@@ -70,7 +76,8 @@ def _legacy_request_fingerprint(request: OperationsRequest, execution_mode: str)
     """Return the oldest Browser Use fingerprint shape kept for test/client compatibility."""
 
     legacy_request = request.model_dump(
-        mode="json", exclude={"browser_provider", "credential_creation_policy"}
+        mode="json",
+        exclude={"browser_provider", "credential_creation_policy", "account_mode"},
     )
     canonical = json.dumps(
         {"execution_mode": execution_mode, "request": legacy_request},

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
@@ -105,6 +106,26 @@ def test_logging_filter_sanitizes_format_args_and_extra_fields() -> None:
     assert getattr(record, sensitive_field) == REDACTED
 
 
+def test_logging_filter_drops_args_when_secret_assignment_consumes_placeholder() -> None:
+    marker = "opaque-storage-key-sentinel"
+    record = logging.LogRecord(
+        name="security-test",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="BROWSER_STORAGE_STATE_KEY=%s status=%s",
+        args=(marker, "failed"),
+        exc_info=None,
+    )
+
+    assert RedactingFilter().filter(record) is True
+
+    rendered = record.getMessage()
+    assert marker not in rendered
+    assert REDACTED in rendered
+    assert record.args == ()
+
+
 def test_recursive_redaction_rejects_bare_secret_keys_and_unknown_objects() -> None:
     marker = "opaque credential material"
     key_marker = "opaque map key credential material"
@@ -203,11 +224,31 @@ def test_installed_logging_filter_redacts_exception_tracebacks() -> None:
         "AIza0123456789abcdefghijKLMN",  # pragma: allowlist secret
         "xoxb-0123456789-abcdef",  # pragma: allowlist secret
         "pplx-0123456789abcdefghijkl",  # pragma: allowlist secret
+        "gsk_0123456789abcdefghijkl",  # pragma: allowlist secret
+        "sk-or-v1-0123456789abcdefghijkl",  # pragma: allowlist secret
+        "ydc-sk-0123456789abcdefghijkl",  # pragma: allowlist secret
+        "bu_0123456789abcdefghijkl",  # pragma: allowlist secret
+        "ak_0123456789abcdefghijkl",  # pragma: allowlist secret
+        "csk-0123456789abcdefghijkl",  # pragma: allowlist secret
         "SG.0123456789abcdef.abcdef0123456789",  # pragma: allowlist secret
     ],
 )
 def test_runtime_provider_redaction_matches_security_gate(provider_key: str) -> None:
     assert redact_text(provider_key) == REDACTED
+
+
+def test_api_lifespan_installs_redaction_on_uvicorn_handlers(
+    tmp_path: Path,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from api.app import create_app
+
+    application = create_app(db_path=tmp_path / "private" / "ops.db")
+    with TestClient(application):
+        for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+            logger = logging.getLogger(logger_name)
+            assert any(isinstance(item, RedactingFilter) for item in logger.filters)
 
 
 def test_redaction_preserves_safe_reason_code_but_hides_credential_codes() -> None:

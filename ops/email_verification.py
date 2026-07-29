@@ -9,7 +9,7 @@ Why this exists as its own boundary
 -----------------------------------
 An autonomous signup accepts a one-time code or magic link from an inbox and then
 types it into a live provider page. That makes the inbox an *untrusted input
-channel*: anyone can send mail to the connected address. Four independent bindings
+channel*: anyone can send mail to the connected address. Five independent bindings
 must therefore hold before a secret is used, and each is checked here:
 
 1. **Recency** — the message must be inside an explicit freshness window measured
@@ -20,7 +20,10 @@ must therefore hold before a secret is used, and each is checked here:
    verification can never be consumed.
 3. **Sender** — the sending domain must be inside the reviewed domain set for the
    app when the caller requires it.
-4. **Link host** — a magic link must be HTTPS and its host must be inside the same
+4. **Sender authentication** — Gmail must report aligned DMARC, DKIM, or SPF
+   authentication (or a validated ARC chain); a matching From header alone is not
+   proof of identity.
+5. **Link host** — a magic link must be HTTPS and its host must be inside the same
    reviewed host set, so a look-alike link in a spoofed email cannot be opened.
 
 Gmail query semantics that motivated the design
@@ -67,6 +70,7 @@ VerificationPurpose = Literal[
 ]
 VerificationSecretKind = Literal["link", "code"]
 RecipientBindingStatus = Literal["exact", "canonical", "tag_conflict", "no_match"]
+SenderAuthenticationMethod = Literal["dmarc", "dkim", "spf", "none"]
 
 # Google treats these mail domains as dot-insensitive, so "a.b@gmail.com" and
 # "ab@gmail.com" are the same mailbox. Applying that rule to any other domain
@@ -78,6 +82,11 @@ _DOT_INSENSITIVE_DOMAINS = frozenset({"gmail.com", "googlemail.com"})
 # newest-first ordering. A small tolerance is allowed; beyond it the message is
 # rejected rather than trusted.
 DEFAULT_CLOCK_SKEW_SECONDS = 300
+# A provider may stamp receipt a few seconds before the browser response that
+# reports "verification requested" reaches us. This much smaller tolerance is
+# used for challenge binding; the general future-date tolerance above does not
+# make an old message eligible for a newly issued challenge.
+VERIFICATION_REQUEST_CLOCK_SKEW_SECONDS = 30
 # Hard ceiling on how old a one-time verification message may be. A caller may
 # request less, never more, so a stale code can never be revived.
 MAX_VERIFICATION_AGE_SECONDS = 3_600
@@ -85,6 +94,24 @@ MAX_VERIFICATION_AGE_SECONDS = 3_600
 _MAX_ADDRESS_LENGTH = 320
 _MAX_LINK_LENGTH = 2_048
 _MAX_SCAN_LENGTH = 200_000
+_AUTH_RESULTS_MAX_LENGTH = 20_000
+_TRUSTED_GMAIL_AUTHSERV_IDS = frozenset({"mx.google.com"})
+_AUTH_METHOD_RE = re.compile(
+    r"(?:^|;)\s*(dmarc|dkim|spf)\s*=\s*([a-z0-9_-]+)\b",
+    re.IGNORECASE,
+)
+_AUTH_PROPERTY_RE = re.compile(
+    r"\b(?P<name>header\.from|header\.d|header\.i|smtp\.mailfrom)\s*=\s*"
+    r"(?P<value>\"[^\"]{1,500}\"|[^\s;]{1,500})",
+    re.IGNORECASE,
+)
+_DOMAIN_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+)
+_LOCAL_PART_RE = re.compile(r"^[a-z0-9!#$%&'*+/=?^_`{|}~.-]{1,64}$")
+_ARC_INSTANCE_RE = re.compile(r"(?:^|;)\s*i\s*=\s*(\d{1,3})\b", re.IGNORECASE)
+_ARC_RESULT_RE = re.compile(r"(?:^|;)\s*arc\s*=\s*pass\b", re.IGNORECASE)
 
 # --- one-time code heuristics -------------------------------------------------
 # Cue words a genuine one-time code sits next to. Word-bounded so "pin" does not
@@ -218,10 +245,13 @@ class VerificationEvidence(BaseModel):
 
     purpose: VerificationPurpose
     verification_kind: VerificationSecretKind
-    message_id: str = Field(min_length=1, max_length=200)
+    # Keep the complete immutable provider identifier. Truncating it before the
+    # at-most-once claim could make two distinct messages share one claim key.
+    message_id: str = Field(min_length=1, max_length=1_000)
     sender_domain: str = Field(default="", max_length=253)
     recipient_binding: RecipientBindingStatus
     sender_reviewed: bool
+    sender_authentication: SenderAuthenticationMethod = "none"
     received_at_ms: int = Field(ge=0)
     age_seconds: int = Field(ge=0)
     link_host: str = Field(default="", max_length=253)
@@ -241,8 +271,11 @@ class VerificationCandidate:
     sender: str
     recipients: tuple[str, ...]
     received_at: object
-    subject: str
-    body: str
+    subject: str = field(repr=False)
+    body: str = field(repr=False)
+    authentication_results: tuple[str, ...] = field(default=(), repr=False)
+    arc_authentication_results: tuple[str, ...] = field(default=(), repr=False)
+    arc_seals: tuple[str, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,7 +329,13 @@ def canonical_address(value: object) -> CanonicalAddress | None:
         return None
     local, domain = raw.split("@", 1)
     domain = domain.rstrip(".")
-    if not local or not domain or "." not in domain or domain.startswith("."):
+    if (
+        _LOCAL_PART_RE.fullmatch(local) is None
+        or local.startswith(".")
+        or local.endswith(".")
+        or ".." in local
+        or _DOMAIN_RE.fullmatch(domain) is None
+    ):
         return None
     tag = ""
     if "+" in local:
@@ -433,23 +472,187 @@ def _epoch_number_to_ms(value: float) -> int | None:
 
 
 def sender_domain_of(value: object) -> str:
-    """Return the lowercased sender domain, or ``""`` when it cannot be parsed."""
+    """Return one parsed sender mailbox's domain, or ``""`` when ambiguous.
 
-    canonical = canonical_address(value)
-    if canonical is not None:
-        return canonical.domain
-    if not isinstance(value, str):
+    Display-name text is untrusted.  In particular, extracting the first
+    ``@domain`` substring would authorize a header such as
+    ``"support@reviewed.example" <attacker.example@example.test>``.  Parse the
+    RFC address list and require exactly one real mailbox instead.
+    """
+
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > 998
+        or any(character in value for character in "\r\n\x00")
+    ):
         return ""
-    match = re.search(r"@([A-Za-z0-9.-]+)", value)
-    return match.group(1).rstrip(".").casefold() if match else ""
+    parsed = getaddresses((value,))
+    if len(parsed) != 1:
+        return ""
+    canonical = canonical_address(parsed[0][1])
+    return canonical.domain if canonical is not None else ""
+
+
+def sender_authentication_method(
+    candidate: VerificationCandidate,
+    *,
+    sender_domain: str,
+) -> tuple[SenderAuthenticationMethod, str]:
+    """Evaluate Gmail-authored sender authentication without trusting From.
+
+    Direct ``Authentication-Results`` is accepted only when the authserv-id is
+    Gmail's receiving MTA. ARC results are considered only when that same trusted
+    header reports ``arc=pass``; an ARC-Seal's self-declared ``cv`` text is not
+    treated as local cryptographic verification. DMARC pass is preferred.
+    When DMARC is absent, an aligned DKIM or SPF pass is accepted using a strict
+    parent/subdomain alignment rule, which is narrower than relaxed DMARC and
+    does not require guessing an organizational domain.
+
+    The returned reason is a stable, value-free code. Raw header contents and
+    domains never leave this module through a decision or log.
+    """
+
+    normalized_sender = _authentication_domain(sender_domain)
+    if normalized_sender is None:
+        return "none", "verification_sender_authentication_failed"
+
+    direct = tuple(
+        value
+        for value in candidate.authentication_results
+        if _trusted_authentication_results_header(value)
+    )
+    if len(direct) > 1:
+        return "none", "verification_sender_authentication_untrusted"
+    if len(direct) == 1:
+        method = _best_authenticated_method(direct, sender_domain=normalized_sender)
+        if method != "none":
+            return method, "verification_sender_authenticated"
+        # ARC-Seal's textual ``cv`` result is not a local cryptographic
+        # verification. Trust preserved results only when Gmail's own direct
+        # Authentication-Results explicitly reports ``arc=pass``.
+        if _ARC_RESULT_RE.search(direct[0]):
+            arc_instances = _arc_instances(candidate.arc_seals)
+            arc = tuple(
+                value
+                for value in candidate.arc_authentication_results
+                if _arc_authentication_results_trusted(value, arc_instances)
+            )
+            if len(arc) == 1:
+                method = _best_authenticated_method(arc, sender_domain=normalized_sender)
+                if method != "none":
+                    return method, "verification_sender_authenticated"
+        return "none", "verification_sender_authentication_failed"
+    if candidate.authentication_results or candidate.arc_authentication_results:
+        return "none", "verification_sender_authentication_untrusted"
+    return "none", "verification_sender_authentication_missing"
+
+
+def _trusted_authentication_results_header(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip() or len(value) > _AUTH_RESULTS_MAX_LENGTH:
+        return False
+    authserv_id = value.split(";", 1)[0].strip().casefold()
+    return authserv_id in _TRUSTED_GMAIL_AUTHSERV_IDS
+
+
+def _arc_instances(seals: Sequence[str]) -> frozenset[int]:
+    instances: set[int] = set()
+    for raw in seals:
+        if not isinstance(raw, str) or not raw.strip() or len(raw) > _AUTH_RESULTS_MAX_LENGTH:
+            continue
+        instance_match = _ARC_INSTANCE_RE.search(raw)
+        if instance_match is not None:
+            instances.add(int(instance_match.group(1)))
+    return frozenset(instances)
+
+
+def _arc_authentication_results_trusted(
+    value: object,
+    trusted_instances: frozenset[int],
+) -> bool:
+    if not isinstance(value, str) or not value.strip() or len(value) > _AUTH_RESULTS_MAX_LENGTH:
+        return False
+    instance_match = _ARC_INSTANCE_RE.search(value)
+    if instance_match is None or int(instance_match.group(1)) not in trusted_instances:
+        return False
+    remainder = value[instance_match.end() :].lstrip(" ;")
+    authserv_id = remainder.split(";", 1)[0].strip().casefold()
+    return authserv_id in _TRUSTED_GMAIL_AUTHSERV_IDS
+
+
+def _best_authenticated_method(
+    headers: Sequence[str],
+    *,
+    sender_domain: str,
+) -> SenderAuthenticationMethod:
+    aligned_dkim = False
+    aligned_spf = False
+    for header in headers:
+        matches = tuple(_AUTH_METHOD_RE.finditer(header))
+        for index, match in enumerate(matches):
+            result = match.group(2).casefold()
+            if result != "pass":
+                continue
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(header)
+            clause = header[match.start() : end]
+            properties = {
+                property_match.group("name").casefold(): property_match.group("value")
+                for property_match in _AUTH_PROPERTY_RE.finditer(clause)
+            }
+            method = match.group(1).casefold()
+            if method == "dmarc":
+                authenticated = _authentication_domain(properties.get("header.from"))
+                if authenticated is not None and _strict_domain_alignment(
+                    authenticated,
+                    sender_domain,
+                ):
+                    return "dmarc"
+            elif method == "dkim":
+                authenticated = _authentication_domain(
+                    properties.get("header.d") or properties.get("header.i")
+                )
+                aligned_dkim = aligned_dkim or (
+                    authenticated is not None
+                    and _strict_domain_alignment(authenticated, sender_domain)
+                )
+            elif method == "spf":
+                authenticated = _authentication_domain(properties.get("smtp.mailfrom"))
+                aligned_spf = aligned_spf or (
+                    authenticated is not None
+                    and _strict_domain_alignment(authenticated, sender_domain)
+                )
+    if aligned_dkim:
+        return "dkim"
+    if aligned_spf:
+        return "spf"
+    return "none"
+
+
+def _authentication_domain(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().strip("\"'<>(),").casefold().rstrip(".")
+    if "@" in normalized:
+        normalized = normalized.rsplit("@", 1)[1]
+    if len(normalized) > 253 or _DOMAIN_RE.fullmatch(normalized) is None:
+        return None
+    return normalized
+
+
+def _strict_domain_alignment(authenticated: str, sender: str) -> bool:
+    return (
+        authenticated == sender
+        or authenticated.endswith(f".{sender}")
+        or sender.endswith(f".{authenticated}")
+    )
 
 
 def host_matches(host: str, patterns: Sequence[str]) -> bool:
     """Match a host against exact names and left-edge ``*.parent`` wildcards.
 
-    A wildcard matches strict subdomains and the parent itself, mirroring the
-    browser host policy so the email boundary and the navigation boundary cannot
-    disagree about what "reviewed" means.
+    A wildcard matches strict subdomains only, mirroring the browser host policy.
+    An apex domain needs its own exact reviewed entry; ``*.example.com`` cannot
+    silently broaden into ``example.com``.
     """
 
     normalized = host.rstrip(".").casefold()
@@ -461,7 +664,7 @@ def host_matches(host: str, patterns: Sequence[str]) -> bool:
         candidate = pattern.rstrip(".").casefold()
         if candidate.startswith("*."):
             parent = candidate[2:]
-            if normalized == parent or normalized.endswith(f".{parent}"):
+            if normalized != parent and normalized.endswith(f".{parent}"):
                 return True
         elif normalized == candidate:
             return True
@@ -572,17 +775,25 @@ def extract_verification_link(
 
 
 def is_safe_verification_link(url: str, allowed_host_patterns: Sequence[str]) -> bool:
-    """Whether a URL may be opened: HTTPS, credential-free, reviewed host."""
+    """Whether a URL may be opened: HTTPS/443, credential-free, reviewed host."""
 
-    if not isinstance(url, str) or not url or len(url) > _MAX_LINK_LENGTH:
+    if (
+        not isinstance(url, str)
+        or not url
+        or len(url) > _MAX_LINK_LENGTH
+        or any(ord(character) <= 32 for character in url)
+    ):
         return False
     try:
         parsed = urlsplit(url)
+        port = parsed.port
     except ValueError:
         return False
     if parsed.scheme != "https" or not parsed.hostname:
         return False
     if parsed.username or parsed.password:
+        return False
+    if port not in {None, 443}:
         return False
     return host_matches(parsed.hostname, allowed_host_patterns)
 
@@ -606,10 +817,13 @@ def select_verification(
     allowed_host_patterns: Sequence[str] = (),
     reviewed_sender_patterns: Sequence[str] = (),
     require_reviewed_sender: bool = True,
+    require_authenticated_sender: bool = False,
     require_reviewed_link_host: bool = True,
     prefer_link: bool = True,
     consumed_message_ids: Sequence[str] = (),
+    verification_requested_at_ms: int | None = None,
     clock_skew_seconds: int = DEFAULT_CLOCK_SKEW_SECONDS,
+    request_clock_skew_seconds: int = VERIFICATION_REQUEST_CLOCK_SKEW_SECONDS,
 ) -> VerificationDecision:
     """Pick the newest message that satisfies every binding, or refuse.
 
@@ -627,6 +841,20 @@ def select_verification(
         )
     if max_age_seconds <= 0 or max_age_seconds > MAX_VERIFICATION_AGE_SECONDS:
         return VerificationDecision(resolved=None, reason_code="verification_age_bound_invalid")
+    if verification_requested_at_ms is not None and (
+        not isinstance(verification_requested_at_ms, int)
+        or verification_requested_at_ms <= 0
+        or verification_requested_at_ms > now_ms + clock_skew_seconds * 1000
+    ):
+        return VerificationDecision(
+            resolved=None,
+            reason_code="verification_request_timestamp_invalid",
+        )
+    if not 0 <= request_clock_skew_seconds <= 60:
+        return VerificationDecision(
+            resolved=None,
+            reason_code="verification_request_skew_invalid",
+        )
     if require_reviewed_sender and not reviewed_sender_patterns:
         return VerificationDecision(
             resolved=None, reason_code="verification_reviewed_sender_set_missing"
@@ -651,18 +879,31 @@ def select_verification(
         if received_at_ms is None:
             rejections.append("verification_timestamp_unparsable")
             continue
+        if (
+            verification_requested_at_ms is not None
+            and received_at_ms < verification_requested_at_ms - request_clock_skew_seconds * 1000
+        ):
+            rejections.append("verification_precedes_current_challenge")
+            continue
         age_ms = now_ms - received_at_ms
         if age_ms < -clock_skew_seconds * 1000:
             rejections.append("verification_message_future_dated")
             continue
-        age_seconds = max(0, age_ms // 1000)
-        if age_seconds > max_age_seconds:
+        if age_ms > max_age_seconds * 1000:
             # Newest-first ordering means every remaining candidate is older.
             rejections.append("verification_message_stale")
             break
+        age_seconds = max(0, age_ms // 1000)
         binding = bind_recipient(expected, parse_addresses(candidate.recipients))
         if binding == "tag_conflict":
             rejections.append("verification_recipient_tag_conflict")
+            continue
+        if binding == "canonical" and expected.tag:
+            # An untagged delivery proves only the base mailbox, not which
+            # concurrent signup challenge it belongs to.  A tagged autonomous
+            # identity therefore requires its exact tag to survive in To,
+            # Delivered-To, or X-Original-To; otherwise leave the run at HITL.
+            rejections.append("verification_recipient_tag_missing")
             continue
         if binding == "no_match":
             rejections.append("verification_recipient_mismatch")
@@ -671,6 +912,13 @@ def select_verification(
         sender_reviewed = bool(domain) and host_matches(domain, reviewed_sender_patterns)
         if require_reviewed_sender and not sender_reviewed:
             rejections.append("verification_sender_not_reviewed")
+            continue
+        sender_authentication, authentication_reason = sender_authentication_method(
+            candidate,
+            sender_domain=domain,
+        )
+        if require_authenticated_sender and sender_authentication == "none":
+            rejections.append(authentication_reason)
             continue
 
         resolved = _extract_secret(
@@ -683,6 +931,7 @@ def select_verification(
             sender_domain=domain,
             binding=binding,
             sender_reviewed=sender_reviewed,
+            sender_authentication=sender_authentication,
             received_at_ms=received_at_ms,
             age_seconds=int(age_seconds),
         )
@@ -719,7 +968,14 @@ def _order_newest_first(
     return tuple(
         sorted(
             stamped,
-            key=lambda entry: (entry[0] is None, -(entry[0] or 0)),
+            # Provider order is not stable across identical reads.  Break equal
+            # timestamps on the immutable message id so retries cannot select a
+            # different one-time secret merely because Gmail reordered a page.
+            key=lambda entry: (
+                entry[0] is None,
+                -(entry[0] or 0),
+                str(entry[1].message_id or ""),
+            ),
         )
     )
 
@@ -735,6 +991,7 @@ def _extract_secret(
     sender_domain: str,
     binding: RecipientBindingStatus,
     sender_reviewed: bool,
+    sender_authentication: SenderAuthenticationMethod,
     received_at_ms: int,
     age_seconds: int,
 ) -> ResolvedVerification | None:
@@ -759,10 +1016,11 @@ def _extract_secret(
             evidence=VerificationEvidence(
                 purpose=purpose,
                 verification_kind="link",
-                message_id=message_id[:200],
+                message_id=message_id,
                 sender_domain=sender_domain[:253],
                 recipient_binding=binding,
                 sender_reviewed=sender_reviewed,
+                sender_authentication=sender_authentication,
                 received_at_ms=received_at_ms,
                 age_seconds=age_seconds,
                 link_host=link_host(url)[:253],
@@ -778,10 +1036,11 @@ def _extract_secret(
             evidence=VerificationEvidence(
                 purpose=purpose,
                 verification_kind="code",
-                message_id=message_id[:200],
+                message_id=message_id,
                 sender_domain=sender_domain[:253],
                 recipient_binding=binding,
                 sender_reviewed=sender_reviewed,
+                sender_authentication=sender_authentication,
                 received_at_ms=received_at_ms,
                 age_seconds=age_seconds,
                 code_length=len(code),
@@ -819,10 +1078,13 @@ def gmail_freshness_query(
         parsed = canonical_address(recipient)
         if parsed is None:
             raise ValueError("recipient is not a valid address")
-        parts.append(f"to:{parsed.address}")
+        # Quote the exact validated dot-atom address so characters that are
+        # legal in a local part (notably braces and a leading minus) cannot be
+        # reinterpreted as Gmail search grammar.
+        parts.append(f'to:"{parsed.address}"')
     if sender_domain:
         domain = sender_domain.strip().lstrip("@").rstrip(".").casefold()
-        if not re.fullmatch(r"[a-z0-9.-]{1,253}", domain) or "." not in domain:
+        if _DOMAIN_RE.fullmatch(domain) is None:
             raise ValueError("sender_domain is not a valid domain")
         parts.append(f"from:{domain}")
     return " ".join(parts)
@@ -834,6 +1096,7 @@ __all__ = [
     "CanonicalAddress",
     "RecipientBindingStatus",
     "ResolvedVerification",
+    "SenderAuthenticationMethod",
     "VerificationCandidate",
     "VerificationDecision",
     "VerificationEvidence",
@@ -851,5 +1114,6 @@ __all__ = [
     "parse_addresses",
     "parse_received_at_ms",
     "select_verification",
+    "sender_authentication_method",
     "sender_domain_of",
 ]

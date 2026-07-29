@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Fail if the browser-service log contains anything that looks like a secret.
+"""Fail if a service log contains anything that looks like a secret.
 
 A defence-in-depth CI check: the service is designed never to log tokens,
 cookies, storage state or credential values, and this asserts it against the
-actual captured log. It matches the CI service token and common credential
-shapes without ever echoing a matched value.
+actual captured log. It matches every configured secret-like environment value
+and common credential shapes without ever echoing a matched value.
 """
 
 from __future__ import annotations
@@ -13,14 +13,43 @@ import os
 import re
 import sys
 
-# Patterns that must never appear in a service log line.
+# Patterns that must never appear in a service log line. A Fernet key is 32
+# bytes encoded as 43 URL-safe base64 characters plus ``=``. The lookarounds
+# deliberately do not use ``\b``: there is no word boundary after ``=``.
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("fernet_key", re.compile(r"\bg[A-Za-z0-9_-]{42}=\b")),
+    (
+        "fernet_key",
+        re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}=(?![A-Za-z0-9_=-])"),
+    ),
+    ("fernet_token", re.compile(r"(?<![A-Za-z0-9_-])gAAAAA[A-Za-z0-9_-]{32,}={0,2}")),
     ("vault_reference", re.compile(r"vault://[a-z0-9-]+/[a-z0-9_-]+/[A-Za-z0-9_-]+")),
     ("cookie_header", re.compile(r"(?i)set-cookie:")),
     ("bearer_token", re.compile(r"(?i)bearer\s+[A-Za-z0-9._-]{16,}")),
     ("storage_state", re.compile(r'"cookies"\s*:\s*\[')),
+    (
+        "provider_key",
+        re.compile(
+            r"(?<![A-Za-z0-9_-])(?:"
+            r"AIza[0-9A-Za-z_-]{20,}|"
+            r"(?:sk-or-v1-|gsk_|pplx-|ydc-sk-|bu_|ak_|csk-)[A-Za-z0-9_-]{16,}"
+            r")(?![A-Za-z0-9_-])"
+        ),
+    ),
 )
+
+_SECRET_ENV_NAME = re.compile(
+    r"(?:^|_)(?:API_KEY|TOKEN|KEY|SECRET|PASSWORD|PRIVATE_KEY)$", re.IGNORECASE
+)
+
+
+def _configured_secret_values() -> tuple[str, ...]:
+    """Return configured secret values without retaining their variable names."""
+
+    values: set[str] = set()
+    for name, value in os.environ.items():
+        if _SECRET_ENV_NAME.search(name) and len(value) >= 8:
+            values.add(value)
+    return tuple(values)
 
 
 def main() -> int:
@@ -33,19 +62,18 @@ def main() -> int:
         print(f"could not read log: {type(exc).__name__}", file=sys.stderr)
         return 2
 
-    offenders: list[str] = []
-    # The CI-only service token is passed via the environment; match it literally.
-    ci_token = os.environ.get("BROWSER_SERVICE_TOKEN", "")
-    if ci_token and ci_token in text:
-        offenders.append("service_token")
+    offenders: set[str] = set()
+    if any(secret in text for secret in _configured_secret_values()):
+        offenders.add("configured_environment_secret")
     for name, pattern in _PATTERNS:
         if pattern.search(text):
-            offenders.append(name)
+            offenders.add(name)
 
     if offenders:
         # Report the CATEGORY only, never the matched text.
         print(
-            f"service log contains secret-shaped content: {', '.join(offenders)}", file=sys.stderr
+            f"service log contains secret-shaped content: {', '.join(sorted(offenders))}",
+            file=sys.stderr,
         )
         return 1
     print("service log is free of secret-shaped content")

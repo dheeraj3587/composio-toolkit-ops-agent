@@ -47,6 +47,13 @@ class RunReconciliationContext(Protocol):
         reason: str,
     ) -> None: ...
 
+    def _run_lock(self, run_id: str) -> Any: ...
+
+    def _continue_pristine_playwright_run(
+        self,
+        record: Mapping[str, Any],
+    ) -> dict[str, Any] | None: ...
+
 
 class RunReconciliationService:
     """Move unrecoverable browser runs to a recoverable state and free the slot."""
@@ -90,6 +97,21 @@ class RunReconciliationService:
                 for record in batch:
                     status = record.get("status")
                     run_id = str(record.get("run_id") or "")
+                    if (
+                        status == "route_selected"
+                        and record.get("state_engine") == "canonical_v1"
+                        and record.get("execution_mode") == "operations"
+                        and record.get("route_kind") == "playwright"
+                        and record.get("browser_provider") == "playwright"
+                        and record.get("phase")
+                        in {
+                            "browser_pending",
+                            "browser_starting",
+                            "authentication_submitted",
+                        }
+                    ):
+                        self.recover_pristine_browser_pending(record)
+                        continue
                     worker = self._context._browser_worker_for(record)
                     if worker is None and status in {"browser_running", "waiting_for_hitl"}:
                         # A disabled/unconfigured provider cannot own a live session.
@@ -138,6 +160,38 @@ class RunReconciliationService:
         except Exception:  # pragma: no cover - reconciliation must never crash boot
             LOGGER.warning("startup run reconciliation was skipped after an error")
 
+    def recover_pristine_browser_pending(self, record: Mapping[str, Any]) -> None:
+        """Continue only a browser dispatch whose side-effect boundary is pristine.
+
+        The canonical runtime rechecks ``attempt``, effect identity, and the
+        side-effect ledger under the per-run lock. A truly pristine run starts;
+        evidence of a prior reservation is moved to effect reconciliation and can
+        never be duplicated automatically.
+        """
+
+        run_id = str(record.get("run_id") or "")
+        if not run_id:
+            return
+        lock = self._context._run_lock(run_id)
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            current = self.storage.get_run(run_id)
+            if (
+                current is None
+                or current.get("status") != "route_selected"
+                or current.get("state_engine") != "canonical_v1"
+                or current.get("execution_mode") != "operations"
+                or current.get("route_kind") != "playwright"
+                or current.get("browser_provider") != "playwright"
+            ):
+                return
+            self._context._continue_pristine_playwright_run(current)
+        except Exception:  # pragma: no cover - one bad run must not abort the sweep
+            LOGGER.warning("could not recover a pristine browser-pending run")
+        finally:
+            lock.release()
+
     def browser_session_is_live(self, record: Mapping[str, Any]) -> bool | None:
         """Ask the browser service whether a persisted session id still exists.
 
@@ -156,7 +210,12 @@ class RunReconciliationService:
         if not isinstance(session_id, str) or not session_id:
             return False
         try:
-            outcome = asyncio.run(reconcile(session_id))
+            scope_kwargs = (
+                {"capability_scope": str(record.get("run_id") or "")}
+                if bool(getattr(worker, "requires_session_capability_scope", False))
+                else {}
+            )
+            outcome = asyncio.run(reconcile(session_id, **scope_kwargs))
         except Exception:
             return None
         if outcome == "resumable":

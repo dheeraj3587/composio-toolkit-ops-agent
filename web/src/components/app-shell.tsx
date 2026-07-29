@@ -1,15 +1,17 @@
 "use client"
 
 import Link from "next/link"
-import { Activity, Boxes, LayoutDashboard, LockKeyhole, Plus, ShieldCheck } from "lucide-react"
+import { usePathname } from "next/navigation"
+import { Activity, Boxes, LayoutDashboard, LogOut, Plus, ShieldCheck } from "lucide-react"
 
+import { signOutAction } from "@/app/login/actions"
 import { NavLink } from "@/components/nav-link"
 
 const navigation = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
-  { href: "/runs/new", label: "New run", icon: Plus },
-  { href: "/#app-catalog", label: "App catalog", icon: Boxes },
-  { href: "/system", label: "System", icon: Activity },
+  { href: "/runs/new", label: "New integration", icon: Plus },
+  { href: "/#app-catalog", label: "Apps", icon: Boxes },
+  { href: "/system", label: "System health", icon: Activity },
 ] as const
 
 export function AppShell({
@@ -19,6 +21,9 @@ export function AppShell({
   children: React.ReactNode
   demoMode: boolean
 }) {
+  const pathname = usePathname()
+  if (pathname === "/login") return children
+
   const topOffset = demoMode ? "top-8" : "top-0"
   const pagePadding = demoMode ? "pt-8" : ""
 
@@ -58,22 +63,34 @@ export function AppShell({
           ))}
         </nav>
 
-        <div className="m-3 border border-white/10 bg-white/[0.035] p-4">
+        <div className="m-3 rounded-xl border border-white/10 bg-white/[0.035] p-4">
           <div className="flex items-center gap-2 text-xs font-medium text-white/85">
             <ShieldCheck className="size-4 text-brand-300" aria-hidden="true" />
             Secure boundary
           </div>
           <p className="mt-2 text-[11px] leading-5 text-white/45">
-            Sanitized DTOs only. Vault values never enter the interface.
+            Account and API secrets stay inside the encrypted credential boundary.
           </p>
           <div className="mt-4 flex items-center gap-2 font-mono text-[9px] uppercase tracking-[0.12em] text-emerald-300">
             <span className="size-1.5 rounded-full bg-emerald-400" />
-            Reference-only UI
+            Secrets protected
           </div>
         </div>
 
-        <div className="border-t border-white/10 px-6 py-4 font-mono text-[9px] uppercase tracking-[0.14em] text-white/35">
-          Private P2 · v0.2
+        <div className="flex items-center justify-between border-t border-white/10 px-5 py-3">
+          <span className="font-mono text-[9px] uppercase tracking-[0.14em] text-white/35">
+            Private workspace
+          </span>
+          <form action={signOutAction}>
+            <button
+              type="submit"
+              className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-[10px] font-medium text-white/50 hover:bg-white/10 hover:text-white"
+              title="Sign out"
+            >
+              <LogOut className="size-3.5" aria-hidden="true" />
+              Sign out
+            </button>
+          </form>
         </div>
       </aside>
 
@@ -93,6 +110,15 @@ export function AppShell({
           >
             <Plus className="size-3.5" aria-hidden="true" /> New
           </Link>
+          <form action={signOutAction}>
+            <button
+              type="submit"
+              className="ml-1 grid size-9 place-items-center rounded-md text-muted-foreground hover:bg-secondary hover:text-foreground"
+              aria-label="Sign out"
+            >
+              <LogOut className="size-4" aria-hidden="true" />
+            </button>
+          </form>
         </div>
       </header>
 
@@ -102,8 +128,8 @@ export function AppShell({
         </main>
         <footer className="border-t border-border px-4 py-5 sm:px-7 lg:px-9 xl:px-12">
           <div className="mx-auto flex max-w-[1240px] flex-col gap-2 font-mono text-[9px] uppercase tracking-[0.13em] text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
-            <p className="flex items-center gap-2"><LockKeyhole className="size-3" aria-hidden="true" /> Private operations surface</p>
-            <p>Backend truth · no synthetic provider success</p>
+            <p className="flex items-center gap-2"><ShieldCheck className="size-3" aria-hidden="true" /> Private operations surface</p>
+            <p>Live provider state · secrets never displayed</p>
           </div>
         </footer>
       </div>

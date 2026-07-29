@@ -30,7 +30,7 @@ from typing import Literal, cast
 LiveViewMode = Literal["screenshot", "interactive_remote"]
 LiveViewAccess = Literal["view", "control"]
 
-_TOKEN_VERSION = "lv2"
+_TOKEN_VERSION = "lv3"
 
 
 class LiveViewTokenError(RuntimeError):
@@ -48,6 +48,7 @@ class LiveViewToken:
     session_id: str
     owner: str
     access: LiveViewAccess
+    hitl_generation: int
     expires_at: datetime
 
     def is_expired(self, now: datetime | None = None) -> bool:
@@ -69,6 +70,7 @@ def issue_live_view_token(
     owner: str,
     secret: str,
     access: LiveViewAccess = "control",
+    hitl_generation: int = 0,
     ttl_seconds: int = 300,
     now: datetime | None = None,
 ) -> tuple[str, datetime]:
@@ -80,6 +82,8 @@ def issue_live_view_token(
         raise LiveViewTokenError("live_view_access_invalid")
     if not secret:
         raise LiveViewTokenError("live_view_secret_missing")
+    if not isinstance(hitl_generation, int) or hitl_generation < 0:
+        raise LiveViewTokenError("hitl_generation_invalid")
     issued = now or datetime.now(UTC)
     expires_at = issued + timedelta(seconds=max(30, min(ttl_seconds, 3_600)))
     payload = {
@@ -87,6 +91,7 @@ def issue_live_view_token(
         "sid": session_id,
         "own": owner,
         "acc": access,
+        "gen": hitl_generation,
         "exp": int(expires_at.timestamp()),
     }
     body = _b64(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
@@ -100,6 +105,7 @@ def verify_live_view_token(
     secret: str,
     expected_session_id: str,
     expected_owner: str,
+    expected_hitl_generation: int = 0,
     now: datetime | None = None,
 ) -> LiveViewToken:
     """Verify a grant, failing closed on signature/binding/expiry problems."""
@@ -122,6 +128,7 @@ def verify_live_view_token(
     session_id = str(payload.get("sid") or "")
     owner = str(payload.get("own") or "")
     access = str(payload.get("acc") or "")
+    generation = payload.get("gen")
     # Binding checks: a token is valid ONLY for its own session and owner.
     if not hmac.compare_digest(session_id, expected_session_id):
         raise LiveViewTokenError("session_mismatch")
@@ -129,6 +136,8 @@ def verify_live_view_token(
         raise LiveViewTokenError("owner_mismatch")
     if access not in {"view", "control"}:
         raise LiveViewTokenError("live_view_access_invalid")
+    if not isinstance(generation, int) or generation < 0 or generation != expected_hitl_generation:
+        raise LiveViewTokenError("hitl_generation_mismatch")
     try:
         expires_at = datetime.fromtimestamp(int(payload.get("exp", 0)), tz=UTC)
     except (ValueError, TypeError, OSError):
@@ -137,6 +146,7 @@ def verify_live_view_token(
         session_id=session_id,
         owner=owner,
         access=cast(LiveViewAccess, access),
+        hitl_generation=generation,
         expires_at=expires_at,
     )
     if verified.is_expired(now):

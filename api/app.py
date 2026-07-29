@@ -20,6 +20,8 @@ from pydantic import AfterValidator, BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
+from api.browser_secret_broker import browser_secret_broker_auth_response
+from api.browser_secret_broker import router as browser_secret_broker_router
 from api.models import (
     ActionReceipt,
     AppCatalogResponse,
@@ -34,6 +36,8 @@ from api.models import (
     LiveViewResponse,
     ManagedConnectionResponse,
     PhaseUnavailableResponse,
+    ProviderReadinessResponse,
+    ProviderState,
     ResourceNotFoundResponse,
     ResumeRequest,
     RetryRequest,
@@ -52,6 +56,7 @@ from api.service import (
     RunService,
 )
 from ops.redaction import install_redacting_filter
+from ops.run_errors import ProviderReadinessError
 from ops.run_service import (
     CredentialSubmissionError,
     IdempotencyConflictError,
@@ -83,6 +88,7 @@ _KNOWN_VALIDATION_FIELDS = frozenset(
     {
         "body",
         "body.app_name",
+        "body.account_mode",
         "body.company",
         "body.company.legal_name",
         "body.company.website",
@@ -92,7 +98,6 @@ _KNOWN_VALIDATION_FIELDS = frozenset(
         "body.company.callback_urls",
         "body.requested_scope_policy",
         "body.dry_run",
-        "body.outreach_recipient_override",
         "body.capability",
         "header.idempotency-key",
         "path.run_id",
@@ -101,6 +106,11 @@ _KNOWN_VALIDATION_FIELDS = frozenset(
         "query.limit",
         "query.offset",
     }
+)
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_MUTATION_GATED_PREFIXES = (
+    "/api/",
+    "/internal/browser-secret-broker/",
 )
 
 
@@ -146,8 +156,24 @@ def _internal_api_auth_response(request: Request) -> JSONResponse | None:
         return None
 
     expected = os.environ.get("OPS_INTERNAL_API_TOKEN", "").strip()
+    forbidden = {
+        os.environ.get("BROWSER_SERVICE_TOKEN", "").strip(),
+        os.environ.get("BROWSER_SESSION_CAPABILITY_KEY", "").strip(),
+        os.environ.get("BROWSER_SECRET_BROKER_TOKEN", "").strip(),
+    }
+    placeholder = any(
+        marker in expected.casefold() for marker in ("replace-with", "change-me", "example")
+    )
+    if len(expected) < 32 or expected in forbidden or placeholder:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "error": "internal_api_unavailable",
+                "message": "Internal API authentication is not configured safely.",
+            },
+        )
     provided = request.headers.get("X-Ops-Internal-Token", "")
-    if expected and provided and secrets.compare_digest(provided, expected):
+    if provided and secrets.compare_digest(provided, expected):
         return None
 
     return JSONResponse(
@@ -157,6 +183,57 @@ def _internal_api_auth_response(request: Request) -> JSONResponse | None:
             "message": "Internal API token is required.",
         },
         headers={"WWW-Authenticate": "OpsInternalToken"},
+    )
+
+
+def _deployment_acceptance_response(request: Request) -> JSONResponse | None:
+    """Fail closed on control-plane writes while a production release is pending.
+
+    This is a per-request admission decision. The deploy/restore contract keeps
+    acceptance monotonic for a running release and quiesces admission and services
+    before changing the marker for rollback, so an admitted mutation cannot race
+    a live marker revocation.
+    """
+
+    path = request.url.path
+    gated_write = request.method in _MUTATING_METHODS and path.startswith(_MUTATION_GATED_PREFIXES)
+    path_parts = path.split("/")
+    # Although this public endpoint is a GET, resolving it can mint a fresh
+    # view/control grant via POST /internal/browser/sessions/{id}/live-view.
+    # Treat that capability issuance as a mutation while leaving the screenshot
+    # and health/readiness GETs available to candidate probes.
+    gated_live_view_grant = bool(
+        request.method == "GET"
+        and len(path_parts) == 5
+        and path_parts[1:3] == ["api", "runs"]
+        and path_parts[3]
+        and path_parts[4] == "live-view"
+    )
+    if not gated_write and not gated_live_view_grant:
+        return None
+
+    service = getattr(request.app.state, "run_service", None)
+    checker = getattr(service, "deployment_mutations_allowed", None)
+    if callable(checker):
+        try:
+            accepted = bool(checker())
+        except Exception:
+            accepted = False
+    else:
+        # An injected test adapter may omit the optional deployment hook. That is
+        # safe only outside production automation mode; a production adapter that
+        # cannot prove acceptance must never receive a write.
+        accepted = not _environment_flag("OPS_STARTUP_AUTOMATION_ENABLED", default=False)
+
+    if accepted:
+        return None
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "error": "deployment_not_accepted",
+            "message": "Release acceptance is still in progress; retry shortly.",
+        },
+        headers={"Retry-After": "5"},
     )
 
 
@@ -206,7 +283,17 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         active_service = service or LocalRunService(db_path)
-        install_redacting_filter(LOGGER)
+        # Uvicorn installs its handlers before entering application lifespan.
+        # Attach the general redactor now so access/error output receives the
+        # same provider-key and credential filtering as application logs.
+        for logger in (
+            logging.getLogger(),
+            LOGGER,
+            logging.getLogger("uvicorn"),
+            logging.getLogger("uvicorn.error"),
+            logging.getLogger("uvicorn.access"),
+        ):
+            install_redacting_filter(logger)
         await active_service.startup()
         application.state.run_service = active_service
         try:
@@ -231,6 +318,7 @@ def create_app(
         redoc_url="/redoc" if docs_enabled else None,
         openapi_url="/openapi.json" if docs_enabled else None,
     )
+    application.include_router(browser_secret_broker_router)
     application.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins if cors_origins is not None else _cors_origins(),
@@ -245,7 +333,11 @@ def create_app(
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
-        auth_response = _internal_api_auth_response(request)
+        auth_response = browser_secret_broker_auth_response(request)
+        if auth_response is None:
+            auth_response = _internal_api_auth_response(request)
+        if auth_response is None:
+            auth_response = _deployment_acceptance_response(request)
 
         response: Response
         if auth_response is not None:
@@ -312,6 +404,20 @@ def create_app(
                 run_id=exc.run_id,
                 action=exc.action,
                 available_in=list(exc.available_in),
+            ),
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+    @application.exception_handler(ProviderReadinessError)
+    async def provider_readiness_handler(
+        request: Request,
+        exc: ProviderReadinessError,
+    ) -> JSONResponse:
+        del request
+        return _model_response(
+            ProviderReadinessResponse(
+                provider=exc.provider,
+                reason_code=exc.reason_code,
             ),
             status_code=status.HTTP_409_CONFLICT,
         )
@@ -387,7 +493,9 @@ def create_app(
         response_model=RunDetailResponse,
         status_code=status.HTTP_201_CREATED,
         responses={
-            409: {"model": IdempotencyConflictResponse},
+            409: {
+                "model": IdempotencyConflictResponse | ProviderReadinessResponse,
+            },
             422: {"model": InvalidRequestResponse},
             500: {"model": InternalErrorResponse},
         },
@@ -400,7 +508,8 @@ def create_app(
     ) -> RunDetailResponse:
         # Autonomous sign-in credentials at create time are an owner action
         # (same gate as resume-with-browser_login). They are injected into
-        # the selected provider's secret boundary and never persisted.
+        # the selected provider's secret boundary. Reusable pairs may be retained
+        # only in the encrypted account vault, never in run state or logs.
         if payload.browser_login is not None:
             _require_owner_action(request)
         return await run_service.create_run(payload, idempotency_key=idempotency_key)
@@ -450,8 +559,9 @@ def create_app(
         opt-in (``ALLOW_LOCAL_CREDENTIAL_SUBMISSION``) and are then reachable from
         loopback or, in a deployed environment, through the trusted internal-token
         caller. ``browser_login`` values cross the selected provider's secret
-        boundary for a single resume and are never persisted; no stored secret
-        is ever read back to the network by this path. Endpoints that return raw
+        boundary for one resume and reusable pairs may remain encrypted in the
+        account vault; no stored secret is ever read back to the network by this
+        path. Endpoints that return raw
         stored secrets (credential reveal) keep the stricter loopback-only gate.
         """
 
@@ -528,15 +638,22 @@ def create_app(
         payload: ResumeRequest | None = None,
     ) -> ActionReceipt:
         browser_login = payload.browser_login if payload is not None else None
+        browser_verification = payload.browser_verification if payload is not None else None
         signal = payload.signal if payload is not None else "completed"
-        if browser_login is not None:
+        if browser_login is not None or browser_verification is not None:
             # Submitting app login credentials for autonomous injection is an
             # owner action. In a deployed environment it is authorized by the
             # internal API token boundary; locally it works over loopback. The
             # raw values cross the selected provider's secret boundary for a single
-            # resume and are never persisted.
+            # resume. Reusable login pairs may remain only in the encrypted,
+            # account-scoped vault; one-time verification values never do.
             _require_owner_action(request)
-        return await run_service.resume(run_id, browser_login=browser_login, signal=signal)
+        return await run_service.resume(
+            run_id,
+            browser_login=browser_login,
+            browser_verification=browser_verification,
+            signal=signal,
+        )
 
     @application.post(
         "/api/runs/{run_id}/connect",
@@ -703,6 +820,15 @@ def create_app(
         run_service: ServiceDependency,
     ) -> AppResearchResponse:
         return await run_service.get_app_research(app_slug)
+
+    @application.get(
+        "/api/system/signup-readiness",
+        response_model=ProviderState,
+        response_model_exclude_none=True,
+        responses={500: {"model": InternalErrorResponse}},
+    )
+    async def signup_readiness(run_service: ServiceDependency) -> ProviderState:
+        return await run_service.signup_readiness()
 
     @application.get(
         "/api/system/health",

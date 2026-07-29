@@ -26,7 +26,8 @@ _PLAYWRIGHT = Settings(
     allow_live_browser=True,
     browser_provider="playwright",
     browser_service_url="http://browser-worker:8081",
-    browser_service_token=SecretStr("service-token"),
+    browser_service_token=SecretStr("service-token-" + ("s" * 32)),
+    browser_session_capability_key=SecretStr("c" * 32),
     allow_local_credential_submission=True,
 )
 _PLAYWRIGHT_INTERACTIVE = _PLAYWRIGHT.model_copy(update={"browser_interactive_hitl_enabled": True})
@@ -214,7 +215,7 @@ def test_a_captcha_gate_does_not_offer_the_login_form() -> None:
     assert state.can_submit_otp is False
 
 
-def test_an_email_otp_gate_reports_no_otp_submission_support() -> None:
+def test_an_email_otp_gate_exposes_the_owner_only_fallback() -> None:
     state = project_browser_ui(
         settings=_BROWSER_USE,
         run_status="waiting_for_hitl",
@@ -223,9 +224,7 @@ def test_an_email_otp_gate_reports_no_otp_submission_support() -> None:
         hitl=_hitl("email_otp"),
     )
 
-    # The API's ResumeRequest carries no OTP field, so claiming otherwise would
-    # advertise a control the backend cannot honor.
-    assert state.can_submit_otp is False
+    assert state.can_submit_otp is True
     assert state.can_resume is True
 
 
@@ -360,8 +359,9 @@ def _production_detail(tmp_path: Path) -> dict[str, Any]:
         "BROWSER_PROVIDER": "playwright",
         "ALLOW_LIVE_BROWSER": "true",
         "BROWSER_SERVICE_URL": "http://browser-worker:8081",
-        "BROWSER_SERVICE_TOKEN": "service-token",
-        "OPS_INTERNAL_API_TOKEN": "probe-token",
+        "BROWSER_SERVICE_TOKEN": "service-token-" + ("s" * 32),
+        "BROWSER_SESSION_CAPABILITY_KEY": "c" * 32,
+        "OPS_INTERNAL_API_TOKEN": "probe-internal-token-" + ("i" * 32),
         "OPS_DB_PATH": str(tmp_path / "ops.db"),
         "CHECKPOINT_DB_PATH": str(tmp_path / "checkpoints.db"),
         "SECRET_VAULT_DB_PATH": str(tmp_path / "vault.db"),

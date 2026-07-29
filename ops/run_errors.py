@@ -13,6 +13,8 @@ credential-shaped.
 
 from __future__ import annotations
 
+from typing import Literal
+
 
 class InvalidIdempotencyKeyError(ValueError):
     """Raised without echoing a malformed or credential-shaped key."""
@@ -20,6 +22,20 @@ class InvalidIdempotencyKeyError(ValueError):
 
 class IdempotencyConflictError(ValueError):
     """Raised when a key is reused for a different canonical request."""
+
+
+class ProviderReadinessError(RuntimeError):
+    """A required provider failed before an executable run was persisted."""
+
+    def __init__(
+        self,
+        *,
+        provider: Literal["gmail", "playwright"],
+        reason_code: str,
+    ) -> None:
+        self.provider = provider
+        self.reason_code = reason_code
+        super().__init__("required provider capability is not ready")
 
 
 class RunConflictError(RuntimeError):
@@ -43,5 +59,6 @@ __all__ = [
     "CredentialSubmissionError",
     "IdempotencyConflictError",
     "InvalidIdempotencyKeyError",
+    "ProviderReadinessError",
     "RunConflictError",
 ]

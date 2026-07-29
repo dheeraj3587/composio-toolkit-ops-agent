@@ -33,6 +33,10 @@ web/.env*
 # Secret-bearing and private runtime state
 private/
 secrets/
+backups/
+restore-safety-backups/
+restore-evidence/
+restore-input-staging/
 *.db
 *.db-*
 *.sqlite

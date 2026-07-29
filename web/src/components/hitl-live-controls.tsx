@@ -18,6 +18,7 @@ import {
 } from "@/app/runs/[runId]/actions"
 import {
   BrowserLoginForm,
+  BrowserVerificationForm,
   CredentialSubmitForm,
 } from "@/components/browser-hitl-forms"
 import { BrowserLiveSurface } from "@/components/browser-live-surface"
@@ -201,6 +202,8 @@ export function HitlLiveControls({
       ) : null}
 
       {browser?.can_submit_login ? <BrowserLoginForm runId={runId} /> : null}
+
+      {browser?.can_submit_otp ? <BrowserVerificationForm runId={runId} /> : null}
 
       {browser?.can_submit_credential ? (
         <CredentialSubmitForm

@@ -241,6 +241,15 @@
   to { transform: scaleX(1); }
 }
 
+@keyframes progress-shimmer {
+  from { transform: translateX(-8rem); }
+  to { transform: translateX(80rem); }
+}
+
+.progress-shimmer {
+  animation: progress-shimmer 2.4s ease-in-out infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

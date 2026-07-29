@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import re
+import secrets
+import threading
+import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from queue import Empty, Queue
+from typing import Any, Literal
 
 from ops.attachment_extract import AttachmentRef, extract_secret_pairs, is_text_like
 from ops.config import Settings
@@ -15,6 +21,7 @@ from ops.effect_ledger import EffectStore, SQLiteEffectStore
 from ops.email_verification import (  # noqa: F401
     DEFAULT_CLOCK_SKEW_SECONDS,
     MAX_VERIFICATION_AGE_SECONDS,
+    VERIFICATION_REQUEST_CLOCK_SKEW_SECONDS,
     ResolvedVerification,
     VerificationCandidate,
     VerificationDecision,
@@ -45,6 +52,7 @@ from ops.gmail_messages import (  # noqa: F401
     _has_attachments,
     _identifier,
     _message_recipients,
+    _message_sender_authenticated,
     _message_sequence,
     _message_timestamp,
     _order_messages_by_trust,
@@ -54,6 +62,7 @@ from ops.gmail_messages import (  # noqa: F401
     _verification_candidate,
     _within_age,
 )
+from ops.gmail_models import GmailOutreachMessageClaim as GmailOutreachMessageClaim
 
 # ``ops.gmail_worker`` remains the declared import home for the Gmail boundary, so
 # every name it used to expose is re-exported here. run_service, run_email,
@@ -69,6 +78,7 @@ from ops.gmail_validation import (  # noqa: F401
     _validate_email,
     _validate_identifier,
     _validate_message,
+    parse_mailbox_address,
 )
 from ops.provider_errors import (
     ConfigurationRequiredError,
@@ -77,7 +87,113 @@ from ops.provider_errors import (
     ProviderOperationError,
 )
 from ops.redaction import redact_text
-from ops.secret_store import SecretStore
+from ops.secret_store import SecretStore, SQLiteSecretStore
+
+GmailSignupPreflightStatus = Literal[
+    "ready",
+    "configuration_required",
+    "timeout",
+    "unavailable",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class GmailSignupPreflight:
+    """Value-free result of the bounded Gmail signup capability probe."""
+
+    status: GmailSignupPreflightStatus
+    reason_code: str
+    provider_read_attempted: bool
+
+    @property
+    def ready(self) -> bool:
+        return self.status == "ready"
+
+
+def _gmail_effect_request_fingerprint(
+    *,
+    settings: Settings,
+    action: str,
+    values: Sequence[str],
+) -> str:
+    """Hash the exact Gmail mutation without persisting its body.
+
+    The caller-supplied idempotency identity says *which logical effect* this is;
+    this fingerprint proves a replay is asking for the same account, recipient,
+    thread, subject and body.  Length-prefixing makes the encoding unambiguous.
+    """
+
+    digest = hashlib.sha256()
+    components = (
+        "gmail-effect-request-v1",
+        str(settings.composio_gmail_connected_account_id or ""),
+        settings.composio_gmail_user_id,
+        action,
+        *values,
+    )
+    for component in components:
+        encoded = component.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _completed_gmail_effect(
+    *,
+    reservation_receipt: Mapping[str, str] | None,
+    request_fingerprint: str,
+    capability: str,
+) -> GmailSendResult:
+    """Validate a completed receipt before treating it as an exact replay."""
+
+    if reservation_receipt is None or not secrets.compare_digest(
+        reservation_receipt.get("request_fingerprint", ""),
+        request_fingerprint,
+    ):
+        raise ProviderOperationError(
+            capability=capability,
+            reason_code="idempotency_payload_mismatch",
+        )
+    try:
+        return _send_result_from_receipt(reservation_receipt)
+    except Exception:
+        raise ProviderOperationError(
+            capability=capability,
+            reason_code="reconciliation_required",
+        ) from None
+
+
+def _gmail_profile_mailbox(payload: Mapping[str, object]) -> str | None:
+    """Extract one exact mailbox from the pinned Gmail profile response.
+
+    Composio toolkit revisions have used both Gmail's native ``emailAddress``
+    spelling and normalized snake-case names. Only one parsed RFC mailbox is
+    accepted, and no value is included in the caller-visible readiness result.
+    """
+
+    candidates: list[object] = [
+        payload.get("emailAddress"),
+        payload.get("email_address"),
+        payload.get("email"),
+    ]
+    for container_name in ("profile", "user", "response_data", "result"):
+        nested = payload.get(container_name)
+        if isinstance(nested, Mapping):
+            candidates.extend(
+                (
+                    nested.get("emailAddress"),
+                    nested.get("email_address"),
+                    nested.get("email"),
+                )
+            )
+    parsed = {
+        mailbox.casefold()
+        for candidate in candidates
+        if isinstance(candidate, str) and (mailbox := parse_mailbox_address(candidate)) is not None
+    }
+    if len(parsed) != 1:
+        return None
+    return next(iter(parsed))
 
 
 class GmailWorker:
@@ -103,6 +219,8 @@ class GmailWorker:
         self._session_id: str | None = None
         self._session: Any = None
         self._connection_lock = asyncio.Lock()
+        self._signup_preflight_lock = threading.Lock()
+        self._signup_preflight_thread: threading.Thread | None = None
 
     async def ensure_connected(self) -> str:
         self._require_configuration()
@@ -127,12 +245,232 @@ class GmailWorker:
                 await asyncio.to_thread(
                     self._execute_checked,
                     "GMAIL_GET_PROFILE",
-                    {"user_id": self._settings.composio_user_id},
+                    {"user_id": "me"},
                 )
             except Exception:
                 pass
             self._session_id = session_id
             return session_id
+
+    async def preflight_signup_inbox(
+        self,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> GmailSignupPreflight:
+        """Prove the configured signup mailbox can execute a bounded inbox read.
+
+        The probe first reads the connected account's Gmail profile and requires
+        its mailbox to equal ``GMAIL_SIGNUP_ADDRESS``. It then calls the exact
+        ``GMAIL_FETCH_EMAILS`` tool used by signup verification with a random
+        RFC-822 message-id query that should never match. Provider payloads never
+        leave this boundary: the method records only a sanitized reason code.
+        A dedicated, isolated probe thread places a strict deadline on the
+        caller-visible operation. The Composio SDK is synchronous underneath, so
+        Python cannot forcibly stop an already-running provider call; a late
+        return is discarded and cannot mutate this worker's live session.
+        """
+
+        if not 1.0 <= timeout_seconds <= 30.0:
+            raise ValueError("timeout_seconds must be between 1 and 30")
+        try:
+            self._require_configuration()
+        except ConfigurationRequiredError as exc:
+            return GmailSignupPreflight(
+                status="configuration_required",
+                reason_code=exc.reason_code,
+                provider_read_attempted=False,
+            )
+        if self._settings.gmail_signup_address is None:
+            return GmailSignupPreflight(
+                status="configuration_required",
+                reason_code="gmail_signup_address_missing",
+                provider_read_attempted=False,
+            )
+
+        nonce = secrets.token_urlsafe(18)
+        query = f"in:anywhere rfc822msgid:<ops-signup-preflight-{nonce}@invalid.invalid>"
+        results: Queue[GmailSignupPreflight] = Queue(maxsize=1)
+        read_started = threading.Event()
+
+        # The Composio SDK is synchronous. Running it through ``asyncio.to_thread``
+        # and wrapping that future in ``wait_for`` looks bounded, but
+        # ``asyncio.run`` waits for its default executor during shutdown and can
+        # therefore still block the HTTP caller indefinitely. A dedicated daemon
+        # probe gives the public operation a real wall-clock deadline. The probe
+        # uses isolated session state so a late provider return cannot clobber the
+        # live worker after this call has timed out.
+        with self._signup_preflight_lock:
+            active = self._signup_preflight_thread
+            if active is not None and active.is_alive():
+                return GmailSignupPreflight(
+                    status="unavailable",
+                    reason_code="gmail_signup_preflight_in_progress",
+                    provider_read_attempted=True,
+                )
+            thread = threading.Thread(
+                target=self._run_signup_preflight_probe,
+                kwargs={
+                    "query": query,
+                    "results": results,
+                    "read_started": read_started,
+                },
+                name="gmail-signup-preflight",
+                daemon=True,
+            )
+            self._signup_preflight_thread = thread
+            try:
+                thread.start()
+            except RuntimeError:
+                self._signup_preflight_thread = None
+                return GmailSignupPreflight(
+                    status="unavailable",
+                    reason_code="gmail_signup_preflight_failed",
+                    provider_read_attempted=False,
+                )
+
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                return results.get_nowait()
+            except Empty:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return GmailSignupPreflight(
+                        status="timeout",
+                        reason_code="gmail_signup_preflight_timeout",
+                        provider_read_attempted=read_started.is_set(),
+                    )
+                await asyncio.sleep(min(0.025, remaining))
+
+    def _run_signup_preflight_probe(
+        self,
+        *,
+        query: str,
+        results: Queue[GmailSignupPreflight],
+        read_started: threading.Event,
+    ) -> None:
+        """Execute the synchronous provider probe and publish only a safe result."""
+
+        owns_client = self._sdk_client is None
+        probe = GmailWorker(
+            settings=self._settings,
+            secret_store=None,
+            effect_store=None,
+            sdk_client=self._sdk_client,
+        )
+        try:
+            result = probe._execute_signup_preflight_query(query, read_started=read_started)
+        except Exception:
+            result = GmailSignupPreflight(
+                status="unavailable",
+                reason_code="gmail_signup_preflight_failed",
+                provider_read_attempted=True,
+            )
+        # The queue never receives the provider response, query, or message data.
+        try:
+            results.put_nowait(result)
+        except Exception:
+            pass
+        if owns_client:
+            client = probe._sdk_client
+            if client is not None and callable(getattr(client, "close", None)):
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    def _execute_signup_preflight_query(
+        self,
+        query: str,
+        *,
+        read_started: threading.Event,
+    ) -> GmailSignupPreflight:
+        """Run the exact read synchronously inside the isolated probe thread."""
+
+        attempted = False
+        attempts = max(1, self._settings.gmail_retry_max_attempts)
+        base = max(0.0, self._settings.gmail_retry_base_delay_seconds)
+        for attempt in range(attempts):
+            try:
+                self._create_scoped_session()
+                attempted = True
+                read_started.set()
+                profile = self._execute_checked(
+                    "GMAIL_GET_PROFILE",
+                    {"user_id": "me"},
+                )
+                profile_mailbox = _gmail_profile_mailbox(profile)
+                del profile
+                signup_address = self._settings.gmail_signup_address
+                if signup_address is None:
+                    return GmailSignupPreflight(
+                        status="configuration_required",
+                        reason_code="gmail_signup_address_missing",
+                        provider_read_attempted=True,
+                    )
+                configured_mailbox = parse_mailbox_address(signup_address.get_secret_value())
+                if profile_mailbox is None:
+                    return GmailSignupPreflight(
+                        status="unavailable",
+                        reason_code="gmail_signup_profile_incompatible",
+                        provider_read_attempted=True,
+                    )
+                if configured_mailbox is None or not secrets.compare_digest(
+                    profile_mailbox.casefold(),
+                    configured_mailbox.casefold(),
+                ):
+                    return GmailSignupPreflight(
+                        status="configuration_required",
+                        reason_code="gmail_signup_mailbox_mismatch",
+                        provider_read_attempted=True,
+                    )
+                payload = self._execute_checked(
+                    "GMAIL_FETCH_EMAILS",
+                    {"max_results": 1, "query": query},
+                )
+                messages = payload.get("messages")
+                # Do not retain, sanitize, summarize, count, or return message data.
+                del payload
+                if not isinstance(messages, list):
+                    return GmailSignupPreflight(
+                        status="unavailable",
+                        reason_code="gmail_signup_preflight_response_incompatible",
+                        provider_read_attempted=True,
+                    )
+                if messages:
+                    return GmailSignupPreflight(
+                        status="unavailable",
+                        reason_code="gmail_signup_preflight_filter_unreliable",
+                        provider_read_attempted=True,
+                    )
+                return GmailSignupPreflight(
+                    status="ready",
+                    reason_code="gmail_signup_inbox_ready",
+                    provider_read_attempted=True,
+                )
+            except ConfigurationRequiredError as exc:
+                return GmailSignupPreflight(
+                    status="configuration_required",
+                    reason_code=exc.reason_code,
+                    provider_read_attempted=attempted,
+                )
+            except ProviderContractError:
+                return GmailSignupPreflight(
+                    status="unavailable",
+                    reason_code="gmail_signup_preflight_failed",
+                    provider_read_attempted=attempted,
+                )
+            except Exception:
+                self._reset_session()
+                if attempt >= attempts - 1:
+                    break
+                if base:
+                    time.sleep(base * (2**attempt))
+        return GmailSignupPreflight(
+            status="unavailable",
+            reason_code="gmail_signup_preflight_failed",
+            provider_read_attempted=attempted,
+        )
 
     async def send_outreach(
         self,
@@ -144,21 +482,43 @@ class GmailWorker:
         intended = _validate_email(recipient)
         _validate_message(subject, body)
         actual = self._actual_recipient(intended)
-        session_id = await self.ensure_connected()
+        request_fingerprint = _gmail_effect_request_fingerprint(
+            settings=self._settings,
+            action="send_outreach",
+            values=(intended, actual, subject, body),
+        )
         store = self._get_effect_store()
         reservation = store.reserve(
             provider="composio_gmail",
             action="send_outreach",
             idempotency_key=idempotency_key,
         )
-        if reservation.status == "completed" and reservation.receipt is not None:
-            return _send_result_from_receipt(reservation.receipt)
+        if reservation.status == "completed":
+            return _completed_gmail_effect(
+                reservation_receipt=reservation.receipt,
+                request_fingerprint=request_fingerprint,
+                capability="Composio Gmail outreach",
+            )
         if reservation.status == "reconcile_required":
             raise ProviderOperationError(
                 capability="Composio Gmail outreach",
                 reason_code="reconciliation_required",
             )
 
+        try:
+            session_id = await self.ensure_connected()
+        except Exception:
+            # Session creation happens before GMAIL_SEND_EMAIL is dispatched, so
+            # this reservation is safe to retry after a definite connect failure.
+            try:
+                store.mark_failed(
+                    provider="composio_gmail",
+                    action="send_outreach",
+                    idempotency_key=idempotency_key,
+                )
+            except Exception:
+                pass
+            raise
         try:
             result = await asyncio.to_thread(
                 self._execute_checked,
@@ -211,7 +571,10 @@ class GmailWorker:
                 provider="composio_gmail",
                 action="send_outreach",
                 idempotency_key=idempotency_key,
-                receipt=_send_result_receipt(sent),
+                receipt=_send_result_receipt(
+                    sent,
+                    request_fingerprint=request_fingerprint,
+                ),
             )
         except Exception:
             try:
@@ -229,6 +592,8 @@ class GmailWorker:
         return sent
 
     async def fetch_thread(self, thread_id: str) -> SanitizedGmailThread:
+        """Fetch and redact a thread without writing to the credential vault."""
+
         safe_thread_id = _validate_identifier(thread_id, "thread_id")
         result = await self._execute_read(
             "GMAIL_FETCH_MESSAGE_BY_THREAD_ID",
@@ -236,6 +601,159 @@ class GmailWorker:
             capability="Composio Gmail thread fetch",
         )
         return self._sanitize_thread_payload(safe_thread_id, result)
+
+    async def claim_outreach_reply(
+        self,
+        *,
+        thread_id: str,
+        message_id: str,
+        expected_sender: str,
+        owner_run_id: str,
+        app_slug: str,
+    ) -> GmailOutreachMessageClaim:
+        """Authenticate and durably claim one immutable inbound reply.
+
+        The raw body never leaves this boundary. The exact RFC mailbox parsed
+        from ``From`` must match ``expected_sender`` before credential-shaped
+        values are extracted. Reservation metadata and encrypted vault rows are
+        committed atomically by :class:`SQLiteSecretStore`.
+        """
+
+        if not isinstance(self._secret_store, SQLiteSecretStore):
+            raise ConfigurationRequiredError(
+                phase=4,
+                capability="Gmail outreach reply ingestion",
+                reason_code="atomic_secret_store_required",
+            )
+        connected_account_id = self._settings.composio_gmail_connected_account_id
+        if not isinstance(connected_account_id, str) or not connected_account_id:
+            raise ConfigurationRequiredError(
+                phase=4,
+                capability="Gmail outreach reply ingestion",
+                reason_code="gmail_connected_account_missing",
+            )
+        safe_thread_id = _validate_identifier(thread_id, "thread_id")
+        safe_message_id = _validate_identifier(message_id, "message_id")
+        safe_run_id = _validate_identifier(owner_run_id, "run_id")
+        expected_mailbox = parse_mailbox_address(expected_sender)
+        if expected_mailbox is None:
+            raise ConfigurationRequiredError(
+                phase=4,
+                capability="Gmail outreach reply ingestion",
+                reason_code="controlled_recipient_invalid",
+            )
+
+        payload = await self._execute_read(
+            "GMAIL_FETCH_MESSAGE_BY_THREAD_ID",
+            {"thread_id": safe_thread_id},
+            capability="Composio Gmail thread fetch",
+        )
+        matching = [
+            message
+            for message in _message_sequence(payload)
+            if _first_string(message, ("message_id", "messageId", "id")) == safe_message_id
+        ]
+        if len(matching) != 1:
+            raise ProviderContractError(
+                phase=4,
+                capability="Gmail outreach reply ingestion",
+                reason_code=(
+                    "message_identifier_missing" if not matching else "message_identifier_ambiguous"
+                ),
+            )
+        selected = matching[0]
+        raw_sender = _first_string(selected, ("sender", "from", "fromEmail", "from_email")) or ""
+        selected_mailbox = parse_mailbox_address(raw_sender)
+        if selected_mailbox is None or selected_mailbox.casefold() != expected_mailbox.casefold():
+            raise ProviderContractError(
+                phase=4,
+                capability="Gmail outreach reply ingestion",
+                reason_code="message_sender_mismatch",
+            )
+        # A matching From mailbox is attacker-controlled text.  Gmail's own
+        # aligned DMARC/DKIM/SPF (or validated ARC) evidence is mandatory before
+        # either classifying this reply or vaulting credential-shaped values.
+        # This is intentionally not coupled to the legacy verification toggle:
+        # credential-bearing outreach ingestion must never have an unauthenticated
+        # compatibility mode.
+        if not _message_sender_authenticated(selected):
+            raise ProviderContractError(
+                phase=4,
+                capability="Gmail outreach reply ingestion",
+                reason_code="message_sender_authentication_failed",
+            )
+        body = (
+            _first_string(
+                selected,
+                ("body", "messageText", "message_body", "text", "snippet"),
+            )
+            or ""
+        )
+        credentials = self._extract_email_secrets(body)
+        reservation = self._secret_store.begin_gmail_message_ingestion(
+            connected_account_id=connected_account_id,
+            thread_id=safe_thread_id,
+            message_id=safe_message_id,
+            owner_run_id=safe_run_id,
+            app_slug=app_slug,
+            credentials=credentials,
+        )
+        return GmailOutreachMessageClaim(
+            status=reservation.status,
+            message_id=safe_message_id,
+            credential_refs=reservation.credential_refs,
+            claim_token=reservation.claim_token,
+        )
+
+    def complete_outreach_reply(
+        self,
+        *,
+        thread_id: str,
+        message_id: str,
+        owner_run_id: str,
+        claim_token: str,
+    ) -> bool:
+        """Finalize a message claim after the canonical run transition commits."""
+
+        store = self._secret_store
+        connected_account_id = self._settings.composio_gmail_connected_account_id
+        if not isinstance(store, SQLiteSecretStore) or not isinstance(connected_account_id, str):
+            return False
+        try:
+            return store.complete_gmail_message_ingestion(
+                connected_account_id=connected_account_id,
+                thread_id=thread_id,
+                message_id=message_id,
+                owner_run_id=owner_run_id,
+                claim_token=claim_token,
+            )
+        except Exception:
+            return False
+
+    def release_outreach_reply(
+        self,
+        *,
+        thread_id: str,
+        message_id: str,
+        owner_run_id: str,
+        claim_token: str,
+    ) -> bool:
+        """Release a claim after a definite local pre-commit failure."""
+
+        store = self._secret_store
+        connected_account_id = self._settings.composio_gmail_connected_account_id
+        if not isinstance(store, SQLiteSecretStore) or not isinstance(connected_account_id, str):
+            return False
+        try:
+            return store.release_gmail_message_ingestion(
+                connected_account_id=connected_account_id,
+                thread_id=thread_id,
+                message_id=message_id,
+                owner_run_id=owner_run_id,
+                claim_token=claim_token,
+            )
+        except Exception:
+            return False
 
     async def search_inbox(
         self,
@@ -272,6 +790,7 @@ class GmailWorker:
             sender = _first_string(message, ("sender", "from", "from_email")) or "unknown"
             subject = _first_string(message, ("subject",)) or ""
             preview = _first_string(message, ("preview", "snippet", "messageText", "body")) or ""
+            safe_subject, safe_preview = self._sanitize_email_display(subject, preview)
             sent_at = (
                 _first_string(message, ("sent_at", "messageTimestamp", "date", "internal_date"))
                 or "unknown"
@@ -281,8 +800,8 @@ class GmailWorker:
                     message_id=message_id[:200],
                     thread_id=thread_id[:200],
                     sender=redact_text(sender)[:320],
-                    sanitized_subject=redact_text(subject)[:998],
-                    sanitized_preview=redact_text(preview)[:2_000],
+                    sanitized_subject=safe_subject[:998],
+                    sanitized_preview=safe_preview[:2_000],
                     sent_at=redact_text(sent_at)[:100],
                     has_attachments=_has_attachments(message),
                 )
@@ -373,6 +892,7 @@ class GmailWorker:
         query: str | None = None,
         trusted_domains: tuple[str, ...] = (),
         max_age_seconds: int = 900,
+        verification_requested_at_ms: int | None = None,
     ) -> str | None:
         """Return the most recent one-time login code from the connected inbox.
 
@@ -402,6 +922,19 @@ class GmailWorker:
         for message in _order_messages_by_trust(messages, trusted_domains):
             if not _within_age(message, now_ms=now_ms, max_age_seconds=max_age_seconds):
                 continue
+            if (
+                self._settings.gmail_verification_require_authenticated_sender
+                and not _message_sender_authenticated(message)
+            ):
+                continue
+            if verification_requested_at_ms is not None:
+                received_at_ms = parse_received_at_ms(_message_timestamp(message))
+                if (
+                    received_at_ms is None
+                    or received_at_ms
+                    < verification_requested_at_ms - VERIFICATION_REQUEST_CLOCK_SKEW_SECONDS * 1000
+                ):
+                    continue
             subject = _first_string(message, ("subject",)) or ""
             body = _first_string(message, ("messageText", "preview", "snippet", "body")) or ""
             code = extract_verification_code(subject, body)
@@ -416,6 +949,7 @@ class GmailWorker:
         trusted_domains: tuple[str, ...] = (),
         allowed_link_host_patterns: Sequence[str] = (),
         max_age_seconds: int = 900,
+        verification_requested_at_ms: int | None = None,
     ) -> str | None:
         """Return the most recent emailed sign-in verification LINK, if any.
 
@@ -448,6 +982,19 @@ class GmailWorker:
         for message in _order_messages_by_trust(messages, trusted_domains):
             if not _within_age(message, now_ms=now_ms, max_age_seconds=max_age_seconds):
                 continue
+            if (
+                self._settings.gmail_verification_require_authenticated_sender
+                and not _message_sender_authenticated(message)
+            ):
+                continue
+            if verification_requested_at_ms is not None:
+                received_at_ms = parse_received_at_ms(_message_timestamp(message))
+                if (
+                    received_at_ms is None
+                    or received_at_ms
+                    < verification_requested_at_ms - VERIFICATION_REQUEST_CLOCK_SKEW_SECONDS * 1000
+                ):
+                    continue
             subject = _first_string(message, ("subject",)) or ""
             body = _first_string(message, ("messageText", "body", "preview", "snippet")) or ""
             link = extract_verification_link(
@@ -468,10 +1015,12 @@ class GmailWorker:
         reviewed_sender_patterns: Sequence[str],
         allowed_link_host_patterns: Sequence[str],
         run_id: str,
+        verification_requested_at_ms: int,
         max_age_seconds: int = 900,
         max_results: int = 10,
         prefer_link: bool = True,
         require_reviewed_sender: bool = True,
+        require_authenticated_sender: bool | None = None,
         require_reviewed_link_host: bool = True,
         consume: bool = True,
     ) -> VerificationDecision:
@@ -488,12 +1037,15 @@ class GmailWorker:
         * it must have been delivered to ``expected_recipient`` exactly, plus-tag
           aware, so another run's verification cannot be consumed;
         * its sender domain must be inside ``reviewed_sender_patterns``;
+        * by production default, Gmail must report aligned DMARC, DKIM, or SPF
+          authentication (or a validated ARC chain) for that sender;
         * a magic link must be HTTPS on a host inside ``allowed_link_host_patterns``.
 
-        When ``consume`` is set, the chosen message is reserved in the effect ledger
-        so the same message cannot be injected twice. A message already completed in
-        the ledger is skipped and the next candidate is considered, which is what
-        stops a resume loop from replaying one expired code forever.
+        When ``consume`` is set, the chosen immutable message id is reserved
+        globally for this connected Gmail account. A different run or purpose
+        therefore cannot inject the same message. A claimed message is skipped
+        and the next candidate is considered, which also stops a resume loop from
+        replaying one expired code forever.
 
         Returns a :class:`VerificationDecision`. The secret lives only in
         ``decision.resolved.secret`` as a ``SecretStr``; ``decision.resolved.evidence``
@@ -505,6 +1057,18 @@ class GmailWorker:
         if not 1 <= max_age_seconds <= MAX_VERIFICATION_AGE_SECONDS:
             raise ValueError("max_age_seconds must be between 1 second and 1 hour")
         safe_run_id = _validate_identifier(run_id, "run_id")
+        authenticated_sender_required = (
+            self._settings.gmail_verification_require_authenticated_sender
+            if require_authenticated_sender is None
+            else bool(require_authenticated_sender)
+        )
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        if (
+            not isinstance(verification_requested_at_ms, int)
+            or verification_requested_at_ms <= 0
+            or verification_requested_at_ms > now_ms + DEFAULT_CLOCK_SKEW_SECONDS * 1000
+        ):
+            raise ValueError("verification_requested_at_ms is invalid")
 
         query = gmail_freshness_query(
             now=datetime.now(UTC),
@@ -523,7 +1087,6 @@ class GmailWorker:
         candidates = tuple(
             _verification_candidate(message) for message in messages if isinstance(message, Mapping)
         )
-        now_ms = int(datetime.now(UTC).timestamp() * 1000)
         consumed: list[str] = []
         # Re-run selection after skipping an already-consumed message so a stale
         # code that is still the newest mail cannot deadlock the run.
@@ -537,9 +1100,11 @@ class GmailWorker:
                 allowed_host_patterns=tuple(allowed_link_host_patterns),
                 reviewed_sender_patterns=tuple(reviewed_sender_patterns),
                 require_reviewed_sender=require_reviewed_sender,
+                require_authenticated_sender=authenticated_sender_required,
                 require_reviewed_link_host=require_reviewed_link_host,
                 prefer_link=prefer_link,
                 consumed_message_ids=tuple(consumed),
+                verification_requested_at_ms=verification_requested_at_ms,
             )
             resolved = decision.resolved
             if resolved is None or not consume:
@@ -567,16 +1132,25 @@ class GmailWorker:
         run_id: str,
         purpose: VerificationPurpose,
     ) -> bool | None:
-        """Reserve one message as this run's verification exactly once.
+        """Reserve one message until the browser acknowledges using it.
 
         Returns ``True`` when this call owns the message, ``False`` when it was
-        already consumed (so the caller should consider an older candidate), and
+        already consumed or has an unresolved prior claim (so the caller should
+        consider an older candidate), and
         ``None`` when the ledger itself could not be used - which fails closed
         rather than allowing an unbounded number of injections of the same code.
+
+        The reservation deliberately remains pending here. The run coordinator
+        completes it only after the browser accepts the resume, releases it on a
+        definite pre-use failure, and marks it outcome-unknown when delivery may
+        have occurred. Completing during inbox fetch used to lose a valid code
+        whenever the subsequent browser RPC failed before injection.
         """
 
         evidence = resolved.evidence
-        key = f"gmail-verification:v1:{run_id}:{purpose}:{evidence.message_id}"
+        key = self._verification_claim_key(
+            message_id=evidence.message_id,
+        )
         try:
             store = self._get_effect_store()
         except PhaseUnavailableError:
@@ -595,7 +1169,41 @@ class GmailWorker:
             # A previous attempt claimed this message and never finished. Treat it
             # as spent instead of re-injecting a code of unknown status.
             return False
+        return True
+
+    @staticmethod
+    def _verification_message_id(message_id: str) -> str:
+        safe_message_id = _validate_identifier(message_id, "message_id")
+        return safe_message_id
+
+    def _verification_claim_key(self, *, message_id: str) -> str:
+        """Bind a claim globally to one connected Gmail account and message."""
+
+        account_id = self._settings.composio_gmail_connected_account_id
+        if not isinstance(account_id, str) or not account_id:
+            raise ValueError("connected Gmail account is required")
+        account_scope = hashlib.sha256(
+            f"gmail-connected-account:v1\0{account_id}".encode()
+        ).hexdigest()
+        safe_message_id = self._verification_message_id(message_id)
+        message_scope = hashlib.sha256(f"gmail-message:v1\0{safe_message_id}".encode()).hexdigest()
+        return f"gmail-verification:v2:{account_scope}:{message_scope}"
+
+    def complete_verification_claim(
+        self,
+        *,
+        run_id: str,
+        purpose: VerificationPurpose,
+        evidence: VerificationEvidence,
+    ) -> bool:
+        """Mark a reserved message used after browser resume was acknowledged."""
+
+        key = self._verification_claim_key(
+            message_id=evidence.message_id,
+        )
+        _validate_identifier(run_id, "run_id")
         try:
+            store = self._get_effect_store()
             store.complete(
                 provider="composio_gmail",
                 action="fetch_verification",
@@ -610,11 +1218,13 @@ class GmailWorker:
                     "message_id": evidence.message_id,
                     "verification_kind": evidence.verification_kind,
                     "sender_domain": evidence.sender_domain,
+                    "sender_authentication": evidence.sender_authentication,
                     "recipient_binding": evidence.recipient_binding,
                 },
             )
         except Exception:
             try:
+                store = self._get_effect_store()
                 store.mark_outcome_unknown(
                     provider="composio_gmail",
                     action="fetch_verification",
@@ -622,7 +1232,53 @@ class GmailWorker:
                 )
             except Exception:
                 pass
-            return None
+            return False
+        return True
+
+    def release_verification_claim(
+        self,
+        *,
+        run_id: str,
+        purpose: VerificationPurpose,
+        evidence: VerificationEvidence,
+    ) -> bool:
+        """Release a claim only when the secret definitely was not submitted."""
+
+        key = self._verification_claim_key(
+            message_id=evidence.message_id,
+        )
+        _validate_identifier(run_id, "run_id")
+        try:
+            self._get_effect_store().mark_failed(
+                provider="composio_gmail",
+                action="fetch_verification",
+                idempotency_key=key,
+            )
+        except Exception:
+            return False
+        return True
+
+    def mark_verification_claim_outcome_unknown(
+        self,
+        *,
+        run_id: str,
+        purpose: VerificationPurpose,
+        evidence: VerificationEvidence,
+    ) -> bool:
+        """Prevent replay when browser delivery may have happened."""
+
+        key = self._verification_claim_key(
+            message_id=evidence.message_id,
+        )
+        _validate_identifier(run_id, "run_id")
+        try:
+            self._get_effect_store().mark_outcome_unknown(
+                provider="composio_gmail",
+                action="fetch_verification",
+                idempotency_key=key,
+            )
+        except Exception:
+            return False
         return True
 
     async def reply(self, thread_id: str, body: str, idempotency_key: str) -> GmailSendResult:
@@ -636,20 +1292,40 @@ class GmailWorker:
                 reason_code="safe_reply_recipient_missing",
             )
         actual = _validate_email(recipient)
-        session_id = await self.ensure_connected()
+        request_fingerprint = _gmail_effect_request_fingerprint(
+            settings=self._settings,
+            action="reply",
+            values=(safe_thread_id, actual, body),
+        )
         store = self._get_effect_store()
         reservation = store.reserve(
             provider="composio_gmail",
             action="reply",
             idempotency_key=idempotency_key,
         )
-        if reservation.status == "completed" and reservation.receipt is not None:
-            return _send_result_from_receipt(reservation.receipt)
+        if reservation.status == "completed":
+            return _completed_gmail_effect(
+                reservation_receipt=reservation.receipt,
+                request_fingerprint=request_fingerprint,
+                capability="Composio Gmail thread reply",
+            )
         if reservation.status == "reconcile_required":
             raise ProviderOperationError(
                 capability="Composio Gmail thread reply",
                 reason_code="reconciliation_required",
             )
+        try:
+            session_id = await self.ensure_connected()
+        except Exception:
+            try:
+                store.mark_failed(
+                    provider="composio_gmail",
+                    action="reply",
+                    idempotency_key=idempotency_key,
+                )
+            except Exception:
+                pass
+            raise
         try:
             result = await asyncio.to_thread(
                 self._execute_checked,
@@ -701,7 +1377,10 @@ class GmailWorker:
                 provider="composio_gmail",
                 action="reply",
                 idempotency_key=idempotency_key,
-                receipt=_send_result_receipt(sent),
+                receipt=_send_result_receipt(
+                    sent,
+                    request_fingerprint=request_fingerprint,
+                ),
             )
         except Exception:
             try:
@@ -725,11 +1404,11 @@ class GmailWorker:
             await asyncio.to_thread(client.close)
 
     def _require_configuration(self) -> None:
-        if self._settings.composio_api_key is None:
+        if self._settings.composio_gmail_api_key is None:
             raise ConfigurationRequiredError(
                 phase=4,
                 capability="Composio Gmail connection",
-                reason_code="composio_api_key_missing",
+                reason_code="composio_gmail_api_key_missing",
             )
         if self._settings.composio_gmail_connected_account_id is None:
             raise ConfigurationRequiredError(
@@ -740,12 +1419,12 @@ class GmailWorker:
 
     def _client(self) -> Any:
         if self._sdk_client is None:
-            if self._settings.composio_api_key is None:  # pragma: no cover - guarded above
+            if self._settings.composio_gmail_api_key is None:  # pragma: no cover - guarded above
                 raise RuntimeError("Composio configuration is missing")
             module = importlib.import_module("composio")
             client_type = module.Composio
             self._sdk_client = client_type(
-                api_key=self._settings.composio_api_key.get_secret_value(),
+                api_key=self._settings.composio_gmail_api_key.get_secret_value(),
                 toolkit_versions={"gmail": GMAIL_TOOLKIT_VERSION},
                 max_retries=0,
                 allow_tracking=False,
@@ -757,7 +1436,7 @@ class GmailWorker:
     def _create_scoped_session(self) -> str:
         module = importlib.import_module("composio")
         session = self._client().sessions.create(
-            user_id=self._settings.composio_user_id,
+            user_id=self._settings.composio_gmail_user_id,
             tools={"gmail": {"enable": list(GMAIL_TOOL_ALLOWLIST)}},
             connected_accounts={"gmail": [str(self._settings.composio_gmail_connected_account_id)]},
             manage_connections=False,
@@ -876,14 +1555,17 @@ class GmailWorker:
         thread_id: str,
         payload: Mapping[str, object],
     ) -> SanitizedGmailThread:
+        """Project an untrusted provider thread without any persistence side effect."""
+
         raw_messages = _message_sequence(payload)
         sanitized: list[SanitizedGmailMessage] = []
-        credential_refs: list[str] = []
         for index, value in enumerate(raw_messages):
             message_id = (
                 _first_string(value, ("message_id", "messageId", "id")) or f"message-{index + 1}"
             )
-            sender = _first_string(value, ("sender", "from", "from_email")) or "unknown"
+            sender = (
+                _first_string(value, ("sender", "from", "fromEmail", "from_email")) or "unknown"
+            )
             recipients = _string_sequence(value, ("recipients", "to", "to_email"))
             sent_at = (
                 _first_string(value, ("sent_at", "messageTimestamp", "date", "internal_date"))
@@ -894,52 +1576,93 @@ class GmailWorker:
                 _first_string(value, ("body", "messageText", "message_body", "text", "snippet"))
                 or ""
             )
-            sanitized_body, references = self._store_and_redact_email_secrets(body)
-            credential_refs.extend(references)
+            sanitized_subject, sanitized_body = self._sanitize_email_display(subject, body)
             sanitized.append(
                 SanitizedGmailMessage(
                     message_id=_validate_identifier(message_id, "message_id"),
                     sender=redact_text(sender)[:320],
                     recipients=tuple(redact_text(item)[:320] for item in recipients),
                     sent_at=redact_text(sent_at)[:100],
-                    sanitized_subject=redact_text(subject)[:998],
-                    sanitized_body=redact_text(sanitized_body)[:100_000],
+                    sanitized_subject=sanitized_subject[:998],
+                    sanitized_body=sanitized_body[:100_000],
+                    sender_mailbox=parse_mailbox_address(sender),
+                    sender_authenticated=_message_sender_authenticated(value),
                 )
             )
         return SanitizedGmailThread(
             thread_id=thread_id,
             messages=tuple(sanitized),
-            credential_refs=tuple(credential_refs),
+            credential_refs=(),
         )
 
-    def _store_and_redact_email_secrets(self, body: str) -> tuple[str, tuple[str, ...]]:
-        references: list[str] = []
+    @staticmethod
+    def _redact_email_secrets(body: str) -> str:
+        """Redact credential-shaped lines without vaulting during a read."""
 
         def replace(match: re.Match[str]) -> str:
-            if self._secret_store is None:
-                raise ConfigurationRequiredError(
-                    phase=4,
-                    capability="Gmail credential extraction",
-                    reason_code="secret_store_missing",
-                )
             kind = match.group("kind").casefold().replace(" ", "_").replace("-", "_")
-            raw_value = match.group("value")
-            reference = self._secret_store.put(
-                app_slug="email-import",
-                kind=kind,
-                value=raw_value,
-            )
-            references.append(reference)
-            del raw_value
             return f"{match.group('kind')}: [REDACTED_SECRET:{kind}]"
 
-        return _SECRET_LINE.sub(replace, body), tuple(references)
+        return _SECRET_LINE.sub(replace, body)
+
+    @classmethod
+    def _sanitize_email_display(cls, subject: str, body: str) -> tuple[str, str]:
+        """Return display-safe mail text with credentials and one-time values removed."""
+
+        safe_subject = subject
+        safe_body = cls._redact_email_secrets(body)
+
+        # Verification links often carry their value in an opaque path segment or
+        # a provider-specific query name that the generic redactor cannot know.
+        # Remove the complete selected link before any inbox/thread projection.
+        link = extract_verification_link(subject, body)
+        if link:
+            for representation in (link, link.replace("&", "&amp;")):
+                safe_subject = safe_subject.replace(
+                    representation,
+                    "[REDACTED_VERIFICATION_LINK]",
+                )
+                safe_body = safe_body.replace(
+                    representation,
+                    "[REDACTED_VERIFICATION_LINK]",
+                )
+
+        code = extract_verification_code(subject, body)
+        if code:
+            if code.isdigit():
+                # Match both compact and the common 123-456 / 123 456 display
+                # forms without placing the value in a log or model.
+                pattern = re.compile(r"(?<!\w)" + r"[\s-]?".join(map(re.escape, code)) + r"(?!\w)")
+            else:
+                pattern = re.compile(rf"(?<!\w){re.escape(code)}(?!\w)")
+            safe_subject = pattern.sub("[REDACTED_VERIFICATION_CODE]", safe_subject)
+            safe_body = pattern.sub("[REDACTED_VERIFICATION_CODE]", safe_body)
+
+        return redact_text(safe_subject), redact_text(safe_body)
+
+    @staticmethod
+    def _extract_email_secrets(body: str) -> tuple[tuple[str, str], ...]:
+        """Extract bounded unique credentials from one already-authenticated body."""
+
+        pairs: list[tuple[str, str]] = []
+        seen_values: set[str] = set()
+        for match in _SECRET_LINE.finditer(body):
+            raw_value = match.group("value")
+            if raw_value in seen_values:
+                continue
+            seen_values.add(raw_value)
+            kind = match.group("kind").casefold().replace(" ", "_").replace("-", "_")
+            pairs.append((kind, raw_value))
+        return tuple(pairs)
 
 
 __all__ = [
     "GMAIL_TOOLKIT_VERSION",
     "GMAIL_TOOL_ALLOWLIST",
+    "GmailSignupPreflight",
+    "GmailSignupPreflightStatus",
     "GmailSendResult",
+    "GmailOutreachMessageClaim",
     "GmailWorker",
     "InboxSearchResult",
     "PhaseUnavailableError",

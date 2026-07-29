@@ -87,10 +87,14 @@ class RunCreationContext(Protocol):
     ) -> dict[str, str]: ...
 
     def _remember_reusable_login(
-        self, *, app_slug: str, values: Mapping[str, SecretStr]
+        self,
+        *,
+        app_slug: str,
+        account_ref: str,
+        values: Mapping[str, SecretStr],
     ) -> tuple[str, ...]: ...
 
-    def _reusable_login_values(self, app_slug: str) -> dict[str, SecretStr]: ...
+    def _reusable_login_values(self, app_slug: str, account_ref: str) -> dict[str, SecretStr]: ...
 
     def _record_verified_research(self, *args: Any, **kwargs: Any) -> Any: ...
 
@@ -430,16 +434,23 @@ class RunCreationService:
                     # run, reuse the ones they already authorized for this app.
                     # Without this a second run always stopped at the login form
                     # even though the credentials were known.
+                    login_account_ref = (
+                        f"acct_{browser_account_ref(request.company.work_email_ref)}"
+                    )
                     login_values: Mapping[str, SecretStr] | None = browser_login
                     login_source = "owner_supplied"
                     if not login_values and run_provider_action:
-                        remembered = service._reusable_login_values(research.app_slug)
+                        remembered = service._reusable_login_values(
+                            research.app_slug, login_account_ref
+                        )
                         if remembered:
                             login_values = remembered
                             login_source = "vault_reuse"
                     if browser_login:
                         remembered_fields = service._remember_reusable_login(
-                            app_slug=research.app_slug, values=browser_login
+                            app_slug=research.app_slug,
+                            account_ref=login_account_ref,
+                            values=browser_login,
                         )
                         if remembered_fields:
                             login_remembered_fields = remembered_fields
@@ -502,7 +513,7 @@ class RunCreationService:
                         account_ref: str | None = None
                         if is_playwright:
                             with contextlib.suppress(Exception):
-                                account_ref = browser_account_ref(request.company.work_email_ref)
+                                account_ref = login_account_ref
                         try:
                             context = asyncio.run(
                                 worker.start(

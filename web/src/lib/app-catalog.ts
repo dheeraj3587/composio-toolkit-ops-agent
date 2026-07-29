@@ -2,7 +2,11 @@
 
 import { useQuery } from "@tanstack/react-query"
 
-import type { AppCatalogResponse, AppSearchItem } from "@/lib/types"
+import type {
+  AppCapabilitiesResponse,
+  AppCatalogResponse,
+  AppSearchItem,
+} from "@/lib/types"
 
 /**
  * The verified catalog, fetched once and shared by every selector.
@@ -27,6 +31,27 @@ export function useAppCatalog() {
     // The snapshot is immutable for the life of a deployment, so refetching it
     // on every mount would be pure noise.
     staleTime: 10 * 60 * 1000,
+  })
+}
+
+export async function fetchAppCapabilities(appSlug: string): Promise<AppCapabilitiesResponse> {
+  const response = await fetch(
+    `/api/ops/apps/${encodeURIComponent(appSlug)}/capabilities`,
+    {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    },
+  )
+  if (!response.ok) throw new Error("app_capabilities_unavailable")
+  return response.json() as Promise<AppCapabilitiesResponse>
+}
+
+export function useAppCapabilities(appSlug?: string) {
+  return useQuery({
+    queryKey: ["app-capabilities", appSlug],
+    queryFn: () => fetchAppCapabilities(appSlug!),
+    enabled: Boolean(appSlug),
+    staleTime: 10 * 60 * 1_000,
   })
 }
 

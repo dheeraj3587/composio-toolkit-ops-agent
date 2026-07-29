@@ -14,7 +14,14 @@ from __future__ import annotations
 
 import re
 
-_INBOX_DOMAIN_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
+_INBOX_DOMAIN_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+)
+_INBOX_EXTRA_RE = re.compile(
+    r"^(?:in:(?:anywhere|inbox|sent|spam|trash)|has:attachment|label:[a-z0-9_-]{1,100})$",
+    re.IGNORECASE,
+)
 
 
 # Gmail's relative age operators accept ONLY d (day), m (month), and y (year).
@@ -49,13 +56,15 @@ def build_inbox_query(
     parts: list[str] = []
     if sender_domain:
         domain = sender_domain.strip().lstrip("@").rstrip(".").casefold()
-        if not _INBOX_DOMAIN_RE.match(domain):
+        if _INBOX_DOMAIN_RE.fullmatch(domain) is None:
             raise ValueError("sender_domain is not a valid domain")
         parts.append(f"from:{domain}")
     if subject:
-        cleaned = re.sub(r'[\r\n"]', " ", subject).strip()[:200]
+        cleaned = " ".join(re.sub(r'[\x00-\x1f\x7f"\\]', " ", subject).split())[:200]
         if cleaned:
-            parts.append(f"subject:({cleaned})")
+            # A quoted phrase keeps colons, braces and parentheses inside the
+            # subject term instead of letting them become Gmail operators.
+            parts.append(f'subject:"{cleaned}"')
     if newer_than:
         age = newer_than.strip().casefold()
         if not _INBOX_AGE_RE.match(age):
@@ -64,7 +73,8 @@ def build_inbox_query(
     if unread:
         parts.append("is:unread")
     if extra:
-        cleaned_extra = re.sub(r"[\r\n]", " ", extra).strip()[:200]
-        if cleaned_extra:
-            parts.append(cleaned_extra)
+        cleaned_extra = extra.strip()
+        if _INBOX_EXTRA_RE.fullmatch(cleaned_extra) is None:
+            raise ValueError("extra is not an allowlisted Gmail query clause")
+        parts.append(cleaned_extra.casefold())
     return " ".join(parts) or "in:anywhere"

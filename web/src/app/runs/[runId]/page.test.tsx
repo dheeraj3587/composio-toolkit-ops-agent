@@ -39,6 +39,10 @@ describe("RunDetailPage", () => {
         status: "route_selected",
         access_route: "self_serve",
         execution_mode: "plan_only",
+        browser_provider: "playwright",
+        credential_creation_policy: "create_if_missing",
+        phase: "route_selected",
+        account_mode: "existing_account",
         external_actions: false,
         created_at: "2026-07-23T10:00:00Z",
         updated_at: "2026-07-23T10:05:00Z",
@@ -107,8 +111,13 @@ describe("RunDetailPage", () => {
     expect(screen.getAllByText("Not Attempted").length).toBeGreaterThanOrEqual(4)
     expect(screen.queryByText("Static backend blocker.")).not.toBeInTheDocument()
     expect(screen.queryByRole("button", { name: /retry browser phase/i })).not.toBeInTheDocument()
-    expect(screen.getByText("Plan Only")).toBeInTheDocument()
-    expect(screen.getByText(/External actions · Off/)).toBeInTheDocument()
+    expect(screen.getByText("Plan only")).toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: "Planning is complete" })).toBeInTheDocument()
+    expect(screen.getByRole("progressbar", { name: "Run completion" })).toHaveAttribute(
+      "aria-valuenow",
+      "100",
+    )
+    expect(screen.queryByText(/auto-updating/i)).not.toBeInTheDocument()
     expect(screen.getByText("Access route selected.")).toBeInTheDocument()
   })
 
@@ -123,6 +132,7 @@ describe("RunDetailPage", () => {
         status: "connection_required",
         access_route: "self_serve",
         execution_mode: "execute_when_configured",
+        account_mode: "existing_account",
         browser_provider: "playwright",
         credential_creation_policy: "create_if_missing",
         recipe_version: "2026-07-28.v1",
@@ -155,11 +165,10 @@ describe("RunDetailPage", () => {
 
     render(await RunDetailPage({ params: Promise.resolve({ runId }) }))
 
-    expect(screen.getByText("Frozen route")).toBeInTheDocument()
+    expect(screen.getByText("Live run")).toBeInTheDocument()
+    expect(screen.getByText("Existing Account")).toBeInTheDocument()
     expect(screen.getByText("Managed Auth")).toBeInTheDocument()
-    expect(screen.getByText("Managed Auth Ready")).toBeInTheDocument()
-    expect(screen.getByText("2026-07-28.v1")).toBeInTheDocument()
-    expect(screen.getByText("Canonical V1")).toBeInTheDocument()
+    expect(screen.getByText("Playwright")).toBeInTheDocument()
     expect(screen.getByRole("button", { name: "Connect account" })).toBeEnabled()
     expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument()
   })

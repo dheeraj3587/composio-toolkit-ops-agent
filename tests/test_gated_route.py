@@ -19,7 +19,7 @@ from ops.gated_route import GatedRoute, GatedRoutePolicyError
 from ops.gmail_models import GmailSendResult
 from ops.gmail_worker import GmailWorker
 from ops.models import CompanyProfile, OperationsRequest
-from ops.provider_errors import ConfigurationRequiredError
+from ops.provider_errors import ConfigurationRequiredError, ProviderOperationError
 
 VENDOR = "reviewed-contact@vendor.example"
 CONTROLLED_SINK = "controlled-sink@example.test"
@@ -67,7 +67,9 @@ def _company() -> CompanyProfile:
         legal_name="Example Labs, Inc.",
         website="https://example.com",
         work_email_ref="vault://company/work_email/profile_1",
-        use_case=("Automate authorized customer support; api_key=sk-test-abcdefghijklmnopqrstuv"),
+        use_case=(
+            "Automate authorized customer support; api_key=sk-test-abcdefghijklmnopqrstuv"  # pragma: allowlist secret
+        ),
     )
 
 
@@ -127,7 +129,10 @@ def test_explicit_send_is_deterministic_and_uses_the_callers_effect_identity() -
     assert first_gmail.calls[0].recipient == VENDOR
     assert REQUEST_OVERRIDE not in first_gmail.calls[0].body
     assert "vault://" not in first_gmail.calls[0].body
-    assert "sk-test-abcdefghijklmnopqrstuv" not in first_gmail.calls[0].body
+    assert (
+        "sk-test-abcdefghijklmnopqrstuv"  # pragma: allowlist secret
+        not in first_gmail.calls[0].body
+    )
     assert "[REDACTED]" in first_gmail.calls[0].body
     assert asdict(first) == {
         "session_id": "session-safe",
@@ -233,6 +238,9 @@ class _Session:
         if slug == "GMAIL_SEND_EMAIL":
             self._sends.append(dict(arguments))
             return _Response({"message_id": "message-controlled", "thread_id": "thread-controlled"})
+        if slug == "GMAIL_REPLY_TO_THREAD":
+            self._sends.append(dict(arguments))
+            return _Response({"message_id": "reply-controlled", "thread_id": "thread-controlled"})
         raise AssertionError(f"unexpected Gmail tool: {slug}")
 
 
@@ -258,7 +266,7 @@ def _real_worker(
     allow_live: bool,
 ) -> GmailWorker:
     settings = Settings(
-        composio_api_key=SecretStr("offline-test-key"),  # pragma: allowlist secret
+        composio_gmail_api_key=SecretStr("offline-test-key"),  # pragma: allowlist secret
         composio_gmail_connected_account_id="gmail-account-test",
         outreach_recipient_override=override,
         allow_live_vendor_email=allow_live,
@@ -313,3 +321,116 @@ def test_gmail_worker_remains_the_recipient_override_and_live_email_authority(
 
     assert raised.value.reason_code == "controlled_recipient_required"
     assert blocked_sends == []
+
+
+def test_completed_outreach_replay_is_restart_safe_and_payload_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "composio",
+        types.SimpleNamespace(SESSION_PRESET_DIRECT_TOOLS="direct_tools"),
+    )
+    first_sends: list[dict[str, object]] = []
+    first_worker = _real_worker(
+        tmp_path,
+        first_sends,
+        override=CONTROLLED_SINK,
+        allow_live=False,
+    )
+    first = asyncio.run(
+        first_worker.send_outreach(
+            VENDOR,
+            "Reviewed subject",
+            "Reviewed body",
+            "run-payload-bound:gated-outreach:v1",
+        )
+    )
+    assert len(first_sends) == 1
+
+    # A fresh worker can reconstruct the completed receipt without reconnecting
+    # to Gmail, while the same logical key with a changed body fails closed.
+    replay_sends: list[dict[str, object]] = []
+    replay_worker = _real_worker(
+        tmp_path,
+        replay_sends,
+        override=CONTROLLED_SINK,
+        allow_live=False,
+    )
+    replay = asyncio.run(
+        replay_worker.send_outreach(
+            VENDOR,
+            "Reviewed subject",
+            "Reviewed body",
+            "run-payload-bound:gated-outreach:v1",
+        )
+    )
+    assert replay == first
+    assert replay_sends == []
+
+    with pytest.raises(ProviderOperationError) as mismatch:
+        asyncio.run(
+            replay_worker.send_outreach(
+                VENDOR,
+                "Reviewed subject",
+                "Changed body",
+                "run-payload-bound:gated-outreach:v1",
+            )
+        )
+    assert mismatch.value.reason_code == "idempotency_payload_mismatch"
+    assert replay_sends == []
+
+
+def test_completed_reply_replay_is_restart_safe_and_payload_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "composio",
+        types.SimpleNamespace(SESSION_PRESET_DIRECT_TOOLS="direct_tools"),
+    )
+    first_calls: list[dict[str, object]] = []
+    first_worker = _real_worker(
+        tmp_path,
+        first_calls,
+        override=CONTROLLED_SINK,
+        allow_live=False,
+    )
+    first = asyncio.run(
+        first_worker.reply(
+            "thread-controlled",
+            "Reviewed follow-up",
+            "run-payload-bound:follow-up:v1",
+        )
+    )
+    assert len(first_calls) == 1
+
+    replay_calls: list[dict[str, object]] = []
+    replay_worker = _real_worker(
+        tmp_path,
+        replay_calls,
+        override=CONTROLLED_SINK,
+        allow_live=False,
+    )
+    replay = asyncio.run(
+        replay_worker.reply(
+            "thread-controlled",
+            "Reviewed follow-up",
+            "run-payload-bound:follow-up:v1",
+        )
+    )
+    assert replay == first
+    assert replay_calls == []
+
+    with pytest.raises(ProviderOperationError) as mismatch:
+        asyncio.run(
+            replay_worker.reply(
+                "thread-controlled",
+                "Changed follow-up",
+                "run-payload-bound:follow-up:v1",
+            )
+        )
+    assert mismatch.value.reason_code == "idempotency_payload_mismatch"
+    assert replay_calls == []

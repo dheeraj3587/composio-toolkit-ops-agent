@@ -26,12 +26,12 @@ jobs:
       RUN_LIVE_TESTS: "0"
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
           cache: pip
@@ -49,6 +49,52 @@ jobs:
       - name: Run backend and security gate
         run: ./scripts/security_gate.sh backend
 
+  real-browser:
+    name: Real Chromium acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      ALLOW_LIVE_BROWSER: "false"
+      ALLOW_LIVE_VENDOR_EMAIL: "false"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      REQUIRE_REAL_BROWSER_TESTS: "1"
+      RUN_LIVE_TESTS: "0"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-providers.txt
+            requirements-dev.txt
+
+      - name: Install Python dependencies
+        run: python -m pip install --requirement requirements-dev.txt
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run real-browser acceptance suite
+        run: >-
+          pytest -q -m browser
+          --junitxml="${RUNNER_TEMP}/real-browser.xml"
+
+      - name: Assert browser suite ran with zero skips
+        if: ${{ always() }}
+        run: python scripts/assert_zero_skips.py "${RUNNER_TEMP}/real-browser.xml"
+
+      - name: Assert Chromium processes were reaped
+        if: ${{ always() }}
+        run: python scripts/assert_no_orphan_chromium.py
+
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
@@ -58,12 +104,12 @@ jobs:
       NEXT_TELEMETRY_DISABLED: "1"
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
       - name: Set up Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           cache: npm
@@ -75,3 +121,576 @@ jobs:
 
       - name: Run frontend gate
         run: ./scripts/security_gate.sh frontend
+
+  production-images:
+    name: Build production image (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: api
+            dockerfile: Dockerfile.api
+          - image: browser
+            dockerfile: Dockerfile.browser
+          - image: web
+            dockerfile: web/Dockerfile
+          - image: edge
+            dockerfile: Dockerfile.caddy
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Build ${{ matrix.image }} image without publishing
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: >-
+          docker build
+          --pull
+          --file "${{ matrix.dockerfile }}"
+          --build-arg "APP_REVISION=${GITHUB_SHA}"
+          --tag "composio-ops-${{ matrix.image }}:ci"
+          .
+
+      - name: Scan ${{ matrix.image }} image for all known high-severity vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: composio-ops-${{ matrix.image }}:ci
+          format: table
+          ignore-unfixed: false
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+  browser-container-acceptance:
+    name: Hardened browser container acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Build browser image without publishing
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: >-
+          docker build
+          --pull
+          --file Dockerfile.browser
+          --build-arg "APP_REVISION=${GITHUB_SHA}"
+          --tag composio-ops-browser:acceptance
+          .
+
+      - name: Start browser with production sandbox posture and poll readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_name="composio-browser-acceptance"
+          browser_token="$(openssl rand -hex 32)"
+          log_file="${RUNNER_TEMP}/browser-container-acceptance.log"
+          echo "::add-mask::${browser_token}"
+
+          capture_and_check_logs() {
+            exit_status=$?
+            trap - EXIT
+            set +e
+            docker logs "${container_name}" >"${log_file}" 2>&1
+            BROWSER_SERVICE_TOKEN="${browser_token}" \
+              python scripts/assert_secret_free_log.py "${log_file}"
+            scan_status=$?
+            if [ "${scan_status}" -eq 0 ] && [ "${exit_status}" -ne 0 ]; then
+              cat "${log_file}"
+            fi
+            if [ "${scan_status}" -ne 0 ]; then
+              exit_status=1
+            fi
+            exit "${exit_status}"
+          }
+          trap capture_and_check_logs EXIT
+
+          docker run --detach \
+            --name "${container_name}" \
+            --init \
+            --user ops \
+            --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g,mode=1777 \
+            --shm-size 2g \
+            --pids-limit 768 \
+            --memory 4g \
+            --cpus 2.0 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --security-opt seccomp=deploy/chromium-seccomp.json \
+            --env ALLOW_LIVE_BROWSER=true \
+            --env BROWSER_INTERACTIVE_HITL_ENABLED=true \
+            --env "BROWSER_SERVICE_TOKEN=${browser_token}" \
+            --env PLAYWRIGHT_DISABLE_SANDBOX=false \
+            --env PLAYWRIGHT_MAX_SESSIONS=2 \
+            composio-ops-browser:acceptance
+
+          ready=0
+          for attempt in $(seq 1 30); do
+            if docker exec "${container_name}" python -c \
+              'import json,sys,urllib.request; p=json.load(urllib.request.urlopen("http://127.0.0.1:8081/internal/ready", timeout=30)); sys.exit(0 if p.get("state") in ("ready","capacity_exhausted") and p.get("chromium_installed") and p.get("context_launch_ok") and p.get("janitor_running") else 1)'
+            then
+              ready=1
+              break
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' "${container_name}")" != "true" ]; then
+              break
+            fi
+            sleep 3
+          done
+
+          [ "${ready}" -eq 1 ]
+          docker inspect --format \
+            'user={{.Config.User}} ipc={{.HostConfig.IpcMode}} security={{json .HostConfig.SecurityOpt}} cap_drop={{json .HostConfig.CapDrop}}' \
+            "${container_name}"
+
+          # Acceptance means more than open ports: create a real headed
+          # Playwright session, obtain a signed view-only grant, and prove the
+          # authenticated relay reaches x11vnc by receiving its RFB greeting.
+          docker exec --interactive "${container_name}" python - <<'PY'
+          import contextlib
+          import json
+          import os
+          import pathlib
+          import secrets
+          import socket
+          import urllib.request
+          from urllib.parse import urlsplit, urlunsplit
+
+          from ops.app_recipes import get_app_recipe
+          from websockets.sync.client import connect
+
+          token = os.environ["BROWSER_SERVICE_TOKEN"]
+          owner = "ci-owner"
+
+          def call(
+              method: str,
+              path: str,
+              *,
+              capability: str,
+              body: dict[str, object] | None = None,
+          ) -> dict:
+              data = None if body is None else json.dumps(body).encode()
+              request = urllib.request.Request(
+                  f"http://127.0.0.1:8081{path}",
+                  method=method,
+                  data=data,
+                  headers={
+                      "Content-Type": "application/json",
+                      "X-Browser-Service-Token": token,
+                      "X-Browser-Session-Owner": owner,
+                      "X-Browser-Session-Capability": capability,
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+
+          recipe = get_app_recipe("pipedrive")
+          if recipe is None:
+              raise SystemExit(1)
+
+          # Both production display stacks and both server-enforced view-only
+          # listeners must be distinct and reachable before exercising them.
+          for port in (5900, 5901, 5910, 5911):
+              with socket.create_connection(("127.0.0.1", port), timeout=2):
+                  pass
+
+          sessions: list[tuple[str, str]] = []
+          try:
+              for index in range(2):
+                  capability = secrets.token_urlsafe(32)
+                  created = call(
+                      "POST",
+                      "/internal/browser/sessions",
+                      capability=capability,
+                      body={
+                          "app_slug": "pipedrive",
+                          "recipe_snapshot": recipe.model_dump(mode="json"),
+                          "secret_scope": f"ci_acceptance_{index}",
+                          "live_view_mode": "interactive_remote",
+                          "use_storage_state": False,
+                      },
+                  )
+                  session_id = str(created.get("session_id") or "")
+                  if not session_id or not created.get("interactive_available"):
+                      raise SystemExit(1)
+                  sessions.append((session_id, capability))
+              if len({session_id for session_id, _ in sessions}) != 2:
+                  raise SystemExit(1)
+
+              chromium_displays: set[str] = set()
+              for process in pathlib.Path("/proc").iterdir():
+                  if not process.name.isdigit():
+                      continue
+                  try:
+                      command = (process / "cmdline").read_bytes().lower()
+                      if b"chrome" not in command and b"chromium" not in command:
+                          continue
+                      environment = (process / "environ").read_bytes().split(b"\0")
+                  except (FileNotFoundError, PermissionError, ProcessLookupError):
+                      continue
+                  for entry in environment:
+                      if entry.startswith(b"DISPLAY="):
+                          chromium_displays.add(
+                              entry.removeprefix(b"DISPLAY=").decode("ascii")
+                          )
+              if not {":99", ":100"}.issubset(chromium_displays):
+                  raise SystemExit(1)
+
+              relay_urls: list[str] = []
+              for session_id, capability in sessions:
+                  grant = call(
+                      "POST",
+                      f"/internal/browser/sessions/{session_id}/live-view",
+                      capability=capability,
+                  )
+                  grant_url = str(grant.get("url") or "")
+                  if (
+                      grant.get("mode") != "interactive_remote"
+                      or not grant.get("view_allowed")
+                  ):
+                      raise SystemExit(1)
+                  parsed = urlsplit(grant_url)
+                  relay_urls.append(
+                      urlunsplit(("ws", "127.0.0.1:8081", parsed.path, parsed.query, ""))
+                  )
+              if len(set(relay_urls)) != 2:
+                  raise SystemExit(1)
+
+              # Keep both relays attached together. Since both browser sessions
+              # are still live, a successful RFB greeting on each proves the
+              # production default has two concurrent headed paths.
+              with contextlib.ExitStack() as stack:
+                  websockets = [
+                      stack.enter_context(
+                          connect(
+                              relay_url,
+                              additional_headers={"X-Browser-Session-Owner": owner},
+                              proxy=None,
+                              open_timeout=10,
+                          )
+                      )
+                      for relay_url in relay_urls
+                  ]
+                  for websocket in websockets:
+                      greeting = websocket.recv(timeout=10)
+                      if not isinstance(greeting, bytes) or not greeting.startswith(b"RFB "):
+                          raise SystemExit(1)
+          finally:
+              for session_id, capability in reversed(sessions):
+                  with contextlib.suppress(Exception):
+                      call(
+                          "DELETE",
+                          f"/internal/browser/sessions/{session_id}",
+                          capability=capability,
+                      )
+          PY
+
+      - name: Stop and remove acceptance container
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          docker stop --time 10 composio-browser-acceptance >/dev/null 2>&1 || true
+          docker rm --force composio-browser-acceptance >/dev/null 2>&1 || true
+
+  production-compose-smoke:
+    name: Full production Compose smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Create private synthetic production environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .env.production.example .env.production
+          python3 - <<'PY'
+          import base64
+          import pathlib
+          import secrets
+
+          path = pathlib.Path(".env.production")
+          replacements = {
+              "DOMAIN": ":80",
+              "OPS_CORS_ORIGINS": "http://127.0.0.1",
+              "OPS_AUTH_USERNAME": "ci-operator",
+              "OPS_AUTH_PASSWORD": secrets.token_urlsafe(32),
+              "OPS_AUTH_SESSION_SECRET": secrets.token_urlsafe(48),
+              "OPS_AUTH_TOTP_SECRET": base64.b32encode(
+                  secrets.token_bytes(20)
+              ).decode().rstrip("="),
+              "OPS_INTERNAL_API_TOKEN": secrets.token_urlsafe(48),
+              "BROWSER_SERVICE_TOKEN": secrets.token_urlsafe(48),
+              "BROWSER_SESSION_CAPABILITY_KEY": secrets.token_urlsafe(48),
+              "BROWSER_SECRET_BROKER_TOKEN": secrets.token_urlsafe(48),
+              "SECRET_VAULT_KEY": base64.urlsafe_b64encode(
+                  secrets.token_bytes(32)
+              ).decode(),
+              "LANGGRAPH_AES_KEY": secrets.token_hex(16),
+              "ALLOW_LIVE_BROWSER": "true",
+              "ALLOW_LIVE_VENDOR_EMAIL": "false",
+              "ALLOW_LOCAL_CREDENTIAL_SUBMISSION": "false",
+          }
+          output = []
+          replaced = set()
+          for raw_line in path.read_text(encoding="utf-8").splitlines():
+              name = raw_line.split("=", 1)[0] if "=" in raw_line else ""
+              if name in replacements:
+                  output.append(f"{name}={replacements[name]}")
+                  replaced.add(name)
+              else:
+                  output.append(raw_line)
+          if replaced != set(replacements):
+              raise SystemExit(1)
+          path.write_text("\n".join(output) + "\n", encoding="utf-8")
+          path.chmod(0o600)
+          PY
+
+      - name: Build and accept the complete production topology
+        shell: bash
+        run: |
+          set -euo pipefail
+          export APP_REVISION="${GITHUB_SHA}"
+          export OPS_DEPLOY_ACCEPTANCE_NONCE="$(
+            python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
+          )"
+          compose=(docker compose -f compose.prod.yaml --env-file .env.production)
+          log_file="${RUNNER_TEMP}/production-compose-smoke.log"
+
+          capture_check_and_cleanup() {
+            exit_status=$?
+            trap - EXIT
+            set +e
+            "${compose[@]}" logs --no-color >"${log_file}" 2>&1
+            set -a
+            . ./.env.production
+            set +a
+            python scripts/assert_secret_free_log.py "${log_file}"
+            scan_status=$?
+            if [ "${scan_status}" -eq 0 ] && [ "${exit_status}" -ne 0 ]; then
+              cat "${log_file}"
+            fi
+            if [ "${scan_status}" -ne 0 ]; then
+              exit_status=1
+            fi
+            "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+            rm -f .env.production
+            exit "${exit_status}"
+          }
+          trap capture_check_and_cleanup EXIT
+
+          "${compose[@]}" config >/dev/null
+          "${compose[@]}" build --pull
+          "${compose[@]}" up --detach --wait --wait-timeout 360
+
+          for service in api browser-worker web caddy; do
+            container_id="$("${compose[@]}" ps --quiet "${service}")"
+            [ -n "${container_id}" ]
+            expected_image="$("${compose[@]}" config --format json | python3 -c \
+              'import json,sys; print(json.load(sys.stdin)["services"][sys.argv[1]]["image"])' \
+              "${service}")"
+            expected_id="$(docker image inspect --format '{{.Id}}' "${expected_image}")"
+            actual_id="$(docker inspect --format '{{.Image}}' "${container_id}")"
+            revision="$(docker inspect --format \
+              '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+              "${container_id}")"
+            [ "${actual_id}" = "${expected_id}" ]
+            [ "${revision}" = "${GITHUB_SHA}" ]
+          done
+
+          # A healthy candidate is intentionally read-only until the exact
+          # revision-and-nonce marker is committed. Prove that a valid,
+          # internally authenticated request cannot persist even one run.
+          "${compose[@]}" exec -T api python - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          token = os.environ["OPS_INTERNAL_API_TOKEN"]
+          headers = {
+              "Content-Type": "application/json",
+              "X-Ops-Internal-Token": token,
+          }
+          payload = {
+              "app_name": "HubSpot",
+              "account_mode": "existing_account",
+              "company": {
+                  "legal_name": "CI Acceptance",
+                  "website": "https://example.test",
+                  "work_email_ref": "vault://company/work_email/ci-operator",
+                  "use_case": "Verify the accepted production control plane.",
+                  "callback_urls": ["https://example.test/oauth/callback"],
+              },
+              "requested_scope_policy": "maximum",
+              "execution_mode": "plan_only",
+              "browser_provider": "playwright",
+              "credential_creation_policy": "reuse_only",
+              "dry_run": True,
+          }
+
+          def call(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+              request = urllib.request.Request(
+                  f"http://127.0.0.1:8000{path}",
+                  method=method,
+                  data=None if body is None else json.dumps(body).encode(),
+                  headers=headers,
+              )
+              opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+              try:
+                  with opener.open(request, timeout=20) as response:
+                      return response.status, json.load(response)
+              except urllib.error.HTTPError as error:
+                  with error:
+                      return error.code, json.load(error)
+
+          status, before = call("GET", "/api/runs")
+          if status != 200 or before.get("total") != 0:
+              raise SystemExit(1)
+          status, blocked = call("POST", "/api/runs", payload)
+          if (
+              status != 503
+              or blocked.get("error") != "deployment_not_accepted"
+          ):
+              raise SystemExit(1)
+          status, after = call("GET", "/api/runs")
+          if status != 200 or after.get("total") != 0:
+              raise SystemExit(1)
+          PY
+
+          [ "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --max-time 20 http://127.0.0.1/healthz)" = "200" ]
+          [ "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --max-time 20 http://127.0.0.1/login)" = "200" ]
+          redirect="$(curl --silent --output /dev/null \
+            --write-out '%{http_code} %{redirect_url}' \
+            --max-time 20 http://127.0.0.1/system)"
+          case "${redirect}" in
+            302\ http://127.0.0.1/login*|303\ http://127.0.0.1/login*|\
+            307\ http://127.0.0.1/login*|308\ http://127.0.0.1/login*) ;;
+            *) exit 1 ;;
+          esac
+
+          # Commit acceptance only after the complete candidate and public auth
+          # boundary pass. Then create a plan-only run and prove it survives an
+          # API process restart; no provider or browser action is authorized.
+          "${compose[@]}" exec -T api python - <<'PY'
+          from ops.config import Settings
+          from ops.deploy_acceptance import (
+              deployment_is_accepted,
+              write_deployment_acceptance_marker,
+          )
+
+          settings = Settings.from_env(dotenv_path=None)
+          write_deployment_acceptance_marker(settings)
+          if not deployment_is_accepted(settings):
+              raise SystemExit(1)
+          PY
+
+          run_id="$("${compose[@]}" exec -T api python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          payload = {
+              "app_name": "HubSpot",
+              "account_mode": "existing_account",
+              "company": {
+                  "legal_name": "CI Acceptance",
+                  "website": "https://example.test",
+                  "work_email_ref": "vault://company/work_email/ci-operator",
+                  "use_case": "Verify the accepted production control plane.",
+                  "callback_urls": ["https://example.test/oauth/callback"],
+              },
+              "requested_scope_policy": "maximum",
+              "execution_mode": "plan_only",
+              "browser_provider": "playwright",
+              "credential_creation_policy": "reuse_only",
+              "dry_run": True,
+          }
+          request = urllib.request.Request(
+              "http://127.0.0.1:8000/api/runs",
+              method="POST",
+              data=json.dumps(payload).encode(),
+              headers={
+                  "Content-Type": "application/json",
+                  "X-Ops-Internal-Token": os.environ["OPS_INTERNAL_API_TOKEN"],
+              },
+          )
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+          with opener.open(request, timeout=30) as response:
+              if response.status != 201:
+                  raise SystemExit(1)
+              body = json.load(response)
+          run = body.get("run") or {}
+          run_id = run.get("run_id")
+          if (
+              not isinstance(run_id, str)
+              or not run_id.startswith("run_")
+              or run.get("external_actions") is not False
+          ):
+              raise SystemExit(1)
+          print(run_id)
+          PY
+          )"
+          [[ "${run_id}" =~ ^run_[A-Za-z0-9_-]+$ ]]
+
+          "${compose[@]}" restart api
+          api_healthy=0
+          for attempt in $(seq 1 60); do
+            api_id="$("${compose[@]}" ps --quiet api)"
+            api_health="$(docker inspect --format \
+              '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+              "${api_id}" 2>/dev/null || true)"
+            if [ "${api_health}" = "healthy" ]; then
+              api_healthy=1
+              break
+            fi
+            sleep 3
+          done
+          [ "${api_healthy}" -eq 1 ]
+
+          "${compose[@]}" exec -T api python - "${run_id}" <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          run_id = sys.argv[1]
+          request = urllib.request.Request(
+              f"http://127.0.0.1:8000/api/runs/{run_id}",
+              headers={"X-Ops-Internal-Token": os.environ["OPS_INTERNAL_API_TOKEN"]},
+          )
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+          with opener.open(request, timeout=20) as response:
+              if response.status != 200:
+                  raise SystemExit(1)
+              body = json.load(response)
+          run = body.get("run") or {}
+          if run.get("run_id") != run_id or run.get("external_actions") is not False:
+              raise SystemExit(1)
+          PY
+
+          # Exercise the real quiesce/archive/restart path and require the
+          # restore helper to decrypt every archived state class with the
+          # synthetic production keys. The dry-run changes no volume.
+          recovery_dir="${RUNNER_TEMP}/production-recovery-smoke"
+          mkdir -m 0700 "${recovery_dir}"
+          ./scripts/backup-production-data.sh "${recovery_dir}"
+          mapfile -t recovery_archives < <(
+            find "${recovery_dir}" -maxdepth 1 -type f \
+              -name 'production-state-*.tar.gz' -print
+          )
+          [ "${#recovery_archives[@]}" -eq 1 ]
+          ./scripts/restore-production-data.sh --dry-run "${recovery_archives[0]}"

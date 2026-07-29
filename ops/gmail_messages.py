@@ -28,6 +28,7 @@ from ops.email_verification import (
     extract_verification_code,
     extract_verification_link,
     parse_received_at_ms,
+    sender_authentication_method,
     sender_domain_of,
 )
 from ops.provider_errors import ProviderContractError
@@ -143,6 +144,64 @@ def _message_recipients(message: Mapping[str, object]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
+def _message_header_values(
+    message: Mapping[str, object],
+    name: str,
+) -> tuple[str, ...]:
+    """Collect one RFC header across the provider's known payload shapes."""
+
+    normalized_name = name.casefold()
+    key_aliases = {
+        "authentication-results": (
+            "Authentication-Results",
+            "authentication-results",
+            "authentication_results",
+            "authenticationResults",
+        ),
+        "arc-authentication-results": (
+            "ARC-Authentication-Results",
+            "arc-authentication-results",
+            "arc_authentication_results",
+            "arcAuthenticationResults",
+        ),
+        "arc-seal": (
+            "ARC-Seal",
+            "arc-seal",
+            "arc_seal",
+            "arcSeal",
+        ),
+    }.get(normalized_name, (name,))
+    values: list[str] = []
+    for key in key_aliases:
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            values.append(value)
+        elif isinstance(value, (list, tuple)):
+            values.extend(item for item in value if isinstance(item, str) and item.strip())
+    for container in (message, message.get("payload")):
+        if not isinstance(container, Mapping):
+            continue
+        headers = container.get("headers")
+        if isinstance(headers, Mapping):
+            for key, value in headers.items():
+                if str(key).casefold() != normalized_name:
+                    continue
+                if isinstance(value, str) and value.strip():
+                    values.append(value)
+                elif isinstance(value, (list, tuple)):
+                    values.extend(item for item in value if isinstance(item, str) and item.strip())
+        elif isinstance(headers, list):
+            for header in headers:
+                if not isinstance(header, Mapping):
+                    continue
+                if str(header.get("name") or "").casefold() != normalized_name:
+                    continue
+                value = header.get("value")
+                if isinstance(value, str) and value.strip():
+                    values.append(value)
+    return tuple(dict.fromkeys(values))
+
+
 def _within_age(
     message: Mapping[str, object],
     *,
@@ -185,7 +244,24 @@ def _verification_candidate(message: Mapping[str, object]) -> VerificationCandid
         ),
         subject=_first_string(message, ("subject",)) or "",
         body=_first_string(message, ("messageText", "body", "preview", "snippet")) or "",
+        authentication_results=_message_header_values(message, "Authentication-Results"),
+        arc_authentication_results=_message_header_values(
+            message,
+            "ARC-Authentication-Results",
+        ),
+        arc_seals=_message_header_values(message, "ARC-Seal"),
     )
+
+
+def _message_sender_authenticated(message: Mapping[str, object]) -> bool:
+    """Whether Gmail supplied aligned sender-authentication evidence."""
+
+    candidate = _verification_candidate(message)
+    method, _reason = sender_authentication_method(
+        candidate,
+        sender_domain=sender_domain_of(candidate.sender),
+    )
+    return method != "none"
 
 
 _TIMESTAMP_KEYS = ("internalDate", "internal_date", "messageTimestamp", "sent_at", "date")

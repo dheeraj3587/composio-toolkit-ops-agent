@@ -47,10 +47,9 @@ LOGIN_HITL_ACTIONS = frozenset({"login_required"})
 # Terminal run statuses: no browser mutation is legal from any of them.
 TERMINAL_RUN_STATUSES = frozenset({"completed", "blocked", "failed"})
 
-# The API exposes no OTP submission field today (``ResumeRequest`` carries only
-# ``browser_login``), so an email_otp gate still needs a human in the live view.
-# This flag flips to True in the same change that adds that surface, never before.
-OTP_SUBMISSION_SUPPORTED = False
+# ``ResumeRequest.browser_verification`` carries a one-time code or reviewed HTTPS
+# magic link through the transient browser boundary. It remains owner-policy gated.
+OTP_SUBMISSION_SUPPORTED = True
 
 
 def resolve_provider(
@@ -139,7 +138,12 @@ def project_browser_ui(
 
     can_resume = bool(mutations_allowed and lifecycle == "waiting_for_hitl" and _resumable(hitl))
     action_type = hitl.action_type if hitl is not None else ""
-    can_submit_otp = bool(can_resume and action_type == "email_otp" and OTP_SUBMISSION_SUPPORTED)
+    can_submit_otp = bool(
+        can_resume
+        and action_type == "email_otp"
+        and OTP_SUBMISSION_SUPPORTED
+        and bool(getattr(settings, "allow_local_credential_submission", False))
+    )
     # Rule 7: an explicit backend requirement — a reviewed HITL gate the owner can
     # clear with credentials — plus the owner-action policy the endpoint enforces.
     can_submit_login = bool(

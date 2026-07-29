@@ -17,6 +17,7 @@ from ops.models import validate_vault_reference
 
 SessionLifecycle = Literal["ACTIVE", "CLOSING", "CLOSED"]
 LiveViewMode = Literal["screenshot", "interactive_remote"]
+_BROKER_GRANT_PATTERN = re.compile(r"^bsg_[A-Za-z0-9_-]{43}$")
 
 # Health states for the Playwright provider path (no Browser Use wording).
 ProviderHealthState = Literal[
@@ -59,9 +60,10 @@ class CreateSessionRequest(_Strict):
     def _storage_state_requires_account_binding(self) -> CreateSessionRequest:
         if self.use_storage_state and not self.account_ref:
             raise ValueError("storage state requires an account reference")
-        if self.account_ref is not None and re.fullmatch(
-            r"[A-Za-z0-9][A-Za-z0-9_-]{0,199}", self.account_ref
-        ) is None:
+        if (
+            self.account_ref is not None
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,199}", self.account_ref) is None
+        ):
             raise ValueError("account reference is invalid")
         return self
 
@@ -82,6 +84,14 @@ class ReconcileSessionsResponse(_Strict):
     """Opaque service session ids matching one exact start binding."""
 
     session_ids: tuple[str, ...] = ()
+
+
+class DrainStatus(_Strict):
+    """Minimal release-drain state; intentionally contains no session metadata."""
+
+    accepting_new_sessions: bool
+    capacity_in_use: int
+    capacity_total: int
 
 
 class SessionSummary(_Strict):
@@ -120,10 +130,31 @@ class NavigateRequest(_Strict):
     recipe_snapshot: dict[str, object] | None = None
     # Vault REFERENCES only — never raw credential values.
     credential_refs: dict[str, str] = Field(default_factory=dict)
+    # One durable, exact broker grant per reference. The sets must match so the
+    # worker cannot redeem an unreserved reference or substitute a different one.
+    secret_grants: dict[str, str] = Field(default_factory=dict)
     # Explicit local intent. The service never infers account existence from a
     # page, research content, or a model response.
     account_creation_requested: bool = False
+    # Strictly approved non-secret OperationsRequest projections. Raw credentials
+    # remain vault references in ``credential_refs``.
+    signup_fields: dict[str, str] = Field(default_factory=dict)
     credential_creation_policy: Literal["reuse_only", "create_if_missing"] = "reuse_only"
+
+    @field_validator("signup_fields")
+    @classmethod
+    def _approved_signup_fields(cls, values: dict[str, str]) -> dict[str, str]:
+        from ops.browser_signup import normalize_signup_fields
+
+        return normalize_signup_fields(values)
+
+    @model_validator(mode="after")
+    def _exact_secret_grants(self) -> NavigateRequest:
+        if set(self.secret_grants) != set(self.credential_refs) or any(
+            _BROKER_GRANT_PATTERN.fullmatch(grant) is None for grant in self.secret_grants.values()
+        ):
+            raise ValueError("every credential reference requires one exact broker grant")
+        return self
 
 
 class ResumeRequest(_Strict):
@@ -133,7 +164,25 @@ class ResumeRequest(_Strict):
     research: dict[str, object] | None = None
     recipe_snapshot: dict[str, object] | None = None
     credential_refs: dict[str, str] = Field(default_factory=dict)
+    secret_grants: dict[str, str] = Field(default_factory=dict)
+    account_creation_requested: bool = False
+    signup_fields: dict[str, str] = Field(default_factory=dict)
     credential_creation_policy: Literal["reuse_only", "create_if_missing"] = "reuse_only"
+
+    @field_validator("signup_fields")
+    @classmethod
+    def _approved_signup_fields(cls, values: dict[str, str]) -> dict[str, str]:
+        from ops.browser_signup import normalize_signup_fields
+
+        return normalize_signup_fields(values)
+
+    @model_validator(mode="after")
+    def _exact_secret_grants(self) -> ResumeRequest:
+        if set(self.secret_grants) != set(self.credential_refs) or any(
+            _BROKER_GRANT_PATTERN.fullmatch(grant) is None for grant in self.secret_grants.values()
+        ):
+            raise ValueError("every credential reference requires one exact broker grant")
+        return self
 
 
 class ObservationResponse(_Strict):
@@ -153,7 +202,7 @@ class ObservationResponse(_Strict):
 
 
 class CaptureCredentialsResponse(_Strict):
-    """Reference-only result of deterministic service-local capture.
+    """Reference-only result of deterministic broker-backed capture.
 
     A credential value has no representable field in this contract. Validation
     also prevents a malformed/raw value from escaping if a worker implementation
@@ -177,6 +226,12 @@ class CaptureCredentialsRequest(_Strict):
     """Creation-time recipe needed for selector-bound deterministic capture."""
 
     recipe_snapshot: dict[str, object] | None = None
+    broker_grant: str = Field(
+        min_length=47,
+        max_length=47,
+        pattern=r"^bsg_[A-Za-z0-9_-]{43}$",
+        repr=False,
+    )
 
 
 class LiveViewGrant(_Strict):
@@ -230,6 +285,7 @@ class ErrorResponse(_Strict):
 __all__ = [
     "CaptureCredentialsResponse",
     "CreateSessionRequest",
+    "DrainStatus",
     "ErrorResponse",
     "HealthResponse",
     "LiveViewGrant",

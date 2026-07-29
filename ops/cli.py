@@ -563,6 +563,7 @@ def main(argv: list[str] | None = None) -> int:
             request = OperationsRequest(
                 app_name=args.app_name,
                 company=_default_company(args),
+                account_mode="existing_account",
                 requested_scope_policy=args.scope_policy,
                 browser_provider=args.browser_provider,
                 credential_creation_policy=args.credential_creation_policy,

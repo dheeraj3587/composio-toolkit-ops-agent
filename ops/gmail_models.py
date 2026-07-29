@@ -15,7 +15,8 @@ is the difference between one message per vendor and a duplicate storm.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,13 @@ class SanitizedGmailMessage:
     sent_at: str
     sanitized_subject: str
     sanitized_body: str
+    # Parsed from the RFC From header before display-name redaction. It is safe
+    # routing metadata, not a credential, and is the only sender identity callers
+    # may compare for authorization.
+    sender_mailbox: str | None = None
+    # Gmail-authored, aligned DMARC/DKIM/SPF/ARC result.  This boolean is safe to
+    # project; raw Authentication-Results headers never leave the worker.
+    sender_authenticated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +50,16 @@ class SanitizedGmailThread:
     thread_id: str
     messages: tuple[SanitizedGmailMessage, ...]
     credential_refs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class GmailOutreachMessageClaim:
+    """Lease-backed claim for one authenticated inbound outreach message."""
+
+    status: Literal["acquired", "busy", "completed"]
+    message_id: str
+    credential_refs: tuple[tuple[str, str], ...] = ()
+    claim_token: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,24 +75,29 @@ class InboxSearchResult:
     has_attachments: bool
 
 
-def _send_result_receipt(result: GmailSendResult) -> dict[str, str]:
+def _send_result_receipt(
+    result: GmailSendResult,
+    *,
+    request_fingerprint: str,
+) -> dict[str, str]:
     return {
         "session_id": result.session_id,
         "thread_id": result.thread_id,
         "message_id": result.message_id,
         "intended_recipient": result.intended_recipient,
         "actual_recipient": result.actual_recipient,
+        "request_fingerprint": request_fingerprint,
     }
 
 
 def _send_result_from_receipt(receipt: Mapping[str, str]) -> GmailSendResult:
-    required = {
+    result_fields = {
         "session_id",
         "thread_id",
         "message_id",
         "intended_recipient",
         "actual_recipient",
     }
-    if set(receipt) != required:
+    if set(receipt) != result_fields | {"request_fingerprint"}:
         raise RuntimeError("stored Gmail effect receipt is invalid")
-    return GmailSendResult(**receipt)
+    return GmailSendResult(**{field: receipt[field] for field in result_fields})

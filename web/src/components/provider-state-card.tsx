@@ -8,7 +8,7 @@ import type { ProviderStatus } from "@/lib/types"
 // ---------------------------------------------------------------------------
 
 const PROVIDER_TITLES: Record<string, string> = {
-  langgraph: "Legacy checkpoint reader",
+  langgraph: "Legacy checkpoint configuration",
   vault: "Secret vault",
   perplexity: "Perplexity search",
   gemini: "Gemini extraction",
@@ -18,7 +18,8 @@ const PROVIDER_TITLES: Record<string, string> = {
 }
 
 const PROVIDER_DESCRIPTIONS: Record<string, string> = {
-  langgraph: "Encrypted checkpoint compatibility for read-only legacy runs.",
+  langgraph:
+    "Reserved compatibility configuration only. Canonical production runs use ordinary SQLite and do not initialize a legacy checkpoint reader.",
   vault: "Fernet-encrypted credential vault for reference-only storage.",
   perplexity: "Bounded official-document discovery via Perplexity search API.",
   gemini: "Structured extraction against fetched official evidence.",
@@ -55,14 +56,20 @@ function policyFact(provider: string, status: string): string {
   return "No policy gate"
 }
 
-function verificationFact(status: string): string {
+function verificationFact(provider: string, status: string): string {
+  if (provider === "langgraph") return "Not part of canonical runtime"
   if (status === "ready") return "Runtime initialized"
   if (status === "configured_not_verified") return "Awaiting run evidence"
   if (status === "disabled") return "Not applicable"
   return "Not reported"
 }
 
-function evidenceFact(evidenceScope: "system" | "run", status: string): string {
+function evidenceFact(
+  provider: string,
+  evidenceScope: "system" | "run",
+  status: string,
+): string {
+  if (provider === "langgraph") return "Key presence only; reader wiring not reported"
   if (status === "ready" && evidenceScope === "run") return "Runtime wiring plus run timeline"
   return evidenceScope === "system"
     ? "System configuration/policy only"
@@ -70,6 +77,9 @@ function evidenceFact(evidenceScope: "system" | "run", status: string): string {
 }
 
 function providerExplanation(provider: ProviderStatus): string {
+  if (provider.provider === "langgraph") {
+    return "A configured key does not prove checkpoint data, encryption activity, or reader wiring."
+  }
   if (provider.status === "configured_not_verified") {
     return "Configuration is present. Execute-mode evidence will promote this capability to Ready when its runtime adapter is initialized."
   }
@@ -102,8 +112,8 @@ export function ProviderStateCard({
   const facts = [
     ["Configuration", configurationFact(provider.status)],
     ["Policy", policyFact(provider.provider, provider.status)],
-    ["Readiness", verificationFact(provider.status)],
-    ["Evidence source", evidenceFact(evidenceScope, provider.status)],
+    ["Readiness", verificationFact(provider.provider, provider.status)],
+    ["Evidence source", evidenceFact(provider.provider, evidenceScope, provider.status)],
   ] as const
 
   return (

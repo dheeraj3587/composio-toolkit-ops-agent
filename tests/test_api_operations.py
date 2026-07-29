@@ -15,6 +15,7 @@ from api.models import CreateRunRequest
 def _payload(app_name: str = "HubSpot") -> dict[str, object]:
     return {
         "app_name": app_name,
+        "account_mode": "existing_account",
         "company": {
             "legal_name": "Example Company",
             "website": "https://example.test",
@@ -53,23 +54,37 @@ def test_app_research_response_includes_explicit_nullable_fields(tmp_path: Path)
 
     assert response.status_code == 200
     research = response.json()["research"]
-    for field in {
+    nullable_fields = {
         "api_available",
         "api_base_url",
         "authorization_url",
         "token_url",
         "developer_portal_url",
         "signup_url",
-        "production_approval_required",
         "contact_email",
         "contact_url",
-    }:
+    }
+    for field in nullable_fields:
         assert field in research
         assert research[field] is None
+    assert research["production_approval_required"] is False
+
+
+def test_signup_capability_comes_from_reviewed_recipe_not_snapshot(tmp_path: Path) -> None:
+    application = create_app(db_path=tmp_path / "private" / "ops.db")
+    with TestClient(application) as client:
+        complete = client.get("/api/apps/pipedrive/research")
+        entry_only = client.get("/api/apps/telegram/research")
+
+    assert complete.status_code == 200
+    assert complete.json()["research"]["signup_url"] == "https://www.pipedrive.com/en/register"
+    assert entry_only.status_code == 200
+    assert entry_only.json()["research"]["signup_url"] is None
 
 
 def test_api_routes_require_internal_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OPS_INTERNAL_API_TOKEN", "expected-internal-token")
+    expected_token = "expected-internal-token-" + ("i" * 32)
+    monkeypatch.setenv("OPS_INTERNAL_API_TOKEN", expected_token)
     application = create_app(db_path=tmp_path / "private" / "ops.db")
     with TestClient(application) as client:
         client.headers.pop("X-Ops-Internal-Token", None)
@@ -80,7 +95,7 @@ def test_api_routes_require_internal_token(tmp_path: Path, monkeypatch: pytest.M
         )
         valid = client.get(
             "/api/system/health",
-            headers={"X-Ops-Internal-Token": "expected-internal-token"},
+            headers={"X-Ops-Internal-Token": expected_token},
         )
 
     assert missing.status_code == 401
@@ -90,6 +105,35 @@ def test_api_routes_require_internal_token(tmp_path: Path, monkeypatch: pytest.M
         "error": "unauthorized",
         "message": "Internal API token is required.",
     }
+
+
+def test_weak_internal_token_fails_before_the_service_is_called(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Service:
+        called = False
+
+        async def startup(self) -> None:
+            return None
+
+        async def shutdown(self) -> None:
+            return None
+
+        async def health(self) -> object:
+            self.called = True
+            raise AssertionError("weak authentication reached the service")
+
+    service = Service()
+    monkeypatch.setenv("OPS_INTERNAL_API_TOKEN", "weak-token")
+    with TestClient(create_app(service=service)) as client:  # type: ignore[arg-type]
+        response = client.get(
+            "/api/system/health",
+            headers={"X-Ops-Internal-Token": "weak-token"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "internal_api_unavailable"
+    assert service.called is False
 
 
 def test_run_detail_explains_route_and_configuration_without_claiming_success(
@@ -181,6 +225,7 @@ def _request_payload(**overrides: object) -> dict[str, object]:
 
     payload: dict[str, object] = {
         "app_name": "HubSpot",
+        "account_mode": "existing_account",
         "company": {
             "legal_name": "Example Company",
             "website": "https://example.test",
@@ -305,6 +350,49 @@ def test_execute_when_configured_via_api_waits_for_managed_connection_without_ke
     assert run["external_actions"] is False
 
 
+def test_invalid_managed_auth_callback_disables_api_action_and_provider_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pydantic import SecretStr
+
+    from api.service import LocalRunService
+    from ops.config import Settings
+
+    settings = Settings(
+        composio_api_key=SecretStr("unit-test-composio-key"),  # pragma: allowlist secret
+        managed_auth_callback_base_url="http://127.0.0.1",
+        provider_effects_db_path=tmp_path / "private" / "provider-effects.db",
+    )
+    monkeypatch.setenv("ALLOW_LOCAL_CREDENTIAL_SUBMISSION", "true")
+    service = LocalRunService(
+        db_path=tmp_path / "private" / "ops.db",
+        settings=settings,
+    )
+    application = create_app(service=service)
+    with TestClient(application) as client:
+        created = client.post(
+            "/api/runs",
+            json=_request_payload(execution_mode="execute_when_configured"),
+        )
+        run_id = created.json()["run"]["run_id"]
+        connect = client.post(f"/api/runs/{run_id}/connect")
+
+    assert created.status_code == 201
+    body = created.json()
+    assert body["primary_action"] == {
+        "kind": "connect_account",
+        "enabled": False,
+        "reason_code": "composio_managed_auth_not_configured",
+    }
+    managed = next(
+        item for item in body["provider_states"] if item["provider"] == "composio_managed_auth"
+    )
+    assert managed["status"] == "not_configured"
+    assert connect.status_code == 409
+    assert connect.json()["reason_code"] == "composio_managed_auth_not_configured"
+
+
 def test_execute_when_configured_does_not_put_langgraph_on_the_new_run_path(
     tmp_path: Path,
 ) -> None:
@@ -327,11 +415,15 @@ def test_execute_when_configured_does_not_put_langgraph_on_the_new_run_path(
 
     assert response.status_code == 201
     run = response.json()["run"]
+    security = response.json()["security"]
     assert run["execution_mode"] == "execute_when_configured"
     assert run["state_engine"] == "canonical_v1"
     assert run["status"] == "connection_required"
     assert run["status"] != "accepted"
     assert run["external_actions"] is False
+    assert security["operational_state_storage"] == "sqlite_not_app_encrypted"
+    assert "checkpoint_encryption" not in security
+    assert any("not application-layer encrypted" in note for note in security["notes"])
     assert not settings.checkpoint_db_path.exists()
 
 
@@ -347,9 +439,13 @@ def test_run_conflict_is_mapped_to_http_409(
         run_id = created["run"]["run_id"]
 
         async def _raise_conflict(
-            target_run_id: str, *, browser_login: object = None, signal: str = "completed"
+            target_run_id: str,
+            *,
+            browser_login: object = None,
+            browser_verification: object = None,
+            signal: str = "completed",
         ) -> object:
-            del browser_login, signal
+            del browser_login, browser_verification, signal
             raise RunConflictError(target_run_id, "resume")
 
         monkeypatch.setattr(application.state.run_service, "resume", _raise_conflict)

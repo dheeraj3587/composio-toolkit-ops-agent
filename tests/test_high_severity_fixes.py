@@ -32,19 +32,19 @@ def test_browser_cost_cap_defaults_high() -> None:
     assert settings.browser_use_max_cost_usd == 50.0
 
 
-# ---- H10: SecurityState reports checkpoint encryption ------------------------
-def test_security_state_has_checkpoint_encryption_field() -> None:
-    assert "checkpoint_encryption" in SecurityState.model_fields
+# ---- H10: SecurityState reports the actual state-storage boundary -------------
+def test_security_state_reports_ordinary_sqlite_without_checkpoint_readiness() -> None:
+    assert "checkpoint_encryption" not in SecurityState.model_fields
+    assert "operational_state_storage" in SecurityState.model_fields
     state = SecurityState(owner_only_storage="verified_owner_only")
-    assert state.checkpoint_encryption == "not_configured"
-    ready = SecurityState(owner_only_storage="verified_owner_only", checkpoint_encryption="ready")
-    assert ready.checkpoint_encryption == "ready"
+    assert state.operational_state_storage == "sqlite_not_app_encrypted"
 
 
 # ---- H1: GmailWorker is wired with the secret store + effect ledger ----------
 def test_gmail_worker_is_wired_with_secret_store(tmp_path: Path) -> None:
     settings = Settings(
         composio_api_key=SecretStr("test-key"),  # pragma: allowlist secret
+        composio_gmail_api_key=SecretStr("test-gmail-key"),  # pragma: allowlist secret
         composio_gmail_connected_account_id="gmail-acct-1",
         outreach_recipient_override="controlled@example.test",
         provider_effects_db_path=tmp_path / "effects.db",

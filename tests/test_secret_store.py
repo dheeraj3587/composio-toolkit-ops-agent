@@ -130,6 +130,83 @@ class TestTransientSecrets:
             )
         assert excinfo.value.reason_code == "browser_secret_not_found"
 
+    def test_generic_reader_cannot_bypass_transient_scope_or_consumption(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+        ref = store.put_transient(
+            app_slug="pipedrive",
+            kind="browser_login_login_password",
+            scope_id="run-123",
+            value="one-time-browser-secret",
+        )
+
+        with pytest.raises(SecretNotFoundError):
+            store.get(ref)
+
+        assert (
+            store.consume_transient(
+                ref,
+                expected_app_slug="pipedrive",
+                expected_kind="browser_login_login_password",
+                expected_scope_id="run-123",
+            )
+            == "one-time-browser-secret"
+        )
+
+    def test_generic_delete_cannot_revoke_a_transient_reference(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+        ref = store.put_transient(
+            app_slug="pipedrive",
+            kind="browser_login_login_password",
+            scope_id="run-123",
+            value="one-time-browser-secret",
+        )
+
+        with pytest.raises(SecretNotFoundError):
+            store.delete(ref)
+
+        assert (
+            store.consume_transient(
+                ref,
+                expected_app_slug="pipedrive",
+                expected_kind="browser_login_login_password",
+                expected_scope_id="run-123",
+            )
+            == "one-time-browser-secret"
+        )
+
+    def test_transient_rollback_delete_requires_complete_binding(self, tmp_path) -> None:
+        from ops.secret_store import TransientSecretError
+
+        store = self._store(tmp_path)
+        ref = store.put_transient(
+            app_slug="pipedrive",
+            kind="browser_login_login_password",
+            scope_id="run-123",
+            value="one-time-browser-secret",
+        )
+
+        with pytest.raises(TransientSecretError):
+            store.delete_transient(
+                ref,
+                expected_app_slug="pipedrive",
+                expected_kind="browser_login_login_password",
+                expected_scope_id="another-run",
+            )
+        store.delete_transient(
+            ref,
+            expected_app_slug="pipedrive",
+            expected_kind="browser_login_login_password",
+            expected_scope_id="run-123",
+        )
+        with pytest.raises(TransientSecretError) as excinfo:
+            store.consume_transient(
+                ref,
+                expected_app_slug="pipedrive",
+                expected_kind="browser_login_login_password",
+                expected_scope_id="run-123",
+            )
+        assert excinfo.value.reason_code == "browser_secret_not_found"
+
     def test_wrong_app_is_refused(self, tmp_path) -> None:
         from ops.secret_store import TransientSecretError
 

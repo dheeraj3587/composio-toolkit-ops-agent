@@ -4,9 +4,9 @@
 #                              ├─ /healthz       ─▶ static 200
 #                              └─ authenticated  ─▶ web  (Next.js UI + route handlers)
 #
-# Only the reverse proxy publishes ports. The api (8000) and web (3000) services
-# are reachable only on the private "opsnet" network. Secrets are provided at
-# runtime through .env.production and are never baked into images.
+# Only the reverse proxy publishes ports. API, web, and browser control traffic
+# use private service networks. Secrets are provided at runtime through
+# .env.production and are never baked into images.
 #
 # Verify (no deploy):
 #   docker compose -f compose.prod.yaml --env-file .env.production.example config
@@ -17,14 +17,23 @@
 
 name: composio-ops-prod
 
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: ${CONTAINER_LOG_MAX_SIZE:-10m}
+    max-file: "${CONTAINER_LOG_MAX_FILES:-5}"
+
 services:
   api:
     init: true
+    image: composio-ops-api:${APP_REVISION:-local-uncommitted}
     build:
       context: .
       dockerfile: Dockerfile.api
       args:
         APP_REVISION: ${APP_REVISION:-local-uncommitted}
+    mem_limit: ${API_MEM_LIMIT:-1536m}
+    cpus: ${API_CPUS:-1.0}
     # Provider keys, vault/AES keys, Composio identifiers and CORS origins are
     # supplied from the untracked .env.production file. Marked not-required so
     # `docker compose config` can be validated with the example env file.
@@ -39,6 +48,21 @@ services:
     environment:
       ALLOW_LIVE_VENDOR_EMAIL: ${ALLOW_LIVE_VENDOR_EMAIL:-false}
       ALLOW_LIVE_BROWSER: ${ALLOW_LIVE_BROWSER:-false}
+      # .env.production also contains edge/deploy and web-session credentials.
+      # The API uses env_file for its provider surface, so explicitly scrub
+      # unrelated credentials instead of granting the control plane ambient
+      # access to them.
+      OPS_AUTH_USERNAME: ""
+      OPS_AUTH_PASSWORD: ""
+      OPS_AUTH_SESSION_SECRET: ""
+      OPS_AUTH_TOTP_SECRET: ""
+      # Browser-only credentials stay out of the control plane. The API uses the
+      # isolated RPC client in production, so it has no reason to hold Chromium
+      # storage encryption or browser-decision-provider credentials.
+      BROWSER_STORAGE_STATE_KEY: ""
+      BROWSER_USE_API_KEY: ""
+      CEREBRAS_API_KEY: ""
+      GROQ_API_KEY: ""
       # Owner-only credential submission / autonomous-login / reveal are gated by
       # this flag. It MUST be true for those operator actions to work; default
       # false keeps them disabled until explicitly enabled.
@@ -47,23 +71,58 @@ services:
       BROWSER_USE_COMPATIBILITY_ENABLED: "false"
       BROWSER_SERVICE_URL: http://browser-worker:8081
       BROWSER_SERVICE_TOKEN: ${BROWSER_SERVICE_TOKEN:?BROWSER_SERVICE_TOKEN is required}
+      # API-only master key. The API derives one run-bound capability and sends
+      # only that derived value to browser-worker; never add this key to worker,
+      # web, or Caddy environments.
+      BROWSER_SESSION_CAPABILITY_KEY: ${BROWSER_SESSION_CAPABILITY_KEY:?BROWSER_SESSION_CAPABILITY_KEY is required}
       BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-production-owner}
+      # The worker owns a 300s browser-operation budget. The API client keeps
+      # 15s of transport headroom so an operation receives the worker's
+      # structured result instead of being cancelled by the caller first.
+      BROWSER_SERVICE_CLIENT_TIMEOUT_SECONDS: ${BROWSER_SERVICE_CLIENT_TIMEOUT_SECONDS:-315}
       # The API must project the same interactive capability the isolated browser
       # service enforces; otherwise a real grant exists but the evaluator UI reports
       # screenshot-only and never requests it.
       BROWSER_INTERACTIVE_HITL_ENABLED: ${BROWSER_INTERACTIVE_HITL_ENABLED:-true}
       PLAYWRIGHT_IN_PROCESS_SANDBOX: "false"
       OPS_ENABLE_API_DOCS: "false"
+      # Startup itself remains observational: automation threads wait through a
+      # bounded grace period before any browser reconciliation or Gmail read.
+      # Once accepted, the production revision resolves OTPs, ingests replies,
+      # and reconciles stranded runs without a manual poll request.
+      OPS_STARTUP_AUTOMATION_ENABLED: "true"
+      OPS_AUTOMATION_START_DELAY_SECONDS: ${OPS_AUTOMATION_START_DELAY_SECONDS:-60}
+      EMAIL_POLL_INTERVAL_SECONDS: ${EMAIL_POLL_INTERVAL_SECONDS:-45}
+      EMAIL_POLL_MAX_RUNS_PER_CYCLE: ${EMAIL_POLL_MAX_RUNS_PER_CYCLE:-25}
+      # Manual Compose starts receive an inert nonce and can never unlock
+      # autonomous maintenance. deploy-droplet.sh injects a fresh nonce and
+      # writes its matching /data marker only after full release acceptance.
+      APP_REVISION: ${APP_REVISION:-local-uncommitted}
+      OPS_DEPLOY_ACCEPTANCE_NONCE: ${OPS_DEPLOY_ACCEPTANCE_NONCE:-manual-unaccepted}
+      OPS_DEPLOY_ACCEPTANCE_MARKER_PATH: /data/deploy-acceptance.json
       RUN_LIVE_TESTS: "0"
       YOU_SEARCH_ENABLED: "false"
       YOU_CONTENTS_ENABLED: "false"
       YOU_RESEARCH_ENABLED: "false"
       OPS_INTERNAL_API_TOKEN: ${OPS_INTERNAL_API_TOKEN:?OPS_INTERNAL_API_TOKEN is required}
+      # Dedicated write/one-time-consume capability for browser-worker. This is
+      # deliberately not OPS_INTERNAL_API_TOKEN and exposes no durable reads.
+      BROWSER_SECRET_BROKER_TOKEN: ${BROWSER_SECRET_BROKER_TOKEN:?BROWSER_SECRET_BROKER_TOKEN is required}
       LANGGRAPH_STRICT_MSGPACK: "true"
       OPS_DB_PATH: /data/ops.db
       CHECKPOINT_DB_PATH: /data/checkpoints.db
       SECRET_VAULT_DB_PATH: /vault/credentials.db
       PROVIDER_EFFECTS_DB_PATH: /data/provider_effects.db
+      # Signup/login verification is an inbox-read capability, independent of
+      # the controlled outbound outreach sink.
+      COMPOSIO_GMAIL_SIGNUP_CONNECTED_ACCOUNT_ID: ${COMPOSIO_GMAIL_SIGNUP_CONNECTED_ACCOUNT_ID:-}
+      GMAIL_SIGNUP_ADDRESS: ${GMAIL_SIGNUP_ADDRESS:-}
+      GMAIL_VERIFICATION_MAX_AGE_SECONDS: ${GMAIL_VERIFICATION_MAX_AGE_SECONDS:-900}
+      GMAIL_SIGNUP_PREFLIGHT_TIMEOUT_SECONDS: ${GMAIL_SIGNUP_PREFLIGHT_TIMEOUT_SECONDS:-10}
+      GMAIL_VERIFICATION_MAX_ATTEMPTS: ${GMAIL_VERIFICATION_MAX_ATTEMPTS:-6}
+      GMAIL_VERIFICATION_POLL_SECONDS: ${GMAIL_VERIFICATION_POLL_SECONDS:-5}
+      GMAIL_VERIFICATION_REQUIRE_BINDING: ${GMAIL_VERIFICATION_REQUIRE_BINDING:-true}
+      GMAIL_VERIFICATION_REQUIRE_AUTHENTICATED_SENDER: ${GMAIL_VERIFICATION_REQUIRE_AUTHENTICATED_SENDER:-true}
       # The Composio SDK creates a local metadata cache at import time. The API
       # root filesystem is intentionally read-only, so keep that ephemeral cache
       # inside the existing hardened /tmp tmpfs rather than under /app.
@@ -75,8 +134,10 @@ services:
       browser-worker:
         condition: service_healthy
     networks:
-      - opsnet
+      - control
+      - browser-control
     restart: unless-stopped
+    logging: *default-logging
     stop_grace_period: 30s
     pids_limit: 256
     read_only: true
@@ -90,22 +151,24 @@ services:
       test:
         - CMD-SHELL
         - |
-          python -c 'import os, urllib.request; token=os.environ.get("OPS_INTERNAL_API_TOKEN") or ""; request=urllib.request.Request("http://127.0.0.1:8000/api/system/health", headers={"X-Ops-Internal-Token": token}); urllib.request.urlopen(request, timeout=3)'
+          python -c 'import json, os, sys, urllib.request; token=os.environ.get("OPS_INTERNAL_API_TOKEN") or ""; request=urllib.request.Request("http://127.0.0.1:8000/api/system/health", headers={"X-Ops-Internal-Token": token}); payload=json.load(urllib.request.urlopen(request, timeout=3)); sys.exit(0 if payload.get("status") == "healthy" else 1)'
       interval: 30s
       timeout: 5s
-      start_period: 20s
+      start_period: 30s
       retries: 3
 
   browser-worker:
+    image: composio-ops-browser:${APP_REVISION:-local-uncommitted}
     build:
       context: .
       dockerfile: Dockerfile.browser
       args:
         APP_REVISION: ${APP_REVISION:-local-uncommitted}
     init: true
-    ipc: host
-    shm_size: 1gb
-    pids_limit: 512
+    mem_limit: ${BROWSER_MEM_LIMIT:-4g}
+    cpus: ${BROWSER_CPUS:-2.0}
+    shm_size: ${BROWSER_SHM_SIZE:-2gb}
+    pids_limit: ${BROWSER_PIDS_LIMIT:-768}
     user: ops
     environment:
       BROWSER_PROVIDER: playwright
@@ -116,12 +179,16 @@ services:
       BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-production-owner}
       BROWSER_SESSION_INACTIVITY_SECONDS: ${BROWSER_SESSION_INACTIVITY_SECONDS:-900}
       BROWSER_SESSION_MAX_AGE_SECONDS: ${BROWSER_SESSION_MAX_AGE_SECONDS:-3600}
-      # This rollout deliberately permits one interactive session. Keep both
-      # capacity owners hard-bound here so an environment override cannot make
-      # the single-VPS acceptance claim untrue.
-      PLAYWRIGHT_MAX_SESSIONS: "1"
-      BROWSER_DISPLAY_SLOTS: "1"
-      PLAYWRIGHT_DISABLE_SANDBOX: ${PLAYWRIGHT_DISABLE_SANDBOX:-true}
+      BROWSER_SESSION_DRAIN_SECONDS: ${BROWSER_SESSION_DRAIN_SECONDS:-30}
+      BROWSER_SCREEN_GEOMETRY: ${BROWSER_SCREEN_GEOMETRY:-1440x900x24}
+      # Capacity has one source of truth. browser-entrypoint.sh derives the
+      # display-stack count from PLAYWRIGHT_MAX_SESSIONS, and the service derives
+      # its display pool from the same value. Supported range is 1..10.
+      PLAYWRIGHT_MAX_SESSIONS: "${PLAYWRIGHT_MAX_SESSIONS:-2}"
+      # Give each bounded operation enough time for multi-page login/signup and
+      # email verification. Outer callers retain additional transport headroom.
+      BROWSER_OPERATION_TIMEOUT_SECONDS: "${BROWSER_OPERATION_TIMEOUT_SECONDS:-300}"
+      PLAYWRIGHT_DISABLE_SANDBOX: ${PLAYWRIGHT_DISABLE_SANDBOX:-false}
       # Opt-in remains environment controlled, but is no longer hard-disabled by
       # Compose after the deployment explicitly enables it.
       BROWSER_INTERACTIVE_HITL_ENABLED: ${BROWSER_INTERACTIVE_HITL_ENABLED:-true}
@@ -137,18 +204,22 @@ services:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-nvidia/nemotron-3-ultra-550b-a55b:free}
       GOOGLE_GENAI_API_KEY: ${GOOGLE_GENAI_API_KEY:-}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
       BROWSER_STORAGE_STATE_KEY: ${BROWSER_STORAGE_STATE_KEY:-}
       BROWSER_STORAGE_STATE_DIR: /browser-data/storage-state
-      SECRET_VAULT_KEY: ${SECRET_VAULT_KEY:-}
-      SECRET_VAULT_DB_PATH: /vault/credentials.db
+      # This capability can only consume an exact run-scoped transient secret or
+      # write one reviewed captured kind. The browser has no vault key/database.
+      BROWSER_SECRET_BROKER_URL: http://api:8000  # pragma: allowlist secret
+      BROWSER_SECRET_BROKER_TOKEN: ${BROWSER_SECRET_BROKER_TOKEN:?BROWSER_SECRET_BROKER_TOKEN is required}
+      BROWSER_SECRET_BROKER_TIMEOUT_SECONDS: ${BROWSER_SECRET_BROKER_TIMEOUT_SECONDS:-10}
       PYTHONPATH: /app
     volumes:
       - browser_profiles:/browser-data
-      - credential_vault:/vault
     networks:
-      - opsnet
+      - browser-control
+      - browser-egress
     restart: unless-stopped
+    logging: *default-logging
     stop_grace_period: 30s
     read_only: true
     tmpfs:
@@ -157,6 +228,7 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+      - seccomp=./deploy/chromium-seccomp.json
     healthcheck:
       test:
         - CMD
@@ -164,21 +236,30 @@ services:
         - -c
         - |
           import json, sys, urllib.request
-          response = urllib.request.urlopen("http://127.0.0.1:8081/internal/health", timeout=30)
-          state = json.load(response).get("state")
-          sys.exit(0 if state in ("ready", "configured_not_verified", "capacity_exhausted") else 1)
+          response = urllib.request.urlopen("http://127.0.0.1:8081/internal/ready", timeout=30)
+          payload = json.load(response)
+          state = payload.get("state")
+          verified = (
+              payload.get("chromium_installed")
+              and payload.get("context_launch_ok")
+              and payload.get("janitor_running")
+          )
+          sys.exit(0 if state in ("ready", "capacity_exhausted") and verified else 1)
       interval: 60s
       timeout: 40s
-      start_period: 30s
+      start_period: 45s
       retries: 3
 
   web:
     init: true
+    image: composio-ops-web:${APP_REVISION:-local-uncommitted}
     build:
       context: .
       dockerfile: web/Dockerfile
       args:
         APP_REVISION: ${APP_REVISION:-local-uncommitted}
+    mem_limit: ${WEB_MEM_LIMIT:-1g}
+    cpus: ${WEB_CPUS:-0.75}
     # Only server-only runtime values reach the frontend container. Provider
     # secrets are intentionally NOT passed here. OPS_API_URL and
     # OPS_INTERNAL_API_TOKEN are read exclusively by Next.js server code
@@ -188,12 +269,23 @@ services:
       OPS_API_URL: ${OPS_API_URL:-http://api:8000}
       OPS_INTERNAL_API_TOKEN: ${OPS_INTERNAL_API_TOKEN:?OPS_INTERNAL_API_TOKEN is required}
       OPS_DEMO_MODE: ${OPS_DEMO_MODE:-false}
+      # Application-level session auth. These values are server-only and must
+      # never use a NEXT_PUBLIC_ prefix.
+      OPS_AUTH_USERNAME: ${OPS_AUTH_USERNAME:?OPS_AUTH_USERNAME is required}
+      OPS_AUTH_PASSWORD: ${OPS_AUTH_PASSWORD:?OPS_AUTH_PASSWORD is required}
+      OPS_AUTH_SESSION_SECRET: ${OPS_AUTH_SESSION_SECRET:?OPS_AUTH_SESSION_SECRET is required}
+      OPS_AUTH_TOTP_SECRET: ${OPS_AUTH_TOTP_SECRET:?OPS_AUTH_TOTP_SECRET is required}
+      # Next.js waits longer than the API client, which in turn waits longer than
+      # the worker. This preserves the worker's structured timeout/error result.
+      OPS_RUN_ACTION_TIMEOUT_MS: ${OPS_RUN_ACTION_TIMEOUT_MS:-330000}
     depends_on:
       api:
         condition: service_healthy
     networks:
-      - opsnet
+      - edge
+      - control
     restart: unless-stopped
+    logging: *default-logging
     stop_grace_period: 30s
     pids_limit: 256
     read_only: true
@@ -209,14 +301,21 @@ services:
         - CMD
         - node
         - -e
-        - fetch('http://127.0.0.1:3000').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+        - fetch('http://127.0.0.1:3000/health').then(async r=>{const p=await r.json();if(!r.ok||p.status!=='ok')process.exit(1)}).catch(()=>process.exit(1))
       interval: 30s
       timeout: 5s
       start_period: 20s
       retries: 3
 
   caddy:
-    image: caddy:2.10-alpine
+    image: composio-ops-edge:${APP_REVISION:-local-uncommitted}
+    build:
+      context: .
+      dockerfile: Dockerfile.caddy
+      args:
+        APP_REVISION: ${APP_REVISION:-local-uncommitted}
+    mem_limit: ${CADDY_MEM_LIMIT:-512m}
+    cpus: ${CADDY_CPUS:-0.25}
     depends_on:
       web:
         condition: service_healthy
@@ -230,18 +329,25 @@ services:
     environment:
       DOMAIN: ${DOMAIN:-your-domain.example}
       ACME_EMAIL: ${ACME_EMAIL:-admin@example.com}
-      OPS_BASIC_AUTH_USER: ${OPS_BASIC_AUTH_USER:?OPS_BASIC_AUTH_USER is required}
-      OPS_BASIC_AUTH_HASH: ${OPS_BASIC_AUTH_HASH:?OPS_BASIC_AUTH_HASH is required}
       # Must match the owner bound into browser-service sessions and live grants.
       BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-production-owner}
     volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     networks:
-      - opsnet
+      - edge
+      - browser-control
     restart: unless-stopped
+    logging: *default-logging
     stop_grace_period: 30s
+    pids_limit: 128
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
     security_opt:
       - no-new-privileges:true
     healthcheck:
@@ -257,13 +363,24 @@ services:
       retries: 3
 
 networks:
-  opsnet:
+  edge:
+    driver: bridge
+  control:
+    driver: bridge
+  # API/broker and live-view traffic stays on an isolated internal segment.
+  # browser-worker gets outbound vendor access from browser-egress, which has
+  # no other service attached.
+  browser-control:
+    driver: bridge
+    internal: true
+  browser-egress:
     driver: bridge
 
 volumes:
-  # Canonical SQLite state plus the temporary read-only legacy checkpoint and
-  # provider-effect databases. A first-run named volume inherits the ops:0700
-  # ownership pre-created in Dockerfile.api at /data.
+  # Ordinary-SQLite canonical/effect state. CHECKPOINT_DB_PATH is reserved for
+  # recovery of possible legacy artifacts; production does not initialize its
+  # reader or writer. A first-run named volume inherits the ops:0700 ownership
+  # pre-created in Dockerfile.api at /data.
   ops_data:
   browser_profiles:
   credential_vault:

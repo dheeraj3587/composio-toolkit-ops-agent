@@ -10,9 +10,8 @@
 # Build:  docker build -f Dockerfile.browser -t composio-ops-browser .
 # Compose (see compose.prod.yaml notes) should run this with:
 #   init: true          # reap zombie Chromium children
-#   ipc: host           # Chromium needs a real IPC namespace
-#   shm_size: 1gb       # avoids --disable-dev-shm-usage crashes
-#   pids_limit: 512
+#   shm_size: 2gb       # default for two isolated headed sessions
+#   pids_limit: 768
 #
 # This image is the only browser execution path in the production stack, so
 # Chromium availability is a build-time fact rather than a runtime surprise.
@@ -21,7 +20,10 @@
 # probe, so Chromium's lifetime is decoupled from the API's: restarting the API no
 # longer kills a live browser session.
 
-FROM python:3.11-slim
+# Docker Hub official-image index digest for python:3.11.15-slim-bookworm,
+# reviewed 2026-07-29. Chromium itself remains pinned by requirements-providers
+# and is installed during the build from that exact Playwright package.
+FROM python:3.11.15-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba
 
 ARG APP_REVISION=local-uncommitted
 LABEL org.opencontainers.image.revision=$APP_REVISION
@@ -34,6 +36,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     BROWSER_PROVIDER=playwright \
     ALLOW_LIVE_BROWSER=false \
     BROWSER_SERVICE_PORT=8081 \
+    BROWSER_OPERATION_TIMEOUT_SECONDS=300 \
+    PLAYWRIGHT_MAX_SESSIONS=2 \
     BROWSER_INTERACTIVE_HITL_ENABLED=false \
     BROWSER_VNC_PORT=5900 \
     BROWSER_DISPLAY_NUM=99
@@ -42,10 +46,9 @@ RUN addgroup --system ops && adduser --system --ingroup ops --home /app ops
 
 WORKDIR /app
 
-COPY requirements-api.txt requirements-providers.txt ./
-RUN python -m pip install --no-cache-dir \
-    --requirement requirements-api.txt \
-    --requirement requirements-providers.txt
+COPY requirements-api.txt requirements-providers.txt requirements-runtime.lock ./
+RUN python -m pip install --no-cache-dir --no-build-isolation --require-hashes \
+    --requirement requirements-runtime.lock
 
 # Install the Chromium binary AND its OS dependencies. `pip install playwright`
 # alone does not do this — omitting it is why a Playwright launch fails inside a
@@ -76,16 +79,14 @@ COPY --chown=root:root browser_service ./browser_service
 COPY --chown=root:root data/p1 ./data/p1
 COPY --chown=root:root docker/browser-entrypoint.sh /usr/local/bin/browser-entrypoint.sh
 
-# /browser-data holds profiles + encrypted storage state; /vault is the SHARED
-# credential vault the control plane writes one-time browser-login references to.
-# Both are pre-created owned by "ops" mode 0700 so a first-run named volume
-# inherits that ownership under the non-root, read-only container.
+# /browser-data holds profiles + encrypted storage state. The credential vault
+# intentionally does not exist in this image; browser secrets cross only the
+# authenticated, narrowly scoped API broker boundary.
 RUN find /app/api /app/ops /app/browser_service /app/data/p1 -type d -exec chmod 0555 {} + \
     && find /app/api /app/ops /app/browser_service /app/data/p1 -type f -exec chmod 0444 {} + \
     && chmod 0555 /usr/local/bin/browser-entrypoint.sh \
     && install -d -o ops -g ops -m 0700 /browser-data \
     && install -d -o ops -g ops -m 0700 /browser-data/storage-state \
-    && install -d -o ops -g ops -m 0700 /vault \
     && install -d -m 1777 /tmp/.X11-unix
 
 # Non-root: Chromium's own sandbox stays ENABLED by default. Set
@@ -97,8 +98,8 @@ EXPOSE 8081
 # Readiness: the SERVICE's own provider-aware health endpoint, which reports
 # whether Chromium can actually launch (a Python import check would not catch a
 # missing binary or a broken sandbox).
-HEALTHCHECK --interval=60s --timeout=40s --start-period=30s --retries=3 \
-    CMD ["python", "-c", "import urllib.request,sys,json; r=json.load(urllib.request.urlopen('http://127.0.0.1:8081/internal/health', timeout=30)); sys.exit(0 if r.get('state') in ('ready','configured_not_verified','capacity_exhausted') else 1)"]
+HEALTHCHECK --interval=60s --timeout=40s --start-period=45s --retries=3 \
+    CMD ["python", "-c", "import urllib.request,sys,json; r=json.load(urllib.request.urlopen('http://127.0.0.1:8081/internal/ready', timeout=30)); sys.exit(0 if r.get('state') in ('ready','capacity_exhausted') and r.get('chromium_installed') and r.get('context_launch_ok') and r.get('janitor_running') else 1)"]
 
 # The entrypoint conditionally starts Xvfb/fluxbox/x11vnc, then execs this CMD.
 ENTRYPOINT ["/usr/local/bin/browser-entrypoint.sh"]
@@ -106,4 +107,4 @@ ENTRYPOINT ["/usr/local/bin/browser-entrypoint.sh"]
 # Disable HTTP access logs here; browser_service.main separately filters the
 # uvicorn.error WebSocket handshake records that also include the query string.
 # Application logs emit only sanitized session/reason fields.
-CMD ["uvicorn", "browser_service.main:app", "--host", "0.0.0.0", "--port", "8081", "--no-access-log"]
+CMD ["uvicorn", "browser_service.main:app", "--host", "0.0.0.0", "--port", "8081", "--timeout-graceful-shutdown", "25", "--no-access-log"]

@@ -1,14 +1,18 @@
 # syntax=docker/dockerfile:1
 
-FROM node:22-bookworm-slim AS dependencies
+# Docker Hub official-image index digest for node:22.23.1-bookworm-slim,
+# reviewed 2026-07-29. All stages share one immutable runtime/toolchain base.
+FROM node:22.23.1-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS dependencies
 
 ENV NEXT_TELEMETRY_DISABLED=1
 WORKDIR /app
 
-COPY web/package.json web/package-lock.json ./
-RUN npm ci --no-audit --no-fund
+COPY web/package.json web/package-lock.json web/.npmrc ./
+# Third-party dependency lifecycle scripts are disabled. The reviewed
+# application build remains an explicit command in the next stage.
+RUN npm ci --ignore-scripts --no-audit --no-fund
 
-FROM node:22-bookworm-slim AS builder
+FROM node:22.23.1-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS builder
 
 ENV NEXT_TELEMETRY_DISABLED=1
 WORKDIR /app
@@ -17,7 +21,7 @@ COPY --from=dependencies /app/node_modules ./node_modules
 COPY web/ ./
 RUN npm run build
 
-FROM node:22-bookworm-slim AS runner
+FROM node:22.23.1-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS runner
 
 ARG APP_REVISION=local-uncommitted
 LABEL org.opencontainers.image.revision=$APP_REVISION
@@ -30,6 +34,11 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 COPY --from=builder --chown=node:node /app/.next/standalone ./
+# Next.js standalone output intentionally excludes static/public assets. Copy
+# them explicitly or a clean image either fails the assertion below or serves
+# the UI without fonts, icons, and compiled client chunks.
+COPY --from=builder --chown=node:node /app/public ./public
+COPY --from=builder --chown=node:node /app/.next/static ./.next/static
 RUN test -f /app/server.js && test -d /app/public && test -d /app/.next/static
 
 USER node
@@ -37,6 +46,6 @@ EXPOSE 3000
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:3000').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:3000/health').then(async r=>{const p=await r.json();if(!r.ok||p.status!=='ok')process.exit(1)}).catch(()=>process.exit(1))"
 
 CMD ["node", "server.js"]

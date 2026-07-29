@@ -250,20 +250,14 @@ class RunCredentialService:
             ),
         ]
         try:
-            validation_policy = (
-                recipe_to_validation_policy(recipe) if recipe is not None else None
-            )
+            validation_policy = recipe_to_validation_policy(recipe) if recipe is not None else None
             if recipe is not None and validation_policy is None:
                 raise CredentialSubmissionError("immutable_validation_policy_missing")
             result = asyncio.run(
                 validator.validate(
                     app_slug=research.app_slug,
                     credential_refs=references,
-                    **(
-                        {"policy": validation_policy}
-                        if validation_policy is not None
-                        else {}
-                    ),
+                    **({"policy": validation_policy} if validation_policy is not None else {}),
                 )
             )
         except ConfigurationRequiredError as exc:

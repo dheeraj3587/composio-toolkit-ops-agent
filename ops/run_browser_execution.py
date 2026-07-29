@@ -312,8 +312,24 @@ class RunBrowserExecutionService:
                 ):
                     handle = str(workflow_state.get("browser_session_id") or "")
                     try:
+                        capture_scope_kwargs = (
+                            {"capability_scope": run_id}
+                            if bool(
+                                getattr(
+                                    selected_worker,
+                                    "requires_session_capability_scope",
+                                    False,
+                                )
+                            )
+                            else {}
+                        )
                         captured_refs = asyncio.run(
-                            auto_capture(handle, research_obj.app_slug, service._secret_store)
+                            auto_capture(
+                                handle,
+                                research_obj.app_slug,
+                                service._secret_store,
+                                **capture_scope_kwargs,
+                            )
                         )
                     except Exception as exc:
                         log_event(
@@ -491,6 +507,7 @@ class RunBrowserExecutionService:
             created_at="",
             inactivity_expires_at="",
             maximum_expires_at="",
+            capability_scope=run_id,
         )
 
     def mark_async_browser_failed(self, run_id: str) -> None:

@@ -17,9 +17,9 @@ const contentSecurityPolicy = [
   "base-uri 'self'",
   "form-action 'self'",
   "frame-ancestors 'none'",
-  // Allow embedding the Browser Use live session viewer so the operator can
-  // watch and interact (CAPTCHA/OTP) inline without leaving the run page.
-  "frame-src 'self' https://live.browser-use.com https://*.browser-use.com",
+  // Production uses the same-origin Playwright/noVNC relay. Browser Use is a
+  // disabled compatibility adapter and therefore receives no framing authority.
+  "frame-src 'self'",
   "manifest-src 'self'",
 ].join("; ");
 

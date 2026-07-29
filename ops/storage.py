@@ -624,6 +624,13 @@ class OperationsStorage:
         with self._connect() as connection:
             return self._get_run(connection, run_id)
 
+    def get_idempotent_run(self, idempotency_key: str) -> tuple[dict[str, Any], str] | None:
+        """Read an idempotent replay without opening a write transaction."""
+
+        self.initialize()
+        with self._connect() as connection:
+            return self._get_idempotent_run(connection, idempotency_key)
+
     def _get_run(
         self,
         connection: sqlite3.Connection,

@@ -8,7 +8,7 @@ import { HitlLiveControls } from "@/components/hitl-live-controls"
 import { CanonicalPrimaryAction } from "@/components/canonical-primary-action"
 import { PhaseActionForm } from "@/components/phase-action-form"
 import { ProviderStateCard } from "@/components/provider-state-card"
-import { RunAutoRefresh } from "@/components/run-auto-refresh"
+import { RunProgress } from "@/components/run-progress"
 import {
   CapabilityPanel,
   HitlPanel,
@@ -82,7 +82,15 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
     : detail.run.status === "waiting_for_hitl" &&
       detail.hitl_request?.resumable === true
 
-  const canPoll = !primaryAction && !isPlanOnly && ["outreach_sent", "waiting_for_reply"].includes(detail.run.status)
+  const verificationPending =
+    !isPlanOnly &&
+    detail.run.status === "waiting_for_hitl" &&
+    detail.hitl_request?.action_type === "email_otp"
+  const canPollOutreach =
+    !primaryAction &&
+    !isPlanOnly &&
+    ["outreach_sent", "waiting_for_reply"].includes(detail.run.status)
+  const canPoll = canPollOutreach
   const missingFields = Array.from(new Set([
     ...(detail.missing_fields ?? []),
     ...(detail.research?.missing_fields ?? []),
@@ -90,7 +98,6 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
 
   return (
     <div className="page-enter page-stack">
-      <RunAutoRefresh status={detail.run.status} />
       <Button asChild variant="ghost" size="sm" className="-ml-2 font-mono text-[10px] uppercase tracking-[0.1em]"><Link href="/"><ArrowLeft aria-hidden="true" /> Overview</Link></Button>
 
       <header className="flex flex-col gap-6 border-b border-border pb-7 xl:flex-row xl:items-end xl:justify-between">
@@ -99,23 +106,27 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
             <p className="eyebrow">Run · {detail.run.app_slug}</p>
             <StatusBadge status={detail.run.status} />
             <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">
-              External actions · {detail.run.external_actions ? "Enabled" : "Off"}
+              {isPlanOnly ? "Plan only" : "Live run"}
             </Badge>
           </div>
           <h1 className="mt-3 text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">{detail.run.app_name}</h1>
           <p className="mt-3 break-all font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">{detail.run.run_id}</p>
         </div>
-        <div className="grid overflow-hidden rounded-md border border-border bg-border sm:grid-cols-2 xl:min-w-[920px] xl:grid-cols-4 2xl:grid-cols-8">
-          <Meta icon={Route} label="Frozen route" value={humanize(detail.run.route_kind ?? detail.run.access_route)} />
-          <Meta icon={Settings2} label="Readiness" value={humanize(detail.run.readiness_tier)} />
-          <Meta icon={Globe2} label="Frozen provider" value={humanize(detail.run.browser_provider)} />
-          <Meta icon={Fingerprint} label="Recipe" value={detail.run.recipe_version ?? "Legacy"} />
-          <Meta icon={Settings2} label="Run phase" value={humanize(detail.run.phase)} />
-          <Meta icon={Settings2} label="Execution mode" value={humanize(detail.run.execution_mode)} />
+        <div className="grid overflow-hidden rounded-xl border border-border bg-border sm:grid-cols-2 xl:min-w-[660px] xl:grid-cols-4">
+          <Meta icon={Route} label="Access route" value={humanize(detail.run.route_kind ?? detail.run.access_route)} />
+          <Meta icon={Settings2} label="Account" value={detail.run.account_mode ? humanize(detail.run.account_mode) : "Not reported"} />
+          <Meta icon={Globe2} label="Browser" value={humanize(detail.run.browser_provider)} />
           <Meta icon={Clock3} label="Updated · UTC" value={formatTimestamp(detail.run.updated_at)} />
-          <Meta icon={CircleOff} label="State engine" value={humanize(detail.run.state_engine)} />
         </div>
       </header>
+
+      <RunProgress
+        status={detail.run.status}
+        phase={detail.run.phase}
+        executionMode={detail.run.execution_mode}
+        accountMode={detail.run.account_mode}
+        hitlAction={detail.hitl_request?.action_type}
+      />
 
       {isPlanOnly ? (
         <Alert className="rounded-md border-sky-300 bg-sky-50 text-sky-950">
@@ -177,10 +188,33 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
               )}
             </CapabilityPanel>
           </div>
-          <HitlPanel request={isPlanOnly ? null : detail.hitl_request} action={canResume && !interactivePlaywrightResume ? <PhaseActionForm runId={runId} action="resume" label="Resume after human action" /> : undefined} />
+          <HitlPanel
+            request={isPlanOnly ? null : detail.hitl_request}
+            action={
+              verificationPending
+                ? <PhaseActionForm runId={runId} action="poll-email" label="Check verification email" />
+                : canResume && !interactivePlaywrightResume
+                  ? <PhaseActionForm runId={runId} action="resume" label="Resume after human action" />
+                  : undefined
+            }
+          />
           <div id="outreach-review" className="h-full scroll-mt-6">
-            <CapabilityPanel title="Provider email" icon={Mail} phase={emailPhase}>
-              {canPoll ? <PhaseActionForm runId={runId} action="poll-email" label="Poll controlled inbox" /> : !primaryAction && isRetryable(emailPhase) ? <PhaseActionForm runId={runId} action="retry" capability="email" label="Retry email phase" /> : <ControlUnavailable />}
+            <CapabilityPanel title={verificationPending ? "Verification inbox" : "Provider email"} icon={Mail} phase={emailPhase}>
+              {verificationPending ? (
+                <p className="text-xs leading-5 text-muted-foreground">
+                  The connected inbox is being checked automatically. Use the verification action beside the live browser to check immediately.
+                </p>
+              ) : canPoll ? (
+                <PhaseActionForm
+                  runId={runId}
+                  action="poll-email"
+                  label="Check controlled inbox"
+                />
+              ) : !primaryAction && isRetryable(emailPhase) ? (
+                <PhaseActionForm runId={runId} action="retry" capability="email" label="Retry email phase" />
+              ) : (
+                <ControlUnavailable />
+              )}
             </CapabilityPanel>
           </div>
         </div>

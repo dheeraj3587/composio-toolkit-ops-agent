@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   openLiveView: vi.fn(),
   runPhaseAction: vi.fn(),
   submitBrowserLoginAction: vi.fn(),
+  submitBrowserVerificationAction: vi.fn(),
   submitCredentialAction: vi.fn(),
   order: [] as string[],
 }))
@@ -16,6 +17,7 @@ vi.mock("@/app/runs/[runId]/actions", () => ({
   openLiveView: mocks.openLiveView,
   runPhaseAction: mocks.runPhaseAction,
   submitBrowserLoginAction: mocks.submitBrowserLoginAction,
+  submitBrowserVerificationAction: mocks.submitBrowserVerificationAction,
   submitCredentialAction: mocks.submitCredentialAction,
 }))
 
@@ -75,6 +77,7 @@ describe("HitlLiveControls interactive lifecycle", () => {
     mocks.openLiveView.mockReset()
     mocks.runPhaseAction.mockReset()
     mocks.submitBrowserLoginAction.mockReset()
+    mocks.submitBrowserVerificationAction.mockReset()
     mocks.submitCredentialAction.mockReset()
     mocks.order.splice(0)
     mocks.openLiveView.mockResolvedValue({
@@ -91,6 +94,10 @@ describe("HitlLiveControls interactive lifecycle", () => {
     mocks.runPhaseAction.mockImplementation(async () => {
       mocks.order.push("resume")
       return { message: "Backend accepted the action.", tone: "neutral" }
+    })
+    mocks.submitBrowserVerificationAction.mockResolvedValue({
+      message: "Verification accepted.",
+      tone: "neutral",
     })
   })
 
@@ -184,5 +191,33 @@ describe("HitlLiveControls interactive lifecycle", () => {
     expect(mocks.order).toEqual(["disconnect", "resume"])
     expect(screen.queryByLabelText(/mock controlled playwright browser/i)).not.toBeInTheDocument()
     expect(document.body.textContent).not.toContain("signed-grant")
+  })
+
+  it("submits a one-time verification code without retaining it in the DOM", async () => {
+    const user = userEvent.setup()
+    render(
+      <HitlLiveControls
+        runId={RUN_ID}
+        browser={{
+          ...waitingBrowser,
+          can_submit_otp: true,
+          can_resume: false,
+          reason_code: "email_verification_required",
+        }}
+        browserStateVersion="v1"
+      />,
+    )
+
+    const code = screen.getByRole("textbox", { name: "Verification code" })
+    await user.type(code, "123456")
+    await user.click(screen.getByRole("button", { name: "Submit verification once" }))
+
+    await waitFor(() =>
+      expect(mocks.submitBrowserVerificationAction).toHaveBeenCalledOnce(),
+    )
+    const submitted = mocks.submitBrowserVerificationAction.mock.calls[0]?.[1] as FormData
+    expect(submitted.get("verification_code")).toBe("123456")
+    expect(submitted.get("verification_url")).toBeNull()
+    await waitFor(() => expect(code).toHaveValue(""))
   })
 })

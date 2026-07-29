@@ -54,7 +54,7 @@ def derive_browser_account_ref(
     if len(identities) == 1 and isinstance(key, str) and key:
         digest = hmac.new(
             key.encode("utf-8"),
-            f"browser-account-v1\0{app_slug}\0{identities[0]}".encode("utf-8"),
+            f"browser-account-v1\0{app_slug}\0{identities[0]}".encode(),
             hashlib.sha256,
         ).hexdigest()[:32]
         return f"acct_{digest}"
@@ -63,7 +63,7 @@ def derive_browser_account_ref(
     # two operators that somehow reuse a run id; the public run id guarantees this
     # fallback never authorizes cross-run state reuse.
     digest = hashlib.sha256(
-        f"browser-run-v1\0{app_slug}\0{run_id}\0{work_email_ref}".encode("utf-8")
+        f"browser-run-v1\0{app_slug}\0{run_id}\0{work_email_ref}".encode()
     ).hexdigest()[:32]
     return f"run_{digest}"
 

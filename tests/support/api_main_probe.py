@@ -19,6 +19,7 @@ from pathlib import Path
 
 _PAYLOAD = {
     "app_name": "Pipedrive",
+    "account_mode": "existing_account",
     "company": {
         "legal_name": "Example Company",
         "website": "https://example.test",
@@ -49,7 +50,7 @@ def main() -> int:
     service = LocalRunService(db_path, core_service=core, settings=settings)
     application = production_main.create_app(service=service)
 
-    headers = {"X-Ops-Internal-Token": "probe-token"}
+    headers = {"X-Ops-Internal-Token": "probe-internal-token-" + ("i" * 32)}
     with TestClient(application, raise_server_exceptions=False) as client:
         created = client.post("/api/runs", json=_PAYLOAD, headers=headers)
         if created.status_code != 201:
