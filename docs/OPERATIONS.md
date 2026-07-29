@@ -261,15 +261,19 @@ namespace.
 
 ### Chromium seccomp and AppArmor provenance
 
-`deploy/chromium-seccomp.json` is vendored byte-for-byte from Playwright
-v1.61.0's official
+`deploy/chromium-seccomp.json` is reviewed from Playwright v1.61.0's official
 [`utils/docker/seccomp_profile.json`](https://github.com/microsoft/playwright/blob/v1.61.0/utils/docker/seccomp_profile.json),
 matching the pinned Python package in `requirements-providers.txt`. It extends
 Docker's default policy only with the namespace syscalls Playwright documents
-for Chromium's user sandbox. The vendored file's SHA-256 is:
+for Chromium's user sandbox and `chroot`. The latter is required after Chromium
+enters its private user namespace: a production-host acceptance probe proved
+that the sandbox fails closed at `sys_chroot("/proc/self/fdinfo/")` without it
+and completes a real render with it. The container receives no host
+`CAP_SYS_CHROOT`; the operation is usable only inside Chromium's isolated
+namespace. The reviewed file's SHA-256 is:
 
 ```text
-cc3e61cabda6bbc1e53e54d27ba4d55a9d3be829b6dd1a596f4a7b31b1cc7849
+48f49fe40f3c2f66984b05a431d25f26280841590244e05e4aa574624d301d1d
 ```
 
 Verify it after checkout:
@@ -278,9 +282,10 @@ Verify it after checkout:
 sha256sum deploy/chromium-seccomp.json
 ```
 
-When upgrading Playwright, fetch the profile from the same release tag, review
-the diff, update the checksum here and in the scaffold test, and run the browser
-container acceptance job. Production and CI both run non-root, keep
+When upgrading Playwright, fetch the profile from the same release tag, reapply
+and review the host-proven `chroot` addition, update the checksum here and in
+the scaffold test, and run the browser container acceptance job. Production and
+CI both run non-root, keep
 `no-new-privileges`, drop all Linux capabilities, avoid host IPC, and leave
 `PLAYWRIGHT_DISABLE_SANDBOX=false`.
 

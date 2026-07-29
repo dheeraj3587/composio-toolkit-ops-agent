@@ -9,7 +9,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 PLAYWRIGHT_SECCOMP_SHA256 = (
-    "cc3e61cabda6bbc1e53e54d27ba4d55a9d3be829b6dd1a596f4a7b31b1cc7849"  # pragma: allowlist secret
+    "48f49fe40f3c2f66984b05a431d25f26280841590244e05e4aa574624d301d1d"  # pragma: allowlist secret
 )
 
 
@@ -28,7 +28,7 @@ def _production_env() -> dict[str, str]:
     return values
 
 
-def test_vendored_playwright_seccomp_profile_has_pinned_provenance() -> None:
+def test_reviewed_playwright_seccomp_profile_has_pinned_provenance() -> None:
     profile_path = ROOT / "deploy" / "chromium-seccomp.json"
     raw = profile_path.read_bytes()
     profile = json.loads(raw)
@@ -44,6 +44,12 @@ def test_vendored_playwright_seccomp_profile_has_pinned_provenance() -> None:
         "includes": {},
         "excludes": {},
     }
+    syscall_names = {
+        name
+        for rule in profile["syscalls"]
+        for name in rule.get("names", [])
+    }
+    assert "chroot" in syscall_names
     requirements = (ROOT / "requirements-providers.txt").read_text(encoding="utf-8")
     operations = (ROOT / "docs" / "OPERATIONS.md").read_text(encoding="utf-8")
     assert "playwright==1.61.0" in requirements
