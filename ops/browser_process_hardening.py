@@ -79,6 +79,15 @@ def chromium_launch_environment(display: str | None, *, headless: bool) -> dict[
     target_display = display or os.environ.get("DISPLAY")
     if target_display:
         launch_env["DISPLAY"] = target_display
+
+    browser_home = os.environ.get("BROWSER_HOME") or "/tmp/browser-home"
+    current_home = launch_env.get("HOME")
+    if not current_home or current_home == "/app" or os.environ.get("BROWSER_HOME"):
+        launch_env["HOME"] = browser_home
+        launch_env["XDG_CACHE_HOME"] = os.path.join(browser_home, ".cache")
+        launch_env["XDG_CONFIG_HOME"] = os.path.join(browser_home, ".config")
+        launch_env["XDG_RUNTIME_DIR"] = os.path.join(browser_home, "run")
+
     return launch_env
 
 
