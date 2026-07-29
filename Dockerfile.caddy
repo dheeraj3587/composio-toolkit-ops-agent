@@ -1,15 +1,40 @@
 # syntax=docker/dockerfile:1
 
-# Docker Hub official-image index digest for caddy:2.11.4-alpine,
-# reviewed 2026-07-29. Baking the Caddyfile into the SHA-tagged candidate makes
-# edge configuration part of the same transactional release as the app images.
+# Caddy 2.11.4 is still the current upstream release, but its published binary
+# predates fixes in the Go standard library, x/text, and grpc. Build the same
+# reviewed Caddy release with the fixed Go toolchain and explicitly selected
+# dependency versions. The official Go image is digest-pinned for reproducible
+# builder provenance and is not present in the runtime image.
+FROM golang:1.26.5-alpine3.24@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS caddy-builder
+
+WORKDIR /src
+COPY deploy/caddy-build/go.mod deploy/caddy-build/main.go ./
+RUN go mod tidy \
+    && test "$(go list -m -f '{{.Version}}' github.com/caddyserver/caddy/v2)" = "v2.11.4" \
+    && test "$(go list -m -f '{{.Version}}' golang.org/x/text)" = "v0.39.0" \
+    && test "$(go list -m -f '{{.Version}}' google.golang.org/grpc)" = "v1.82.1" \
+    && mkdir -p /out \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/caddy ./main.go \
+    && go version -m /out/caddy \
+       | awk '$2 == "golang.org/x/text" && $3 == "v0.39.0" { found=1 } END { exit !found }' \
+    && go version -m /out/caddy \
+       | awk '$2 == "google.golang.org/grpc" && $3 == "v1.82.1" { found=1 } END { exit !found }'
+
+# Retain the reviewed official Caddy runtime layout and ACME data conventions.
+# Upgrade the affected Alpine packages to vendor-fixed versions, then replace
+# only the Caddy executable with the verified binary built above.
 FROM caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
 
 ARG APP_REVISION=local-uncommitted
 LABEL org.opencontainers.image.revision=$APP_REVISION
 
+COPY --from=caddy-builder --chown=root:root --chmod=0755 /out/caddy /usr/bin/caddy
 COPY --chown=root:root deploy/Caddyfile /etc/caddy/Caddyfile
-RUN chmod 0444 /etc/caddy/Caddyfile \
+RUN apk add --no-cache \
+        'c-ares>=1.34.8-r0' \
+        'curl>=8.20.0-r0' \
+        'libcurl>=8.20.0-r0' \
+    && chmod 0444 /etc/caddy/Caddyfile \
     && DOMAIN=localhost \
        ACME_EMAIL=validation@example.invalid \
        BROWSER_SERVICE_OWNER=build-validation \

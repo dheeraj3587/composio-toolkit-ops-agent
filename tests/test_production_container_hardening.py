@@ -316,6 +316,24 @@ def test_web_runtime_removes_build_only_npm_cli() -> None:
     assert "test ! -e /usr/local/bin/npx" in dockerfile
 
 
+def test_edge_rebuilds_current_caddy_with_fixed_go_dependencies() -> None:
+    dockerfile = (ROOT / "Dockerfile.caddy").read_text(encoding="utf-8")
+    go_mod = (ROOT / "deploy" / "caddy-build" / "go.mod").read_text(encoding="utf-8")
+    main = (ROOT / "deploy" / "caddy-build" / "main.go").read_text(encoding="utf-8")
+
+    assert "golang:1.26.5-alpine3.24@sha256:" in dockerfile
+    assert "github.com/caddyserver/caddy/v2 v2.11.4" in go_mod
+    assert "golang.org/x/text v0.39.0" in go_mod
+    assert "google.golang.org/grpc v1.82.1" in go_mod
+    assert 'test "$(go list -m' in dockerfile
+    assert "go version -m /out/caddy" in dockerfile
+    assert "'c-ares>=1.34.8-r0'" in dockerfile
+    assert "'curl>=8.20.0-r0'" in dockerfile
+    assert "'libcurl>=8.20.0-r0'" in dockerfile
+    assert 'caddycmd "github.com/caddyserver/caddy/v2/cmd"' in main
+    assert '_ "github.com/caddyserver/caddy/v2/modules/standard"' in main
+
+
 def test_ci_actions_are_full_sha_pinned_with_readable_release_comments() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 

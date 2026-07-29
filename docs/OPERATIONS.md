@@ -342,6 +342,10 @@ package becomes available. Python build-only packaging tools are removed from
 the API and browser runtime images after the locked dependencies are installed.
 The web build uses npm in isolated builder stages, but the npm/npx CLI and its
 dependency tree are removed from the final image before it runs as `node`.
+The edge image retains the official Caddy 2.11.4 runtime layout but rebuilds
+that release with Go 1.26.5, `golang.org/x/text` 0.39.0, and gRPC 1.82.1, then
+requires the vendor-fixed Alpine c-ares and curl packages before validating the
+baked Caddyfile.
 
 Any failure after the edge closes recreates the previous revision with the
 frozen Git topology, seccomp profile, prior runtime environment/limits, and exact
