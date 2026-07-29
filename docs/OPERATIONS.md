@@ -340,6 +340,8 @@ they are mitigated by the runtime's non-root user, read-only filesystem,
 dropped capabilities, seccomp policy, and network boundaries until an upstream
 package becomes available. Python build-only packaging tools are removed from
 the API and browser runtime images after the locked dependencies are installed.
+The web build uses npm in isolated builder stages, but the npm/npx CLI and its
+dependency tree are removed from the final image before it runs as `node`.
 
 Any failure after the edge closes recreates the previous revision with the
 frozen Git topology, seccomp profile, prior runtime environment/limits, and exact

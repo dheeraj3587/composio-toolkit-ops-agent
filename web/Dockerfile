@@ -39,7 +39,17 @@ COPY --from=builder --chown=node:node /app/.next/standalone ./
 # the UI without fonts, icons, and compiled client chunks.
 COPY --from=builder --chown=node:node /app/public ./public
 COPY --from=builder --chown=node:node /app/.next/static ./.next/static
-RUN test -f /app/server.js && test -d /app/public && test -d /app/.next/static
+# npm is required in the two build stages but the production process only
+# executes the generated Node server. Remove npm and npx from the final image so
+# their package-management and archive-extraction dependency trees are not part
+# of the remotely reachable runtime.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx \
+    && test -f /app/server.js \
+    && test -d /app/public \
+    && test -d /app/.next/static \
+    && test ! -e /usr/local/lib/node_modules/npm \
+    && test ! -e /usr/local/bin/npm \
+    && test ! -e /usr/local/bin/npx
 
 USER node
 EXPOSE 3000

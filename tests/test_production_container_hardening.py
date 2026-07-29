@@ -309,6 +309,13 @@ def test_python_runtime_images_remove_build_only_packaging_tools() -> None:
         assert "python -m pip uninstall --yes setuptools wheel" in contents
 
 
+def test_web_runtime_removes_build_only_npm_cli() -> None:
+    dockerfile = (ROOT / "web" / "Dockerfile").read_text(encoding="utf-8")
+    assert "rm -rf /usr/local/lib/node_modules/npm" in dockerfile
+    assert "test ! -e /usr/local/bin/npm" in dockerfile
+    assert "test ! -e /usr/local/bin/npx" in dockerfile
+
+
 def test_ci_actions_are_full_sha_pinned_with_readable_release_comments() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
