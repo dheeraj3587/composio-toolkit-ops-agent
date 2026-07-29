@@ -43,10 +43,11 @@ RUN python -m pip install --no-cache-dir --no-build-isolation --require-hashes \
 
 COPY --chown=root:root api ./api
 COPY --chown=root:root ops ./ops
+COPY --chown=root:root browser_service ./browser_service
 COPY --chown=root:root data/p1 ./data/p1
 
-RUN find /app/api /app/ops /app/data/p1 -type d -exec chmod 0555 {} + \
-    && find /app/api /app/ops /app/data/p1 -type f -exec chmod 0444 {} + \
+RUN find /app/api /app/ops /app/browser_service /app/data/p1 -type d -exec chmod 0555 {} + \
+    && find /app/api /app/ops /app/browser_service /app/data/p1 -type f -exec chmod 0444 {} + \
     && install -d -o ops -g ops -m 0700 /private /data /vault
 
 USER ops
