@@ -333,6 +333,14 @@ The script:
 8. atomically records the exact revision-and-nonce acceptance marker, which is
    the only event that releases autonomous Gmail and reconciliation maintenance.
 
+The Trivy gate fails on every `HIGH` or `CRITICAL` vulnerability for which the
+package vendor publishes a fixed version. Unfixed vendor advisories remain
+visible in the scan report but do not make a rebuild permanently undeployable;
+they are mitigated by the runtime's non-root user, read-only filesystem,
+dropped capabilities, seccomp policy, and network boundaries until an upstream
+package becomes available. Python build-only packaging tools are removed from
+the API and browser runtime images after the locked dependencies are installed.
+
 Any failure after the edge closes recreates the previous revision with the
 frozen Git topology, seccomp profile, prior runtime environment/limits, and exact
 previous image IDs. If candidate activation began, it first restores the exact

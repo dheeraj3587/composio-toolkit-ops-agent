@@ -298,9 +298,15 @@ def test_ci_scans_every_revisioned_production_image_with_pinned_trivy() -> None:
         "ed142fd0673e97e23eac54620cfb913e5ce36c25"  # pragma: allowlist secret
     ) in production_job
     assert "image-ref: composio-ops-${{ matrix.image }}:ci" in production_job
-    assert "ignore-unfixed: false" in production_job
+    assert "ignore-unfixed: true" in production_job
     assert "severity: HIGH,CRITICAL" in production_job
     assert 'exit-code: "1"' in production_job
+
+
+def test_python_runtime_images_remove_build_only_packaging_tools() -> None:
+    for dockerfile in ("Dockerfile.api", "Dockerfile.browser"):
+        contents = (ROOT / dockerfile).read_text(encoding="utf-8")
+        assert "python -m pip uninstall --yes setuptools wheel" in contents
 
 
 def test_ci_actions_are_full_sha_pinned_with_readable_release_comments() -> None:

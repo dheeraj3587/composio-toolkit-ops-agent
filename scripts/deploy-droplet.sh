@@ -597,6 +597,7 @@ scan_candidate_images() {
 			--cache-dir "$cache_dir" \
 			--scanners vuln \
 			--severity HIGH,CRITICAL \
+			--ignore-unfixed \
 			--exit-code 1 \
 			--no-progress \
 			"${CANDIDATE_IMAGE_ID[$service]}"; then

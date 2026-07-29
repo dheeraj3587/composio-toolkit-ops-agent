@@ -48,7 +48,8 @@ WORKDIR /app
 
 COPY requirements-api.txt requirements-providers.txt requirements-runtime.lock ./
 RUN python -m pip install --no-cache-dir --no-build-isolation --require-hashes \
-    --requirement requirements-runtime.lock
+    --requirement requirements-runtime.lock \
+    && python -m pip uninstall --yes setuptools wheel
 
 # Install the Chromium binary AND its OS dependencies. `pip install playwright`
 # alone does not do this — omitting it is why a Playwright launch fails inside a

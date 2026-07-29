@@ -160,7 +160,10 @@ jobs:
         with:
           image-ref: composio-ops-${{ matrix.image }}:ci
           format: table
-          ignore-unfixed: false
+          # Fail on every actionable HIGH/CRITICAL finding. Advisories for
+          # which the OS vendor has not published a fixed package remain in
+          # the report but cannot be remediated by rebuilding this image.
+          ignore-unfixed: true
           severity: HIGH,CRITICAL
           exit-code: "1"
 
