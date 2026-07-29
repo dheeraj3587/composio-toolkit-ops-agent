@@ -273,6 +273,17 @@ export interface ProviderStatus {
   expires_at?: string | null
 }
 
+export interface BrowserServiceHealthView {
+  state: string
+  reason_code: string
+  version: string
+  chromium_installed: boolean
+  context_launch_ok: boolean
+  capacity_total: number
+  capacity_in_use: number
+  janitor_running: boolean
+}
+
 export interface HealthResponse {
   status: "healthy" | "degraded"
   phase: string
@@ -280,6 +291,7 @@ export interface HealthResponse {
   snapshot: SnapshotHealth
   checks: HealthCheck[]
   providers?: ProviderStatus[]
+  browser_service?: BrowserServiceHealthView | null
 }
 
 export interface CompanyProfileInput {

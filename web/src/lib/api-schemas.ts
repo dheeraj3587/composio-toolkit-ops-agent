@@ -360,6 +360,17 @@ export const snapshotHealthSchema = z.strictObject({
   coverage_sha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
 })
 
+export const browserServiceHealthViewSchema = z.strictObject({
+  state: safeToken,
+  reason_code: safeToken,
+  version: boundedText(40),
+  chromium_installed: z.boolean(),
+  context_launch_ok: z.boolean(),
+  capacity_total: z.number().int().nonnegative(),
+  capacity_in_use: z.number().int().nonnegative(),
+  janitor_running: z.boolean(),
+})
+
 export const healthResponseSchema = z.strictObject({
   status: z.enum(["healthy", "degraded"]),
   phase: boundedText(40),
@@ -375,6 +386,7 @@ export const healthResponseSchema = z.strictObject({
     )
     .max(50),
   providers: z.array(providerStatusSchema).max(30).optional(),
+  browser_service: browserServiceHealthViewSchema.nullish().default(null),
 })
 
 export const actionReceiptSchema = z.strictObject({
