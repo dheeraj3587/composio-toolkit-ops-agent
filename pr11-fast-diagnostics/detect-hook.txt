@@ -1,0 +1,5 @@
+The baseline file was updated.
+Probably to keep line numbers of secrets up-to-date.
+Please `git add .secrets.baseline`, thank you.
+
+

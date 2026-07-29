@@ -1,0 +1,4 @@
+detect_hook=3
+detect_scan=0
+ruff_check=0
+ruff_format=0
