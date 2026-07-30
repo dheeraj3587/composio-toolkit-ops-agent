@@ -420,6 +420,21 @@ def _make_fake_repo(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
         """,
     )
     _write_executable(fake_bin / "docker", _fake_docker_script())
+    # The release refuses to run unless it is root, because loading the browser
+    # AppArmor policy needs it. Simulate that host fact rather than requiring the
+    # whole suite to run as root; every privileged action itself is faked above.
+    _write_executable(
+        fake_bin / "id",
+        """
+        #!/usr/bin/env bash
+        set -euo pipefail
+        if [ "${1:-}" = "-u" ]; then
+            printf '0\\n'
+        else
+            exec /usr/bin/id "$@"
+        fi
+        """,
+    )
     _write_executable(
         fake_bin / "install",
         """

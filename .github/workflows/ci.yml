@@ -52,7 +52,10 @@ jobs:
   real-browser:
     name: Real Chromium acceptance
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # Every test here starts a real Chromium and drives a real page. Until the
+    # sandbox fix below, the whole suite failed at launch in under two minutes,
+    # so this budget had never covered an actual run.
+    timeout-minutes: 75
     env:
       ALLOW_LIVE_BROWSER: "false"
       ALLOW_LIVE_VENDOR_EMAIL: "false"
@@ -95,8 +98,10 @@ jobs:
           sysctl kernel.apparmor_restrict_unprivileged_userns
 
       - name: Run real-browser acceptance suite
+        # --durations reports the slowest cases so a regression in browser test
+        # time is visible in the log instead of only as a job timeout.
         run: >-
-          pytest -q -m browser
+          pytest -m browser -v --durations=25
           --junitxml="${RUNNER_TEMP}/real-browser.xml"
 
       - name: Assert browser suite ran with zero skips
