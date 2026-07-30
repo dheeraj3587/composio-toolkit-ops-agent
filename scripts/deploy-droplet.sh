@@ -24,6 +24,10 @@ RELEASE_LOCK_FD=9
 readonly -a RELEASE_SERVICES=(api browser-worker web caddy)
 readonly -a INTERNAL_SERVICES=(browser-worker api web)
 readonly BROWSER_APPARMOR_PROFILE_NAME="composio-ops-browser-v1"
+# Bound on the first-release wait for a Let's Encrypt certificate. Long enough
+# for an ACME order plus retry, short enough that a genuinely broken TLS setup
+# still fails the release instead of hanging it.
+readonly PUBLIC_CERTIFICATE_TIMEOUT_SECONDS=240
 readonly BROWSER_APPARMOR_SOURCE="deploy/composio-ops-browser.apparmor"
 readonly BROWSER_APPARMOR_DESTINATION="/etc/apparmor.d/composio-ops-browser-v1"
 
@@ -836,9 +840,39 @@ verify_running_identity() {
 	[ "$actual_id" = "$expected_id" ] && [ "$actual_revision" = "$expected_revision" ]
 }
 
+wait_for_public_certificate() {
+	# The FIRST release on a host has no certificate yet. Caddy only starts the
+	# ACME order once it is listening, so for a few seconds after the container
+	# reports healthy the HTTPS port answers with a TLS alert rather than a
+	# handshake — and an immediate probe failed a release whose certificate was
+	# seconds away. Wait for the handshake only; every assertion below stays
+	# strict and single-pass, and an HTTP-level answer (any status) ends the wait.
+	local origin="$1" deadline status
+	case "$origin" in
+	https://*) ;;
+	*) return 0 ;;
+	esac
+	deadline=$((SECONDS + PUBLIC_CERTIFICATE_TIMEOUT_SECONDS))
+	while :; do
+		status=0
+		curl --silent --output /dev/null --max-time 15 "${origin}/healthz" || status=$?
+		case "$status" in
+		# 7 not listening yet, 35/51/56/60 no usable certificate yet.
+		7 | 35 | 51 | 56 | 60) ;;
+		*) return 0 ;;
+		esac
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			return 1
+		fi
+		log "Waiting for the public certificate on ${origin}..."
+		sleep 5
+	done
+}
+
 public_probes() {
 	local origin="${1:-$PUBLIC_ORIGIN}"
 	local health_status redirect_probe unauthenticated_status redirect_url extra login_status
+	wait_for_public_certificate "$origin" || return 1
 	health_status="$(
 		curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
 			--max-time 20 "${origin}/healthz"
