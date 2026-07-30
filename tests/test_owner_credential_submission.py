@@ -8,12 +8,12 @@ import pytest
 from cryptography.fernet import Fernet
 from pydantic import SecretStr
 
-from ops.browser_worker import BrowserObservation, BrowserSessionContext
-from ops.config import Settings
-from ops.models import CompanyProfile, OperationsRequest
-from ops.run_errors import CredentialSubmissionError
-from ops.run_service import RunService
-from ops.secret_store import SQLiteSecretStore
+from ops.browser.worker import BrowserObservation, BrowserSessionContext
+from ops.core.config import Settings
+from ops.core.models import CompanyProfile, OperationsRequest
+from ops.core.secret_store import SQLiteSecretStore
+from ops.runs.errors import CredentialSubmissionError
+from ops.runs.service import RunService
 
 RAW_TOKEN = "canonical-owner-token-DO-NOT-PERSIST"  # pragma: allowlist secret
 
@@ -141,7 +141,7 @@ def test_owner_submission_after_restart_uses_creation_time_field_schema(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import ops.app_recipes as recipe_module
+    import ops.recipes.app_recipes as recipe_module
 
     service, store = _service(tmp_path)
     run_id = _entry_reached(service)

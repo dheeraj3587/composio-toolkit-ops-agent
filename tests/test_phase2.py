@@ -8,8 +8,9 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from ops.models import OperationalResearch
-from ops.p1_adapter import (
+from ops.access.routing import decide_access, resolve_access
+from ops.core.models import OperationalResearch
+from ops.research.p1_adapter import (
     DEFAULT_P1_ROOT,
     P1AppRecord,
     P1LookupFound,
@@ -18,7 +19,6 @@ from ops.p1_adapter import (
     SnapshotIntegrityError,
     load_verified_snapshot,
 )
-from ops.routing import decide_access, resolve_access
 
 
 def operational_research(**overrides: object) -> OperationalResearch:

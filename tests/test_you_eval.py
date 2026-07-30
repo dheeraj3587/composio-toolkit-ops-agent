@@ -11,8 +11,8 @@ measures real provider quality.
 
 from __future__ import annotations
 
-from ops.you_eval import EvalReport, load_dataset, score_candidates
-from ops.you_research import EvidenceCandidate, classify_category
+from ops.you.eval import EvalReport, load_dataset, score_candidates
+from ops.you.research import EvidenceCandidate, classify_category
 
 DATASET = load_dataset()
 

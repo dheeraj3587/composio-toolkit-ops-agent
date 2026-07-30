@@ -16,9 +16,10 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
-from ops.config import Settings
-from ops.models import OperationalResearch, OperationalUrlClaim, ScopeRequirement
-from ops.operational_research import (
+from ops.core.config import Settings
+from ops.core.models import OperationalResearch, OperationalUrlClaim, ScopeRequirement
+from ops.research.cache import SqliteResearchCache
+from ops.research.operational_research import (
     EvidenceDocument,
     OperationalResearchEnricher,
     _compact_extraction_evidence,
@@ -26,8 +27,7 @@ from ops.operational_research import (
     _validate_extracted_research,
     _validate_operational_urls,
 )
-from ops.research_cache import SqliteResearchCache
-from ops.you_research import (
+from ops.you.research import (
     CompositeEvidenceDiscovery,
     EvidenceCandidate,
     FallbackEvidenceContentFetcher,
@@ -354,7 +354,7 @@ class TestResearchHostPolicy:
         )
 
     def test_reviewed_wildcard_rejects_bare_root(self) -> None:
-        # Matches ops.browser_host_policy: a wildcard does NOT permit the root.
+        # Matches ops.browser.host_policy: a wildcard does NOT permit the root.
         p = ResearchHostPolicy(wildcard_domains=["example.com"], resolver=_FakeResolver())
         with pytest.raises(ValueError):
             p.validate_candidate_url("https://example.com/x")
@@ -977,7 +977,7 @@ def _docs(text: str, url: str = f"https://{_ALLOWED}/oauth") -> tuple[EvidenceDo
 
 class TestOperationalUrlClaims:
     def _policy_obj(self):  # noqa: ANN202
-        from ops.operational_research import OfficialURLPolicy
+        from ops.research.operational_research import OfficialURLPolicy
 
         return OfficialURLPolicy([_ALLOWED], resolver=_FakeResolver())
 
@@ -1252,7 +1252,7 @@ class TestBrowserBoundary:
         assert "you" not in Settings.model_fields["browser_provider"].annotation.__args__  # type: ignore[union-attr]
 
     def test_research_domains_do_not_modify_browser_allowlist(self) -> None:
-        from ops.browser_host_policy import build_browser_allowed_hosts
+        from ops.browser.host_policy import build_browser_allowed_hosts
 
         malicious = _baseline(developer_portal_url="https://developers.pipedrive.com/")
         allowed = build_browser_allowed_hosts("pipedrive", malicious)

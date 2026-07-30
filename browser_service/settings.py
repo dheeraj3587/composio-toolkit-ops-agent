@@ -1,6 +1,6 @@
 """Browser-service configuration (environment-backed, secret-safe).
 
-Deliberately separate from ``ops.config.Settings``: the browser service is its
+Deliberately separate from ``ops.core.config.Settings``: the browser service is its
 own process with its own, much smaller, configuration surface. The shared RPC
 token is a ``SecretStr`` so it can never be printed by ``repr``/``str``.
 """
@@ -15,6 +15,14 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from browser_service.display_pool import MAX_DISPLAY_SLOTS
+
+# The browser pool's capacity bounds, named rather than repeated as literals so
+# the default and the ceiling have exactly one definition in this process. Two
+# concurrent Chromium contexts is the shipped default; ten is the hard ceiling a
+# deployment cannot raise, because beyond it a single container's memory and the
+# per-session display stack stop being honest about what it can serve.
+DEFAULT_MAX_SESSIONS = 2
+MAX_SESSIONS_CEILING = 10
 
 
 class BrowserServiceSettings(BaseModel):
@@ -36,7 +44,7 @@ class BrowserServiceSettings(BaseModel):
     port: int = Field(default=8081, ge=1, le=65_535)
 
     # Session bounds (the service, not the caller, owns these).
-    max_sessions: int = Field(default=2, ge=1, le=10)
+    max_sessions: int = Field(default=DEFAULT_MAX_SESSIONS, ge=1, le=MAX_SESSIONS_CEILING)
     inactivity_seconds: int = Field(default=900, ge=30, le=86_400)
     maximum_age_seconds: int = Field(default=14_400, ge=60, le=172_800)
     # How long the janitor waits for in-flight operations before cancelling them.
@@ -204,6 +212,19 @@ class BrowserServiceSettings(BaseModel):
                 return False
             raise ValueError(f"{name} must be true or false")
 
+        def _capacity(name: str) -> int:
+            """Read the pool capacity, naming the ceiling in the failure itself.
+
+            The model bound already refuses an out-of-range value, but it does so
+            with a generic constraint message. An operator who sets 20 needs to be
+            told the ceiling is 10, not that ``max_sessions`` failed ``le``.
+            """
+
+            value = _int(name, DEFAULT_MAX_SESSIONS)
+            if not 1 <= value <= MAX_SESSIONS_CEILING:
+                raise ValueError(f"{name} must be between 1 and {MAX_SESSIONS_CEILING}")
+            return value
+
         token = _text("BROWSER_SERVICE_TOKEN")
         storage_key = _text("BROWSER_STORAGE_STATE_KEY")
         secret_broker_token = _text("BROWSER_SECRET_BROKER_TOKEN")
@@ -215,7 +236,7 @@ class BrowserServiceSettings(BaseModel):
             secret_broker_timeout_seconds=_float("BROWSER_SECRET_BROKER_TIMEOUT_SECONDS", 10.0),
             host=_text("BROWSER_SERVICE_HOST") or "0.0.0.0",  # noqa: S104 - private network
             port=_int("BROWSER_SERVICE_PORT", 8081),
-            max_sessions=_int("PLAYWRIGHT_MAX_SESSIONS", 2),
+            max_sessions=_capacity("PLAYWRIGHT_MAX_SESSIONS"),
             inactivity_seconds=_int("BROWSER_SESSION_INACTIVITY_SECONDS", 900),
             maximum_age_seconds=_int("BROWSER_SESSION_MAX_AGE_SECONDS", 14_400),
             drain_seconds=_float("BROWSER_SESSION_DRAIN_SECONDS", 10.0),
@@ -241,4 +262,4 @@ class BrowserServiceSettings(BaseModel):
         )
 
 
-__all__ = ["BrowserServiceSettings"]
+__all__ = ["DEFAULT_MAX_SESSIONS", "MAX_SESSIONS_CEILING", "BrowserServiceSettings"]

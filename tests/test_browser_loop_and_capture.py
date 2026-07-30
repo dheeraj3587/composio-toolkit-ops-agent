@@ -12,9 +12,9 @@ import asyncio
 
 import pytest
 
-from ops.browser_loop import BrowserLoop, BrowserLoopClosedError, shared_browser_loop
-from ops.config import Settings
-from ops.playwright_worker import PlaywrightBrowserWorker
+from ops.browser.loop import BrowserLoop, BrowserLoopClosedError, shared_browser_loop
+from ops.core.config import Settings
+from ops.playwright.worker import PlaywrightBrowserWorker
 from tests.browser_app.harness import require_chromium
 
 

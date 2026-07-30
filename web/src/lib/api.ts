@@ -4,13 +4,18 @@ import type { ZodType } from "zod"
 
 import {
   actionReceiptSchema,
+  admissionDecisionResponseSchema,
   appCatalogResponseSchema,
   appResearchResponseSchema,
   appSearchResponseSchema,
   healthResponseSchema,
   liveViewResponseSchema,
   managedConnectionResponseSchema,
+  pauseResponseSchema,
+  providerProfileResponseSchema,
   providerStatusSchema,
+  resetResponseSchema,
+  retryStepResponseSchema,
   runDetailResponseSchema,
   runListResponseSchema,
   runOutputResponseSchema,
@@ -18,6 +23,8 @@ import {
 } from "@/lib/api-schemas"
 import type {
   ActionReceipt,
+  AdmissionDecisionResponse,
+  AdmissionInput,
   AppCatalogResponse,
   AppResearchResponse,
   AppSearchResponse,
@@ -27,9 +34,14 @@ import type {
   IntegratorOutput,
   LiveViewResponse,
   ManagedConnectionResponse,
+  OnboardingPhase,
   OperationsRequestInput,
+  PauseResponse,
   PhaseConflict,
+  ProviderProfileView,
   ProviderStatus,
+  ResetResponse,
+  RetryStepResponse,
   RunDetailResponse,
   RunListResponse,
   RunPhaseAction,
@@ -39,6 +51,7 @@ import type {
 
 const CREDENTIAL_FIELD_PATTERN = /^[a-z0-9][a-z0-9_-]{0,99}$/
 const RUN_ID_PATTERN = /^run_[0-9a-f]{32}$/
+const SHA256_DIGEST_PATTERN = /^[0-9a-f]{64}$/
 
 const DEFAULT_API_ORIGIN = "http://127.0.0.1:8000"
 const REQUEST_TIMEOUT_MS = 8_000
@@ -236,6 +249,15 @@ export function getTimeline(runId: string): Promise<TimelineResponse> {
   return apiRequest(runPath(runId, "/timeline"), timelineResponseSchema)
 }
 
+/**
+ * The sanitized provider profile for one onboarding run. The backend answers 409
+ * until a profile is committed, so callers treat a rejection as "not reported"
+ * rather than fabricating profile state.
+ */
+export function getProviderProfile(runId: string): Promise<ProviderProfileView> {
+  return apiRequest(runPath(runId, "/profile"), providerProfileResponseSchema)
+}
+
 export function connectManagedRun(runId: string): Promise<ManagedConnectionResponse> {
   return apiRequest(
     runPath(runId, "/connect"),
@@ -297,6 +319,87 @@ export function performPhaseAction(
       body: JSON.stringify(action === "retry" ? { capability } : {}),
     },
     timeout,
+  )
+}
+
+/**
+ * Record the operator's one admission decision (`POST /api/runs/{id}/decision`).
+ *
+ * `profileDigest` is optimistic concurrency, not decoration: the backend refuses
+ * a decision that names a profile the run has not committed, so the operator can
+ * only ever decide about the profile they were actually shown.
+ */
+export function decideAdmission(
+  runId: string,
+  decision: AdmissionInput,
+  profileDigest: string,
+): Promise<AdmissionDecisionResponse> {
+  if (!SHA256_DIGEST_PATTERN.test(profileDigest)) {
+    throw new ApiError(400, "INVALID_PROFILE_DIGEST", "The profile reference is invalid.")
+  }
+  return apiRequest(
+    runPath(runId, "/decision"),
+    admissionDecisionResponseSchema,
+    {
+      method: "POST",
+      body: JSON.stringify({ decision, profile_digest: profileDigest }),
+    },
+    CREDENTIAL_TIMEOUT_MS,
+  )
+}
+
+/** Stop the run at its next safe boundary, keeping the browser session up. */
+export function pauseOnboarding(runId: string): Promise<PauseResponse> {
+  return apiRequest(
+    runPath(runId, "/pause"),
+    pauseResponseSchema,
+    { method: "POST", body: JSON.stringify({}) },
+    CREDENTIAL_TIMEOUT_MS,
+  )
+}
+
+/**
+ * Restart the walk at research. The backend requires `confirm: true`, so an
+ * unconfirmed reset is a validation error before any session is released.
+ */
+export function resetOnboarding(runId: string): Promise<ResetResponse> {
+  return apiRequest(
+    runPath(runId, "/reset"),
+    resetResponseSchema,
+    { method: "POST", body: JSON.stringify({ confirm: true }) },
+    CREDENTIAL_TIMEOUT_MS,
+  )
+}
+
+/**
+ * Re-attempt the run's current step. `expectedPhase` is an optimistic check, not
+ * a choice of step: naming a phase the run is not standing in is refused.
+ */
+export function retryOnboardingStep(
+  runId: string,
+  expectedPhase: OnboardingPhase,
+): Promise<RetryStepResponse> {
+  return apiRequest(
+    runPath(runId, "/retry"),
+    retryStepResponseSchema,
+    { method: "POST", body: JSON.stringify({ expected_phase: expectedPhase }) },
+    CREDENTIAL_TIMEOUT_MS,
+  )
+}
+
+/**
+ * Resume or cancel a waiting onboarding run. `cancelled` releases the browser
+ * session and reports through the same receipt (design LL-6.3).
+ */
+export function resumeOnboarding(
+  runId: string,
+  signal: "completed" | "cancelled",
+): Promise<ActionReceipt> {
+  return apiRequest(
+    runPath(runId, "/resume"),
+    actionReceiptSchema,
+    { method: "POST", body: JSON.stringify({ signal }) },
+    RUN_ACTION_TIMEOUT_MS,
   )
 }
 

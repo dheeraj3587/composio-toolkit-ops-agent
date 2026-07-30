@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import pytest
 
-from ops.email_ai import _analyze_prompt
-from ops.gmail_worker import (
+from ops.core.models import CompanyProfile
+from ops.email.ai import _analyze_prompt
+from ops.gmail.worker import (
     _extract_otp,
     _order_messages_by_trust,
     _sender_domain,
 )
-from ops.models import CompanyProfile
 
 
 # --- Positive cases: a real code is present and must be extracted -------------

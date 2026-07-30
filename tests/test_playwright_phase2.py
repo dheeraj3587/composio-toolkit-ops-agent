@@ -15,8 +15,8 @@ from typing import Any
 
 import pytest
 
-from ops.browser_api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
-from ops.browser_candidates import (
+from ops.browser.api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
+from ops.browser.candidates import (
     ActionCandidate,
     CandidatePostcondition,
     ElementIdentity,
@@ -25,14 +25,14 @@ from ops.browser_candidates import (
     resolve_identity,
     select_candidate,
 )
-from ops.browser_decider import SnapshotElement, build_snapshot, validate_choice
-from ops.browser_egress import (
+from ops.browser.decider import SnapshotElement, build_snapshot, validate_choice
+from ops.browser.egress import (
     EgressStage,
     EgressStageTracker,
     build_egress_policy,
     reviewed_egress_extensions,
 )
-from ops.browser_pages import (
+from ops.browser.pages import (
     BrowserPageRegistry,
     DialogPolicy,
     DialogRecord,
@@ -42,10 +42,10 @@ from ops.browser_pages import (
     install_dialog_handler,
     install_download_guard,
 )
-from ops.browser_risk import BrowserActionRiskPolicy
-from ops.browser_snapshot import build_ranked_snapshot, rank_raw_elements
-from ops.inference import DecisionBudget, DecisionFailed, JsonInference
-from ops.playwright_worker import (
+from ops.browser.risk import BrowserActionRiskPolicy
+from ops.browser.snapshot import build_ranked_snapshot, rank_raw_elements
+from ops.core.inference import DecisionBudget, DecisionFailed, JsonInference
+from ops.playwright.worker import (
     PageInspection,
     make_route_handler,
     postcondition_satisfied,
@@ -290,7 +290,7 @@ def test_iframe_element_is_resolved_with_frame_path() -> None:
 
 
 def test_unreviewed_frame_secret_injection_is_blocked() -> None:
-    from ops.playwright_worker import _login_frames_are_reviewed
+    from ops.playwright.worker import _login_frames_are_reviewed
 
     async def _c(page: Any, _reached: list[str]) -> object:
         # The evil frame will fail to load (guard aborts it), so also assert the

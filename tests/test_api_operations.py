@@ -330,7 +330,7 @@ def test_execute_when_configured_via_api_waits_for_managed_connection_without_ke
     tmp_path: Path,
 ) -> None:
     from api.service import LocalRunService
-    from ops.config import Settings
+    from ops.core.config import Settings
 
     service = LocalRunService(db_path=tmp_path / "private" / "ops.db", settings=Settings())
     application = create_app(service=service)
@@ -357,7 +357,7 @@ def test_invalid_managed_auth_callback_disables_api_action_and_provider_state(
     from pydantic import SecretStr
 
     from api.service import LocalRunService
-    from ops.config import Settings
+    from ops.core.config import Settings
 
     settings = Settings(
         composio_api_key=SecretStr("unit-test-composio-key"),  # pragma: allowlist secret
@@ -399,7 +399,7 @@ def test_execute_when_configured_does_not_put_langgraph_on_the_new_run_path(
     from pydantic import SecretStr
 
     from api.service import LocalRunService
-    from ops.config import Settings
+    from ops.core.config import Settings
 
     settings = Settings(
         langgraph_aes_key=SecretStr("0" * 32),
@@ -431,7 +431,7 @@ def test_run_conflict_is_mapped_to_http_409(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from ops.run_service import RunConflictError
+    from ops.runs.service import RunConflictError
 
     application = create_app(db_path=tmp_path / "private" / "ops.db")
     with TestClient(application) as client:
@@ -466,9 +466,9 @@ def test_api_package_does_not_import_ops_graph_directly() -> None:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
-                assert all(not alias.name.startswith("ops.graph") for alias in node.names), (
-                    path.name
-                )
+                assert all(
+                    not alias.name.startswith("ops.workflow.graph") for alias in node.names
+                ), path.name
             elif isinstance(node, ast.ImportFrom) and node.module:
-                assert node.module != "ops.graph", path.name
-                assert not node.module.startswith("ops.graph."), path.name
+                assert node.module != "ops.workflow.graph", path.name
+                assert not node.module.startswith("ops.workflow.graph."), path.name

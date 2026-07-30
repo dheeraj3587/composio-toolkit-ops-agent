@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from api.app import create_app
 from api.models import ActionReceipt
 from api.service import LocalRunService
-from ops.run_service import RunService as CoreRunService
+from ops.runs.service import RunService as CoreRunService
 
 
 def create_payload(app_name: str = "HubSpot") -> dict[str, object]:
@@ -123,7 +123,7 @@ def test_create_run_rejects_per_run_outreach_recipient_override(
 
 
 def test_executable_signup_readiness_refusal_persists_no_run(tmp_path: Path) -> None:
-    from ops.config import Settings
+    from ops.core.config import Settings
 
     settings = Settings(
         allow_live_browser=True,
@@ -198,8 +198,16 @@ def test_exact_requested_routes_are_registered(harness: ApiHarness) -> None:
         # Playwright live view (Browser Use keeps using live-view's hosted URL).
         ("/api/runs/{run_id}/live-view/screenshot", "GET"),
         ("/api/runs/{run_id}/poll-email", "POST"),
+        # Retry serves both shapes: the legacy capability retry and the
+        # onboarding current-step retry, discriminated by the request body.
         ("/api/runs/{run_id}/retry", "POST"),
         ("/api/runs/{run_id}/output", "GET"),
+        # The onboarding operator surface (design LL-6.3). Every one requires the
+        # internal token and the owner gate.
+        ("/api/runs/{run_id}/decision", "POST"),
+        ("/api/runs/{run_id}/pause", "POST"),
+        ("/api/runs/{run_id}/reset", "POST"),
+        ("/api/runs/{run_id}/profile", "GET"),
         # The full verified catalog, so the interface can offer a selector
         # instead of requiring the operator to know an app's exact name.
         ("/api/apps", "GET"),
@@ -225,6 +233,10 @@ def test_create_and_detail_expose_verified_phase_two_contract(harness: ApiHarnes
         # Explicit backend-authoritative browser permissions (BrowserUiState).
         "browser",
         "primary_action",
+        # Onboarding projections (design LL-6.3); null on a legacy run.
+        "onboarding",
+        "controls",
+        "autonomy",
     }
     run = created["run"]
     assert isinstance(run, dict)
@@ -360,7 +372,17 @@ def test_timeline_endpoint_returns_summaries_not_raw_audit_payloads(
     assert payload["run_id"] == run_id
     assert payload["items"]
     assert all(
-        set(item) == {"event_id", "event_type", "summary", "status", "created_at"}
+        set(item)
+        == {
+            "event_id",
+            "event_type",
+            "summary",
+            "status",
+            "created_at",
+            # Closed onboarding attribution (design LL-7); null on legacy events.
+            "correlation",
+            "detail",
+        }
         for item in payload["items"]
     )
     rendered = response.text
@@ -688,7 +710,7 @@ def test_app_catalog_lists_every_reviewed_runnable_app(harness: ApiHarness) -> N
     assert response.status_code == 200
     payload = response.json()
     assert payload["total"] == len(payload["items"])
-    from ops.app_recipes import load_app_recipe_catalog
+    from ops.recipes.app_recipes import load_app_recipe_catalog
 
     reviewed_slugs = {recipe.app_slug for recipe in load_app_recipe_catalog().apps}
     assert payload["total"] == 50

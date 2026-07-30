@@ -16,13 +16,13 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 import browser_service.main as browser_main
-import ops.browser_process_hardening as process_hardening
+import ops.browser.process_hardening as process_hardening
 from browser_service.settings import BrowserServiceSettings
-from ops.browser_process_hardening import (
+from ops.browser.process_hardening import (
     PLAYWRIGHT_DRIVER_CONTRACT_VERSION,
     install_playwright_driver_environment_guard,
 )
-from ops.browser_readiness import BrowserReadiness
+from ops.browser.readiness import BrowserReadiness
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
@@ -155,8 +155,8 @@ def test_playwright_parent_hardening_precedes_driver_environment_guard(
 def test_in_process_worker_hardens_parent_before_driver_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from ops.config import Settings
-    from ops.playwright_worker import PlaywrightBrowserWorker
+    from ops.core.config import Settings
+    from ops.playwright.worker import PlaywrightBrowserWorker
 
     events: list[str] = []
 
@@ -176,7 +176,7 @@ def test_in_process_worker_hardens_parent_before_driver_start(
 
     monkeypatch.setattr(importlib, "import_module", import_module)
     monkeypatch.setattr(
-        "ops.playwright_worker.harden_playwright_parent_process",
+        "ops.playwright.worker.harden_playwright_parent_process",
         fail_hardening,
     )
     worker = PlaywrightBrowserWorker(
@@ -197,7 +197,7 @@ def test_in_process_worker_hardens_parent_before_driver_start(
 def test_readiness_hardens_parent_before_driver_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from ops.browser_readiness import probe_playwright
+    from ops.browser.readiness import probe_playwright
 
     events: list[str] = []
 
@@ -217,7 +217,7 @@ def test_readiness_hardens_parent_before_driver_start(
 
     monkeypatch.setattr(importlib, "import_module", import_module)
     monkeypatch.setattr(
-        "ops.browser_readiness.harden_playwright_parent_process",
+        "ops.browser.readiness.harden_playwright_parent_process",
         fail_hardening,
     )
 
@@ -249,7 +249,7 @@ def test_browser_service_hardens_parent_before_readiness(
 
     monkeypatch.setattr(browser_main, "harden_browser_service_process", harden)
     monkeypatch.setattr(browser_main, "install_browser_service_log_filters", install_log_filters)
-    monkeypatch.setattr("ops.browser_readiness.probe_playwright", readiness_probe)
+    monkeypatch.setattr("ops.browser.readiness.probe_playwright", readiness_probe)
 
     app = browser_main.create_app(
         BrowserServiceSettings(
@@ -295,7 +295,7 @@ def test_nondumpable_parent_denies_child_proc_environ_access() -> None:
         import subprocess
         import sys
 
-        from ops.browser_process_hardening import disable_process_dumpability
+        from ops.browser.process_hardening import disable_process_dumpability
 
         disable_process_dumpability()
         child_env = {{

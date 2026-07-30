@@ -24,10 +24,10 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from ops.browser_loop import BrowserLoop, BrowserOperationTimeout
-from ops.browser_readiness import browser_configuration_state
-from ops.config import Settings
-from ops.playwright_worker import (
+from ops.browser.loop import BrowserLoop, BrowserOperationTimeout
+from ops.browser.readiness import browser_configuration_state
+from ops.core.config import Settings
+from ops.playwright.worker import (
     PlaywrightBrowserWorker,
     _launch_reason_code,
     make_route_handler,
@@ -83,7 +83,7 @@ def test_matched_success_signals_can_match_via_url_or_title() -> None:
 def test_submit_login_clicks_a_submit_control() -> None:
     """Behavioral: _submit_login must actually click/press, not just exist."""
 
-    from ops.playwright_worker import _submit_login
+    from ops.playwright.worker import _submit_login
 
     clicked: list[str] = []
 
@@ -115,7 +115,7 @@ def test_submit_login_clicks_a_submit_control() -> None:
 
 
 def test_submit_login_falls_back_to_pressing_enter() -> None:
-    from ops.playwright_worker import _submit_login
+    from ops.playwright.worker import _submit_login
 
     pressed: list[str] = []
 
@@ -217,7 +217,7 @@ def test_screenshot_masks_credential_fields() -> None:
     # playwright_worker.py, and asserting on the old file would have kept passing
     # for the wrong reason (an unrelated password selector elsewhere in it) while
     # no longer covering the masking code at all.
-    source = (_REPO / "ops" / "playwright_capture_safety.py").read_text(encoding="utf-8")
+    source = (_REPO / "ops" / "playwright" / "capture_safety.py").read_text(encoding="utf-8")
     assert "mask=masks" in source
     assert "input[type='password']" in source
 
@@ -250,7 +250,7 @@ def test_browser_loop_run_enforces_timeout() -> None:
 
 # --- A9: per-session operation lock --------------------------------------------
 def test_session_has_its_own_operation_lock() -> None:
-    from ops.playwright_worker import _PwSession
+    from ops.playwright.worker import _PwSession
 
     first = _PwSession(None, None, None, None, asyncio.Lock())
     second = _PwSession(None, None, None, None, asyncio.Lock())
@@ -260,7 +260,7 @@ def test_session_has_its_own_operation_lock() -> None:
 def test_session_expiry_is_tracked() -> None:
     from datetime import UTC, datetime, timedelta
 
-    from ops.playwright_worker import _PwSession
+    from ops.playwright.worker import _PwSession
 
     session = _PwSession(None, None, None, None, asyncio.Lock())
     now = datetime.now(UTC)
@@ -328,9 +328,9 @@ def test_configuration_state_is_provider_aware() -> None:
 
 # --- A13: effect-ledger provider identity follows the backend ------------------
 def test_graph_resolves_browser_provider_name() -> None:
-    from ops.graph import DurableOperationsWorkflow
+    from ops.workflow.graph import DurableOperationsWorkflow
 
-    source = (_REPO / "ops" / "graph.py").read_text(encoding="utf-8")
+    source = (_REPO / "ops" / "workflow" / "graph.py").read_text(encoding="utf-8")
     # No hardcoded browser_use literal remains at the ledger call sites.
     assert 'provider="browser_use"' not in source
     assert "provider=self._browser_provider_name(state)" in source
@@ -346,6 +346,21 @@ def test_graph_resolves_browser_provider_name() -> None:
         ("Timeout 30000ms exceeded while launching", "browser_launch_timeout"),
         ("Cannot allocate memory", "browser_out_of_memory"),
         ("something else entirely", "browser_launch_failed"),
+        ("Chromium sandboxing failed!", "browser_sandbox_unavailable"),
+        (
+            "Running as root without --no-sandbox is not supported",
+            "browser_sandbox_unavailable",
+        ),
+        ("SingletonLock could not be created", "browser_profile_locked"),
+        # Playwright echoes the whole Chromium command line on failure. It always
+        # contains a "..._profile-XXXX" user-data-dir and "--disable-popup-blocking",
+        # which a loose "profile" plus "lock" match read as a locked profile — so
+        # every launch failure was misreported. This is the regression guard.
+        (
+            "Target closed --user-data-dir=/tmp/playwright_chromiumdev_profile-a1 "
+            "--disable-popup-blocking",
+            "browser_launch_failed",
+        ),
     ],
 )
 def test_launch_reason_codes_are_specific(message: str, expected: str) -> None:

@@ -7,12 +7,12 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
-from ops.config import Settings
-from ops.deploy_acceptance import write_deployment_acceptance_marker
-from ops.models import CompanyProfile, OperationsRequest
-from ops.run_advance import RunAdvanceService
-from ops.run_email import RunEmailService
-from ops.run_service import RunService
+from ops.core.config import Settings
+from ops.core.models import CompanyProfile, OperationsRequest
+from ops.deploy.acceptance import write_deployment_acceptance_marker
+from ops.runs.advance import RunAdvanceService
+from ops.runs.email import RunEmailService
+from ops.runs.service import RunService
 
 
 def _request() -> OperationsRequest:

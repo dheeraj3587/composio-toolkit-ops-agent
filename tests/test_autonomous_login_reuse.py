@@ -19,14 +19,14 @@ import pytest
 from cryptography.fernet import Fernet
 from pydantic import SecretStr
 
-from ops.config import Settings
-from ops.run_service import RunService
-from ops.secret_store import (
+from ops.core.config import Settings
+from ops.core.secret_store import (
     ACCOUNT_LOGIN_KIND_PREFIX,
     REUSABLE_LOGIN_FIELDS,
     AccountLoginStateError,
     SQLiteSecretStore,
 )
+from ops.runs.service import RunService
 
 _EMAIL = "owner@example.test"
 _PASSWORD = "correct-horse-battery"  # pragma: allowlist secret
@@ -419,7 +419,7 @@ def test_pipedrive_trace_has_no_blanket_human_checkpoint() -> None:
     redundant as well as fatal to autonomy.
     """
 
-    from ops.browser_api_trace_catalog import get_browser_api_trace
+    from ops.browser.api_trace_catalog import get_browser_api_trace
 
     trace = get_browser_api_trace("pipedrive")
     assert trace is not None

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr
 
-from ops.redaction import (
+from ops.core.redaction import (
     REDACTED,
     RedactingFilter,
     install_redacting_filter,

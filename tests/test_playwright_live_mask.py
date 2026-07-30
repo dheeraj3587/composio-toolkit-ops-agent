@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from ops.playwright_live_mask import install_live_pixel_mask
+from ops.playwright.live_mask import install_live_pixel_mask
 
 
 class _Context:

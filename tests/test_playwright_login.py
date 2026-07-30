@@ -13,13 +13,13 @@ from typing import Any
 
 import pytest
 
-from ops.browser_api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
-from ops.browser_candidates import (
+from ops.browser.api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
+from ops.browser.candidates import (
     APPROVED_VALUE_REFS,
     generate_candidates,
 )
-from ops.browser_decider import SnapshotElement, build_snapshot
-from ops.browser_login import (
+from ops.browser.decider import SnapshotElement, build_snapshot
+from ops.browser.login import (
     drive_login,
     inject_otp,
     inspect_after_login_submit,
@@ -28,8 +28,8 @@ from ops.browser_login import (
     normalize_resume_signal,
     visible_login_challenge,
 )
-from ops.config import Settings
-from ops.playwright_worker import (
+from ops.core.config import Settings
+from ops.playwright.worker import (
     ApprovedBrowserValueResolver,
     PageInspection,
     checkpoint_satisfied,
@@ -43,7 +43,7 @@ _PATTERNS = (_HOST, "*.pipedrive.com")
 
 
 def _login_inspection(state: str, reason: str) -> Any:
-    from ops.browser_login import LoginInspection
+    from ops.browser.login import LoginInspection
 
     return LoginInspection(
         state=state,
@@ -153,7 +153,7 @@ def _run(path: str, coro_factory: Any) -> Any:
 def test_post_submit_visible_challenge_is_typed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import ops.browser_login as login_module
+    import ops.browser.login as login_module
 
     async def unchanged(*args: Any, **kwargs: Any) -> Any:
         del args, kwargs
@@ -247,7 +247,7 @@ def test_visible_recaptcha_checkbox_anchor_is_a_login_challenge() -> None:
 def test_post_submit_unchanged_form_requires_provider_verification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import ops.browser_login as login_module
+    import ops.browser.login as login_module
 
     async def unchanged(*args: Any, **kwargs: Any) -> Any:
         del args, kwargs
@@ -512,8 +512,8 @@ class TestLoginResultPropagation:
 
     @staticmethod
     def _worker() -> Any:
-        from ops.config import Settings
-        from ops.playwright_worker import PlaywrightBrowserWorker
+        from ops.core.config import Settings
+        from ops.playwright.worker import PlaywrightBrowserWorker
 
         return PlaywrightBrowserWorker(
             settings=Settings(allow_live_browser=True, browser_provider="playwright")
@@ -523,12 +523,12 @@ class TestLoginResultPropagation:
     def _session() -> Any:
         import asyncio as _asyncio
 
-        from ops.playwright_worker import _PwSession
+        from ops.playwright.worker import _PwSession
 
         return _PwSession(None, None, None, None, _asyncio.Lock(), patterns=_PATTERNS)
 
     def _disposition(self, state: str, reason: str, *, had_credentials: bool = True) -> Any:
-        from ops.browser_login import LoginInspection
+        from ops.browser.login import LoginInspection
 
         worker = self._worker()
         result = LoginInspection(
@@ -632,8 +632,8 @@ class TestLoginResultPropagation:
     def test_resume_checks_a_form_hiding_captcha_before_target_retry(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import ops.playwright_worker as worker_module
-        from ops.browser_api_trace_catalog import get_browser_api_trace
+        import ops.playwright.worker as worker_module
+        from ops.browser.api_trace_catalog import get_browser_api_trace
 
         worker = self._worker()
         session = self._session()
@@ -679,7 +679,7 @@ class TestLoginResultPropagation:
         assert _re.fullmatch(r"[a-z0-9_:-]+", obs.reason_code)
 
     def test_reason_code_field_rejects_page_text(self) -> None:
-        from ops.browser_worker import BrowserObservation
+        from ops.browser.worker import BrowserObservation
 
         with pytest.raises(ValueError, match="reason code is invalid"):
             BrowserObservation(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -28,11 +29,19 @@ from browser_service.secret_broker import (
     BrokerCaptureStore,
     BrowserSecretBrokerClient,
 )
-from ops.browser_session_capability import (
+from ops.browser.session_capability import (
     CAPABILITY_HEADER,
     derive_browser_session_capability,
 )
-from ops.secret_store import SQLiteSecretStore
+from ops.core.secret_store import SQLiteSecretStore
+from ops.providers.profile import (
+    FieldEvidence,
+    FlowSpec,
+    ProviderProfile,
+    compute_profile_digest,
+)
+from ops.providers.profile_store import SQLiteProviderProfileStore
+from ops.recipes.app_recipes import get_app_capture_spec
 
 BROKER_TOKEN = "broker-token-" + ("b" * 40)  # pragma: allowlist secret
 OPS_TOKEN = "ops-token-" + ("o" * 40)  # pragma: allowlist secret
@@ -53,6 +62,8 @@ class _Core:
 
     def __init__(self, store: SQLiteSecretStore) -> None:
         self._secret_store = store
+        # Bound only by the runs that reach the profile-derived capture contract.
+        self.provider_profile_store: SQLiteProviderProfileStore | None = None
         # The production broker reads the authoritative storage row, never the
         # public RunService projection. This test double intentionally exposes the
         # same narrow storage surface.
@@ -645,3 +656,101 @@ def test_edge_display_and_backup_hardening_are_declared() -> None:
     assert '"${control_vnc_pid}"' in entrypoint
     assert '"${view_vnc_pid}"' in entrypoint
     assert "browser_profiles" in backup
+
+
+NEW_PROVIDER_SLUG = "acme-labs"
+NEW_PROVIDER_ENTRY_URL = "https://app.acme-labs.com/settings/api-keys"
+
+
+def _new_provider_profile() -> ProviderProfile:
+    """A committed profile for a provider with no reviewed recipe."""
+
+    evidence = FieldEvidence(
+        field="api_key_flow",
+        value=NEW_PROVIDER_ENTRY_URL,
+        source_url="https://developers.acme-labs.com/docs",
+        source_digest="d" * 64,
+        adapters=("fake-discovery",),
+        corroborations=2,
+        confidence=0.9,
+        extracted_at="2025-01-01T00:00:00Z",
+    )
+    profile = ProviderProfile(
+        run_id=RUN_ID,
+        provider_name="Acme Labs",
+        app_slug=NEW_PROVIDER_SLUG,
+        registrable_domain="acme-labs.com",
+        auxiliary_hosts=(),
+        developer_portal_url="https://developers.acme-labs.com/",
+        signup_url="https://acme-labs.com/signup",
+        login_url="https://app.acme-labs.com/login",
+        developer_docs_url="https://developers.acme-labs.com/docs",
+        developer_app_flow=FlowSpec(kind="developer_app", supported=False, entry_url=None),
+        oauth_flow=FlowSpec(kind="oauth", supported=False, entry_url=None),
+        api_key_flow=FlowSpec(
+            kind="api_key",
+            supported=True,
+            entry_url=NEW_PROVIDER_ENTRY_URL,
+            produces=("api_key",),
+            evidence=(evidence,),
+        ),
+        pat_flow=FlowSpec(kind="pat", supported=False, entry_url=None),
+        approval_requirement="none",
+        billing_requirement="unknown",
+        evidence=(replace(evidence, field="signup_url", value="https://acme-labs.com/signup"),),
+        confidence=0.85,
+        adapters_engaged=("fake-discovery",),
+        built_at="2025-01-01T00:00:01Z",
+    )
+    return replace(profile, profile_digest=compute_profile_digest(profile))
+
+
+def test_capture_succeeds_for_a_brand_new_provider_via_profile_contract(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """Open item 1: no reviewed recipe used to mean no capture at all."""
+
+    client, store, core = _client(tmp_path, monkeypatch)
+    assert get_app_capture_spec(NEW_PROVIDER_SLUG) is None
+    profile_store = SQLiteProviderProfileStore(
+        tmp_path / "private" / "provider_profiles.db",
+        owner=OWNER,
+    )
+    profile_store.put(_new_provider_profile())
+    core.provider_profile_store = profile_store
+    effect_identity = f"{RUN_ID}:credential-capture:v1"
+    record = _active_record(
+        phase="credential_capture_reserved",
+        effect_identity=effect_identity,
+    )
+    core.records[RUN_ID] = {**record, "app_slug": NEW_PROVIDER_SLUG}
+    grant = store.reserve_browser_secret_grant(
+        operation_key=f"{effect_identity}:capture:api_key",
+        run_id=RUN_ID,
+        session_id=SESSION_ID,
+        app_slug=NEW_PROVIDER_SLUG,
+        kind="api_key",
+        action="capture",
+    )
+    value = "k" * 32
+    with client:
+        captured = client.post(
+            "/internal/browser-secret-broker/capture",
+            json={
+                "grant": grant,
+                "app_slug": NEW_PROVIDER_SLUG,
+                "kind": "api_key",
+                "scope_id": RUN_ID,
+                "session_id": SESSION_ID,
+                "value": value,
+            },
+            headers=_headers(),
+        )
+
+    assert captured.status_code == 200
+    assert set(captured.json()) == {"reference"}
+    reference = captured.json()["reference"]
+    assert value not in captured.text
+    # The vault write happens before the reference is returned.
+    assert store.get(reference) == value

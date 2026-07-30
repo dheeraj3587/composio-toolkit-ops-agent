@@ -16,15 +16,15 @@ from pydantic import SecretStr
 
 from api.app import create_app
 from api.service import LocalRunService
-from ops.app_recipes import get_app_recipe, recipe_to_operational_research
-from ops.browser_worker import BrowserObservation
-from ops.canonical_runtime import CanonicalRuntime
-from ops.config import Settings
-from ops.gmail_worker import GmailSignupPreflight, GmailWorker
-from ops.models import CompanyProfile, OperationsRequest
-from ops.run_projections import _public_run
-from ops.run_service import RunService as CoreRunService
-from ops.secret_store import SignupCredentialStateError, SQLiteSecretStore
+from ops.browser.worker import BrowserObservation
+from ops.core.config import Settings
+from ops.core.models import CompanyProfile, OperationsRequest
+from ops.core.secret_store import SignupCredentialStateError, SQLiteSecretStore
+from ops.gmail.worker import GmailSignupPreflight, GmailWorker
+from ops.recipes.app_recipes import get_app_recipe, recipe_to_operational_research
+from ops.runs.projections import _public_run
+from ops.runs.service import RunService as CoreRunService
+from ops.workflow.canonical_runtime import CanonicalRuntime
 
 _APP = "pipedrive"
 _ACCOUNT = "acct_0123456789abcdef0123456789abcdef"

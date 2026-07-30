@@ -13,8 +13,8 @@ import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from ops.config import Settings
-from ops.run_service import RunService, _parse_timestamp
+from ops.core.config import Settings
+from ops.runs.service import RunService, _parse_timestamp
 
 
 class _StubTransaction:

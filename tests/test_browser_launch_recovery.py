@@ -19,13 +19,13 @@ from types import MethodType
 from typing import Any
 from unittest.mock import patch
 
-from ops.browser_worker import BrowserSessionContext
-from ops.composio_capability import ComposioCapabilityReport
-from ops.config import Settings
-from ops.models import CapabilityAvailability, CompanyProfile, OperationsRequest
-from ops.operational_research import ResearchEnrichmentOutcome
-from ops.provider_errors import ProviderOperationError
-from ops.run_service import RunService
+from ops.browser.worker import BrowserSessionContext
+from ops.core.config import Settings
+from ops.core.models import CapabilityAvailability, CompanyProfile, OperationsRequest
+from ops.providers.composio_capability import ComposioCapabilityReport
+from ops.providers.errors import ProviderOperationError
+from ops.research.operational_research import ResearchEnrichmentOutcome
+from ops.runs.service import RunService
 
 _REPO = Path(__file__).resolve().parents[1]
 _ENTRYPOINT = _REPO / "docker" / "browser-entrypoint.sh"
@@ -255,9 +255,9 @@ def test_failed_precreated_session_still_persists_the_run(tmp_path: Path) -> Non
     service = _service(tmp_path, worker)
     try:
         # Patched where create_run RESOLVES the name. A shim re-exported from
-        # ops.run_service would make this patch silently ineffective rather than
+        # ops.runs.service would make this patch silently ineffective rather than
         # failing, so the target has to follow the implementation.
-        with patch("ops.run_creation.get_browser_api_trace", return_value=object()):
+        with patch("ops.runs.creation.get_browser_api_trace", return_value=object()):
             record = service.create_run(_request(), execution_mode="execute_when_configured")
         rows, total = service.list_runs(limit=10, offset=0)
     finally:

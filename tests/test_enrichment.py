@@ -9,8 +9,8 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from ops.models import CapabilityAvailability, OperationalResearch, ScopeRequirement
-from ops.operational_research import (
+from ops.core.models import CapabilityAvailability, OperationalResearch, ScopeRequirement
+from ops.research.operational_research import (
     EvidenceDocument,
     OfficialEvidenceFetcher,
     OfficialURLPolicy,

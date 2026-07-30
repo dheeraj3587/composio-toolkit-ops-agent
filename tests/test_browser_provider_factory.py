@@ -7,8 +7,8 @@ from typing import Any
 
 from pydantic import SecretStr
 
-from ops.config import Settings
-from ops.run_service import RunService
+from ops.core.config import Settings
+from ops.runs.service import RunService
 
 
 def _svc(tmp_path: Path, settings: Settings) -> RunService:

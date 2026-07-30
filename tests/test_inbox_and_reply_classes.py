@@ -15,14 +15,14 @@ import types
 import pytest
 from pydantic import SecretStr
 
-from ops.config import Settings
-from ops.gmail_worker import (
+from ops.core.config import Settings
+from ops.email.reply_classifier import ReplyClassifier
+from ops.gmail.worker import (
     GmailWorker,
     SanitizedGmailMessage,
     SanitizedGmailThread,
     build_inbox_query,
 )
-from ops.reply_classifier import ReplyClassifier
 
 
 # --- Offline fake Composio client that returns canned inbox messages ----------

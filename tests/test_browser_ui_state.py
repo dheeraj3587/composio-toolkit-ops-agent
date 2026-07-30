@@ -20,7 +20,7 @@ from pydantic import SecretStr
 
 from api.browser_ui import project_browser_ui
 from api.models import HitlRequestView
-from ops.config import Settings
+from ops.core.config import Settings
 
 _PLAYWRIGHT = Settings(
     allow_live_browser=True,

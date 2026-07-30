@@ -13,9 +13,9 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from ops.browser_egress import EgressStage, build_egress_policy
-from ops.config import Settings
-from ops.playwright_worker import (
+from ops.browser.egress import EgressStage, build_egress_policy
+from ops.core.config import Settings
+from ops.playwright.worker import (
     PlaywrightBrowserWorker,
     _has_credential_content,
     _looks_credential_bearing,
@@ -312,8 +312,8 @@ def test_screenshots_stay_disabled_once_a_sensitive_state_is_reached() -> None:
 
 
 def test_looks_credential_bearing_is_structural() -> None:
-    from ops.browser_decider import build_snapshot
-    from ops.playwright_worker import PageInspection
+    from ops.browser.decider import build_snapshot
+    from ops.playwright.worker import PageInspection
 
     secret_page = PageInspection(
         url=f"https://{_HOST}/x",
@@ -414,7 +414,7 @@ def test_simultaneous_close_calls_release_capacity_once() -> None:
     asyncio.run(_both())
     assert session.capacity_released is True
     # Exactly one slot came back: a new session can start, and only one.
-    from ops.provider_errors import ProviderOperationError
+    from ops.providers.errors import ProviderOperationError
 
     first = _start(worker)
     with pytest.raises(ProviderOperationError):

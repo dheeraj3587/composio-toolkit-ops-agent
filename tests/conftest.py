@@ -1,6 +1,7 @@
 import os
 
 import pytest
+from hypothesis import HealthCheck, settings
 from starlette.testclient import TestClient
 
 _old_init = TestClient.__init__
@@ -32,12 +33,42 @@ def _never_load_developer_dotenv() -> None:
     settings during collection, before any fixture could run.
     """
 
-    import ops.config
+    import ops.core.config
 
-    ops.config.load_dotenv = lambda *args, **kwargs: False
+    ops.core.config.load_dotenv = lambda *args, **kwargs: False
 
 
 _never_load_developer_dotenv()
+
+
+def _load_hypothesis_ci_profile() -> None:
+    """Make every property-based test deterministic and fixture-friendly.
+
+    ``derandomize`` fixes the example seed so a CI failure reproduces locally from
+    the reported counterexample alone. ``deadline=None`` is required because the
+    property suites drive real SQLite files and async code, neither of which is
+    millisecond-stable, so a per-example timeout would flake rather than find a
+    bug. ``function_scoped_fixture`` is suppressed deliberately: the storage
+    properties WANT a fresh ``tmp_path`` database per test function and reuse it
+    across examples inside that function, which is exactly what the health check
+    warns about.
+
+    Applied at conftest IMPORT time, matching ``_never_load_developer_dotenv``,
+    because ``@settings``-decorated tests bind their profile during collection —
+    a fixture would run too late.
+    """
+
+    settings.register_profile(
+        "ci",
+        max_examples=200,
+        deadline=None,
+        derandomize=True,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    settings.load_profile("ci")
+
+
+_load_hypothesis_ci_profile()
 
 
 @pytest.fixture(autouse=True)

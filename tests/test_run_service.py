@@ -7,17 +7,17 @@ from pathlib import Path
 
 import pytest
 
-from ops.models import (
+from ops.core.models import (
     CompanyProfile,
     OperationsRequest,
 )
-from ops.p1_adapter import DEFAULT_P1_ROOT, SnapshotIntegrityError
-from ops.run_service import (
+from ops.core.storage import OperationsUnitOfWork
+from ops.research.p1_adapter import DEFAULT_P1_ROOT, SnapshotIntegrityError
+from ops.runs.service import (
     IdempotencyConflictError,
     InvalidIdempotencyKeyError,
     RunService,
 )
-from ops.storage import OperationsUnitOfWork
 
 
 def request_for(app_name: str) -> OperationsRequest:
@@ -137,7 +137,7 @@ def test_idempotency_replay_returns_original_run_without_duplicate_events(tmp_pa
 
 
 def test_legacy_browser_use_fingerprint_replays_without_false_conflict(tmp_path: Path) -> None:
-    from ops.run_service import _legacy_request_fingerprint
+    from ops.runs.service import _legacy_request_fingerprint
 
     service = RunService.from_paths(db_path=tmp_path / "private" / "ops.db")
     request = request_for("HubSpot")

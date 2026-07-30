@@ -37,16 +37,16 @@ from browser_service.models import SessionSummary
 from browser_service.novnc import LiveViewDenied, VncTarget, authorize_live_view
 from browser_service.session_manager import SessionManager, SessionUnavailable
 from browser_service.settings import BrowserServiceSettings
-from ops.app_recipes import get_app_recipe
-from ops.browser_live_view import (
+from ops.browser.live_view import (
     LiveViewTokenError,
     issue_live_view_token,
     verify_live_view_token,
 )
-from ops.browser_session_capability import CAPABILITY_HEADER
-from ops.browser_storage_state import EncryptedStorageStateStore, StorageStateBinding
-from ops.browser_worker import BrowserObservation, BrowserSessionContext
-from ops.redaction import REDACTED, RedactingFilter
+from ops.browser.session_capability import CAPABILITY_HEADER
+from ops.browser.storage_state import EncryptedStorageStateStore, StorageStateBinding
+from ops.browser.worker import BrowserObservation, BrowserSessionContext
+from ops.core.redaction import REDACTED, RedactingFilter
+from ops.recipes.app_recipes import get_app_recipe
 
 TOKEN = "phase3-test-token-" + ("t" * 32)
 OWNER = "run_owner_1"
@@ -88,7 +88,7 @@ RECIPE_SNAPSHOT: dict[str, object] = _PIPEDRIVE_RECIPE.model_dump(mode="json")
 
 
 class _FakePwSession:
-    """Stands in for ops.playwright_worker's per-session record."""
+    """Stands in for ops.playwright.worker's per-session record."""
 
     def __init__(self) -> None:
         self.screenshot: bytes | None = None
@@ -257,7 +257,7 @@ class _FakeSecretBroker:
         return None
 
     def consume(self, **_kwargs: str) -> str:
-        from ops.provider_errors import ProviderOperationError
+        from ops.providers.errors import ProviderOperationError
 
         raise ProviderOperationError(
             capability="browser secret broker",
@@ -316,8 +316,8 @@ class _VaultBackedBroker(_FakeSecretBroker):
         assert grant == BROKER_GRANT
         assert owner == OWNER
         assert capability == SESSION_CAPABILITY
-        from ops.provider_errors import ProviderOperationError
-        from ops.secret_store import TransientSecretError
+        from ops.core.secret_store import TransientSecretError
+        from ops.providers.errors import ProviderOperationError
 
         try:
             return self._store.consume_transient(
@@ -509,6 +509,77 @@ class TestSessionRpcLifecycle:
 
             gone = client.get(f"/internal/browser/sessions/{session_id}/status", headers=_headers())
             assert gone.status_code == 404
+
+    def test_session_carries_the_run_allow_list_and_the_container_enforces_it(self) -> None:
+        """A run's allow-list is bound at creation and enforced inside the service.
+
+        The caller sends the flat pattern list, the service rebuilds it and echoes
+        back exactly what it will enforce, and a payload whose destination lies
+        outside it is refused by the CONTAINER — proven here with a second client
+        that never learned the allow-list, so no caller-side check can shadow it.
+
+        Requirements 5.11, 15.1.
+        """
+
+        import httpx
+
+        from ops.browser.host_policy import BrowserAllowedHosts
+        from ops.browser.service_client import BrowserServiceClient
+        from ops.core.models import OperationalResearch
+        from ops.providers.errors import ProviderOperationError
+
+        allowed = BrowserAllowedHosts(
+            app_slug="pipedrive",
+            exact_hosts=("pipedrive.com",),
+            vendor_wildcard_domains=("pipedrive.com",),
+        )
+        app = create_app(_settings())
+        worker = _FakeWorker()
+        app.state.worker = worker
+        app.state.secret_broker = _FakeSecretBroker()
+
+        def _service_client(http: httpx.AsyncClient) -> BrowserServiceClient:
+            return BrowserServiceClient(
+                base_url="http://browser-worker:8081",
+                token=TOKEN,
+                owner=OWNER,
+                capability_key=CAPABILITY_KEY,
+                client=http,
+            )
+
+        async def _scenario() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://browser-worker:8081",
+            ) as http:
+                client = _service_client(http)
+                context = await client.start(
+                    None,
+                    recipe=_PIPEDRIVE_RECIPE,
+                    app_slug="pipedrive",
+                    account_ref="acct_confined",
+                    secret_scope="run_confined_1",  # pragma: allowlist secret
+                    allowed_hosts=allowed,
+                )
+                # The session carries the allow-list the service confirmed it will
+                # enforce, not merely the one the caller intended.
+                assert set(context.allowed_domains) == set(allowed.patterns())
+
+                research = OperationalResearch.model_validate(RESEARCH_PAYLOAD)
+                observation = await client.navigate_onboarding(context, research)
+                assert observation.status == "human_action_required"
+
+                unaware = _service_client(http)
+                off_domain = research.model_copy(
+                    update={"signup_url": "https://pipedrive.com.evil.io/signup"}
+                )
+                with pytest.raises(ProviderOperationError) as denied:
+                    await unaware.navigate_onboarding(context, off_domain)
+                assert denied.value.reason_code == "browser_host_not_in_app_policy"
+                # The refusal happened before the browser was driven a second time.
+                assert worker.boundary_events.count("navigate") == 1
+
+        asyncio.run(_scenario())
 
     def test_capture_endpoint_uses_write_only_broker_and_returns_only_reference(self) -> None:
         client, worker = _client()
@@ -1316,7 +1387,7 @@ class TestRestartReattachment:
     def _service_client(base_url: str, transport: Any) -> Any:
         import httpx
 
-        from ops.browser_service_client import BrowserServiceClient
+        from ops.browser.service_client import BrowserServiceClient
 
         return BrowserServiceClient(
             base_url=base_url,
@@ -1359,7 +1430,7 @@ class TestRestartReattachment:
     def test_sync_live_frame_is_available_to_run_projection(self) -> None:
         import httpx
 
-        from ops.browser_service_client import BrowserServiceClient
+        from ops.browser.service_client import BrowserServiceClient
 
         def handler(request: httpx.Request) -> httpx.Response:
             assert request.headers[TOKEN_HEADER] == TOKEN
@@ -1389,7 +1460,7 @@ class TestRestartReattachment:
     def test_sync_interactive_grant_is_fresh_and_not_cached(self) -> None:
         import httpx
 
-        from ops.browser_service_client import BrowserServiceClient
+        from ops.browser.service_client import BrowserServiceClient
 
         calls = 0
 
@@ -1489,7 +1560,7 @@ class TestRestartReattachment:
     def test_run_service_treats_unreachable_as_leave_alone(self) -> None:
         """Reconciliation must not tear down a run on a transient outage."""
 
-        from ops.run_service import RunService
+        from ops.runs.service import RunService
 
         class _Worker:
             async def reconcile_session(self, session_id: str) -> str:
@@ -1512,7 +1583,7 @@ class TestRestartReattachment:
         assert service._browser_session_is_live({}) is False
 
     def test_run_service_reports_live_session_for_resumable(self) -> None:
-        from ops.run_service import RunService
+        from ops.runs.service import RunService
 
         class _Worker:
             async def reconcile_session(self, session_id: str) -> str:
@@ -1526,7 +1597,7 @@ class TestRestartReattachment:
     def test_provider_without_reconcile_is_inconclusive(self) -> None:
         """Browser Use has no such endpoint: its behaviour must be unchanged."""
 
-        from ops.run_service import RunService
+        from ops.runs.service import RunService
 
         service = RunService.__new__(RunService)
         service._browser_worker = object()  # type: ignore[attr-defined]
@@ -1585,7 +1656,7 @@ class TestEncryptedStorageState:
     def test_tampered_binding_fingerprint_is_refused(self, tmp_path: Path) -> None:
         from cryptography.fernet import Fernet
 
-        from ops.browser_storage_state import StorageStateError
+        from ops.browser.storage_state import StorageStateError
 
         key = Fernet.generate_key().decode()
         store = EncryptedStorageStateStore(tmp_path / "state", key)
@@ -1615,7 +1686,7 @@ class TestEncryptedStorageState:
         assert not path.exists()
 
     def test_without_a_key_nothing_is_persisted_in_the_clear(self, tmp_path: Path) -> None:
-        from ops.browser_storage_state import StorageStateError
+        from ops.browser.storage_state import StorageStateError
 
         store = EncryptedStorageStateStore(tmp_path / "state", None)
         binding = StorageStateBinding(app_slug="pipedrive", account_ref="acct1", owner=OWNER)
@@ -1816,7 +1887,7 @@ class TestProviderAwareHealth:
     def test_client_detects_a_service_major_version_mismatch(self) -> None:
         import httpx
 
-        from ops.browser_service_client import BrowserServiceClient
+        from ops.browser.service_client import BrowserServiceClient
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
@@ -2227,7 +2298,7 @@ class TestHealthDoesNotLaunchChromiumPerRequest:
     """The readiness probe launches a browser, so it must be cached."""
 
     def test_repeated_health_calls_probe_once(self) -> None:
-        import ops.browser_readiness as readiness_module
+        import ops.browser.readiness as readiness_module
 
         calls = {"count": 0}
         original = readiness_module.probe_playwright
@@ -2267,7 +2338,7 @@ class TestRpcCredentialBoundary:
     """Raw credentials must be REFUSED, not silently dropped."""
 
     def test_vault_references_pass_through(self) -> None:
-        from ops.browser_service_client import _vault_references_only
+        from ops.browser.service_client import _vault_references_only
 
         refs = _vault_references_only({"login_email": "vault://pipedrive/login_email/abc123"})
         assert refs == {"login_email": "vault://pipedrive/login_email/abc123"}
@@ -2279,24 +2350,24 @@ class TestRpcCredentialBoundary:
     def test_raw_credential_is_refused_with_a_typed_reason(self, field: str) -> None:
         """A silent drop meant login failed opaquely; it is now an explicit error."""
 
-        from ops.browser_service_client import _vault_references_only
-        from ops.provider_errors import ProviderOperationError
+        from ops.browser.service_client import _vault_references_only
+        from ops.providers.errors import ProviderOperationError
 
         with pytest.raises(ProviderOperationError) as excinfo:
             _vault_references_only({field: "an-actual-secret-value"})
         assert excinfo.value.reason_code == "raw_credentials_not_allowed_over_rpc"
 
     def test_unknown_secret_field_is_refused(self) -> None:
-        from ops.browser_service_client import _vault_references_only
-        from ops.provider_errors import ProviderOperationError
+        from ops.browser.service_client import _vault_references_only
+        from ops.providers.errors import ProviderOperationError
 
         with pytest.raises(ProviderOperationError) as excinfo:
             _vault_references_only({"totally_new_secret": "vault://a/b/c"})
         assert excinfo.value.reason_code == "browser_secret_field_not_allowed"
 
     def test_malformed_vault_reference_is_refused(self) -> None:
-        from ops.browser_service_client import _vault_references_only
-        from ops.provider_errors import ProviderOperationError
+        from ops.browser.service_client import _vault_references_only
+        from ops.providers.errors import ProviderOperationError
 
         with pytest.raises(ProviderOperationError) as excinfo:
             _vault_references_only({"login_email": "vault://not a valid reference"})
@@ -2307,7 +2378,7 @@ class TestRpcCredentialBoundary:
 
         import httpx
 
-        from ops.browser_service_client import BrowserServiceClient
+        from ops.browser.service_client import BrowserServiceClient
 
         captured: dict[str, Any] = {}
 
@@ -2368,7 +2439,7 @@ class TestProviderFactoryWiring:
 
     @staticmethod
     def _service() -> Any:
-        from ops.run_service import RunService
+        from ops.runs.service import RunService
 
         return RunService.__new__(RunService)
 
@@ -2382,12 +2453,12 @@ class TestProviderFactoryWiring:
         environment must be empty rather than "whatever this machine exports".
         """
 
-        from ops.config import Settings
+        from ops.core.config import Settings
 
         return Settings.from_env(env={}, dotenv_path=None)
 
     def test_playwright_without_service_configuration_fails_closed(self) -> None:
-        from ops.provider_errors import ConfigurationRequiredError
+        from ops.providers.errors import ConfigurationRequiredError
 
         settings = self._baseline_settings().model_copy(update={"browser_provider": "playwright"})
         with pytest.raises(ConfigurationRequiredError) as excinfo:
@@ -2395,7 +2466,7 @@ class TestProviderFactoryWiring:
         assert excinfo.value.reason_code == "browser_service_configuration_required"
 
     def test_configured_service_yields_the_rpc_client(self) -> None:
-        from ops.browser_service_client import BrowserServiceClient
+        from ops.browser.service_client import BrowserServiceClient
 
         settings = self._baseline_settings().model_copy(
             update={
@@ -2411,7 +2482,7 @@ class TestProviderFactoryWiring:
         assert worker.supports_restart_reattach is True
 
     def test_in_process_sandbox_requires_an_explicit_flag(self) -> None:
-        from ops.playwright_worker import PlaywrightBrowserWorker
+        from ops.playwright.worker import PlaywrightBrowserWorker
 
         settings = self._baseline_settings().model_copy(
             update={"browser_provider": "playwright", "playwright_in_process_sandbox": True}
@@ -2440,8 +2511,8 @@ class TestServiceIsSoleCapacityOwner:
         the second create would wrongly fail with browser_capacity_exceeded.
         """
 
-        from ops.config import Settings
-        from ops.playwright_worker import PlaywrightBrowserWorker
+        from ops.core.config import Settings
+        from ops.playwright.worker import PlaywrightBrowserWorker
 
         worker = PlaywrightBrowserWorker(
             settings=Settings(
@@ -2469,8 +2540,8 @@ class TestServiceIsSoleCapacityOwner:
         assert second.status_code == 201
 
     def test_service_mode_worker_does_not_start_a_janitor(self) -> None:
-        from ops.config import Settings
-        from ops.playwright_worker import PlaywrightBrowserWorker
+        from ops.core.config import Settings
+        from ops.playwright.worker import PlaywrightBrowserWorker
 
         worker = PlaywrightBrowserWorker(
             settings=Settings(allow_live_browser=True, browser_provider="playwright"),
@@ -2479,8 +2550,8 @@ class TestServiceIsSoleCapacityOwner:
         assert worker._janitor_thread is None
 
     def test_service_mode_reaper_is_a_no_op(self) -> None:
-        from ops.config import Settings
-        from ops.playwright_worker import PlaywrightBrowserWorker
+        from ops.core.config import Settings
+        from ops.playwright.worker import PlaywrightBrowserWorker
 
         worker = PlaywrightBrowserWorker(
             settings=Settings(allow_live_browser=True, browser_provider="playwright"),
@@ -2489,8 +2560,8 @@ class TestServiceIsSoleCapacityOwner:
         assert worker._reap_expired() == ()
 
     def test_in_process_mode_still_enforces_worker_capacity(self) -> None:
-        from ops.config import Settings
-        from ops.playwright_worker import PlaywrightBrowserWorker
+        from ops.core.config import Settings
+        from ops.playwright.worker import PlaywrightBrowserWorker
 
         worker = PlaywrightBrowserWorker(
             settings=Settings(allow_live_browser=True, browser_provider="playwright"),
@@ -2613,7 +2684,7 @@ class TestTransientSecretRoundTrip:
     def _shared_vault(tmp_path: Path) -> tuple[Any, str]:
         from cryptography.fernet import Fernet
 
-        from ops.secret_store import SQLiteSecretStore
+        from ops.core.secret_store import SQLiteSecretStore
 
         key = Fernet.generate_key().decode()
         store = SQLiteSecretStore(tmp_path / "vault" / "credentials.db", key)
@@ -2630,7 +2701,7 @@ class TestTransientSecretRoundTrip:
         )
         from browser_service.main import _resolve_credential_refs
         from browser_service.session_manager import ManagedSession
-        from ops.provider_errors import ProviderOperationError
+        from ops.providers.errors import ProviderOperationError
 
         session = ManagedSession(
             session_id="bs_1", owner=OWNER, app_slug="pipedrive", secret_scope="run-xyz"
@@ -2666,7 +2737,7 @@ class TestTransientSecretRoundTrip:
         )
         from browser_service.main import _resolve_credential_refs
         from browser_service.session_manager import ManagedSession
-        from ops.provider_errors import ProviderOperationError
+        from ops.providers.errors import ProviderOperationError
 
         # A session for a DIFFERENT run must not consume run-A's reference.
         session = ManagedSession(
@@ -2686,7 +2757,7 @@ class TestTransientSecretRoundTrip:
     def test_missing_secret_broker_is_an_explicit_error(self) -> None:
         from browser_service.main import _resolve_credential_refs
         from browser_service.session_manager import ManagedSession
-        from ops.provider_errors import ProviderOperationError
+        from ops.providers.errors import ProviderOperationError
 
         session = ManagedSession(
             session_id="bs_1", owner=OWNER, app_slug="pipedrive", secret_scope="run-1"
@@ -2705,7 +2776,7 @@ class TestTransientSecretRoundTrip:
     def test_service_rejects_a_raw_secret_reference(self) -> None:
         from browser_service.main import _resolve_credential_refs
         from browser_service.session_manager import ManagedSession
-        from ops.provider_errors import ProviderOperationError
+        from ops.providers.errors import ProviderOperationError
 
         session = ManagedSession(
             session_id="bs_1", owner=OWNER, app_slug="pipedrive", secret_scope="run-1"
@@ -2724,7 +2795,7 @@ class TestTransientSecretRoundTrip:
     def test_client_start_sends_scope_and_account_ref(self) -> None:
         import httpx
 
-        from ops.browser_service_client import BrowserServiceClient
+        from ops.browser.service_client import BrowserServiceClient
 
         captured: dict[str, Any] = {}
 
@@ -2770,7 +2841,7 @@ class TestTransientSecretRoundTrip:
     def test_client_capture_accepts_only_valid_vault_references(self) -> None:
         import httpx
 
-        from ops.browser_service_client import BrowserServiceClient
+        from ops.browser.service_client import BrowserServiceClient
 
         def handler(request: httpx.Request) -> httpx.Response:
             assert request.url.path.endswith("/bs_1/capture-credentials")
@@ -2812,8 +2883,8 @@ class TestTransientSecretRoundTrip:
     ) -> None:
         import httpx
 
-        from ops.browser_service_client import BrowserServiceClient
-        from ops.provider_errors import ProviderOperationError
+        from ops.browser.service_client import BrowserServiceClient
+        from ops.providers.errors import ProviderOperationError
 
         client = BrowserServiceClient(
             base_url="http://browser-worker:8081",
@@ -2843,7 +2914,7 @@ class TestStorageStateBinding:
     """Storage state is bound to (app, opaque account, owner) and is opaque on disk."""
 
     def test_account_ref_is_an_opaque_hash_not_an_email(self) -> None:
-        from ops.graph import browser_account_ref
+        from ops.workflow.graph import browser_account_ref
 
         ref = browser_account_ref("vault://pipedrive/work_email/abc123")
         assert len(ref) == 32

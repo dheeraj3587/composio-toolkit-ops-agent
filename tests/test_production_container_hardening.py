@@ -44,11 +44,7 @@ def test_reviewed_playwright_seccomp_profile_has_pinned_provenance() -> None:
         "includes": {},
         "excludes": {},
     }
-    syscall_names = {
-        name
-        for rule in profile["syscalls"]
-        for name in rule.get("names", [])
-    }
+    syscall_names = {name for rule in profile["syscalls"] for name in rule.get("names", [])}
     assert "chroot" in syscall_names
     requirements = (ROOT / "requirements-providers.txt").read_text(encoding="utf-8")
     operations = (ROOT / "docs" / "OPERATIONS.md").read_text(encoding="utf-8")
@@ -76,9 +72,7 @@ def test_browser_compose_uses_profile_and_keeps_the_sandbox_boundary() -> None:
 
 
 def test_browser_apparmor_profile_preserves_docker_boundary_and_allows_chromium_userns() -> None:
-    profile = (ROOT / "deploy" / "composio-ops-browser.apparmor").read_text(
-        encoding="utf-8"
-    )
+    profile = (ROOT / "deploy" / "composio-ops-browser.apparmor").read_text(encoding="utf-8")
 
     assert "abi <abi/4.0>," in profile
     assert "profile composio-ops-browser-v1" in profile

@@ -12,14 +12,14 @@ from typing import cast
 import pytest
 from pydantic import SecretStr
 
-from ops.app_recipes import AppRecipe, get_app_recipe
-from ops.config import Settings
-from ops.effect_ledger import SQLiteEffectStore
-from ops.gated_route import GatedRoute, GatedRoutePolicyError
-from ops.gmail_models import GmailSendResult
-from ops.gmail_worker import GmailWorker
-from ops.models import CompanyProfile, OperationsRequest
-from ops.provider_errors import ConfigurationRequiredError, ProviderOperationError
+from ops.access.gated_route import GatedRoute, GatedRoutePolicyError
+from ops.core.config import Settings
+from ops.core.effect_ledger import SQLiteEffectStore
+from ops.core.models import CompanyProfile, OperationsRequest
+from ops.gmail.models import GmailSendResult
+from ops.gmail.worker import GmailWorker
+from ops.providers.errors import ConfigurationRequiredError, ProviderOperationError
+from ops.recipes.app_recipes import AppRecipe, get_app_recipe
 
 VENDOR = "reviewed-contact@vendor.example"
 CONTROLLED_SINK = "controlled-sink@example.test"

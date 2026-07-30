@@ -13,15 +13,15 @@ from pydantic import SecretStr
 
 from api.app import create_app
 from api.service import LocalRunService
-from ops.config import Settings
-from ops.deploy_acceptance import (
+from ops.core.config import Settings
+from ops.deploy.acceptance import (
     deployment_is_accepted,
     deployment_payload_is_accepted,
     wait_for_deployment_acceptance,
     write_deployment_acceptance_marker,
 )
-from ops.run_email import RunEmailService
-from ops.run_service import RunService
+from ops.runs.email import RunEmailService
+from ops.runs.service import RunService
 
 REVISION = "a" * 40
 NONCE = "N" * 64

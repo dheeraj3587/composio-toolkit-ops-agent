@@ -5,7 +5,7 @@ import stat
 import pytest
 from cryptography.fernet import Fernet
 
-from ops.secret_store import (
+from ops.core.secret_store import (
     SecretDecryptionError,
     SecretNotFoundError,
     SQLiteSecretStore,
@@ -104,7 +104,7 @@ class TestTransientSecrets:
         return SQLiteSecretStore(tmp_path / "vault" / "secrets.db", Fernet.generate_key())  # type: ignore[operator]
 
     def test_consume_once_returns_value_then_is_gone(self, tmp_path) -> None:
-        from ops.secret_store import TransientSecretError
+        from ops.core.secret_store import TransientSecretError
 
         store = self._store(tmp_path)
         ref = store.put_transient(
@@ -175,7 +175,7 @@ class TestTransientSecrets:
         )
 
     def test_transient_rollback_delete_requires_complete_binding(self, tmp_path) -> None:
-        from ops.secret_store import TransientSecretError
+        from ops.core.secret_store import TransientSecretError
 
         store = self._store(tmp_path)
         ref = store.put_transient(
@@ -208,7 +208,7 @@ class TestTransientSecrets:
         assert excinfo.value.reason_code == "browser_secret_not_found"
 
     def test_wrong_app_is_refused(self, tmp_path) -> None:
-        from ops.secret_store import TransientSecretError
+        from ops.core.secret_store import TransientSecretError
 
         store = self._store(tmp_path)
         ref = store.put_transient(
@@ -224,7 +224,7 @@ class TestTransientSecrets:
         assert excinfo.value.reason_code == "browser_secret_app_mismatch"
 
     def test_wrong_kind_is_refused(self, tmp_path) -> None:
-        from ops.secret_store import TransientSecretError
+        from ops.core.secret_store import TransientSecretError
 
         store = self._store(tmp_path)
         ref = store.put_transient(
@@ -240,7 +240,7 @@ class TestTransientSecrets:
         assert excinfo.value.reason_code == "browser_secret_kind_mismatch"
 
     def test_wrong_scope_is_refused(self, tmp_path) -> None:
-        from ops.secret_store import TransientSecretError
+        from ops.core.secret_store import TransientSecretError
 
         store = self._store(tmp_path)
         ref = store.put_transient(
@@ -259,7 +259,7 @@ class TestTransientSecrets:
         import sqlite3
         from datetime import UTC, datetime, timedelta
 
-        from ops.secret_store import TransientSecretError, parse_vault_reference
+        from ops.core.secret_store import TransientSecretError, parse_vault_reference
 
         store = self._store(tmp_path)
         ref = store.put_transient(
@@ -286,7 +286,7 @@ class TestTransientSecrets:
         assert excinfo.value.reason_code == "browser_secret_expired"
 
     def test_permanent_entry_cannot_be_consumed_as_transient(self, tmp_path) -> None:
-        from ops.secret_store import TransientSecretError
+        from ops.core.secret_store import TransientSecretError
 
         store = self._store(tmp_path)
         # A normal permanent put (one_time=0) must not be consumable one-time.
@@ -322,7 +322,7 @@ class TestTransientSecrets:
         assert second.get(ref) == "keep-me"
 
     def test_parse_vault_reference_is_the_shared_parser(self) -> None:
-        from ops.secret_store import parse_vault_reference
+        from ops.core.secret_store import parse_vault_reference
 
         parts = parse_vault_reference("vault://pipedrive/browser_login_login_email/abc123")
         assert parts.app_slug == "pipedrive"

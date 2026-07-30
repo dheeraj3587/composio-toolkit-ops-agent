@@ -8,7 +8,7 @@ So ``require_chromium`` FAILS when ``REQUIRE_REAL_BROWSER_TESTS=1`` (set by the
 browser-image CI job) and only skips in a developer environment without Chromium.
 
 **Guards under test must be the production ones.** ``browser_page`` installs
-``ops.playwright_worker.make_route_handler`` — the real staged-egress guard — rather
+``ops.playwright.worker.make_route_handler`` — the real staged-egress guard — rather
 than a test reimplementation, so what is verified is the shipping code path.
 """
 
@@ -80,7 +80,7 @@ async def browser_page(
 
     from playwright.async_api import async_playwright
 
-    from ops.playwright_worker import make_route_handler
+    from ops.playwright.worker import make_route_handler
 
     allow = patterns if patterns is not None else app.host_patterns
     blocked: list[str] = []

@@ -8,13 +8,13 @@ from __future__ import annotations
 
 from pydantic import SecretStr
 
-from ops.composio_capability import (
+from ops.core.config import Settings
+from ops.providers.composio_capability import (
     ComposioCapabilityPreflight,
     ToolkitInfo,
     classify_capability,
     normalize_app_slug,
 )
-from ops.config import Settings
 
 
 class _FakeCatalog:

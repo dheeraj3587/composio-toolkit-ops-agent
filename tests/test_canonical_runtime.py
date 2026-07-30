@@ -7,6 +7,8 @@ uses a research provider.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import sqlite3
 import threading
 from collections import Counter
@@ -23,7 +25,21 @@ from pydantic import SecretStr
 
 from api.app import create_app
 from api.models import ManagedConnectionResponse, RunSummary
-from ops.app_recipes import (
+from ops.browser.account_binding import derive_browser_account_ref
+from ops.browser.worker import BrowserObservation, BrowserSessionContext
+from ops.core.config import Settings
+from ops.core.models import CompanyProfile, OperationsRequest
+from ops.core.redaction import RedactingFilter
+from ops.core.secret_store import SQLiteSecretStore
+from ops.core.storage import OperationsStorage, OperationsUnitOfWork
+from ops.gmail.models import GmailSendResult
+from ops.onboarding.composition import build_onboarding_ports
+from ops.onboarding.driver import SQLitePhaseHistoryStore
+from ops.onboarding.lease_store import SQLiteLeaseStore, SQLiteRunQueue
+from ops.playwright.routing import select_initial_target
+from ops.providers.composio_managed_auth import ManagedConnectionPoll, ManagedConnectionStart
+from ops.providers.profile_store import SQLiteProviderProfileStore
+from ops.recipes.app_recipes import (
     GATED_SLUGS,
     MANAGED_AUTH_SLUGS,
     PLAYWRIGHT_SLUGS,
@@ -32,18 +48,10 @@ from ops.app_recipes import (
     load_app_recipe_catalog,
     recipe_to_operational_research,
 )
-from ops.browser_account_binding import derive_browser_account_ref
-from ops.browser_worker import BrowserObservation, BrowserSessionContext
-from ops.canonical_runtime import CanonicalRuntime
-from ops.composio_managed_auth import ManagedConnectionPoll, ManagedConnectionStart
-from ops.gmail_models import GmailSendResult
-from ops.models import CompanyProfile, OperationsRequest
-from ops.p1_adapter import P1OperationalAdapter
-from ops.playwright_routing import select_initial_target
-from ops.run_errors import CredentialSubmissionError
-from ops.run_reconciliation import RunReconciliationService
-from ops.secret_store import SQLiteSecretStore
-from ops.storage import OperationsStorage, OperationsUnitOfWork
+from ops.research.p1_adapter import P1OperationalAdapter
+from ops.runs.errors import CredentialSubmissionError
+from ops.runs.reconciliation import RunReconciliationService
+from ops.workflow.canonical_runtime import CanonicalRuntime
 
 
 class _TransactionTrackingStorage(OperationsStorage):
@@ -625,8 +633,8 @@ def test_managed_and_gated_operations_ignore_catalog_mutation(
 ) -> None:
     """Route, toolkit and reviewed recipient stay frozen at run creation."""
 
-    import ops.app_recipes as recipe_module
-    import ops.canonical_runtime as runtime_module
+    import ops.recipes.app_recipes as recipe_module
+    import ops.workflow.canonical_runtime as runtime_module
 
     context = _RuntimeContext(tmp_path)
     gmail = _FakeGmail()
@@ -1443,8 +1451,8 @@ def test_browser_retry_and_resume_after_restart_use_creation_time_selectors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import ops.app_recipes as recipe_module
-    import ops.canonical_runtime as runtime_module
+    import ops.recipes.app_recipes as recipe_module
+    import ops.workflow.canonical_runtime as runtime_module
 
     first_context = _RuntimeContext(tmp_path, with_browser=True, browser_start_failures=1)
     failed = CanonicalRuntime(cast(Any, first_context)).create_run(
@@ -1616,3 +1624,72 @@ def test_managed_api_endpoints_are_owner_gated_typed_and_no_store(
     assert polled.json()["state"] == "active"
     assert "redirect_url" not in polled.json()
     assert service.calls == [f"connect:{run_id}", f"poll:{run_id}"]
+
+
+class _UnusedSessions:
+    """The browser seam the composition root does not own; never opened here."""
+
+    async def session_for(self, *, run_id: str, phase: str, lease: object) -> object:
+        raise AssertionError("composing the ports opens no browser session")
+
+
+def test_composition_root_binds_every_onboarding_port(tmp_path: Path) -> None:
+    """One happy path through the application boundary (design LL-2).
+
+    A configured deployment composes the durable stores, the mailbox adapter, the
+    validator, and the inference-backed decider, and hands the driver a fully wired
+    ``OnboardingDeps``. No provider is called: binding an adapter is not using one.
+    """
+
+    settings = _settings(tmp_path)
+    ports = build_onboarding_ports(settings, ledger_path=tmp_path / "ops.db")
+    try:
+        # The four durable ports, all against the one ledger this deployment owns.
+        assert isinstance(ports.phases, SQLitePhaseHistoryStore)
+        assert isinstance(ports.leases, SQLiteLeaseStore)
+        assert isinstance(ports.queue, SQLiteRunQueue)
+        assert isinstance(ports.profiles, SQLiteProviderProfileStore)
+        assert ports.profiles.owner == settings.browser_service_owner
+        # The adapters that need configuration, bound because it is present.
+        assert ports.verification is not None and ports.verification.kind == "gmail"
+        assert ports.validator is not None
+        assert ports.decider is not None
+        assert ports.vault is not None
+        # Research is the one port with no implementation to bind in this tree, and
+        # it says so rather than pretending (Requirement 2.7 is a run outcome; this
+        # is a configuration one).
+        assert ports.unavailable == {"research": "research_adapters_unavailable"}
+        # The budgets and lease timings come from settings, not from literals.
+        assert ports.captcha_budget.max_pauses == settings.onboarding_captcha_pause_budget
+        assert ports.budget.max_actions == settings.onboarding_loop_max_actions
+        assert ports.timings.ttl_seconds == settings.onboarding_lease_ttl_seconds
+
+        deps = ports.deps_for(
+            run_id="run_" + "a" * 32,
+            sessions=cast(Any, _UnusedSessions()),
+        )
+        # The phase store is bound as all three of its ports, so the boundary, the
+        # pause, and the reservation view are one consistent set of rows.
+        assert deps.phases is ports.phases
+        assert deps.pauses is ports.phases
+        assert deps.effects is ports.phases
+        assert deps.outcomes is ports.outcomes
+        assert deps.decider is ports.decider
+        assert deps.verification is ports.verification
+        assert deps.vault is ports.vault
+        # Requirement 19.4: the same filter the API and CLI startup boundaries
+        # install is in place for a process that composed these ports directly.
+        assert any(isinstance(item, RedactingFilter) for item in logging.getLogger().filters)
+    finally:
+        asyncio.run(ports.aclose())
+
+
+def _settings(tmp_path: Path) -> Settings:
+    """A deployment with a vault, a model key, and no network access configured."""
+
+    return Settings(
+        ops_db_path=tmp_path / "ops.db",
+        secret_vault_db_path=tmp_path / "secret_vault.db",
+        secret_vault_key=SecretStr(Fernet.generate_key().decode()),
+        groq_api_key=SecretStr("gsk_" + "a" * 40),
+    )

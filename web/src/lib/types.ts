@@ -84,7 +84,7 @@ export interface ScopeRequirement {
   source_url: string
 }
 
-/** Mirrors ops/models.py::OperationalUrlField exactly. */
+/** Mirrors ops/core/models.py::OperationalUrlField exactly. */
 export type OperationalUrlField =
   | "api_base_url"
   | "authorization_url"
@@ -212,6 +212,207 @@ export interface BrowserUiState {
   reason_code?: string | null
 }
 
+/** The durable position inside the onboarding walk (ops/onboarding/phase.py). */
+export type OnboardingPhase =
+  | "research"
+  | "vault_check"
+  | "awaiting_admission"
+  | "route_selected_login"
+  | "route_selected_signup"
+  | "signup"
+  | "email_verification"
+  | "authenticated"
+  | "developer_app"
+  | "credential_generation"
+  | "vault_storage"
+  | "credential_validation"
+  | "captcha_paused"
+  | "completed"
+  | "paused"
+  | "blocked"
+  | "cancelled"
+
+/** The steps an operator may re-attempt in place (api/models.py::RetryableStep). */
+export type RetryableStep =
+  | "research"
+  | "signup"
+  | "email_verification"
+  | "developer_app"
+  | "credential_generation"
+  | "credential_validation"
+
+/**
+ * The onboarding sub-state projected onto the run detail response
+ * (api/models.py::OnboardingStateView). `goal`, `step`, and `latest_decision`
+ * are short decision-shaped labels, never prompts or reasoning traces.
+ */
+export interface OnboardingStateView {
+  phase: OnboardingPhase
+  phase_at_pause?: OnboardingPhase | null
+  profile_digest: string
+  reason_code?: string | null
+  goal: string
+  step: string
+  latest_decision: string
+  attempt: number
+  admission_prompts: number
+  captcha_prompts: number
+  correlation_id: string
+}
+
+/**
+ * Backend-projected control availability (api/models.py::OnboardingControlsView).
+ * Each flag is a decision: the console never infers a control from run status.
+ */
+export interface OnboardingControlsView {
+  can_decide_admission: boolean
+  can_pause: boolean
+  can_resume: boolean
+  can_cancel: boolean
+  can_reset: boolean
+  can_retry_step: boolean
+  retryable_step?: RetryableStep | null
+  reason_code?: string | null
+}
+
+/** The operator's answer to the one admission prompt (ops/onboarding/admission.py). */
+export type AdmissionInput = "create_account" | "cancel"
+export type AdmissionRoute = "login" | "signup" | "cancelled"
+export type AdmissionDecider = "system" | "operator"
+/** A provider-visible effect the ledger can prove was already performed. */
+export type OnboardingEffect = "signup_submit" | "create_dev_app" | "generate_credential"
+export type ExpectedRestartRoute = "login" | "signup" | "undetermined"
+
+/** The recorded admission decision (api/models.py::AdmissionDecisionResponse). */
+export interface AdmissionDecisionResponse {
+  run_id: string
+  route: AdmissionRoute
+  reason_code: string
+  decided_by: AdmissionDecider
+  decided_at: string
+  // True when the run already held a decision; the body is then the ORIGINAL
+  // record and nothing was rewritten.
+  replayed: boolean
+  onboarding: OnboardingStateView
+}
+
+/** Where a pause takes effect (api/models.py::PauseResponse). */
+export interface PauseResponse {
+  run_id: string
+  accepted: boolean
+  pausing_after_phase: OnboardingPhase
+  reason_code: string
+  // Always false: a pause keeps the authenticated browser session alive.
+  browser_session_released: false
+  onboarding: OnboardingStateView
+}
+
+/** The four facts that make a reset trustworthy (api/models.py::ResetResponse). */
+export interface ResetResponse {
+  run_id: string
+  reason_code: string
+  phase: OnboardingPhase
+  browser_session_released: boolean
+  workflow_state_cleared: boolean
+  vault_references_preserved: number
+  expected_route_on_restart: ExpectedRestartRoute
+}
+
+/** What a step retry re-attempted (api/models.py::RetryStepResponse). */
+export interface RetryStepResponse {
+  run_id: string
+  accepted: boolean
+  phase: OnboardingPhase
+  attempt: number
+  reason_code: string
+  skipped_effects: OnboardingEffect[]
+}
+
+/** The durable per-run autonomy record, projected once the run is terminal. */
+export interface AutonomyOutcomeView {
+  verdict: "fully_autonomous" | "operator_assisted" | "blocked" | "cancelled"
+  terminal_phase: OnboardingPhase
+  reason_code: string
+  admission_prompts: number
+  captcha_prompts: number
+  duration_seconds: number
+}
+
+export type ApprovalRequirement = "none" | "manual_review" | "invite_only" | "unknown"
+export type BillingRequirement = "none" | "card_required" | "paid_plan_required" | "unknown"
+export type FlowKind = "developer_app" | "oauth" | "api_key" | "pat" | "client_credentials"
+export type CredentialKind =
+  | "oauth_client_id"
+  | "oauth_client_secret"
+  | "api_key"
+  | "personal_access_token"
+  | "client_credentials_pair"
+export type AuxiliaryHostKind = "identity_provider" | "static_assets" | "email_link_host"
+export type ProfileField =
+  | "registrable_domain"
+  | "developer_portal_url"
+  | "signup_url"
+  | "login_url"
+  | "developer_docs_url"
+  | "developer_app_flow"
+  | "oauth_flow"
+  | "api_key_flow"
+  | "pat_flow"
+  | "approval_requirement"
+  | "billing_requirement"
+
+/** One credential-producing path through the provider's own site. */
+export interface FlowSpecView {
+  kind: FlowKind
+  supported: boolean
+  entry_url?: string | null
+  steps: string[]
+  produces: CredentialKind[]
+  requires_approval: boolean
+  requires_billing: boolean
+}
+
+/** Why one profile field is believed: the citation and its digest, never the excerpt. */
+export interface FieldEvidenceView {
+  field: ProfileField
+  value: string
+  source_url: string
+  source_digest: string
+  adapters: string[]
+  corroborations: number
+  confidence: number
+}
+
+export interface AuxiliaryHostView {
+  host: string
+  kind: AuxiliaryHostKind
+}
+
+/**
+ * The sanitized provider profile served by `GET /api/runs/{id}/profile`
+ * (api/models.py::ProviderProfileView). It deliberately omits raw evidence
+ * excerpts, prompts, adapter responses, and anything carrying page content.
+ */
+export interface ProviderProfileView {
+  run_id: string
+  profile_digest: string
+  provider_name: string
+  app_slug: string
+  registrable_domain: string
+  allowed_host_patterns: string[]
+  auxiliary_hosts: AuxiliaryHostView[]
+  developer_portal_url?: string | null
+  signup_url?: string | null
+  login_url?: string | null
+  developer_docs_url?: string | null
+  flows: FlowSpecView[]
+  approval_requirement: ApprovalRequirement
+  billing_requirement: BillingRequirement
+  evidence: FieldEvidenceView[]
+  confidence: number
+  built_at: string
+}
+
 export interface RunDetailResponse {
   run: RunSummary
   research: OperationalResearch | null
@@ -223,6 +424,11 @@ export interface RunDetailResponse {
   provider_states?: ProviderStatus[]
   browser?: BrowserUiState | null
   primary_action?: PrimaryAction | null
+  // Onboarding projections: absent on a legacy run; `autonomy` is present only
+  // once the run reaches a terminal phase.
+  onboarding?: OnboardingStateView | null
+  controls?: OnboardingControlsView | null
+  autonomy?: AutonomyOutcomeView | null
 }
 
 export interface ManagedConnectionResponse {
@@ -233,12 +439,46 @@ export interface ManagedConnectionResponse {
   replayed: boolean
 }
 
+/** Correlation attribution carried by an onboarding timeline event. */
+export interface TimelineCorrelation {
+  run_id: string
+  correlation_id: string
+  onboarding_phase: OnboardingPhase
+  profile_digest: string
+  attempt: number
+  reason_code: string
+  browser_session_id?: string | null
+  vault_reference_id?: string | null
+}
+
+/** A closed union of non-secret timeline detail fields (no free text). */
+export interface TimelineDetail {
+  adapters_engaged?: string[] | null
+  registrable_domain?: string | null
+  evidence_count?: number | null
+  credentials_present?: boolean | null
+  decision?: "create_account" | "cancel" | null
+  decided_by?: "system" | "operator" | null
+  host?: string | null
+  sender_domain?: string | null
+  verification_kind?: "link" | "code" | null
+  developer_app_id?: string | null
+  credential_kind?: CredentialKind | null
+  validation_endpoint?: string | null
+  validation_http_status?: number | null
+  checked_at?: string | null
+  duration_seconds?: number | null
+  verdict?: "fully_autonomous" | "operator_assisted" | "blocked" | "cancelled" | null
+}
+
 export interface TimelineItem {
   event_id: number
   event_type: string
   summary: string
   status: "recorded" | "completed" | "blocked" | "failed"
   created_at: string
+  correlation?: TimelineCorrelation | null
+  detail?: TimelineDetail | null
 }
 
 export interface TimelineResponse {
@@ -390,9 +630,11 @@ export type BrowserVerificationInput =
 
 export interface ActionReceipt {
   run_id: string
-  action: "resume" | "poll_email" | "retry" | "send_outreach"
+  action: "resume" | "poll_email" | "retry" | "send_outreach" | "cancel"
   status: "accepted" | "configuration_required" | "unavailable" | "no_change"
   detail?: string | null
+  // Present only for an onboarding run: the phase the command landed in.
+  onboarding?: OnboardingStateView | null
 }
 
 export interface PhaseConflict {

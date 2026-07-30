@@ -4,7 +4,7 @@ import { notFound } from "next/navigation"
 import { connection } from "next/server"
 import { ArrowLeft, CircleOff, Clock3, Fingerprint, Globe2, Mail, Route, Settings2 } from "lucide-react"
 
-import { HitlLiveControls } from "@/components/hitl-live-controls"
+import { HitlLiveControls, OnboardingControlBar } from "@/components/hitl-live-controls"
 import { CanonicalPrimaryAction } from "@/components/canonical-primary-action"
 import { PhaseActionForm } from "@/components/phase-action-form"
 import { ProviderStateCard } from "@/components/provider-state-card"
@@ -12,8 +12,10 @@ import { RunProgress } from "@/components/run-progress"
 import {
   CapabilityPanel,
   HitlPanel,
+  OnboardingFocusPanel,
   OutputPanel,
   PhaseGrid,
+  ProviderProfilePanel,
   ResearchPanel,
   SecurityPanel,
 } from "@/components/run-detail-panels"
@@ -22,7 +24,7 @@ import { Timeline } from "@/components/timeline"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { ApiError, getRun, getRunOutput, getTimeline } from "@/lib/api"
+import { ApiError, getProviderProfile, getRun, getRunOutput, getTimeline } from "@/lib/api"
 import { formatTimestamp, humanize } from "@/lib/format"
 import { phaseMap } from "@/lib/phases"
 import type { PhaseCollection, PhaseState, RetryCapability } from "@/lib/types"
@@ -40,10 +42,19 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
     return <BackendUnavailable />
   }
 
-  const [timelineResult, outputResult] = await Promise.allSettled([getTimeline(runId), getRunOutput(runId)])
+  // The profile route answers 409 until a profile is committed, so it is only
+  // requested for a run the backend reports as an onboarding run, and a
+  // rejection is rendered as "not reported" rather than filled in.
+  const onboarding = detail.onboarding ?? null
+  const [timelineResult, outputResult, profileResult] = await Promise.allSettled([
+    getTimeline(runId),
+    getRunOutput(runId),
+    onboarding ? getProviderProfile(runId) : Promise.resolve(null),
+  ])
   const timeline = timelineResult.status === "fulfilled" ? timelineResult.value.items : []
   const timelineUnavailable = timelineResult.status === "rejected"
   const output = outputResult.status === "fulfilled" ? outputResult.value : null
+  const profile = profileResult.status === "fulfilled" ? profileResult.value : null
   const isPlanOnly = detail.run.execution_mode === "plan_only"
   const displayPhases = isPlanOnly ? planOnlyPhases(detail.phases) : detail.phases
   const phases = phaseMap(displayPhases)
@@ -53,6 +64,10 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
   const researchPhase = phases.get("research")
   const browser = detail.browser ?? null
   const primaryAction = detail.primary_action ?? null
+  // Backend-projected onboarding capability. Present only for an onboarding run,
+  // and the sole authority for that run's controls (Requirement 18.4): the
+  // status-derived controls below stay in place for legacy runs only.
+  const controls = detail.controls ?? null
 
   // The backend owns every browser permission. A run status alone does not prove
   // that a session is live, a credential page is verified, or a resume is legal.
@@ -82,11 +97,16 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
     : detail.run.status === "waiting_for_hitl" &&
       detail.hitl_request?.resumable === true
 
+  // Status-derived controls are the legacy path. An onboarding run takes every
+  // control from `controls` instead, so none of them is offered twice.
+  const legacyControls = controls === null
   const verificationPending =
+    legacyControls &&
     !isPlanOnly &&
     detail.run.status === "waiting_for_hitl" &&
     detail.hitl_request?.action_type === "email_otp"
   const canPollOutreach =
+    legacyControls &&
     !primaryAction &&
     !isPlanOnly &&
     ["outreach_sent", "waiting_for_reply"].includes(detail.run.status)
@@ -108,6 +128,11 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
             <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">
               {isPlanOnly ? "Plan only" : "Live run"}
             </Badge>
+            {onboarding ? (
+              <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">
+                Phase · {humanize(onboarding.phase)}
+              </Badge>
+            ) : null}
           </div>
           <h1 className="mt-3 text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">{detail.run.app_name}</h1>
           <p className="mt-3 break-all font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">{detail.run.run_id}</p>
@@ -127,6 +152,32 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         accountMode={detail.run.account_mode}
         hitlAction={detail.hitl_request?.action_type}
       />
+
+      {onboarding ? (
+        <section aria-labelledby="onboarding-console">
+          <div className="mb-3 flex items-end justify-between gap-4">
+            <div>
+              <p className="eyebrow">Autonomous onboarding</p>
+              <h2 id="onboarding-console" className="mt-1 text-xl font-semibold">What the agent is doing now</h2>
+            </div>
+            <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">Backend projection</Badge>
+          </div>
+          <div className="grid items-stretch gap-6 xl:grid-cols-2">
+            <OnboardingFocusPanel state={onboarding} />
+            <ProviderProfilePanel profile={profile} />
+          </div>
+          {controls ? (
+            <div className="mt-6">
+              <OnboardingControlBar
+                runId={runId}
+                state={onboarding}
+                controls={controls}
+                providerName={profile?.provider_name ?? detail.run.app_name}
+              />
+            </div>
+          ) : null}
+        </section>
+      ) : null}
 
       {isPlanOnly ? (
         <Alert className="rounded-md border-sky-300 bg-sky-50 text-sky-950">
@@ -179,9 +230,11 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
                     canResumeInteractive={interactivePlaywrightResume}
                     fieldName={detail.research?.credential_fields?.[0] ?? "api_token"}
                     fieldLabel={humanize(detail.research?.credential_fields?.[0] ?? "API token")}
+                    onboarding={onboarding}
+                    controls={controls}
                   />
                 </div>
-              ) : !primaryAction && isRetryable(browserPhase) ? (
+              ) : legacyControls && !primaryAction && isRetryable(browserPhase) ? (
                 <PhaseActionForm runId={runId} action="retry" capability="browser" label="Retry browser phase" />
               ) : (
                 <ControlUnavailable />
@@ -191,11 +244,13 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
           <HitlPanel
             request={isPlanOnly ? null : detail.hitl_request}
             action={
-              verificationPending
-                ? <PhaseActionForm runId={runId} action="poll-email" label="Check verification email" />
-                : canResume && !interactivePlaywrightResume
-                  ? <PhaseActionForm runId={runId} action="resume" label="Resume after human action" />
-                  : undefined
+              !legacyControls
+                ? undefined
+                : verificationPending
+                  ? <PhaseActionForm runId={runId} action="poll-email" label="Check verification email" />
+                  : canResume && !interactivePlaywrightResume
+                    ? <PhaseActionForm runId={runId} action="resume" label="Resume after human action" />
+                    : undefined
             }
           />
           <div id="outreach-review" className="h-full scroll-mt-6">
@@ -210,7 +265,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
                   action="poll-email"
                   label="Check controlled inbox"
                 />
-              ) : !primaryAction && isRetryable(emailPhase) ? (
+              ) : legacyControls && !primaryAction && isRetryable(emailPhase) ? (
                 <PhaseActionForm runId={runId} action="retry" capability="email" label="Retry email phase" />
               ) : (
                 <ControlUnavailable />
@@ -231,9 +286,9 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         </section>
       ) : null}
 
-      <section className={primaryAction ? "grid items-stretch gap-6" : "grid items-stretch gap-6 lg:grid-cols-2"}>
+      <section className={primaryAction || !legacyControls ? "grid items-stretch gap-6" : "grid items-stretch gap-6 lg:grid-cols-2"}>
         <OutputPanel output={output} />
-        {!primaryAction ? <div className="panel rounded-md p-5">
+        {legacyControls && !primaryAction ? <div className="panel rounded-md p-5">
           <p className="eyebrow">Bounded controls</p>
           <h2 className="mt-1 text-lg font-semibold">Retry authority</h2>
           <p className="mt-2 text-xs leading-5 text-muted-foreground">Retries are idempotent backend commands. A configuration-required or no-change receipt is shown as such, never as success.</p>

@@ -1,7 +1,7 @@
 import { Circle, TerminalSquare } from "lucide-react"
 
 import { EmptyState } from "@/components/empty-state"
-import { formatTimestamp, relativeTimestamp } from "@/lib/format"
+import { formatTimestamp, humanize, relativeTimestamp } from "@/lib/format"
 import type { TimelineItem } from "@/lib/types"
 
 function summary(item: TimelineItem): string {
@@ -32,6 +32,15 @@ export function Timeline({ items }: { items: TimelineItem[] }) {
               {item.event_type.replaceAll("_", " ")}
             </p>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">{summary(item)}</p>
+            {/* Onboarding attribution, when the backend reported it. These are
+                closed-vocabulary values only: the phase the event belongs to, the
+                attempt it was recorded under, and its reason code. */}
+            {item.correlation ? (
+              <p className="mt-2 font-mono text-[9px] uppercase tracking-[0.1em] text-muted-foreground">
+                Phase · {humanize(item.correlation.onboarding_phase)} · Attempt {item.correlation.attempt} ·{" "}
+                {humanize(item.correlation.reason_code)}
+              </p>
+            ) : null}
           </div>
         </li>
       ))}

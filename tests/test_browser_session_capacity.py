@@ -14,6 +14,11 @@ from typing import Any
 import pytest
 
 from browser_service.session_manager import SessionManager, SessionUnavailable
+from browser_service.settings import (
+    DEFAULT_MAX_SESSIONS,
+    MAX_SESSIONS_CEILING,
+    BrowserServiceSettings,
+)
 
 OWNER = "assignment-owner"
 
@@ -251,3 +256,36 @@ def test_concurrent_creates_cannot_both_acquire_the_single_slot() -> None:
     assert refused == ["capacity_exhausted"] * 7
     assert manager.capacity_in_use == 1
     assert len(manager.all_sessions()) == 1
+
+
+# --- Requirement 21.3, 21.4. the pool's bounds and per-session accounting -----
+def test_pool_capacity_defaults_to_two_with_a_ceiling_of_ten_and_is_per_session() -> None:
+    """Default 2, ceiling 10, and each held slot is attributable to its session."""
+
+    assert BrowserServiceSettings().max_sessions == DEFAULT_MAX_SESSIONS == 2
+    assert MAX_SESSIONS_CEILING == 10
+    assert (
+        BrowserServiceSettings.from_env({"PLAYWRIGHT_MAX_SESSIONS": "10"}).max_sessions
+        == MAX_SESSIONS_CEILING
+    )
+    with pytest.raises(ValueError, match="between 1 and 10"):
+        BrowserServiceSettings.from_env({"PLAYWRIGHT_MAX_SESSIONS": "11"})
+
+    manager = _manager(max_sessions=2)
+
+    async def scenario() -> None:
+        first = _create(manager)
+        second = _create(manager, app_slug="asana")
+        assert manager.capacity_in_use == 2
+        assert set(manager.held_capacity_session_ids()) == {
+            first.session_id,
+            second.session_id,
+        }
+
+        await manager.close(first.session_id, reason_code="closed_by_api")
+        # Only the closed session gave its slot back; the other one still holds its own.
+        assert manager.holds_capacity(first.session_id) is False
+        assert manager.holds_capacity(second.session_id) is True
+        assert manager.capacity_in_use == 1
+
+    asyncio.run(scenario())

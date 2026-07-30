@@ -24,6 +24,8 @@ from api.browser_secret_broker import browser_secret_broker_auth_response
 from api.browser_secret_broker import router as browser_secret_broker_router
 from api.models import (
     ActionReceipt,
+    AdmissionDecisionRequest,
+    AdmissionDecisionResponse,
     AppCatalogResponse,
     AppResearchResponse,
     AppSearchResponse,
@@ -35,12 +37,19 @@ from api.models import (
     InvalidRequestResponse,
     LiveViewResponse,
     ManagedConnectionResponse,
+    PauseRequest,
+    PauseResponse,
     PhaseUnavailableResponse,
+    ProviderProfileView,
     ProviderReadinessResponse,
     ProviderState,
+    ResetRequest,
+    ResetResponse,
     ResourceNotFoundResponse,
     ResumeRequest,
     RetryRequest,
+    RetryStepRequest,
+    RetryStepResponse,
     RunConflictResponse,
     RunDetailResponse,
     RunListResponse,
@@ -55,9 +64,9 @@ from api.service import (
     RunNotFoundError,
     RunService,
 )
-from ops.redaction import install_redacting_filter
-from ops.run_errors import ProviderReadinessError
-from ops.run_service import (
+from ops.core.redaction import install_redacting_filter
+from ops.runs.errors import ProviderReadinessError
+from ops.runs.service import (
     CredentialSubmissionError,
     IdempotencyConflictError,
     RunConflictError,
@@ -99,6 +108,15 @@ _KNOWN_VALIDATION_FIELDS = frozenset(
         "body.requested_scope_policy",
         "body.dry_run",
         "body.capability",
+        # The onboarding control bodies (design LL-6.3). Named so a refused
+        # control reports which field was wrong instead of degrading to
+        # "unknown_field"; every one of them is a closed vocabulary or a digest.
+        "body.decision",
+        "body.profile_digest",
+        "body.idempotency_key",
+        "body.expected_phase",
+        "body.confirm",
+        "body.reason",
         "header.idempotency-key",
         "path.run_id",
         "path.app_slug",
@@ -404,6 +422,7 @@ def create_app(
                 run_id=exc.run_id,
                 action=exc.action,
                 available_in=list(exc.available_in),
+                reason_code=exc.reason_code,
             ),
             status_code=status.HTTP_409_CONFLICT,
         )
@@ -760,16 +779,109 @@ def create_app(
 
     @application.post(
         "/api/runs/{run_id}/retry",
-        response_model=ActionReceipt,
+        response_model=ActionReceipt | RetryStepResponse,
         response_model_exclude_none=True,
         responses=common_responses,
     )
     async def retry_run(
         run_id: RunId,
-        payload: RetryRequest,
+        payload: RetryRequest | RetryStepRequest,
+        request: Request,
         run_service: ServiceDependency,
-    ) -> ActionReceipt:
+    ) -> ActionReceipt | RetryStepResponse:
+        """Retry a legacy capability, or the onboarding run's current step.
+
+        One path, two request shapes, discriminated by the body: the legacy form
+        names a capability, and the onboarding form names the phase the operator
+        believes the run is standing in. The phase is never a free choice — it is
+        an optimistic check, so a client cannot ask for a step whose effect the
+        ledger has already completed (design LL-6.3).
+        """
+
+        if isinstance(payload, RetryStepRequest):
+            _require_owner_action(request)
+            return await run_service.retry_onboarding_step(run_id, payload)
         return await run_service.retry(run_id, payload.capability)
+
+    @application.post(
+        "/api/runs/{run_id}/decision",
+        response_model=AdmissionDecisionResponse,
+        response_model_exclude_none=True,
+        responses=common_responses,
+    )
+    async def decide_admission(
+        run_id: RunId,
+        payload: AdmissionDecisionRequest,
+        request: Request,
+        run_service: ServiceDependency,
+    ) -> AdmissionDecisionResponse:
+        """Record the operator's one admission decision (Requirements 3.8, 3.9).
+
+        Owner-gated because account creation is the business decision this whole
+        feature refuses to make autonomously. The response is built from the
+        durable row, and it carries no credential reference.
+        """
+
+        _require_owner_action(request)
+        return await run_service.decide_admission(run_id, payload)
+
+    @application.post(
+        "/api/runs/{run_id}/pause",
+        response_model=PauseResponse,
+        response_model_exclude_none=True,
+        responses=common_responses,
+    )
+    async def pause_run(
+        run_id: RunId,
+        request: Request,
+        run_service: ServiceDependency,
+        payload: PauseRequest | None = None,
+    ) -> PauseResponse:
+        """Stop the run at its next safe boundary, keeping the browser session."""
+
+        _require_owner_action(request)
+        return await run_service.pause_onboarding(
+            run_id,
+            reason=payload.reason if payload is not None else None,
+        )
+
+    @application.post(
+        "/api/runs/{run_id}/reset",
+        response_model=ResetResponse,
+        response_model_exclude_none=True,
+        responses=common_responses,
+    )
+    async def reset_run(
+        run_id: RunId,
+        payload: ResetRequest,
+        request: Request,
+        run_service: ServiceDependency,
+    ) -> ResetResponse:
+        """Restart the walk at research. Never destroys a vault reference.
+
+        ``confirm: true`` is required by the request model, so an unconfirmed reset
+        is refused as a validation error before any session is released
+        (Requirement 14.12).
+        """
+
+        _require_owner_action(request)
+        return await run_service.reset_onboarding(run_id, confirm=payload.confirm)
+
+    @application.get(
+        "/api/runs/{run_id}/profile",
+        response_model=ProviderProfileView,
+        response_model_exclude_none=True,
+        responses=common_responses,
+    )
+    async def get_provider_profile(
+        run_id: RunId,
+        request: Request,
+        run_service: ServiceDependency,
+    ) -> ProviderProfileView:
+        """The sanitized provider profile: citations and hosts, never excerpts."""
+
+        _require_owner_action(request)
+        return await run_service.get_provider_profile(run_id)
 
     @application.get(
         "/api/runs/{run_id}/output",

@@ -16,9 +16,9 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr
 
-from ops.config import Settings
-from ops.effect_ledger import SQLiteEffectStore
-from ops.gmail_worker import GmailWorker
+from ops.core.config import Settings
+from ops.core.effect_ledger import SQLiteEffectStore
+from ops.gmail.worker import GmailWorker
 
 _IDENTITY = "ops.signup+hubspot@gmail.com"
 _REVIEWED = ("hubspot.com", "app.hubspot.com", "*.hubspot.com")

@@ -23,10 +23,10 @@ import httpx
 from cryptography.fernet import Fernet
 from pydantic import ValidationError
 
-from ops.models import CompanyProfile, OperationsRequest
-from ops.redaction import install_redacting_filter
-from ops.run_service import RunService
-from ops.storage import OperationsStorage
+from ops.core.models import CompanyProfile, OperationsRequest
+from ops.core.redaction import install_redacting_filter
+from ops.core.storage import OperationsStorage
+from ops.runs.service import RunService
 
 EXIT_OK = 0
 EXIT_NOT_FOUND = 2
@@ -56,7 +56,7 @@ def _database_path(explicit: str | Path | None = None) -> Path:
         return Path(configured).expanduser().resolve()
 
     try:
-        from ops.config import load_settings
+        from ops.core.config import load_settings
 
         settings = load_settings()
         for field in ("ops_db_path", "operations_db_path", "database_path"):
@@ -95,7 +95,7 @@ def _redact_text(value: str) -> str:
     """Use the security core redactor, with a conservative local fallback."""
 
     try:
-        from ops.redaction import redact_text
+        from ops.core.redaction import redact_text
 
         return redact_text(value)
     except (ImportError, TypeError, ValueError):
@@ -213,7 +213,7 @@ def doctor(*, db_path: str | Path | None = None) -> tuple[dict[str, Any], bool]:
         checks.append({"name": "operations_storage", "status": "fail"})
 
     try:
-        from ops.config import load_settings
+        from ops.core.config import load_settings
 
         settings = load_settings()
         live_email = settings.allow_live_vendor_email
@@ -265,16 +265,16 @@ def research_app(app_name: str, *, provider: str = "you") -> dict[str, Any]:
     cookies, or a browser session.
     """
 
-    from ops.config import load_settings
-    from ops.operational_research import (
+    from ops.core.config import load_settings
+    from ops.research.cache import SqliteResearchCache
+    from ops.research.operational_research import (
         OfficialEvidenceFetcher,
         PerplexitySearchDiscovery,
         _missing_fields,  # noqa: SLF001 - internal reuse within the same package
         _rich_candidate_urls,  # noqa: SLF001 - internal reuse within the same package
     )
-    from ops.p1_adapter import lookup_p1_record, to_operational_research
-    from ops.research_cache import SqliteResearchCache
-    from ops.you_research import (
+    from ops.research.p1_adapter import lookup_p1_record, to_operational_research
+    from ops.you.research import (
         CompositeEvidenceDiscovery,
         FallbackEvidenceContentFetcher,
         GuardedHTTPEvidenceFetcher,
@@ -407,8 +407,8 @@ def probe_you() -> dict[str, Any]:
     full response body, or a raw provider exception.
     """
 
-    from ops.config import load_settings
-    from ops.you_research import YouProviderError, YouSearchDiscovery
+    from ops.core.config import load_settings
+    from ops.you.research import YouProviderError, YouSearchDiscovery
 
     settings = load_settings()
     if settings.you_api_key is None:
@@ -439,7 +439,7 @@ def probe_you() -> dict[str, Any]:
 
 
 def _default_company(args: argparse.Namespace) -> CompanyProfile:
-    from ops.config import load_settings
+    from ops.core.config import load_settings
 
     settings = load_settings()
     return CompanyProfile(

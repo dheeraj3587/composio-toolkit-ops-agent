@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from ops.app_recipes import get_app_recipe, recipe_to_operational_research
-from ops.browser_host_policy import (
+from ops.browser.host_policy import (
     BrowserPolicyInactiveError,
     build_browser_allowed_hosts,
     evaluate_navigation,
 )
-from ops.models import OperationalResearch
+from ops.core.models import OperationalResearch
+from ops.recipes.app_recipes import get_app_recipe, recipe_to_operational_research
 
 
 def _pipedrive_hosts():

@@ -2,7 +2,7 @@
 
 import os
 
-from ops.models import (
+from ops.core.models import (
     AccountMode,
     CompanyProfile,
     IntegratorBundle,
@@ -10,8 +10,8 @@ from ops.models import (
     OperationsRequest,
     ScopeRequirement,
 )
-from ops.redaction import install_redacting_filter
-from ops.state import AccessRoute, OperationsState, RunStatus
+from ops.core.redaction import install_redacting_filter
+from ops.core.state import AccessRoute, OperationsState, RunStatus
 
 # The process owns every runtime artifact. Set this once at application import
 # so SQLite journals and any later checkpoints inherit owner-only defaults.
