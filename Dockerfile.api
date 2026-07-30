@@ -5,9 +5,6 @@
 # the digest makes a reviewed build reproducible.
 FROM python:3.11.15-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba
 
-ARG APP_REVISION=local-uncommitted
-LABEL org.opencontainers.image.revision=$APP_REVISION
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -63,5 +60,12 @@ STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD python -c "import json, os, sys, urllib.request; token=os.environ.get('OPS_INTERNAL_API_TOKEN') or ''; request=urllib.request.Request('http://127.0.0.1:8000/api/system/health', headers={'X-Ops-Internal-Token': token}); payload=json.load(urllib.request.urlopen(request, timeout=3)); sys.exit(0 if payload.get('status') == 'healthy' else 1)"
+
+# Declared LAST on purpose. The revision changes on every commit, so an ARG near
+# the top invalidated the dependency install and every later layer, making each
+# CI build and each deployment a full rebuild. As the final metadata layer it
+# still labels the image while the expensive layers stay cacheable.
+ARG APP_REVISION=local-uncommitted
+LABEL org.opencontainers.image.revision=$APP_REVISION
 
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--timeout-graceful-shutdown", "25", "--no-access-log"]
