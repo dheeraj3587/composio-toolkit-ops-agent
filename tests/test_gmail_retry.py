@@ -14,9 +14,9 @@ import types
 import pytest
 from pydantic import SecretStr
 
-from ops.config import Settings
-from ops.gmail_worker import GmailWorker
-from ops.provider_errors import ProviderContractError, ProviderOperationError
+from ops.core.config import Settings
+from ops.gmail.worker import GmailWorker
+from ops.providers.errors import ProviderContractError, ProviderOperationError
 
 _MESSAGES = [
     {

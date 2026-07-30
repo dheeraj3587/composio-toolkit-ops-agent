@@ -40,8 +40,8 @@ def main() -> int:
     # assignment runtime, live bootstrap and projection layers.
     import api.main as production_main
     from api.service import LocalRunService
-    from ops.config import Settings
-    from ops.run_service import RunService as CoreRunService
+    from ops.core.config import Settings
+    from ops.runs.service import RunService as CoreRunService
 
     root = Path(tempfile.mkdtemp())
     settings = Settings.from_env(dotenv_path=None)

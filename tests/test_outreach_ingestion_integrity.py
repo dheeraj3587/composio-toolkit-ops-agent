@@ -12,20 +12,20 @@ import pytest
 from cryptography.fernet import Fernet
 from pydantic import SecretStr
 
-from ops.config import Settings
-from ops.gmail_models import (
+from ops.core.config import Settings
+from ops.core.models import CompanyProfile, OperationsRequest
+from ops.core.secret_store import SQLiteSecretStore
+from ops.core.storage import OperationsStorage
+from ops.gmail.models import (
     GmailOutreachMessageClaim,
     SanitizedGmailMessage,
     SanitizedGmailThread,
 )
-from ops.gmail_validation import _validate_email, _validate_identifier, parse_mailbox_address
-from ops.gmail_worker import GmailWorker
-from ops.models import CompanyProfile, OperationsRequest
-from ops.provider_errors import ProviderContractError
-from ops.run_email import _latest_exact_inbound
-from ops.run_service import RunService
-from ops.secret_store import SQLiteSecretStore
-from ops.storage import OperationsStorage
+from ops.gmail.validation import _validate_email, _validate_identifier, parse_mailbox_address
+from ops.gmail.worker import GmailWorker
+from ops.providers.errors import ProviderContractError
+from ops.runs.email import _latest_exact_inbound
+from ops.runs.service import RunService
 
 CONTROLLED = "controlled@example.test"
 VALID_SECRET = "valid-provider-key-123456"  # pragma: allowlist secret

@@ -13,14 +13,14 @@ from urllib.parse import urlsplit
 
 import pytest
 
-import ops.browser_signup as signup_module
-from ops.app_recipes import get_app_recipe
-from ops.browser_signup import (
+import ops.browser.signup as signup_module
+from ops.browser.signup import (
     SignupResult,
     SignupSessionState,
     drive_signup,
     signup_secret_continuation_ready,
 )
+from ops.recipes.app_recipes import get_app_recipe
 from tests.browser_app.harness import require_chromium
 
 _PATTERNS = ("www.pipedrive.com", "app.pipedrive.com")

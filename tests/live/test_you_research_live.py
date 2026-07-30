@@ -21,8 +21,8 @@ import os
 
 import pytest
 
-from ops.config import Settings
-from ops.you_research import ResearchHostPolicy, YouResearchFallback
+from ops.core.config import Settings
+from ops.you.research import ResearchHostPolicy, YouResearchFallback
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_LIVE_YOU_RESEARCH_TESTS") != "1",

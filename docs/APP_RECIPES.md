@@ -1,6 +1,6 @@
 # Application recipes
 
-`ops/app_recipes.json` is the data source for new canonical runs. `ops/app_recipes.py` validates it at startup against an exact 50-app matrix.
+`ops/recipes/app_recipes.json` is the data source for new canonical runs. `ops/recipes/app_recipes.py` validates it at startup against an exact 50-app matrix.
 
 Current catalog:
 
@@ -137,7 +137,7 @@ To promote a gated recipe to `outreach_ready`, add a reviewed vendor contact and
 ```bash
 source .venv/bin/activate
 python -m pytest -q tests/test_app_recipes.py
-python -m ruff check ops/app_recipes.py tests/test_app_recipes.py
+python -m ruff check ops/recipes/app_recipes.py tests/test_app_recipes.py
 ```
 
 Catalog validation enforces the exact app order and route assignment. A count of 50 alone is not sufficient.

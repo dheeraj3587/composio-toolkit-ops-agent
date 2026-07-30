@@ -9,9 +9,9 @@ import httpx
 from pydantic import SecretStr
 
 from browser_service.auth import OWNER_HEADER
-from ops.browser_session_capability import CAPABILITY_HEADER
-from ops.models import validate_vault_reference
-from ops.provider_errors import ProviderOperationError
+from ops.browser.session_capability import CAPABILITY_HEADER
+from ops.core.models import validate_vault_reference
+from ops.providers.errors import ProviderOperationError
 
 BROKER_TOKEN_HEADER = "X-Browser-Secret-Broker-Token"
 _KIND = re.compile(r"^[a-z0-9][a-z0-9_-]{0,99}$")

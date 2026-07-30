@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from ops.email_verification import (
+from ops.email.verification import (
     MAX_VERIFICATION_AGE_SECONDS,
     VerificationCandidate,
     bind_recipient,
@@ -27,7 +27,7 @@ from ops.email_verification import (
     sender_authentication_method,
     sender_domain_of,
 )
-from ops.gmail_worker import _message_timestamp, build_inbox_query
+from ops.gmail.worker import _message_timestamp, build_inbox_query
 
 _NOW = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
 _NOW_MS = int(_NOW.timestamp() * 1000)

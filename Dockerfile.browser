@@ -25,9 +25,6 @@
 # and is installed during the build from that exact Playwright package.
 FROM python:3.11.15-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba
 
-ARG APP_REVISION=local-uncommitted
-LABEL org.opencontainers.image.revision=$APP_REVISION
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -109,3 +106,8 @@ ENTRYPOINT ["/usr/local/bin/browser-entrypoint.sh"]
 # uvicorn.error WebSocket handshake records that also include the query string.
 # Application logs emit only sanitized session/reason fields.
 CMD ["uvicorn", "browser_service.main:app", "--host", "0.0.0.0", "--port", "8081", "--timeout-graceful-shutdown", "25", "--no-access-log"]
+
+# Declared LAST on purpose: see Dockerfile.api. With the revision ARG at the top,
+# every commit re-downloaded Chromium and reinstalled the apt display stack.
+ARG APP_REVISION=local-uncommitted
+LABEL org.opencontainers.image.revision=$APP_REVISION

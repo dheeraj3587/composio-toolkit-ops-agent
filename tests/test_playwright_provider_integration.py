@@ -14,10 +14,10 @@ from cryptography.fernet import Fernet
 from pydantic import SecretStr, ValidationError
 
 from api.models import LiveViewResponse, ProviderState
-from ops.browser_readiness import browser_configuration_state
-from ops.config import Settings
-from ops.models import CompanyProfile, OperationsRequest
-from ops.run_service import RunService
+from ops.browser.readiness import browser_configuration_state
+from ops.core.config import Settings
+from ops.core.models import CompanyProfile, OperationsRequest
+from ops.runs.service import RunService
 
 _REPO = Path(__file__).resolve().parents[1]
 _INTERACTIVE_GRANT = (

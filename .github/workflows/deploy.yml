@@ -1,0 +1,127 @@
+name: Deploy
+
+# Continuous delivery for the single-host production Droplet.
+#
+# The runner never holds production configuration. `.env.production` lives only
+# on the host, and this workflow only tells the host which reviewed Git revision
+# to activate. scripts/deploy-droplet.sh owns the transactional release: it
+# scans candidate images, drains browser work, verifies a restorable backup,
+# activates the exact pre-built images, proves public TLS plus the application
+# auth boundary, and rolls back to the previous image identities on failure.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Git revision to deploy (defaults to the tip of main)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # One production release at a time, and never cancel a release in flight:
+  # the host holds a flock and an interrupted activation must finish its own
+  # rollback rather than be killed mid-way.
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Activate revision on the production host
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+    # Manual dispatch always runs. An automatic deploy requires a green CI run
+    # for a push on main; a failed, cancelled, or PR-triggered run never ships.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    steps:
+      - name: Resolve the target revision
+        id: target
+        env:
+          DISPATCH_REVISION: ${{ inputs.revision }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          revision="${DISPATCH_REVISION:-}"
+          if [ -z "${revision}" ]; then
+            revision="${WORKFLOW_RUN_SHA:-main}"
+          fi
+          printf 'revision=%s\n' "${revision}" >>"${GITHUB_OUTPUT}"
+          printf 'Deploying revision: %s\n' "${revision}"
+
+      - name: Configure the release SSH identity
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SSH_PRIVATE_KEY}" ] || [ -z "${SSH_KNOWN_HOSTS}" ]; then
+            echo "DEPLOY_SSH_PRIVATE_KEY and DEPLOY_SSH_KNOWN_HOSTS must be configured." >&2
+            exit 1
+          fi
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "${SSH_PRIVATE_KEY}" >~/.ssh/deploy_key
+          chmod 0600 ~/.ssh/deploy_key
+          printf '%s\n' "${SSH_KNOWN_HOSTS}" >~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/known_hosts
+
+      - name: Activate the revision on the host
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_APP_PATH || '/opt/composio-ops' }}
+          TARGET_REVISION: ${{ steps.target.outputs.revision }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ServerAliveInterval=30 \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "APP_PATH='${DEPLOY_PATH}' TARGET_REVISION='${TARGET_REVISION}' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "${APP_PATH}"
+
+          git fetch --prune --tags origin
+          resolved="$(git rev-parse --verify "${TARGET_REVISION}^{commit}")"
+          git checkout --detach "${resolved}"
+          git clean -fdx --exclude=.env.production --exclude=backups --exclude=private
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "The host worktree is not clean; refusing to deploy." >&2
+            exit 1
+          fi
+          printf 'Host is on revision %s\n' "$(git rev-parse --short HEAD)"
+
+          ./scripts/deploy-droplet.sh
+          REMOTE
+
+      - name: Verify the public boundary from outside the host
+        env:
+          PUBLIC_ORIGIN: ${{ vars.DEPLOY_PUBLIC_ORIGIN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PUBLIC_ORIGIN}" ]; then
+            echo "DEPLOY_PUBLIC_ORIGIN is not set; skipping the external probe."
+            exit 0
+          fi
+          health="$(curl --silent --show-error --fail --max-time 30 "${PUBLIC_ORIGIN}/healthz")"
+          printf 'healthz: %s\n' "${health}"
+          login_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --max-time 30 "${PUBLIC_ORIGIN}/login")"
+          [ "${login_status}" = "200" ]
+          protected="$(curl --silent --output /dev/null \
+            --write-out '%{http_code}' --max-time 30 "${PUBLIC_ORIGIN}/system")"
+          case "${protected}" in
+            30[2378]) ;;
+            *)
+              echo "An unauthenticated request to /system returned ${protected}." >&2
+              exit 1
+              ;;
+          esac

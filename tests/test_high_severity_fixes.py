@@ -8,10 +8,10 @@ from cryptography.fernet import Fernet
 from pydantic import SecretStr
 
 from api.models import SecurityState
-from ops.config import Settings
-from ops.models import CompanyProfile, OperationsRequest
-from ops.run_service import RunService
-from ops.secret_store import SQLiteSecretStore
+from ops.core.config import Settings
+from ops.core.models import CompanyProfile, OperationsRequest
+from ops.core.secret_store import SQLiteSecretStore
+from ops.runs.service import RunService
 
 
 def _request(app_name: str = "HubSpot") -> OperationsRequest:

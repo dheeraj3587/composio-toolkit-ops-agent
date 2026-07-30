@@ -57,7 +57,53 @@ dist/
 build/
 *.egg-info/
 
-# Agent / IDE assistant files (kept local, not tracked)
+# AI assistant / agent workspace files (kept local, never tracked)
+# Kiro: specs, steering, agents, skills, hooks, settings (incl. MCP config)
 .kiro/
+**/.kiro/
+
+# Agent instruction files
 AGENTS.md
-web/AGENTS.md
+**/AGENTS.md
+CLAUDE.md
+**/CLAUDE.md
+GEMINI.md
+**/GEMINI.md
+QWEN.md
+**/QWEN.md
+.clinerules
+.cursorrules
+.windsurfrules
+.aiderignore
+.aider.conf.yml
+.github/copilot-instructions.md
+.github/instructions/
+.github/prompts/
+.github/chatmodes/
+
+# Agent tool state directories
+.claude/
+**/.claude/
+.codex/
+.gemini/
+.cursor/
+.windsurf/
+.continue/
+.cline/
+.roo/
+.trae/
+.zed/
+.serena/
+.crush/
+.opencode/
+.qodo/
+.sourcegraph/
+.aider*
+.specstory/
+.ai/
+repomix-output.*
+
+# Assistant scratch output
+MANIFEST.txt
+*_AUDIT.md
+_contract_check.py

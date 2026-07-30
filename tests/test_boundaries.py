@@ -7,26 +7,26 @@ from pathlib import Path
 
 import pytest
 
-from ops.browser_worker import BrowserObservation, BrowserWorker
-from ops.credential_capture import CredentialCapture
-from ops.gmail_worker import GMAIL_TOOL_ALLOWLIST, GmailWorker
-from ops.graph import PhaseUnavailableError, build_graph
-from ops.outreach import correlation_subject
-from ops.p1_adapter import get_operational_research
-from ops.routing import classify_access
+from ops.access.routing import classify_access
+from ops.browser.worker import BrowserObservation, BrowserWorker
+from ops.credentials.capture import CredentialCapture
+from ops.email.outreach import correlation_subject
+from ops.gmail.worker import GMAIL_TOOL_ALLOWLIST, GmailWorker
+from ops.research.p1_adapter import get_operational_research
+from ops.workflow.graph import PhaseUnavailableError, build_graph
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PROVIDER_BOUNDARY_FILES = (
-    "graph.py",
-    "routing.py",
-    "p1_adapter.py",
-    "operational_research.py",
-    "browser_worker.py",
-    "credential_capture.py",
-    "credential_validator.py",
-    "gmail_worker.py",
-    "outreach.py",
-    "reply_classifier.py",
+    "workflow/graph.py",
+    "access/routing.py",
+    "research/p1_adapter.py",
+    "research/operational_research.py",
+    "browser/worker.py",
+    "credentials/capture.py",
+    "credentials/validator.py",
+    "gmail/worker.py",
+    "email/outreach.py",
+    "email/reply_classifier.py",
 )
 BANNED_IMPORT_ROOTS = {
     "browser_use_sdk",

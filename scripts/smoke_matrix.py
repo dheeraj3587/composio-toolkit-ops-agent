@@ -24,7 +24,7 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPOSITORY_ROOT))
 
-from ops.app_recipes import (  # noqa: E402 - repository root bootstrap for direct execution
+from ops.recipes.app_recipes import (  # noqa: E402 - repository root bootstrap for direct execution
     AppRecipe,
     load_app_recipe_catalog,
     recipes_for_route,

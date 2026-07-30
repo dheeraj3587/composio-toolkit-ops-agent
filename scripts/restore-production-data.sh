@@ -722,8 +722,8 @@ archived_acceptance_matches_running_release() {
 import json
 import sys
 
-from ops.config import Settings
-from ops.deploy_acceptance import deployment_payload_is_accepted
+from ops.core.config import Settings
+from ops.deploy.acceptance import deployment_payload_is_accepted
 
 try:
     payload = json.load(sys.stdin)
@@ -739,8 +739,8 @@ if not deployment_payload_is_accepted(settings, payload):
 
 running_release_accepts_restored_marker() {
 	docker_command exec "${CONTAINER_ID[api]}" python -c '
-from ops.config import Settings
-from ops.deploy_acceptance import deployment_is_accepted
+from ops.core.config import Settings
+from ops.deploy.acceptance import deployment_is_accepted
 
 raise SystemExit(
     0 if deployment_is_accepted(Settings.from_env(dotenv_path=None)) else 1

@@ -10,6 +10,7 @@ There is no durable read, list, delete, or arbitrary-reference endpoint.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import secrets
@@ -21,14 +22,21 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from starlette.concurrency import run_in_threadpool
 
 from browser_service.auth import OWNER_HEADER
-from ops.app_recipes import get_app_capture_spec
-from ops.browser_session_capability import (
+from ops.browser.session_capability import (
     CAPABILITY_HEADER,
     BrowserSessionCapabilityError,
     derive_browser_session_capability,
     validate_capability_owner,
 )
-from ops.secret_store import BrowserSecretGrantError
+from ops.core.secret_store import BrowserSecretGrantError
+from ops.credentials.capture_specs import CredentialCaptureSpec
+from ops.onboarding.capture_specs import (
+    CaptureContractUnavailable,
+    profile_capture_contract,
+)
+from ops.recipes.app_recipes import get_app_capture_spec
+
+LOGGER = logging.getLogger("composio_ops.browser_secret_broker")
 
 _APP_SLUG_PATTERN = r"^[a-z0-9]+(?:-[a-z0-9]+)*$"
 _KIND_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,99}$"
@@ -257,6 +265,45 @@ def _consume_sync(
         lock.release()
 
 
+def _resolve_capture_spec(
+    core: Any,
+    payload: BrowserCredentialCaptureRequest,
+) -> CredentialCaptureSpec:
+    """Reviewed recipe first; otherwise the run's profile-derived contract.
+
+    PRE:  ``payload.scope_id`` names a run of this owner. The stronger
+          precondition — that the run is active and bound to
+          ``payload.session_id`` — is re-proved under the run lock by
+          :func:`_bound_active_run` before anything is written.
+    POST: returns a contract whose ``value_pattern`` came from CHECKED-IN code
+          and whose ``url`` / ``vendor_domain`` came from either a reviewed
+          recipe or the run's immutable profile, or raises
+          :class:`BrowserCaptureNotAuthorized`. Research never supplies a
+          pattern.
+
+    A checked-in recipe is the stronger authority, so it stays first. The
+    profile contract is the runtime stand-in for the providers that have no
+    reviewed recipe — every brand-new provider — which is exactly the set that
+    used to be refused here because ``get_app_capture_spec`` returned ``None``.
+    """
+
+    reviewed = get_app_capture_spec(payload.app_slug)
+    if reviewed is not None:
+        return reviewed
+    try:
+        return profile_capture_contract(core, run_id=payload.scope_id, kind=payload.kind)
+    except CaptureContractUnavailable as exc:
+        # The orchestrator pauses the run on ``exc.reason_code``; the broker's
+        # response vocabulary does not grow a third code. ``detail`` is closed
+        # and carries no provider string, page text, or credential material, so
+        # it is safe next to the run id and is the only diagnosable trace.
+        LOGGER.warning(
+            "browser capture contract unavailable",
+            extra={"run_id": payload.scope_id, "detail": exc.detail},
+        )
+        raise BrowserCaptureNotAuthorized from None
+
+
 def _capture_sync(
     service: Any,
     payload: BrowserCredentialCaptureRequest,
@@ -266,8 +313,8 @@ def _capture_sync(
     if not authorized:
         raise BrowserCaptureNotAuthorized
     core, store = _core_and_store(service)
-    spec = get_app_capture_spec(payload.app_slug)
-    if spec is None or spec.field_kind != payload.kind:
+    spec = _resolve_capture_spec(core, payload)
+    if spec.field_kind != payload.kind:
         raise BrowserCaptureNotAuthorized
     value = payload.value.get_secret_value()
     if re.fullmatch(spec.value_pattern, value) is None:

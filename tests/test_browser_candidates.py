@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from ops.browser_candidates import (
+from ops.browser.candidates import (
     APPROVED_VALUE_REFS,
     ActionCandidate,
     ElementIdentity,
@@ -20,7 +20,7 @@ from ops.browser_candidates import (
     select_candidate,
     validate_press_key,
 )
-from ops.browser_decider import (
+from ops.browser.decider import (
     CandidateChoice,
     build_snapshot,
     candidate_choice_schema,

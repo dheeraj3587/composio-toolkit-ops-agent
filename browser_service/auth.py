@@ -24,7 +24,7 @@ import secrets
 from fastapi import Header, HTTPException, Request, status
 
 from browser_service.settings import BrowserServiceSettings
-from ops.browser_session_capability import (
+from ops.browser.session_capability import (
     CAPABILITY_HEADER,
     BrowserSessionCapabilityError,
     capability_digest,

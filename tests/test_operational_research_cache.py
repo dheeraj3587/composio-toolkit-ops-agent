@@ -5,10 +5,10 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from ops.models import OperationalUrlClaim
-from ops.operational_research import EvidenceDocument, OperationalResearchEnricher
-from ops.p1_adapter import load_verified_snapshot, to_operational_research
-from ops.you_research import InMemoryResearchCache
+from ops.core.models import OperationalUrlClaim
+from ops.research.operational_research import EvidenceDocument, OperationalResearchEnricher
+from ops.research.p1_adapter import load_verified_snapshot, to_operational_research
+from ops.you.research import InMemoryResearchCache
 
 
 class _Discovery:

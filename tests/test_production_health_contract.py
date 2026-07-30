@@ -13,10 +13,10 @@ from api.app import create_app as create_api_app
 from api.service import LocalRunService
 from browser_service.main import create_app as create_browser_app
 from browser_service.settings import BrowserServiceSettings
-from ops.browser_readiness import BrowserReadiness, probe_playwright
-from ops.browser_service_client import BrowserServiceClient, BrowserServiceHealth
-from ops.config import Settings
-from ops.run_service import RunService as CoreRunService
+from ops.browser.readiness import BrowserReadiness, probe_playwright
+from ops.browser.service_client import BrowserServiceClient, BrowserServiceHealth
+from ops.core.config import Settings
+from ops.runs.service import RunService as CoreRunService
 
 
 def test_browser_health_is_cache_only_and_ready_owns_refresh(
@@ -33,7 +33,7 @@ def test_browser_health_is_cache_only_and_ready_owns_refresh(
             detail="",
         )
 
-    monkeypatch.setattr("ops.browser_readiness.probe_playwright", ready_probe)
+    monkeypatch.setattr("ops.browser.readiness.probe_playwright", ready_probe)
     app = create_browser_app(
         BrowserServiceSettings(
             service_token=SecretStr("s" * 32),
@@ -97,7 +97,7 @@ def test_interactive_readiness_launches_headed_chromium(
 
     monkeypatch.setattr(importlib, "import_module", import_module)
     monkeypatch.setattr(
-        "ops.browser_readiness.Settings.from_env",
+        "ops.browser.readiness.Settings.from_env",
         lambda: SimpleNamespace(
             playwright_disable_sandbox=False,
             browser_interactive_hitl_enabled=True,

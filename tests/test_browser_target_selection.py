@@ -6,13 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from ops.browser_target_selection import (
+from ops.browser.target_selection import (
     derive_account_state,
     sanitize_target_url,
     select_browser_target,
 )
-from ops.browser_worker import is_allowed_browser_url
-from ops.playwright_worker import select_initial_target
+from ops.browser.worker import is_allowed_browser_url
+from ops.playwright.worker import select_initial_target
 
 _ALLOWED = ("app.example.test",)
 

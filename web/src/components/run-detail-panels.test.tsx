@@ -1,7 +1,14 @@
 import { render, screen } from "@testing-library/react"
 import { axe } from "jest-axe"
 
-import { HitlPanel, OutputPanel, ResearchPanel, SecurityPanel } from "@/components/run-detail-panels"
+import {
+  HitlPanel,
+  OnboardingFocusPanel,
+  OutputPanel,
+  ProviderProfilePanel,
+  ResearchPanel,
+  SecurityPanel,
+} from "@/components/run-detail-panels"
 import type { IntegratorOutput, OperationalResearch } from "@/lib/types"
 
 const research: OperationalResearch = {
@@ -143,6 +150,82 @@ describe("safe run detail panels", () => {
       />,
     )
     expect(screen.getByRole("button", { name: "Resume run" })).toBeInTheDocument()
+  })
+
+  it("renders the onboarding focus and sanitized profile, reporting unknown as unknown", () => {
+    render(
+      <>
+        <OnboardingFocusPanel
+          state={{
+            phase: "developer_app",
+            phase_at_pause: null,
+            profile_digest: "a".repeat(64),
+            reason_code: "developer_app_created",
+            goal: "Create a developer application",
+            step: "Filling the application form",
+            latest_decision: "Opening the developer portal",
+            attempt: 1,
+            admission_prompts: 1,
+            captcha_prompts: 0,
+            correlation_id: "corr_01",
+          }}
+        />
+        <ProviderProfilePanel
+          profile={{
+            run_id: "run_1",
+            profile_digest: "b".repeat(64),
+            provider_name: "Pipedrive",
+            app_slug: "pipedrive",
+            registrable_domain: "pipedrive.com",
+            allowed_host_patterns: ["*.pipedrive.com"],
+            auxiliary_hosts: [{ host: "accounts.google.com", kind: "identity_provider" }],
+            developer_portal_url: "https://developers.pipedrive.com/",
+            signup_url: null,
+            login_url: null,
+            developer_docs_url: null,
+            flows: [
+              {
+                kind: "developer_app",
+                supported: true,
+                entry_url: "https://developers.pipedrive.com/apps",
+                steps: ["Open the app registry."],
+                produces: ["oauth_client_id"],
+                requires_approval: false,
+                requires_billing: false,
+              },
+            ],
+            approval_requirement: "unknown",
+            billing_requirement: "unknown",
+            evidence: [
+              {
+                field: "developer_portal_url",
+                value: "https://developers.pipedrive.com/",
+                source_url: "https://developers.pipedrive.com/docs",
+                source_digest: "c".repeat(64),
+                adapters: ["perplexity_search"],
+                corroborations: 2,
+                confidence: 0.9,
+              },
+            ],
+            confidence: 0.88,
+            built_at: "2026-07-23T10:00:00Z",
+          }}
+        />
+      </>,
+    )
+
+    expect(screen.getByText("Create a developer application")).toBeInTheDocument()
+    expect(screen.getByText("Filling the application form")).toBeInTheDocument()
+    expect(screen.getByText("Opening the developer portal")).toBeInTheDocument()
+    expect(screen.getByText("pipedrive.com")).toBeInTheDocument()
+    expect(screen.getByText("*.pipedrive.com")).toBeInTheDocument()
+    expect(screen.getByText("accounts.google.com")).toBeInTheDocument()
+    expect(screen.getByText("Produces · Oauth Client Id")).toBeInTheDocument()
+    // Requirement 9.9: an unproven requirement is reported as unknown, never none.
+    expect(screen.getByText("Approval requirement")).toBeInTheDocument()
+    expect(screen.getAllByText("Unknown")).toHaveLength(2)
+    expect(screen.queryByText("None")).not.toBeInTheDocument()
+    expect(screen.getByText("Adapters · Perplexity Search")).toBeInTheDocument()
   })
 
   it("keeps the human intervention panel accessible", async () => {

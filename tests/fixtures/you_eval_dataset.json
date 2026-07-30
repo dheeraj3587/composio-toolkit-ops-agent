@@ -1,5 +1,5 @@
 {
-  "_comment": "Reviewed offline evaluation data for the research proposal layer. These approved_hosts test discovery classification only; they never grant runtime browser authority. Production navigation authority comes exclusively from ops/app_recipes.json as documented in docs/APP_RECIPES.md. expected_categories records what the keyword classifier actually returns, including honest unknown values for bare SPA roots. unknown-nonexistent-vendor verifies that discovery degrades to an empty result instead of fabricating hosts or categories.",
+  "_comment": "Reviewed offline evaluation data for the research proposal layer. These approved_hosts test discovery classification only; they never grant runtime browser authority. Production navigation authority comes exclusively from ops/recipes/app_recipes.json as documented in docs/APP_RECIPES.md. expected_categories records what the keyword classifier actually returns, including honest unknown values for bare SPA roots. unknown-nonexistent-vendor verifies that discovery degrades to an empty result instead of fabricating hosts or categories.",
   "schema_version": 1,
   "apps": [
     {
@@ -12,7 +12,7 @@
         "oauth.pipedrive.com",
         "*.pipedrive.com"
       ],
-      "reviewed_by": "ops/browser_host_policy.py (existing reviewed dataset)"
+      "reviewed_by": "ops/browser/host_policy.py (existing reviewed dataset)"
     },
     {
       "app_slug": "hubspot",
@@ -22,7 +22,7 @@
         "developers.hubspot.com",
         "app.hubspot.com"
       ],
-      "reviewed_by": "ops/browser_host_policy.py (existing reviewed dataset)"
+      "reviewed_by": "ops/browser/host_policy.py (existing reviewed dataset)"
     },
     {
       "app_slug": "twilio",
@@ -32,7 +32,7 @@
         "console.twilio.com",
         "www.twilio.com"
       ],
-      "reviewed_by": "verified via direct source lookup during this integration (2026); not yet cross-reviewed in ops/browser_host_policy.py"
+      "reviewed_by": "verified via direct source lookup during this integration (2026); not yet cross-reviewed in ops/browser/host_policy.py"
     },
     {
       "app_slug": "slack",
@@ -43,7 +43,7 @@
         "slack.com",
         "docs.slack.dev"
       ],
-      "reviewed_by": "verified via direct source lookup during this integration (2026); not yet cross-reviewed in ops/browser_host_policy.py"
+      "reviewed_by": "verified via direct source lookup during this integration (2026); not yet cross-reviewed in ops/browser/host_policy.py"
     },
     {
       "app_slug": "zoho",
@@ -54,7 +54,7 @@
         "api-console.zoho.com",
         "www.zoho.com"
       ],
-      "reviewed_by": "verified via direct source lookup during this integration (2026); not yet cross-reviewed in ops/browser_host_policy.py"
+      "reviewed_by": "verified via direct source lookup during this integration (2026); not yet cross-reviewed in ops/browser/host_policy.py"
     },
     {
       "app_slug": "attio",
@@ -65,7 +65,7 @@
         "app.attio.com",
         "build.attio.com"
       ],
-      "reviewed_by": "ops/browser_host_policy.py (existing reviewed dataset)"
+      "reviewed_by": "ops/browser/host_policy.py (existing reviewed dataset)"
     },
     {
       "app_slug": "twenty",
@@ -76,7 +76,7 @@
         "app.twenty.com",
         "docs.twenty.com"
       ],
-      "reviewed_by": "ops/browser_host_policy.py (existing reviewed dataset)"
+      "reviewed_by": "ops/browser/host_policy.py (existing reviewed dataset)"
     },
     {
       "app_slug": "unknown-nonexistent-vendor",

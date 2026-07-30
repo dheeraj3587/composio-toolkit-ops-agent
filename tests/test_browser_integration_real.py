@@ -8,8 +8,8 @@ than decorative:
    the browser-image job) a missing or broken Chromium is a hard FAILURE. Locally,
    without Chromium, it skips.
 2. **It exercises production code.** The egress guard is
-   ``ops.playwright_worker.make_route_handler``; the login state machine is
-   ``ops.browser_login``; snapshots come from ``ops.browser_snapshot``. Nothing is
+   ``ops.playwright.worker.make_route_handler``; the login state machine is
+   ``ops.browser.login``; snapshots come from ``ops.browser.snapshot``. Nothing is
    reimplemented for the test, so a regression in the shipping path shows up here.
 
 The security tests are the reason the app serves two genuinely separate origins
@@ -30,19 +30,19 @@ from typing import Any
 
 import pytest
 
-from ops.browser_api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
-from ops.browser_candidates import (
+from ops.browser.api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
+from ops.browser.candidates import (
     generate_candidates,
     resolve_identity,
     select_candidate,
 )
-from ops.browser_login import (
+from ops.browser.login import (
     drive_login,
     inject_otp,
     inspect_login,
     magic_link_is_safe,
 )
-from ops.browser_pages import (
+from ops.browser.pages import (
     BrowserPageRegistry,
     DialogPolicy,
     DownloadPolicy,
@@ -50,9 +50,9 @@ from ops.browser_pages import (
     install_dialog_handler,
     install_download_guard,
 )
-from ops.browser_snapshot import build_ranked_snapshot, frame_chain
-from ops.browser_worker import is_allowed_browser_url
-from ops.playwright_worker import (
+from ops.browser.snapshot import build_ranked_snapshot, frame_chain
+from ops.browser.worker import is_allowed_browser_url
+from ops.playwright.worker import (
     PageInspection,
     checkpoint_satisfied,
     navigation_allowed,
@@ -179,7 +179,7 @@ class TestCheckpointStateMachine:
                 # Re-resolving the old element identity against the NEW snapshot
                 # must fail rather than silently match something else.
                 identity_source = first.elements[0]
-                from ops.browser_candidates import ElementIdentity
+                from ops.browser.candidates import ElementIdentity
 
                 identity = ElementIdentity(
                     role=identity_source.role,
@@ -543,7 +543,7 @@ class TestComplexBrowserBehavior:
                     fx.page, reviewed_patterns=app.host_patterns, checkpoint_signals=("save",)
                 )
                 saves = [e for e in elements if e.name.casefold() == "save"]
-                from ops.browser_candidates import ElementIdentity
+                from ops.browser.candidates import ElementIdentity
 
                 identity = ElementIdentity(role="button", name="Save", test_id="save-team")
                 resolution, element = resolve_identity(identity, elements)
@@ -811,7 +811,7 @@ class TestSecurityBoundaries:
         readable input, and still must not reach anything model-facing."""
 
         async def scenario(app: BrowserTestApp) -> tuple[str, str]:
-            from ops.browser_candidates import render_candidates
+            from ops.browser.candidates import render_candidates
 
             async with browser_page(app) as fx:
                 await fx.page.goto(app.url("/settings/api"), wait_until="domcontentloaded")
@@ -962,7 +962,7 @@ class TestCredentialCapture:
 
     @staticmethod
     def _spec(app: BrowserTestApp, **overrides: Any) -> Any:
-        from ops.credential_capture_specs import CredentialCaptureSpec
+        from ops.credentials.capture_specs import CredentialCaptureSpec
 
         defaults: dict[str, Any] = {
             "app_slug": "vendor-test",
@@ -1073,7 +1073,7 @@ class TestCredentialCapture:
 
             from cryptography.fernet import Fernet
 
-            from ops.secret_store import SQLiteSecretStore
+            from ops.core.secret_store import SQLiteSecretStore
 
             async with browser_page(app) as fx:
                 await fx.page.goto(app.url("/settings/api"), wait_until="domcontentloaded")
@@ -1194,7 +1194,7 @@ class TestPopupLifecycle:
         assert _run(scenario) == "Settings"
 
     def test_committed_url_helper_returns_empty_for_a_closed_popup(self) -> None:
-        from ops.browser_pages import wait_for_committed_popup_url
+        from ops.browser.pages import wait_for_committed_popup_url
 
         async def scenario(app: BrowserTestApp) -> str:
             async with browser_page(app) as fx:

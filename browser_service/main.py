@@ -9,7 +9,7 @@ and enforces session ownership. The browser worker publishes no host port in
 observations — never cookies, storage state, credential values, or the token.
 
 The Phase 1/2 safety logic is REUSED, not re-implemented: this service drives
-``ops.playwright_worker.PlaywrightBrowserWorker``, so the reviewed host policy,
+``ops.playwright.worker.PlaywrightBrowserWorker``, so the reviewed host policy,
 candidate policy, risk policy, staged egress, dialog/popup/download guards and
 DLP boundary all still apply exactly as tested.
 """
@@ -57,9 +57,14 @@ from browser_service.novnc import LiveViewDenied, VncTarget, authorize_live_view
 from browser_service.secret_broker import BrokerCaptureStore, BrowserSecretBrokerClient
 from browser_service.session_manager import ManagedSession, SessionManager, SessionUnavailable
 from browser_service.settings import BrowserServiceSettings
-from ops.browser_process_hardening import harden_browser_service_process
-from ops.provider_errors import ProviderOperationError
-from ops.redaction import install_redacting_filter
+from ops.browser.host_policy import (
+    allowed_hosts_from_patterns,
+    first_denied_navigation,
+    navigation_target_urls,
+)
+from ops.browser.process_hardening import harden_browser_service_process
+from ops.core.redaction import install_redacting_filter
+from ops.providers.errors import ProviderOperationError
 
 LOGGER = logging.getLogger("browser_service")
 
@@ -220,7 +225,7 @@ class _ReadinessCache:
 def _storage_binding(payload: CreateSessionRequest, owner: str) -> Any:
     """The (app, account, owner) triple stored state is bound to."""
 
-    from ops.browser_storage_state import StorageStateBinding
+    from ops.browser.storage_state import StorageStateBinding
 
     if payload.account_ref is None:
         raise ValueError("browser account reference is required")
@@ -234,7 +239,7 @@ def _storage_binding(payload: CreateSessionRequest, owner: str) -> Any:
 
 
 def _state_store(settings: BrowserServiceSettings) -> Any:
-    from ops.browser_storage_state import EncryptedStorageStateStore
+    from ops.browser.storage_state import EncryptedStorageStateStore
 
     key = settings.storage_state_key.get_secret_value() if settings.storage_state_key else None
     return EncryptedStorageStateStore(settings.storage_state_dir, key)
@@ -434,8 +439,8 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
 
     def _worker() -> Any:
         if app.state.worker is None:
-            from ops.config import Settings
-            from ops.playwright_worker import PlaywrightBrowserWorker
+            from ops.core.config import Settings
+            from ops.playwright.worker import PlaywrightBrowserWorker
 
             app.state.worker = PlaywrightBrowserWorker(
                 settings=Settings.from_env(dotenv_path=None),
@@ -528,6 +533,20 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="recipe_snapshot_required",
             )
+        # Rebuild the run's allow-list from its serialized patterns rather than
+        # trusting loose strings later. A malformed list is refused outright: a
+        # partially understood allow-list is not confinement.
+        allowed_hosts = None
+        if payload.allowed_host_patterns:
+            try:
+                allowed_hosts = allowed_hosts_from_patterns(
+                    payload.app_slug, payload.allowed_host_patterns
+                )
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="browser_allow_list_invalid",
+                ) from None
         try:
             session = manager.create(
                 owner=auth.owner,
@@ -536,6 +555,8 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 session_capability_digest=session_capability_digest,
                 secret_scope=payload.secret_scope,
                 account_ref=payload.account_ref,
+                run_id=payload.run_id,
+                allowed_hosts=allowed_hosts,
             )
         except SessionUnavailable as exc:
             raise _sanitized_error(exc) from None
@@ -627,6 +648,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 app_slug=payload.app_slug,
                 secret_scope=payload.secret_scope,
                 account_ref=payload.account_ref,
+                run_id=payload.run_id,
             )
         )
 
@@ -922,7 +944,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 view_allowed=False,
                 control_allowed=False,
             )
-        from ops.browser_live_view import (
+        from ops.browser.live_view import (
             LiveViewAudit,
             build_interactive_url,
             issue_live_view_token,
@@ -1128,7 +1150,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             if not force and not cache.is_stale():
                 return
             try:
-                from ops.browser_readiness import probe_playwright
+                from ops.browser.readiness import probe_playwright
 
                 readiness = await probe_playwright(timeout_seconds=25.0)
                 interactive_ready = _interactive_stack_ready(display_pool)
@@ -1248,7 +1270,7 @@ def _validated_recipe_snapshot(
 
     if payload is None:
         return None
-    from ops.app_recipes import AppRecipe
+    from ops.recipes.app_recipes import AppRecipe
 
     try:
         recipe = AppRecipe.model_validate(payload)
@@ -1289,8 +1311,8 @@ async def _drive(
     the value is never returned on the control RPC or persisted by this service.
     """
 
-    from ops.browser_worker import BrowserSessionContext
-    from ops.models import OperationalResearch
+    from ops.browser.worker import BrowserSessionContext
+    from ops.core.models import OperationalResearch
 
     try:
         research = OperationalResearch.model_validate(research_payload)
@@ -1307,6 +1329,16 @@ async def _drive(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="research_app_mismatch",
         )
+    # Confinement is enforced HERE for a session that carries a run allow-list.
+    # Every URL this payload could turn into a top-level destination is checked
+    # before the worker is driven, so a caller that skipped its own check (or was
+    # steered by page content) still cannot leave the provider's domain.
+    run_allowed_hosts = session.allowed_hosts
+    if run_allowed_hosts is not None:
+        denial = first_denied_navigation(navigation_target_urls(research), run_allowed_hosts)
+        if denial is not None:
+            session.reason_code = denial.reason_code
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=denial.reason_code)
 
     handle = session.current_page_id
     context = BrowserSessionContext(
@@ -1377,6 +1409,17 @@ async def _drive(
         ) from None
     finally:
         sensitive.clear()  # drop credential values immediately
+
+    # Where the browser actually ENDED UP, not only where it was asked to go: a
+    # provider redirect can drift off the run's allow-list without any navigation
+    # being requested. Refuse rather than report the page, and do not persist
+    # authenticated state for an off-allow-list surface. A failed observation is
+    # exempt because it carries a placeholder URL, not a real destination.
+    if run_allowed_hosts is not None and observation.status != "failed":
+        drift = session.authorize_navigation(observation.current_url)
+        if not drift.allowed:
+            session.reason_code = drift.reason_code
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=drift.reason_code)
 
     _set_hitl_pending(session, observation.status == "human_action_required")
     session.current_url_path = _url_path(observation.current_url)

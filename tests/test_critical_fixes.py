@@ -11,11 +11,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ops.models import CompanyProfile
-from ops.p1_adapter import P1OperationalAdapter, to_operational_research
-from ops.run_service import RunService
-from ops.state import OperationsState, validate_status_transition
-from ops.storage import OperationsStorage
+from ops.core.models import CompanyProfile
+from ops.core.state import OperationsState, validate_status_transition
+from ops.core.storage import OperationsStorage
+from ops.research.p1_adapter import P1OperationalAdapter, to_operational_research
+from ops.runs.service import RunService
 
 
 def _service(tmp_path: Path) -> RunService:

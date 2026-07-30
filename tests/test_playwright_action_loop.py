@@ -13,11 +13,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from ops.browser_egress import EgressStage
-from ops.browser_loop import BrowserLoop, BrowserOperationTimeout
-from ops.config import Settings
-from ops.models import OperationalResearch
-from ops.playwright_worker import (
+from ops.browser.egress import EgressStage
+from ops.browser.loop import BrowserLoop, BrowserOperationTimeout
+from ops.core.config import Settings
+from ops.core.models import OperationalResearch
+from ops.playwright.worker import (
     PlaywrightBrowserWorker,
     detect_human_gate,
 )
@@ -66,7 +66,7 @@ def _synthetic_trace(
     """Build an in-test v2 trace so the state machine can be exercised without a
     conservative catalog checkpoint short-circuiting to HITL."""
 
-    from ops.browser_api_trace_catalog import BrowserApiTrace
+    from ops.browser.api_trace_catalog import BrowserApiTrace
 
     return BrowserApiTrace(
         position=3,
@@ -83,7 +83,7 @@ def _synthetic_trace(
 
 
 def _install_trace(monkeypatch: object, trace: object) -> None:
-    import ops.playwright_worker as worker_module
+    import ops.playwright.worker as worker_module
 
     monkeypatch.setattr(worker_module, "recipe_to_browser_trace", lambda recipe: trace)
 
@@ -129,7 +129,7 @@ def test_loop_submits_login_follows_checkpoints_and_verifies_success(
     """A full deterministic path: the loop must submit the login form, then report
     the credential page ONLY when the structured success predicate is proven."""
 
-    from ops.browser_api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
+    from ops.browser.api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
 
     _install_trace(
         monkeypatch,
@@ -194,7 +194,7 @@ def test_initial_login_requires_credentials_then_resume_injects_them_in_same_ses
     reach the reviewed target in the original Chromium context.
     """
 
-    from ops.browser_api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
+    from ops.browser.api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
 
     _install_trace(
         monkeypatch,
@@ -261,7 +261,7 @@ def test_pre_auth_challenge_does_not_consume_post_hitl_target_retry(
 ) -> None:
     """A target probe redirected to CAPTCHA must preserve the post-HITL retry."""
 
-    from ops.browser_api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
+    from ops.browser.api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
 
     _install_trace(
         monkeypatch,
@@ -431,7 +431,7 @@ def test_loop_reports_hitl_for_a_captcha_page() -> None:
 def test_loop_stops_on_repeated_state_without_inference(monkeypatch: pytest.MonkeyPatch) -> None:
     """No inference configured + an AMBIGUOUS checkpoint -> bounded, honest HITL."""
 
-    from ops.browser_api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
+    from ops.browser.api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
 
     _install_trace(
         monkeypatch,
@@ -492,7 +492,7 @@ def test_model_cannot_declare_success_without_a_reviewed_signal() -> None:
 
     asyncio.run(worker._loop.run(_load()))
 
-    from ops.app_recipes import get_app_browser_trace
+    from ops.recipes.app_recipes import get_app_browser_trace
 
     trace = get_app_browser_trace("pipedrive")
     assert trace is not None
@@ -541,7 +541,7 @@ def test_snapshot_from_a_real_page_excludes_secret_values() -> None:
 
 # --- Human gate detection is STRUCTURAL, not substring-based (item 8) ---------
 def _inspection(elements: tuple, *, text: str = "", title: str = "") -> object:
-    from ops.playwright_worker import PageInspection
+    from ops.playwright.worker import PageInspection
 
     return PageInspection(
         url=f"https://{_HOST}/x",
@@ -554,7 +554,7 @@ def _inspection(elements: tuple, *, text: str = "", title: str = "") -> object:
 
 
 def _snap(*specs: dict) -> tuple:
-    from ops.browser_decider import build_snapshot
+    from ops.browser.decider import build_snapshot
 
     return build_snapshot(list(specs))
 
@@ -790,8 +790,8 @@ def test_llm_decision_path_is_actually_reached_on_an_ambiguous_page(
     unreachable, so the loop silently degraded to HITL on every ambiguous page and
     the brain was never invoked. This asserts the model is genuinely consulted."""
 
-    from ops.browser_api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
-    from ops.inference import JsonInference
+    from ops.browser.api_trace_catalog import BrowserApiTraceStep, CheckpointPredicate
+    from ops.core.inference import JsonInference
 
     _install_trace(
         monkeypatch,
@@ -844,7 +844,7 @@ def test_llm_decision_path_is_actually_reached_on_an_ambiguous_page(
 def test_dlp_boundary_still_blocks_a_prompt_carrying_secret_material() -> None:
     """The guard that broke the path must still fire on a genuine leak."""
 
-    from ops.model_input_dlp import contains_secret_material
+    from ops.core.model_input_dlp import contains_secret_material
 
     assert contains_secret_material("token " + "a1b2c3d4e5" * 4) is True
     # ...but not on ordinary prompt scaffolding or a normal URL.

@@ -880,8 +880,8 @@ mark_current_release_accepted() {
 	# The nonce remains inside the API container environment. Only its
 	# revision-bound SHA-256 digest is persisted, atomically and owner-only.
 	compose exec -T api python - <<'PY'
-from ops.config import Settings
-from ops.deploy_acceptance import (
+from ops.core.config import Settings
+from ops.deploy.acceptance import (
     deployment_is_accepted,
     write_deployment_acceptance_marker,
 )
@@ -895,8 +895,8 @@ PY
 
 mark_rollback_release_accepted() {
 	rollback_compose exec -T api python - <<'PY'
-from ops.config import Settings
-from ops.deploy_acceptance import (
+from ops.core.config import Settings
+from ops.deploy.acceptance import (
     deployment_is_accepted,
     write_deployment_acceptance_marker,
 )

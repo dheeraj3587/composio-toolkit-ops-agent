@@ -20,10 +20,10 @@ import time
 
 import pytest
 
-from ops.config import Settings
-from ops.operational_research import PerplexitySearchDiscovery
-from ops.you_eval import EvalReport, load_dataset, score_candidates
-from ops.you_research import (
+from ops.core.config import Settings
+from ops.research.operational_research import PerplexitySearchDiscovery
+from ops.you.eval import EvalReport, load_dataset, score_candidates
+from ops.you.research import (
     CompositeEvidenceDiscovery,
     LegacyDiscoveryAdapter,
     ResearchHostPolicy,
@@ -42,7 +42,7 @@ _CREDENTIAL_CATEGORIES = {"developer_portal", "api_authentication", "credential_
 
 
 def _baseline_for(app_slug: str, app_name: str) -> object:
-    from ops.models import OperationalResearch
+    from ops.core.models import OperationalResearch
 
     return OperationalResearch.model_validate(
         {

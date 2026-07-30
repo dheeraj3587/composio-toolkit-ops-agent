@@ -12,19 +12,28 @@ import { useFormStatus } from "react-dom"
 
 import {
   openLiveView,
+  runOnboardingControlAction,
   runPhaseAction,
   type LiveViewState,
+  type OnboardingControlState,
   type PhaseActionState,
 } from "@/app/runs/[runId]/actions"
 import {
+  AdmissionDecisionForm,
   BrowserLoginForm,
   BrowserVerificationForm,
+  CaptchaResumeForm,
   CredentialSubmitForm,
 } from "@/components/browser-hitl-forms"
 import { BrowserLiveSurface } from "@/components/browser-live-surface"
 import type { PlaywrightRemoteViewHandle } from "@/components/playwright-remote-view"
 import { Button } from "@/components/ui/button"
-import type { BrowserUiState } from "@/lib/types"
+import { humanize } from "@/lib/format"
+import type {
+  BrowserUiState,
+  OnboardingControlsView,
+  OnboardingStateView,
+} from "@/lib/types"
 
 const initialLiveView: LiveViewState = {
   provider: null,
@@ -34,10 +43,12 @@ const initialLiveView: LiveViewState = {
   interactivePath: null,
   capturedAt: null,
   interactionAvailable: false,
+  reasonCode: null,
   message: null,
   tone: "neutral",
 }
 const initialPhaseAction: PhaseActionState = { message: null, tone: "neutral" }
+const initialControl: OnboardingControlState = { message: null, tone: "neutral", control: null }
 
 function SubmitButton({ label, pendingLabel }: { label: string; pendingLabel: string }) {
   const { pending } = useFormStatus()
@@ -63,6 +74,8 @@ export function HitlLiveControls({
   canResumeInteractive = false,
   fieldName = "api_token",
   fieldLabel = "API token",
+  onboarding = null,
+  controls = null,
 }: {
   runId: string
   browser: BrowserUiState | null
@@ -70,6 +83,11 @@ export function HitlLiveControls({
   canResumeInteractive?: boolean
   fieldName?: string
   fieldLabel?: string
+  // Present only for an onboarding run. When they are present, the only decision
+  // surface beside the live browser is the CAPTCHA prompt, and its buttons come
+  // from the projected controls rather than from the run status.
+  onboarding?: OnboardingStateView | null
+  controls?: OnboardingControlsView | null
 }) {
   const [liveState, setLiveState] = useState<LiveViewState>(initialLiveView)
   const [resumeState, resumeAction] = useActionState(runPhaseAction, initialPhaseAction)
@@ -177,10 +195,78 @@ export function HitlLiveControls({
         remoteViewRef={remoteViewRef}
       />
 
+      {/*
+        An onboarding run has exactly two decision surfaces (Requirement 18.4).
+        The admission prompt lives in the onboarding console; the one that belongs
+        beside the live browser is the CAPTCHA prompt, so every legacy prompt is
+        withheld here rather than added as a third surface.
+      */}
+      {controls ? (
+        <div className="border-t border-border pt-4">
+          {onboarding?.phase === "captcha_paused" ? (
+            <CaptchaResumeForm
+              runId={runId}
+              canResume={controls.can_resume}
+              canCancel={controls.can_cancel}
+              onResumeSubmit={isInteractiveHitl ? disconnectBeforeResume : undefined}
+            />
+          ) : (
+            <p className="text-[10px] leading-4 text-muted-foreground">
+              The agent is driving this session. Operator controls for this run come from the
+              onboarding console above, and no credential is ever typed on this page.
+            </p>
+          )}
+        </div>
+      ) : (
+        <LegacyBrowserSurfaces
+          runId={runId}
+          browser={browser}
+          canResumeInteractive={canResumeInteractive}
+          isInteractiveHitl={isInteractiveHitl}
+          fieldName={fieldName}
+          fieldLabel={fieldLabel}
+          resumeAction={resumeAction}
+          resumeState={resumeState}
+          onResumeSubmit={disconnectBeforeResume}
+        />
+      )}
+    </div>
+  )
+}
+
+/**
+ * The pre-onboarding browser surfaces, unchanged.
+ *
+ * A legacy run projects no onboarding controls, so it keeps deriving these
+ * surfaces from `BrowserUiState` exactly as before.
+ */
+function LegacyBrowserSurfaces({
+  runId,
+  browser,
+  canResumeInteractive,
+  isInteractiveHitl,
+  fieldName,
+  fieldLabel,
+  resumeAction,
+  resumeState,
+  onResumeSubmit,
+}: {
+  runId: string
+  browser: BrowserUiState | null
+  canResumeInteractive: boolean
+  isInteractiveHitl: boolean
+  fieldName: string
+  fieldLabel: string
+  resumeAction: (payload: FormData) => void
+  resumeState: PhaseActionState
+  onResumeSubmit: () => void
+}) {
+  return (
+    <>
       {canResumeInteractive && isInteractiveHitl ? (
         <form
           action={resumeAction}
-          onSubmit={disconnectBeforeResume}
+          onSubmit={onResumeSubmit}
           className="space-y-2 border-t border-border pt-4"
         >
           <input type="hidden" name="run_id" value={runId} />
@@ -220,6 +306,131 @@ export function HitlLiveControls({
           Credential submission unlocks only after the backend verifies the official credential-management page.
         </p>
       )}
+    </>
+  )
+}
+
+/**
+ * The backend-projected operator control strip (Requirements 18.4, 18.6).
+ *
+ * Every button here exists because `OnboardingControlsView` says it is legal —
+ * nothing is inferred from the run status. The admission prompt is one of the two
+ * decision surfaces the console may render; pause, resume, cancel, reset, and the
+ * step retry are controls, not prompts. Resume during a CAPTCHA pause belongs to
+ * the CAPTCHA prompt beside the live browser, so it is not duplicated here.
+ */
+export function OnboardingControlBar({
+  runId,
+  state,
+  controls,
+  providerName,
+}: {
+  runId: string
+  state: OnboardingStateView
+  controls: OnboardingControlsView
+  providerName?: string | null
+}) {
+  const [controlState, controlAction] = useActionState(runOnboardingControlAction, initialControl)
+  const captchaPaused = state.phase === "captcha_paused"
+  const simpleControls = [
+    { control: "pause", available: controls.can_pause, label: "Pause at next boundary", pending: "Pausing…" },
+    {
+      control: "resume",
+      // A CAPTCHA pause is resumed from its own prompt beside the live browser.
+      available: controls.can_resume && !captchaPaused,
+      label: "Resume the run",
+      pending: "Resuming…",
+    },
+    { control: "cancel", available: controls.can_cancel, label: "Cancel the run", pending: "Cancelling…" },
+  ].filter((item) => item.available)
+  const nothingAvailable =
+    simpleControls.length === 0 &&
+    !controls.can_decide_admission &&
+    !controls.can_retry_step &&
+    !controls.can_reset
+
+  return (
+    <div className="panel rounded-md p-5" data-testid="onboarding-control-bar">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <p className="eyebrow">Backend-projected capability</p>
+          <h3 className="mt-1 text-lg font-semibold">Operator controls</h3>
+        </div>
+        <p className="font-mono text-[9px] uppercase tracking-[0.1em] text-muted-foreground">
+          Control reason · {humanize(controls.reason_code)}
+        </p>
+      </div>
+      <p className="mt-2 text-xs leading-5 text-muted-foreground">
+        Each control below is one the backend reports as legal for {humanize(state.phase)}. A control
+        the backend withholds is absent rather than shown and then refused.
+      </p>
+
+      <div className="mt-5 space-y-4 border-t border-border pt-4">
+        {controls.can_decide_admission ? (
+          <AdmissionDecisionForm
+            runId={runId}
+            profileDigest={state.profile_digest}
+            providerName={providerName}
+          />
+        ) : null}
+
+        {simpleControls.length || controls.can_retry_step ? (
+          <div className="flex flex-wrap gap-2">
+            {simpleControls.map((item) => (
+              <form key={item.control} action={controlAction}>
+                <input type="hidden" name="run_id" value={runId} />
+                <input type="hidden" name="control" value={item.control} />
+                <SubmitButton label={item.label} pendingLabel={item.pending} />
+              </form>
+            ))}
+            {controls.can_retry_step ? (
+              <form action={controlAction}>
+                <input type="hidden" name="run_id" value={runId} />
+                <input type="hidden" name="control" value="retry-step" />
+                {/* Optimistic check, not a choice of step: the backend refuses a
+                    phase the run is not standing in. */}
+                <input type="hidden" name="expected_phase" value={state.phase} />
+                <SubmitButton
+                  label={`Retry ${humanize(controls.retryable_step ?? state.phase).toLowerCase()}`}
+                  pendingLabel="Retrying…"
+                />
+              </form>
+            ) : null}
+          </div>
+        ) : null}
+
+        {controls.can_reset ? (
+          <form action={controlAction} className="space-y-2 border-t border-border pt-4">
+            <input type="hidden" name="run_id" value={runId} />
+            <input type="hidden" name="control" value="reset" />
+            <label htmlFor={`reset-confirm-${runId}`} className="flex items-center gap-2 text-xs">
+              <input
+                id={`reset-confirm-${runId}`}
+                type="checkbox"
+                name="confirm"
+                value="true"
+              />
+              Confirm restart from research. Workflow state is cleared; stored credentials are kept.
+            </label>
+            <SubmitButton label="Reset this run" pendingLabel="Resetting…" />
+          </form>
+        ) : null}
+
+        {nothingAvailable ? (
+          <p className="text-xs leading-5 text-muted-foreground">
+            The backend authorizes no operator control in this phase.
+          </p>
+        ) : null}
+
+        {controlState.message ? (
+          <p
+            className={controlState.tone === "error" ? "text-xs text-destructive" : "text-xs text-muted-foreground"}
+            role={controlState.tone === "error" ? "alert" : "status"}
+          >
+            {controlState.message}
+          </p>
+        ) : null}
+      </div>
     </div>
   )
 }

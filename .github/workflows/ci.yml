@@ -52,7 +52,10 @@ jobs:
   real-browser:
     name: Real Chromium acceptance
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # Every test here starts a real Chromium and drives a real page. Until the
+    # sandbox fix below, the whole suite failed at launch in under two minutes,
+    # so this budget had never covered an actual run.
+    timeout-minutes: 75
     env:
       ALLOW_LIVE_BROWSER: "false"
       ALLOW_LIVE_VENDOR_EMAIL: "false"
@@ -82,9 +85,23 @@ jobs:
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
+      - name: Allow Chromium's user-namespace sandbox on this runner
+        # Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1, so an
+        # unconfined Chromium cannot create the user namespace its zygote sandbox
+        # needs and every launch dies with "Chromium sandboxing failed!". Production
+        # grants exactly that one operation through the browser-only AppArmor policy
+        # inside the container; this bare runner has no such profile, so the
+        # ephemeral host relaxes the sysctl instead. The product default is
+        # untouched: chromium_sandbox stays enabled in the tests being run.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+
       - name: Run real-browser acceptance suite
+        # --durations reports the slowest cases so a regression in browser test
+        # time is visible in the log instead of only as a job timeout.
         run: >-
-          pytest -q -m browser
+          pytest -m browser -v --durations=25
           --junitxml="${RUNNER_TEMP}/real-browser.xml"
 
       - name: Assert browser suite ran with zero skips
@@ -275,7 +292,7 @@ jobs:
           import urllib.request
           from urllib.parse import urlsplit, urlunsplit
 
-          from ops.app_recipes import get_app_recipe
+          from ops.recipes.app_recipes import get_app_recipe
           from websockets.sync.client import connect
 
           token = os.environ["BROWSER_SERVICE_TOKEN"]
@@ -604,8 +621,8 @@ jobs:
           # boundary pass. Then create a plan-only run and prove it survives an
           # API process restart; no provider or browser action is authorized.
           "${compose[@]}" exec -T api python - <<'PY'
-          from ops.config import Settings
-          from ops.deploy_acceptance import (
+          from ops.core.config import Settings
+          from ops.deploy.acceptance import (
               deployment_is_accepted,
               write_deployment_acceptance_marker,
           )

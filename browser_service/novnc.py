@@ -19,7 +19,7 @@ Instead the WebSocket relay lives here, behind the SAME verification the RPC
 endpoints use:
 
 1. the grant token must verify (HMAC signature, bound session id, bound owner,
-   unexpired) — see ``ops.browser_live_view.verify_live_view_token``,
+   unexpired) — see ``ops.browser.live_view.verify_live_view_token``,
 2. the session must exist, be ``ACTIVE``, be viewable, and be owned by the caller,
 3. control grants additionally require a live HITL pause, and
 4. only then is a TCP connection opened to the matching x11vnc listener on
@@ -90,7 +90,7 @@ def authorize_live_view(
     already succeeded.
     """
 
-    from ops.browser_live_view import LiveViewTokenError, verify_live_view_token
+    from ops.browser.live_view import LiveViewTokenError, verify_live_view_token
 
     if not interactive_enabled:
         raise LiveViewDenied("interactive_hitl_disabled")

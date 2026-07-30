@@ -11,8 +11,8 @@ from __future__ import annotations
 import pytest
 from pydantic import SecretStr
 
-from ops.browser_api_trace_catalog import BrowserApiTraceStep
-from ops.browser_decider import (
+from ops.browser.api_trace_catalog import BrowserApiTraceStep
+from ops.browser.decider import (
     MAX_ELEMENTS,
     BrowserAction,
     SnapshotElement,
@@ -23,9 +23,9 @@ from ops.browser_decider import (
     render_snapshot,
     validate_action,
 )
-from ops.browser_worker import is_allowed_browser_url
-from ops.config import Settings
-from ops.inference import (
+from ops.browser.worker import is_allowed_browser_url
+from ops.core.config import Settings
+from ops.core.inference import (
     JsonInference,
     RateLimited,
     _loads_json_object,
@@ -284,7 +284,7 @@ def test_inference_raises_a_typed_failure_when_every_backend_fails() -> None:
     # Phase 2: the decision path raises the TYPED DecisionFailed carrying a
     # sanitized reason code, instead of an untyped error with provider text in
     # its message.
-    from ops.inference import DecisionFailed
+    from ops.core.inference import DecisionFailed
 
     with pytest.raises(DecisionFailed) as exc_info:
         JsonInference([_Backend("groq", error=RuntimeError("boom"))]).generate("p")

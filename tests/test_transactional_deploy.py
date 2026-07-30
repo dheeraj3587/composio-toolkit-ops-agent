@@ -420,6 +420,21 @@ def _make_fake_repo(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
         """,
     )
     _write_executable(fake_bin / "docker", _fake_docker_script())
+    # The release refuses to run unless it is root, because loading the browser
+    # AppArmor policy needs it. Simulate that host fact rather than requiring the
+    # whole suite to run as root; every privileged action itself is faked above.
+    _write_executable(
+        fake_bin / "id",
+        """
+        #!/usr/bin/env bash
+        set -euo pipefail
+        if [ "${1:-}" = "-u" ]; then
+            printf '0\\n'
+        else
+            exec /usr/bin/id "$@"
+        fi
+        """,
+    )
     _write_executable(
         fake_bin / "install",
         """
@@ -892,12 +907,8 @@ def test_successful_release_has_transactional_order_and_secret_free_output(
     assert _index(trace, "APPARMOR_LOAD") < _index(trace, "BUILD")
     assert _index(trace, "BUILD") < _index(trace, "DRAIN POST")
     assert _index(trace, "TRIVY sha256:candidate-caddy") < _index(trace, "DRAIN POST")
-    assert _index(trace, "TRIVY sha256:candidate-caddy") < _index(
-        trace, "BROWSER_HOST_PREFLIGHT"
-    )
-    assert _index(trace, "BROWSER_HOST_PREFLIGHT_CLEANUP") < _index(
-        trace, "DRAIN POST"
-    )
+    assert _index(trace, "TRIVY sha256:candidate-caddy") < _index(trace, "BROWSER_HOST_PREFLIGHT")
+    assert _index(trace, "BROWSER_HOST_PREFLIGHT_CLEANUP") < _index(trace, "DRAIN POST")
     assert _index(trace, "DRAIN GET") < _index(trace, "STOP caddy")
     assert _index(trace, "STOP caddy") < _index(trace, "BACKUP")
     assert _index(trace, "BACKUP") < _index(trace, "RESTORE")

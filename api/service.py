@@ -11,32 +11,47 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Final, Literal, Protocol, TypeVar, cast
 
-from pydantic import SecretStr
+from fastapi.exceptions import RequestValidationError
+from pydantic import SecretStr, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from api.browser_ui import project_browser_ui, session_lost_recorded
 from api.models import (
     ActionReceipt,
+    AdmissionDecisionRequest,
+    AdmissionDecisionResponse,
     AppCatalogResponse,
     AppResearchResponse,
     AppSearchResponse,
     AppSummary,
+    AutonomyOutcomeView,
+    AuxiliaryHostView,
     BrowserLoginInput,
     BrowserServiceHealthView,
     BrowserUiState,
     BrowserVerificationInput,
     CreateRunRequest,
     CredentialSubmissionRequest,
+    FieldEvidenceView,
+    FlowSpecView,
     HealthCheck,
     HealthResponse,
     HitlRequestView,
     LiveViewResponse,
     ManagedConnectionResponse,
+    OnboardingControlsView,
+    OnboardingStateView,
+    PauseResponse,
     PhaseState,
     PrimaryAction,
+    ProviderProfileView,
     ProviderState,
+    ResetResponse,
+    RetryableStep,
+    RetryStepRequest,
+    RetryStepResponse,
     RouteDecisionView,
     RunDetailResponse,
     RunListResponse,
@@ -44,25 +59,48 @@ from api.models import (
     RunSummary,
     SecurityState,
     SnapshotHealth,
+    TimelineCorrelation,
+    TimelineDetail,
     TimelineEvent,
     TimelineResponse,
 )
-from ops.app_recipes import (
+from ops.browser.metrics import autonomy_outcome_view
+from ops.browser.readiness import browser_configuration_state
+from ops.browser.service_client import BrowserServiceClient, BrowserServiceHealth
+from ops.core.config import Settings, load_settings
+from ops.core.models import AccountMode, CompanyProfile, OperationalResearch, OperationsRequest
+from ops.core.state import BrowserProvider
+from ops.deploy.acceptance import deployment_is_accepted
+from ops.gmail.worker import GmailSignupPreflight
+from ops.onboarding.admission import AdmissionDecision, decide_from_operator
+from ops.onboarding.driver import (
+    WAITING_PHASES,
+    EffectReservationRecord,
+    SQLitePhaseHistoryStore,
+)
+from ops.onboarding.phase import (
+    TERMINAL_PHASES,
+    OnboardingPhase,
+    OnboardingReasonCode,
+    is_legal_phase_transition,
+    legal_phase_targets,
+)
+from ops.providers.composio_managed_auth import managed_auth_configuration_is_valid
+from ops.providers.profile import FieldEvidence, FlowSpec, ProviderProfile
+from ops.providers.profile_store import SQLiteProviderProfileStore
+from ops.recipes.app_recipes import (
     get_app_recipe,
     get_app_recipe_for_name,
     load_app_recipe_catalog,
     recipe_to_operational_research,
 )
-from ops.browser_readiness import browser_configuration_state
-from ops.browser_service_client import BrowserServiceClient, BrowserServiceHealth
-from ops.composio_managed_auth import managed_auth_configuration_is_valid
-from ops.config import Settings, load_settings
-from ops.deploy_acceptance import deployment_is_accepted
-from ops.gmail_worker import GmailSignupPreflight
-from ops.models import AccountMode, CompanyProfile, OperationalResearch, OperationsRequest
-from ops.run_service import CredentialSubmissionError
-from ops.run_service import RunService as CoreRunService
-from ops.state import BrowserProvider
+from ops.runs.projections import (
+    ProjectedTimelineEvent,
+    onboarding_timeline_event,
+)
+from ops.runs.reconciliation import OnboardingRunRecoveryService
+from ops.runs.service import CredentialSubmissionError
+from ops.runs.service import RunService as CoreRunService
 
 
 class RunNotFoundError(LookupError):
@@ -94,12 +132,17 @@ class PhaseUnavailableError(RuntimeError):
         available_in: tuple[str, ...],
         error: str = "phase_unavailable",
         message: str = "Action is unavailable in the current runtime configuration.",
+        reason_code: OnboardingReasonCode | None = None,
     ) -> None:
         self.run_id = run_id
         self.action = action
         self.available_in = available_in
         self.error = error
         self.safe_message = message
+        # The onboarding refusals carry their reason code (design LL-6.4). It is
+        # a member of the closed vocabulary or nothing at all, so a 409 body can
+        # never carry provider text.
+        self.reason_code = reason_code
         super().__init__(message)
 
 
@@ -156,6 +199,26 @@ class RunService(Protocol):
 
     async def retry(self, run_id: str, capability: str) -> ActionReceipt: ...
 
+    async def decide_admission(
+        self,
+        run_id: str,
+        request: AdmissionDecisionRequest,
+    ) -> AdmissionDecisionResponse: ...
+
+    async def pause_onboarding(
+        self, run_id: str, *, reason: str | None = None
+    ) -> PauseResponse: ...
+
+    async def reset_onboarding(self, run_id: str, *, confirm: bool) -> ResetResponse: ...
+
+    async def retry_onboarding_step(
+        self,
+        run_id: str,
+        request: RetryStepRequest,
+    ) -> RetryStepResponse: ...
+
+    async def get_provider_profile(self, run_id: str) -> ProviderProfileView: ...
+
     async def search_apps(self, query: str) -> AppSearchResponse: ...
 
     async def list_apps(self) -> AppCatalogResponse: ...
@@ -167,7 +230,7 @@ class RunService(Protocol):
     async def health(self) -> HealthResponse: ...
 
 
-_EVENT_SUMMARIES = {
+_LEGACY_EVENT_SUMMARIES: Final[dict[str, str]] = {
     "dry_run_created": "Local dry-run ledger entry created.",
     "run_created": "Executable run ledger entry created.",
     "operational_research_started": "Deterministic operational research started.",
@@ -198,6 +261,273 @@ _EVENT_SUMMARIES = {
     "run_completed": "Run completed.",
     "completed": "Run completed.",
 }
+
+# The 14 onboarding progress events of Requirement 17.2, with the LL-7 summaries.
+# Every summary is a STATIC constant: it is looked up by event type and is never
+# derived from a durable payload, so a run cannot author timeline text.
+_ONBOARDING_PROGRESS_SUMMARIES: Final[dict[str, str]] = {
+    "onboarding_research_started": "Provider research started.",
+    "onboarding_official_domain_found": "Official provider domain corroborated.",
+    "onboarding_vault_checked": "Vault checked for existing credentials.",
+    "onboarding_credentials_missing": "No credentials exist for this provider.",
+    "onboarding_operator_approved_signup": "Operator approved account creation.",
+    "onboarding_signup_started": "Account signup started.",
+    "onboarding_verification_email_received": "Verification email received and authenticated.",
+    "onboarding_verification_completed": "Provider accepted email verification.",
+    "onboarding_authenticated": "Authenticated session established.",
+    "onboarding_developer_app_created": "Developer application created.",
+    "onboarding_credentials_generated": (
+        "Credential generated and stored behind a vault reference."
+    ),
+    "onboarding_stored_in_vault": "Credential material stored behind a vault reference.",
+    "onboarding_credentials_validated": "Credential validation passed.",
+    "onboarding_completed": "Onboarding completed.",
+}
+
+# The 9 onboarding exception events of Requirement 17.3, with the LL-7 summaries.
+_ONBOARDING_EXCEPTION_SUMMARIES: Final[dict[str, str]] = {
+    "onboarding_research_inconclusive": (
+        "Provider research was inconclusive; nothing was executed."
+    ),
+    "onboarding_captcha_detected": "CAPTCHA detected; waiting for an operator.",
+    "onboarding_captcha_resolved": "CAPTCHA resolved; run resumed.",
+    "onboarding_verification_unresolved": (
+        "Verification email was not received in the allowed window."
+    ),
+    "onboarding_validation_failed": "Credential validation failed.",
+    "onboarding_run_paused": "Run paused.",
+    "onboarding_run_cancelled": "Run cancelled.",
+    "onboarding_run_reset": "Run reset; credentials preserved.",
+    "onboarding_step_retried": "Current step retried.",
+}
+
+# The admission prompt is neither progress nor exception — it is the run asking
+# for authorization — but LL-7 gives it a static summary, so it is allow-listed
+# here rather than degrading to the generic one.
+_ONBOARDING_ADMISSION_SUMMARIES: Final[dict[str, str]] = {
+    "onboarding_admission_requested": "Operator authorization requested for account creation.",
+}
+
+_EVENT_SUMMARIES: Final[dict[str, str]] = {
+    **_LEGACY_EVENT_SUMMARIES,
+    **_ONBOARDING_PROGRESS_SUMMARIES,
+    **_ONBOARDING_EXCEPTION_SUMMARIES,
+    **_ONBOARDING_ADMISSION_SUMMARIES,
+}
+
+# What an event type absent from the allow-list projects. The durable row is left
+# exactly as written; only its projection degrades (Requirement 17.5).
+_GENERIC_EVENT_TYPE: Final = "run_updated"
+_GENERIC_EVENT_SUMMARY: Final = "Run state updated."
+
+_TimelineAttribution = TypeVar("_TimelineAttribution", TimelineCorrelation, TimelineDetail)
+
+
+def _timeline_model(
+    model: type[_TimelineAttribution],
+    values: Mapping[str, object] | None,
+) -> _TimelineAttribution | None:
+    """Validate one projected attribution object, dropping an unprojectable one.
+
+    The closed schemas are the last check on the durable columns. A column the
+    schema refuses is omitted rather than failing the whole timeline response,
+    which keeps the narrative readable and still lets nothing unvalidated out.
+    """
+
+    if not values:
+        return None
+    try:
+        return model.model_validate(values)
+    except ValidationError:
+        return None
+
+
+# --- Onboarding projections (design LL-6.1, LL-6.2, LL-6.3) ------------------
+#
+# Everything an onboarding response says about what the run is doing comes from
+# one of two places: a durable column, or one of the STATIC tables below keyed by
+# phase or by event type. Nothing is composed from a worker object, a page
+# observation, a prompt, or a model response, which is what makes Requirement
+# 19.13 a property of the projection rather than a rule a handler has to remember.
+
+# Phase -> (goal, step). Static labels for the two narrative fields of
+# ``OnboardingStateView``; the run cannot author either one.
+_PHASE_NARRATIVE: Final[dict[OnboardingPhase, tuple[str, str]]] = {
+    "research": ("Identify the provider's official domain", "Corroborating research evidence"),
+    "vault_check": ("Decide how to authenticate", "Checking the vault for credentials"),
+    "awaiting_admission": ("Decide how to authenticate", "Waiting for an admission decision"),
+    "route_selected_login": ("Sign in to the provider", "Signing in with stored credentials"),
+    "route_selected_signup": ("Create a provider account", "Opening the provider's signup page"),
+    "signup": ("Create a provider account", "Completing the signup form"),
+    "email_verification": ("Verify the account's email", "Waiting for the verification email"),
+    "authenticated": ("Reach the developer portal", "Opening the developer portal"),
+    "developer_app": ("Create a developer application", "Filling the application form"),
+    "credential_generation": ("Generate API credentials", "Requesting a new credential"),
+    "vault_storage": ("Store the credential safely", "Writing the credential to the vault"),
+    "credential_validation": ("Prove the credential works", "Running a read-only validation call"),
+    "captcha_paused": (
+        "Clear the provider's challenge",
+        "Waiting for an operator to solve a CAPTCHA",
+    ),
+    "completed": ("Onboarding complete", "Validated credential references are ready"),
+    "paused": ("Paused by the operator", "Waiting for the operator to resume"),
+    "blocked": ("Onboarding blocked", "No autonomous path remains"),
+    "cancelled": ("Onboarding cancelled", "The run was cancelled"),
+}
+
+# Phase -> the step an operator may retry in place. A phase absent here has no
+# retryable step, so the controls view cannot offer a retry the backend refuses.
+_RETRYABLE_STEP_FOR_PHASE: Final[dict[OnboardingPhase, RetryableStep]] = {
+    "research": "research",
+    "signup": "signup",
+    "email_verification": "email_verification",
+    "developer_app": "developer_app",
+    "credential_generation": "credential_generation",
+    "credential_validation": "credential_validation",
+}
+
+# Once a session has entered the secret capture boundary the live view is
+# reported unavailable (Requirement 18.8). Both halves are durable: the phases in
+# which credential material can render, and the recorded fact that a capture
+# started.
+_SECRET_CAPTURE_PHASES: Final[frozenset[str]] = frozenset(
+    {"credential_generation", "vault_storage", "credential_validation"}
+)
+_SECRET_CAPTURE_EVENTS: Final[frozenset[str]] = frozenset(
+    {
+        "credential_capture_started",
+        "credentials_stored",
+        "credential_stored",
+        "onboarding_credentials_generated",
+        "onboarding_stored_in_vault",
+    }
+)
+
+# The three refusal codes the onboarding error mapping reports (design LL-6.4).
+# Annotated with the closed vocabulary rather than ``str``, so a typo is a type
+# error here instead of an unrecognized code on a 409 body.
+_PHASE_REPLAY_NOOP: Final[OnboardingReasonCode] = "phase_replay_noop"
+_OPERATOR_APPROVED_SIGNUP: Final[OnboardingReasonCode] = "operator_approved_signup"
+_OUTCOME_UNKNOWN: Final[OnboardingReasonCode] = "outcome_unknown"
+
+
+class _OnboardingEffectLedger:
+    """The effect-ledger port the pause and retry controls read and settle through.
+
+    Every verb is delegated verbatim to :class:`SQLitePhaseHistoryStore`, which owns
+    all three: the reservation table it writes is the same table the enumeration
+    reads, so a control decides from the standing disposition of each key rather
+    than from anything reconstructed on this side.
+    """
+
+    def __init__(self, *, storage: object, phases: SQLitePhaseHistoryStore) -> None:
+        self._storage = storage
+        self._phases = phases
+
+    def reservations(self, *, run_id: str) -> tuple[EffectReservationRecord, ...]:
+        return self._phases.reservations(run_id=run_id)
+
+    def complete_effect_reservation(
+        self, *, run_id: str, operation_key: str, receipt: Mapping[str, str]
+    ) -> EffectReservationRecord:
+        return self._phases.complete_effect_reservation(
+            run_id=run_id, operation_key=operation_key, receipt=receipt
+        )
+
+    def mark_effect_reservation_outcome_unknown(
+        self, *, run_id: str, operation_key: str
+    ) -> EffectReservationRecord:
+        return self._phases.mark_effect_reservation_outcome_unknown(
+            run_id=run_id, operation_key=operation_key
+        )
+
+
+def _evidence_views(evidence: tuple[FieldEvidence, ...]) -> list[FieldEvidenceView]:
+    """Project each citation, dropping one the closed schema will not admit.
+
+    A dropped row is the right failure: the schemas refuse anything that is not a
+    URL, a domain, or an enum member, and an unprojectable citation is more likely
+    to be page-derived text than a fact the operator needs.
+    """
+
+    views: list[FieldEvidenceView] = []
+    for item in evidence[:64]:
+        try:
+            views.append(
+                FieldEvidenceView(
+                    field=item.field,
+                    value=item.value,
+                    source_url=item.source_url,
+                    source_digest=item.source_digest,
+                    adapters=list(item.adapters[:8]),
+                    corroborations=item.corroborations,
+                    confidence=item.confidence,
+                )
+            )
+        except ValidationError:
+            continue
+    return views
+
+
+def _flow_views(flows: tuple[FlowSpec, ...]) -> list[FlowSpecView]:
+    """Project the declared credential-producing flows, evidence excluded."""
+
+    views: list[FlowSpecView] = []
+    for flow in flows[:5]:
+        try:
+            views.append(
+                FlowSpecView(
+                    kind=flow.kind,
+                    supported=flow.supported,
+                    entry_url=flow.entry_url,
+                    steps=list(flow.steps[:8]),
+                    produces=list(flow.produces[:4]),
+                    requires_approval=flow.requires_approval,
+                    requires_billing=flow.requires_billing,
+                )
+            )
+        except ValidationError:
+            continue
+    return views
+
+
+def _project_provider_profile(
+    profile: ProviderProfile,
+    *,
+    evidence: tuple[FieldEvidence, ...],
+) -> ProviderProfileView:
+    """The sanitized profile projection (design LL-6.1, Requirement 18.9).
+
+    The allow-list patterns are projected in the shape the reviewed browser policy
+    derives them in — one vendor wildcard over the primary registrable domain,
+    plus each typed auxiliary host as an exact entry — so the console shows the
+    same confinement the browser enforces rather than a second description of it.
+    """
+
+    patterns = [f"*.{profile.registrable_domain}", profile.registrable_domain]
+    patterns.extend(auxiliary.host for auxiliary in profile.auxiliary_hosts)
+    return ProviderProfileView(
+        run_id=profile.run_id,
+        profile_digest=profile.profile_digest,
+        provider_name=profile.provider_name,
+        app_slug=profile.app_slug,
+        registrable_domain=profile.registrable_domain,
+        allowed_host_patterns=list(dict.fromkeys(patterns))[:32],
+        auxiliary_hosts=[
+            AuxiliaryHostView(host=auxiliary.host, kind=auxiliary.kind)
+            for auxiliary in profile.auxiliary_hosts[:16]
+        ],
+        developer_portal_url=profile.developer_portal_url,
+        signup_url=profile.signup_url,
+        login_url=profile.login_url,
+        developer_docs_url=profile.developer_docs_url,
+        flows=_flow_views(profile.flows()),
+        approval_requirement=profile.approval_requirement,
+        billing_requirement=profile.billing_requirement,
+        evidence=_evidence_views(evidence),
+        confidence=profile.confidence,
+        built_at=profile.built_at,
+    )
 
 
 def _work_email_ref_for_app(app_name: str, *, app_slug: str | None = None) -> str:
@@ -237,6 +567,12 @@ class LocalRunService:
         self._started = False
         self._gmail_preflight_lock = threading.Lock()
         self._gmail_preflight_cache: _CachedGmailSignupPreflight | None = None
+        # The two onboarding stores are opened on first use and reused: each one
+        # runs its idempotent DDL in its constructor, and a legacy run pays for
+        # neither until something asks for an onboarding projection.
+        self._onboarding_lock = threading.Lock()
+        self._onboarding_phases: SQLitePhaseHistoryStore | None = None
+        self._onboarding_profiles: SQLiteProviderProfileStore | None = None
 
     async def startup(self) -> None:
         await run_in_threadpool(self._service.startup)
@@ -891,6 +1227,483 @@ class LocalRunService:
             ),
         )
 
+    # --- The onboarding surface (design LL-6.3) -----------------------------
+    #
+    # Every method below reads durable state and returns a response model. None of
+    # them drives a provider, and none of them can resolve a credential value: the
+    # only vault-facing dependency is the reference-only probe reset uses to count
+    # what it preserved.
+
+    def _phase_store(self) -> SQLitePhaseHistoryStore:
+        """The run ledger's phase history, opened once per service instance."""
+
+        with self._onboarding_lock:
+            if self._onboarding_phases is None:
+                self._onboarding_phases = SQLitePhaseHistoryStore(self._service.storage.db_path)
+            return self._onboarding_phases
+
+    def _profile_store(self) -> SQLiteProviderProfileStore:
+        """The content-addressed profile store, scoped to this deployment's owner."""
+
+        with self._onboarding_lock:
+            if self._onboarding_profiles is None:
+                self._onboarding_profiles = SQLiteProviderProfileStore(
+                    Path(self._service.storage.db_path).parent / "provider_profiles.db",
+                    owner=self._settings.browser_service_owner,
+                )
+            return self._onboarding_profiles
+
+    def _release_onboarding_session(self, *, run_id: str, reason: str) -> bool:
+        """Hand the run's bound browser session back, synchronously.
+
+        Cancel and reset must not answer before the session is gone
+        (Requirements 14.5, 14.7), so the release happens on this call rather than
+        in a sweep. The core service owns the worker and the release is idempotent
+        there, so a run with no bound session reports ``False`` instead of raising.
+        """
+
+        record = self._service.storage.get_run(run_id)
+        context = self._service._session_context_for(run_id)
+        if record is None or context is None:
+            return False
+        provider = cast(BrowserProvider, record.get("browser_provider", "browser_use"))
+        self._service._release_browser_session(context, provider, reason=reason)
+        return True
+
+    def _run_controls(self) -> OnboardingRunRecoveryService:
+        """The five operator controls over one run's durable phase machine.
+
+        The vault probe is the run service's own store, so the count reset reports
+        is read from the same references the run itself uses. Its port exposes a
+        reference lookup and nothing else, so this wiring cannot resolve a value.
+        """
+
+        phases = self._phase_store()
+        return OnboardingRunRecoveryService(
+            storage=self._service.storage,
+            phases=phases,
+            effects=_OnboardingEffectLedger(storage=self._service.storage, phases=phases),
+            # No component clears LangGraph checkpoints yet, so a reset reports
+            # ``workflow_state_cleared=False`` honestly rather than claiming it.
+            workflow=None,
+            credentials=getattr(self._service, "_secret_store", None),
+            release_session=self._release_onboarding_session,
+        )
+
+    def _latest_decision(self, run_id: str) -> str:
+        """The newest allow-listed event summary, or empty for a run with none.
+
+        Deliberately the SAME static allow-list the timeline projects through: the
+        console's "latest decision" line is therefore one of a fixed set of
+        strings and can never be authored by a run (Requirement 19.13).
+        """
+
+        summary = ""
+        try:
+            events = self._service.storage.list_audit_events(run_id)
+        except Exception:  # pragma: no cover - a read failure carries no decision
+            return ""
+        for event in events:
+            known = _EVENT_SUMMARIES.get(str(event.get("event_type") or ""))
+            if known is not None:
+                summary = known
+        return summary[:300]
+
+    def _onboarding_state(self, run_id: str) -> OnboardingStateView | None:
+        """Project the run's onboarding sub-state, or ``None`` for a legacy run.
+
+        A run is an onboarding run exactly when it has a committed phase boundary,
+        which is durable and survives an API restart. Every field comes from that
+        boundary, from a durable counter, or from a static table.
+        """
+
+        phases = self._phase_store()
+        history = phases.history(run_id=run_id)
+        if not history:
+            return None
+        boundary = history[-1]
+        try:
+            pause = phases.captcha_pause(run_id=run_id)
+        except KeyError:  # pragma: no cover - written by the first boundary
+            phase_at_pause: OnboardingPhase | None = None
+            captcha_prompts = 0
+        else:
+            phase_at_pause = pause.phase_at_pause
+            captcha_prompts = pause.prompts
+        goal, step = _PHASE_NARRATIVE[boundary.to_phase]
+        return OnboardingStateView(
+            phase=boundary.to_phase,
+            phase_at_pause=phase_at_pause,
+            profile_digest=boundary.profile_digest,
+            reason_code=boundary.reason_code,
+            goal=goal,
+            step=step,
+            latest_decision=self._latest_decision(run_id),
+            attempt=boundary.attempt,
+            admission_prompts=min(phases.admission_prompts(run_id=run_id), 1),
+            captcha_prompts=captcha_prompts,
+            correlation_id=boundary.correlation_id,
+        )
+
+    def _autonomy_view(self, run_id: str) -> AutonomyOutcomeView | None:
+        """Project the run's autonomy outcome once it has one (Requirement 20.8).
+
+        The driver writes the record at a terminal phase and nowhere else, so the
+        PRESENCE of a row is the terminal condition — there is no second status
+        check here that could disagree with it. ``None`` means the run has not
+        finished, and the field is simply absent from the response.
+
+        A row that the projection refuses (a verdict, phase, or count the closed
+        view will not admit) is dropped rather than raised: a corrupted metrics row
+        must not make a run undisplayable.
+        """
+
+        try:
+            row = self._service.storage.read_autonomy_outcome(run_id)
+        except Exception:  # pragma: no cover - a read failure carries no outcome
+            return None
+        if row is None:
+            return None
+        try:
+            # ``model_validate`` rather than a keyword splat: the six projected
+            # values arrive as ``object`` from the stored row, and the view's own
+            # closed vocabularies are what narrow them.
+            return AutonomyOutcomeView.model_validate(autonomy_outcome_view(row))
+        except (ValidationError, ValueError):
+            return None
+
+    def _onboarding_controls(
+        self,
+        run_id: str,
+        state: OnboardingStateView,
+    ) -> OnboardingControlsView:
+        """Decide each control from the phase table and the durable decision row.
+
+        Read the flags as decisions, not hints: the console renders exactly what
+        the backend says is legal, and a control whose boundary the phase table
+        refuses is false here rather than a 409 later (Requirement 18.4).
+        """
+
+        phase = state.phase
+        terminal = phase in TERMINAL_PHASES
+        waiting = phase in WAITING_PHASES
+        targets = legal_phase_targets(phase)
+        retryable = None if terminal or waiting else _RETRYABLE_STEP_FOR_PHASE.get(phase)
+        reset_available = not terminal and (
+            phase == "research"
+            or "research" in targets
+            or ("paused" in targets and is_legal_phase_transition("paused", "research"))
+        )
+        return OnboardingControlsView(
+            can_decide_admission=(
+                phase == "awaiting_admission"
+                and self._service.storage.read_admission_decision(run_id) is None
+            ),
+            can_pause=not terminal and not waiting,
+            can_resume=waiting,
+            can_cancel=not terminal and "cancelled" in targets,
+            can_reset=reset_available,
+            can_retry_step=retryable is not None,
+            retryable_step=retryable,
+            reason_code=state.reason_code,
+        )
+
+    def _secret_capture_boundary_entered(self, record: Mapping[str, object]) -> bool:
+        """Whether a capture surface has been reached for this run (Requirement 18.8).
+
+        Two durable readings: the phases in which credential material can render,
+        and the recorded fact that a capture started. Either one closes the live
+        view, and neither can be re-opened by a later observation.
+
+        A core service that offers no audit trail at all is a different case from
+        a trail that cannot be read: an absent reader is no evidence that a
+        capture happened, so the phase reading above is then the only signal. The
+        probe mirrors the optional-verb convention used for the interactive grant
+        below, and a reader that exists but raises still fails closed.
+        """
+
+        if str(record.get("phase") or "") in _SECRET_CAPTURE_PHASES:
+            return True
+        run_id = str(record.get("run_id") or "")
+        reader = getattr(getattr(self._service, "storage", None), "list_audit_events", None)
+        if not callable(reader):
+            return False
+        try:
+            events = reader(run_id)
+        except Exception:  # pragma: no cover - fail closed on an unreadable trail
+            return True
+        return any(str(event.get("event_type") or "") in _SECRET_CAPTURE_EVENTS for event in events)
+
+    def _require_onboarding_state(self, run_id: str, *, action: str) -> OnboardingStateView:
+        """The run's onboarding state, or a typed 409 for a run that has none."""
+
+        if self._service.get_run(run_id) is None:
+            raise RunNotFoundError(run_id)
+        state = self._onboarding_state(run_id)
+        if state is None:
+            raise PhaseUnavailableError(
+                run_id=run_id,
+                action=action,
+                available_in=("onboarding",),
+                error="phase_unavailable",
+                message="This control is available only for a run on the onboarding driver.",
+            )
+        return state
+
+    @staticmethod
+    def _decision_response(
+        decision: AdmissionDecision,
+        *,
+        state: OnboardingStateView,
+        replayed: bool,
+    ) -> AdmissionDecisionResponse:
+        """Project a recorded decision. The credential references are NOT projected."""
+
+        return AdmissionDecisionResponse(
+            run_id=decision.run_id,
+            route=decision.route,
+            reason_code=decision.reason_code,
+            decided_by=decision.decided_by,
+            decided_at=decision.decided_at,
+            replayed=replayed,
+            onboarding=state,
+        )
+
+    def _decision_sync(
+        self,
+        run_id: str,
+        request: AdmissionDecisionRequest,
+    ) -> AdmissionDecisionResponse:
+        """Record the operator's admission decision, then answer from the record.
+
+        The response is built from what was READ BACK out of the admission table,
+        never from the request, so a body that says ``signup`` is a body whose row
+        exists (Requirements 3.8, 3.9).
+
+        The refusals are ordered, and the order is the design (LL-6.4). The digest
+        check runs first because a request about the wrong profile is wrong
+        whatever the run's phase is (Requirement 3.10). The replay branch runs
+        before the phase check, because a run that has already decided has left
+        ``awaiting_admission`` and a second ``create_account`` must still get the
+        original record back rather than a 409 (Requirement 3.11) — with the one
+        exception the vocabulary names: a ``cancel`` against an approved signup is
+        refused (Requirement 3.12). Only then does a decision on a run that never
+        reached the admission gate get the run's current reason code
+        (Requirement 3.15).
+        """
+
+        state = self._require_onboarding_state(run_id, action="decision")
+        storage = self._service.storage
+        if request.profile_digest != state.profile_digest:
+            # The operator decided about a profile that is not the committed one.
+            # Nothing is read back and nothing is written, so the recorded
+            # decision and the committed phase are untouched.
+            raise PhaseUnavailableError(
+                run_id=run_id,
+                action="decision",
+                available_in=("awaiting_admission",),
+                error="phase_unavailable",
+                message="The decision names a provider profile the run has not committed.",
+                reason_code=_PHASE_REPLAY_NOOP,
+            )
+        recorded = storage.read_admission_decision(run_id)
+        if recorded is not None:
+            if request.decision == "cancel" and recorded.route == "signup":
+                # Account creation is already authorized and may already have run;
+                # withdrawing it here would claim a rollback the API cannot make.
+                # Cancelling the run itself remains available as its own control.
+                raise PhaseUnavailableError(
+                    run_id=run_id,
+                    action="decision",
+                    available_in=("awaiting_admission",),
+                    error="phase_unavailable",
+                    message="Account creation was already approved for this run.",
+                    reason_code=_OPERATOR_APPROVED_SIGNUP,
+                )
+            # Idempotent per run: the ORIGINAL answer comes back with the replay
+            # indicator set and nothing is rewritten (Requirement 3.11).
+            return self._decision_response(recorded, state=state, replayed=True)
+        if state.phase != "awaiting_admission":
+            # No decision on record and the run is not at the gate: the refusal
+            # carries the phase's own reason code so the console can say why.
+            raise PhaseUnavailableError(
+                run_id=run_id,
+                action="decision",
+                available_in=("awaiting_admission",),
+                error="phase_unavailable",
+                message="This run is not waiting for an admission decision.",
+                reason_code=state.reason_code,
+            )
+        decision = decide_from_operator(
+            request.decision,
+            run_id=run_id,
+            profile_digest=state.profile_digest,
+            actor_owner_id=self._settings.browser_service_owner,
+        )
+        stored, replayed = storage.record_admission_decision(decision)
+        if stored.route == "cancelled":
+            # A cancellation is released, persisted, and committed before the API
+            # answers (Requirements 3.13, 14.5, 14.6).
+            self._run_controls().cancel_run(run_id)
+        return self._decision_response(
+            stored,
+            state=self._onboarding_state(run_id) or state,
+            replayed=replayed,
+        )
+
+    def _pause_sync(self, run_id: str, reason: str | None) -> PauseResponse:
+        """Stop the run at its next safe boundary, keeping the session alive.
+
+        ``reason`` is accepted and dropped on purpose: the durable record carries
+        the closed reason code, and an operator-supplied string on an audit row is
+        the one field that could carry anything at all.
+        """
+
+        state = self._require_onboarding_state(run_id, action="pause")
+        del reason
+        outcome = self._run_controls().request_pause(run_id)
+        return PauseResponse(
+            run_id=run_id,
+            accepted=outcome.accepted,
+            pausing_after_phase=outcome.pausing_after_phase,
+            reason_code=outcome.reason_code,
+            onboarding=self._onboarding_state(run_id) or state,
+        )
+
+    def _reset_sync(self, run_id: str, confirm: bool) -> ResetResponse:
+        """Restart the walk at research, preserving every vault reference.
+
+        An unconfirmed reset is a validation error (Requirement 14.12). The
+        request model already refuses it — ``confirm`` admits only ``True`` and has
+        no default — and the same refusal is restated here, ahead of every read
+        and every port, so the guarantee holds for any caller of this service and
+        not only for one that arrived through the route: no session is released,
+        no workflow state is cleared, and no vault reference is touched.
+        """
+
+        if confirm is not True:
+            raise RequestValidationError(
+                [
+                    {
+                        "type": "literal_error",
+                        "loc": ("body", "confirm"),
+                        "msg": "reset requires explicit confirmation",
+                        "input": confirm,
+                    }
+                ]
+            )
+        self._require_onboarding_state(run_id, action="reset")
+        outcome = self._run_controls().reset_run(run_id, confirm=confirm)
+        if not outcome.accepted:
+            # The phase table gives this run no route back to research, so nothing
+            # was released, cleared, or committed. Refused rather than reported as
+            # a reset: the response shape has no way to say "did nothing".
+            raise PhaseUnavailableError(
+                run_id=run_id,
+                action="reset",
+                available_in=("research", "paused"),
+                error="phase_unavailable",
+                message="This run cannot be reset from its current phase.",
+                reason_code=outcome.reason_code,
+            )
+        return ResetResponse(
+            run_id=run_id,
+            reason_code=outcome.reason_code,
+            phase=outcome.phase,
+            browser_session_released=outcome.browser_session_released,
+            workflow_state_cleared=outcome.workflow_state_cleared,
+            vault_references_preserved=min(outcome.vault_references_preserved, 64),
+            expected_route_on_restart=outcome.expected_route_on_restart,
+        )
+
+    def _retry_step_sync(self, run_id: str, request: RetryStepRequest) -> RetryStepResponse:
+        """Re-attempt the current step, naming every effect the ledger will skip.
+
+        Two refusals, both 409 and both carrying the control service's own reason
+        code: an ``expected_phase`` that is not the run's current phase reports
+        ``phase_replay_noop`` and leaves the phase and every ledger row untouched
+        (Requirement 14.16), and a run holding a reservation marked
+        ``outcome_unknown`` reports that code with no provider submission
+        performed (Requirement 14.17). Neither refusal is reachable after a write:
+        the control service decides both before it commits anything.
+        """
+
+        self._require_onboarding_state(run_id, action="retry_step")
+        outcome = self._run_controls().retry_current_step(
+            run_id, expected_phase=request.expected_phase
+        )
+        if not outcome.accepted:
+            unknown = outcome.reason_code == _OUTCOME_UNKNOWN
+            raise PhaseUnavailableError(
+                run_id=run_id,
+                action="retry_step",
+                available_in=(outcome.phase,),
+                error="phase_unavailable",
+                message=(
+                    "An effect for this run has an unknown outcome and must be "
+                    "reconciled before a retry."
+                    if unknown
+                    else "The retry names a step the run is not standing in."
+                ),
+                reason_code=outcome.reason_code,
+            )
+        return RetryStepResponse(
+            run_id=run_id,
+            accepted=outcome.accepted,
+            phase=outcome.phase,
+            attempt=outcome.attempt,
+            reason_code=outcome.reason_code,
+            skipped_effects=list(outcome.skipped_effects),
+        )
+
+    def _profile_sync(self, run_id: str) -> ProviderProfileView:
+        """Serve the sanitized profile projection (Requirement 18.9)."""
+
+        if self._service.get_run(run_id) is None:
+            raise RunNotFoundError(run_id)
+        store = self._profile_store()
+        profile = store.get_for_run(run_id=run_id)
+        if profile is None:
+            raise PhaseUnavailableError(
+                run_id=run_id,
+                action="profile",
+                available_in=("research",),
+                error="phase_unavailable",
+                message="No provider profile is committed for this run yet.",
+            )
+        return _project_provider_profile(
+            profile,
+            evidence=store.evidence_for(profile_digest=profile.profile_digest),
+        )
+
+    async def decide_admission(
+        self,
+        run_id: str,
+        request: AdmissionDecisionRequest,
+    ) -> AdmissionDecisionResponse:
+        self._require_started()
+        return await run_in_threadpool(self._decision_sync, run_id, request)
+
+    async def pause_onboarding(self, run_id: str, *, reason: str | None = None) -> PauseResponse:
+        self._require_started()
+        return await run_in_threadpool(self._pause_sync, run_id, reason)
+
+    async def reset_onboarding(self, run_id: str, *, confirm: bool) -> ResetResponse:
+        self._require_started()
+        return await run_in_threadpool(self._reset_sync, run_id, confirm)
+
+    async def retry_onboarding_step(
+        self,
+        run_id: str,
+        request: RetryStepRequest,
+    ) -> RetryStepResponse:
+        self._require_started()
+        return await run_in_threadpool(self._retry_step_sync, run_id, request)
+
+    async def get_provider_profile(self, run_id: str) -> ProviderProfileView:
+        self._require_started()
+        return await run_in_threadpool(self._profile_sync, run_id)
+
     def _detail(self, summary: RunSummary) -> RunDetailResponse:
         research = self._service.get_research(summary.run_id)
         record = self._service.storage.get_run(summary.run_id)
@@ -900,6 +1713,7 @@ class LocalRunService:
         route_reason_code = record.get("route_reason_code")
         route_explanation = record.get("route_explanation")
         hitl_view = self._hitl_view(record)
+        onboarding = self._onboarding_state(summary.run_id)
         return RunDetailResponse(
             run=summary,
             research=research,
@@ -947,6 +1761,15 @@ class LocalRunService:
             hitl_request=hitl_view,
             browser=self._browser_ui(record, hitl_view),
             primary_action=self._primary_action(record, summary),
+            # Additive: absent for a legacy run, populated for a run the
+            # onboarding phase machine has committed a boundary for.
+            onboarding=onboarding,
+            autonomy=self._autonomy_view(summary.run_id),
+            controls=(
+                None
+                if onboarding is None
+                else self._onboarding_controls(summary.run_id, onboarding)
+            ),
         )
 
     def _create_sync(
@@ -976,27 +1799,36 @@ class LocalRunService:
         return self._detail(self._summary(record))
 
     def _timeline_sync(self, run_id: str) -> TimelineResponse:
-        if self._service.get_run(run_id) is None:
+        record = self._service.get_run(run_id)
+        if record is None:
             raise RunNotFoundError(run_id)
         raw_events = self._service.get_timeline(run_id)
         items = [
-            TimelineEvent(
-                event_id=int(event.get("id") or 0),
-                event_type=(
-                    str(event.get("event_type"))
-                    if event.get("event_type") in _EVENT_SUMMARIES
-                    else "run_updated"
-                ),
-                summary=_EVENT_SUMMARIES.get(
-                    str(event.get("event_type")),
-                    "Run state updated.",
-                ),
-                status="recorded",
-                created_at=str(event.get("created_at") or "unknown"),
-            )
+            self._timeline_event(onboarding_timeline_event(event, durable=record))
             for event in raw_events
         ]
         return TimelineResponse(run_id=run_id, items=items)
+
+    @staticmethod
+    def _timeline_event(projected: ProjectedTimelineEvent) -> TimelineEvent:
+        """Compose one timeline event: durable attribution plus a static summary.
+
+        The projector supplies the correlation and detail objects from durable
+        columns; the summary comes from the static allow-list keyed by event type.
+        An event type the allow-list does not know degrades to the generic
+        run-updated projection instead of carrying anything from its row.
+        """
+
+        known = projected.event_type in _EVENT_SUMMARIES
+        return TimelineEvent(
+            event_id=projected.event_id,
+            event_type=projected.event_type if known else _GENERIC_EVENT_TYPE,
+            summary=_EVENT_SUMMARIES.get(projected.event_type, _GENERIC_EVENT_SUMMARY),
+            status=projected.status,
+            created_at=projected.created_at,
+            correlation=_timeline_model(TimelineCorrelation, projected.correlation),
+            detail=_timeline_model(TimelineDetail, projected.detail),
+        )
 
     def _storage_permissions_are_owner_only(self) -> bool:
         database_path = self._service.storage.db_path
@@ -1350,6 +2182,18 @@ class LocalRunService:
         if record is None:
             raise RunNotFoundError(run_id)
         provider = record.get("browser_provider", "browser_use")
+        if self._secret_capture_boundary_entered(record):
+            # Requirement 18.8: once a capture surface has been reached the live
+            # view is closed rather than masked, so no signed URL and no frame of
+            # a credential page can cross this boundary.
+            return LiveViewResponse(
+                run_id=run_id,
+                provider=provider,
+                available=False,
+                mode="unavailable",
+                interaction_available=False,
+                reason_code="secret_capture_boundary_entered",
+            )
         # Browser Use keeps its exact existing behavior: a signed hosted URL the
         # owner can interact with directly.
         live_url = self._service.get_browser_live_url(run_id)

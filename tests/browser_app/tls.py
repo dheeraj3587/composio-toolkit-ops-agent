@@ -1,7 +1,7 @@
 """A throwaway self-signed certificate for the local test app.
 
 This matters more than it looks. The production host guard requires
-``scheme == "https"`` (see ``ops.browser_worker.is_allowed_browser_url``), so a
+``scheme == "https"`` (see ``ops.browser.worker.is_allowed_browser_url``), so a
 plain-HTTP test app would be rejected by the guard for the WRONG reason: every
 "off-domain request blocked" assertion would pass without the host logic ever
 being consulted, and the tests would prove nothing.

@@ -11,14 +11,14 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
-from ops.browser_worker import BrowserSessionContext
-from ops.config import Settings
-from ops.run_browser_execution import RunBrowserExecutionService
-from ops.run_credentials import RunCredentialService
-from ops.run_reconciliation import RunReconciliationService
-from ops.run_resume import RunResumeService
-from ops.run_service import _TERMINAL_BROWSER_STATUSES, RunService
-from ops.run_state_projection import RunProjectionService
+from ops.browser.worker import BrowserSessionContext
+from ops.core.config import Settings
+from ops.runs.browser_execution import RunBrowserExecutionService
+from ops.runs.credentials import RunCredentialService
+from ops.runs.reconciliation import RunReconciliationService
+from ops.runs.resume import RunResumeService
+from ops.runs.service import _TERMINAL_BROWSER_STATUSES, RunService
+from ops.runs.state_projection import RunProjectionService
 
 
 class _RecordingWorker:

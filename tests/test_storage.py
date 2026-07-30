@@ -5,7 +5,7 @@ import stat
 
 import pytest
 
-from ops.storage import OperationsStorage
+from ops.core.storage import OperationsStorage
 
 
 def mode(path: object) -> int:

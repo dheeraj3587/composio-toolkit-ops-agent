@@ -7,6 +7,7 @@ import {
   browserUiStateSchema,
   liveViewResponseSchema,
   managedConnectionResponseSchema,
+  providerProfileResponseSchema,
   runDetailResponseSchema,
   runSummarySchema,
 } from "@/lib/api-schemas"
@@ -102,6 +103,96 @@ describe("canonical route contracts", () => {
         },
       }).success,
     ).toBe(false)
+  })
+
+  it("accepts the onboarding projections and the sanitized profile", () => {
+    // GET /api/runs/{id} does not exclude nulls, so absent optional fields
+    // arrive as explicit nulls; the profile route does exclude them.
+    const detail = runDetailResponseSchema.safeParse({
+      run: canonicalRun,
+      research: null,
+      phases: null,
+      security: null,
+      route_decision: null,
+      hitl_request: null,
+      browser: null,
+      primary_action: null,
+      onboarding: {
+        phase: "developer_app",
+        phase_at_pause: null,
+        profile_digest: "a".repeat(64),
+        reason_code: "developer_app_created",
+        goal: "Create a developer application",
+        step: "Filling the application form",
+        latest_decision: "Opening the developer portal",
+        attempt: 1,
+        admission_prompts: 1,
+        captcha_prompts: 0,
+        correlation_id: "corr_01",
+      },
+      controls: {
+        can_decide_admission: false,
+        can_pause: true,
+        can_resume: false,
+        can_cancel: true,
+        can_reset: true,
+        can_retry_step: true,
+        retryable_step: "developer_app",
+        reason_code: "developer_app_created",
+      },
+      autonomy: null,
+    })
+
+    expect(detail.success).toBe(true)
+    if (detail.success) {
+      expect(detail.data.onboarding?.phase).toBe("developer_app")
+      expect(detail.data.controls?.retryable_step).toBe("developer_app")
+      expect(detail.data.autonomy).toBeNull()
+    }
+
+    const profile = providerProfileResponseSchema.safeParse({
+      run_id: RUN_ID,
+      profile_digest: "b".repeat(64),
+      provider_name: "GitHub",
+      app_slug: "github",
+      registrable_domain: "github.com",
+      allowed_host_patterns: ["*.github.com"],
+      auxiliary_hosts: [{ host: "accounts.google.com", kind: "identity_provider" }],
+      developer_portal_url: "https://github.com/settings/developers",
+      flows: [
+        {
+          kind: "developer_app",
+          supported: true,
+          entry_url: "https://github.com/settings/apps/new",
+          steps: ["Open the new app form."],
+          produces: ["oauth_client_id"],
+        },
+      ],
+      approval_requirement: "unknown",
+      billing_requirement: "unknown",
+      evidence: [
+        {
+          field: "developer_portal_url",
+          value: "https://github.com/settings/developers",
+          source_url: "https://docs.github.com/en/apps",
+          source_digest: "c".repeat(64),
+          adapters: ["perplexity_search"],
+          corroborations: 2,
+          confidence: 0.9,
+        },
+      ],
+      confidence: 0.92,
+      built_at: "2026-07-28T10:00:00Z",
+    })
+
+    expect(profile.success).toBe(true)
+    if (profile.success) {
+      // Requirement 9.9: unknown stays unknown across the wire.
+      expect(profile.data.approval_requirement).toBe("unknown")
+      expect(profile.data.billing_requirement).toBe("unknown")
+      expect(profile.data.signup_url).toBeNull()
+      expect(profile.data.flows[0]?.requires_approval).toBe(false)
+    }
   })
 
   it("accepts an ephemeral HTTPS provider redirect and rejects unsafe redirects", () => {

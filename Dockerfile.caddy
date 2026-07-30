@@ -25,9 +25,6 @@ RUN go mod tidy \
 # only the Caddy executable with the verified binary built above.
 FROM caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
 
-ARG APP_REVISION=local-uncommitted
-LABEL org.opencontainers.image.revision=$APP_REVISION
-
 COPY --from=caddy-builder --chown=root:root --chmod=0755 /out/caddy /usr/bin/caddy
 COPY --chown=root:root deploy/Caddyfile /etc/caddy/Caddyfile
 RUN apk add --no-cache \
@@ -38,4 +35,12 @@ RUN apk add --no-cache \
     && DOMAIN=localhost \
        ACME_EMAIL=validation@example.invalid \
        BROWSER_SERVICE_OWNER=build-validation \
-       caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+       XDG_DATA_HOME=/tmp/caddy-validate-data \
+       XDG_CONFIG_HOME=/tmp/caddy-validate-config \
+       caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile \
+    && rm -rf /tmp/caddy-validate-data /tmp/caddy-validate-config /data/caddy /config/caddy
+
+# Declared LAST on purpose: see Dockerfile.api. A revision ARG above the Caddy
+# build invalidated the Go toolchain layers on every commit.
+ARG APP_REVISION=local-uncommitted
+LABEL org.opencontainers.image.revision=$APP_REVISION

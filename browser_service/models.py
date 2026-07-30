@@ -13,7 +13,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from ops.models import validate_vault_reference
+from ops.browser.host_policy import MAX_ALLOWED_HOST_PATTERNS
+from ops.core.models import validate_vault_reference
 
 SessionLifecycle = Literal["ACTIVE", "CLOSING", "CLOSED"]
 LiveViewMode = Literal["screenshot", "interactive_remote"]
@@ -55,6 +56,16 @@ class CreateSessionRequest(_Strict):
     # references may be consumed only for the matching scope, so a reference minted
     # for one run cannot be replayed by another.
     secret_scope: str = Field(default="", max_length=200, pattern=r"^[A-Za-z0-9_-]*$")
+    # The run this session is bound to, alongside the app slug and account
+    # reference. Defaults to secret_scope, which canonical callers already set to
+    # the run id.
+    run_id: str = Field(default="", max_length=200, pattern=r"^[A-Za-z0-9_-]*$")
+    # The run's allow-list, serialized exactly as ``BrowserAllowedHosts.patterns()``
+    # produces it. The service rebuilds a ``BrowserAllowedHosts`` from this list and
+    # enforces it inside the container, so confinement does not depend on the caller
+    # checking first. Empty means no run allow-list: the reviewed recipe policy in
+    # the worker stays the only boundary.
+    allowed_host_patterns: tuple[str, ...] = Field(default=(), max_length=MAX_ALLOWED_HOST_PATTERNS)
 
     @model_validator(mode="after")
     def _storage_state_requires_account_binding(self) -> CreateSessionRequest:
@@ -78,6 +89,9 @@ class ReconcileSessionsRequest(_Strict):
         max_length=200,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$",
     )
+    # Part of the same binding as the created session. Empty means "the run scope
+    # is the run id", which is what canonical callers send.
+    run_id: str = Field(default="", max_length=200, pattern=r"^[A-Za-z0-9_-]*$")
 
 
 class ReconcileSessionsResponse(_Strict):
@@ -118,6 +132,10 @@ class SessionSummary(_Strict):
     interactive_available: bool = False
     current_url_path: str = ""
     reason_code: str = ""
+    # The allow-list this container will actually enforce for the session. Echoed
+    # so a caller can verify enforcement rather than assume it; empty means the
+    # session carries no run allow-list.
+    allowed_host_patterns: tuple[str, ...] = ()
 
 
 class NavigateRequest(_Strict):
@@ -144,7 +162,7 @@ class NavigateRequest(_Strict):
     @field_validator("signup_fields")
     @classmethod
     def _approved_signup_fields(cls, values: dict[str, str]) -> dict[str, str]:
-        from ops.browser_signup import normalize_signup_fields
+        from ops.browser.signup import normalize_signup_fields
 
         return normalize_signup_fields(values)
 
@@ -172,7 +190,7 @@ class ResumeRequest(_Strict):
     @field_validator("signup_fields")
     @classmethod
     def _approved_signup_fields(cls, values: dict[str, str]) -> dict[str, str]:
-        from ops.browser_signup import normalize_signup_fields
+        from ops.browser.signup import normalize_signup_fields
 
         return normalize_signup_fields(values)
 
@@ -238,7 +256,7 @@ class LiveViewGrant(_Strict):
     """A short-lived, session-bound view or control grant.
 
     The URL is returned ONCE for immediate operator use and is never durably
-    persisted by the API (see ops.browser_live_view).
+    persisted by the API (see ops.browser.live_view).
     """
 
     mode: LiveViewMode

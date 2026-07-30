@@ -16,9 +16,20 @@ from pydantic import (
     model_validator,
 )
 
-from ops.app_recipes import ReadinessTier, RouteKind
-from ops.models import AccountMode, OperationalResearch
-from ops.state import AccessRoute, BrowserProvider, CredentialCreationPolicy, RunStatus
+from ops.core.models import AccountMode, OperationalResearch
+from ops.core.state import AccessRoute, BrowserProvider, CredentialCreationPolicy, RunStatus
+from ops.onboarding.admission import AdmissionDecider, AdmissionInput, AdmissionRoute
+from ops.onboarding.effects import OnboardingEffect
+from ops.onboarding.phase import OnboardingPhase, OnboardingReasonCode
+from ops.providers.profile import (
+    ApprovalRequirement,
+    AuxiliaryHostKind,
+    BillingRequirement,
+    CredentialKind,
+    FlowKind,
+    ProfileField,
+)
+from ops.recipes.app_recipes import ReadinessTier, RouteKind
 
 CredentialFieldName = Annotated[
     str,
@@ -67,6 +78,88 @@ ReasonCode = Annotated[
     str,
     StringConstraints(pattern=r"^[a-z0-9][a-z0-9_:-]{0,63}$", min_length=1, max_length=64),
 ]
+
+# A bounded, opaque identifier: a run id, a correlation id, a browser session id,
+# the id segment of a vault reference, or a provider-side object id. The character
+# class admits no whitespace, so a page excerpt, a prompt, or a credential value
+# cannot be carried by one.
+BoundedIdentifier = Annotated[
+    str,
+    StringConstraints(pattern=r"^[A-Za-z0-9._-]{1,200}$", min_length=1, max_length=200),
+]
+
+# A discovery adapter's slug (``perplexity_search``), never its output.
+AdapterName = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$", min_length=1, max_length=64),
+]
+
+# A lowercase DNS hostname or registrable domain. Not a URL and not text.
+HostName = Annotated[
+    str,
+    StringConstraints(
+        pattern=(
+            r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+            r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+        ),
+        min_length=4,
+        max_length=253,
+    ),
+]
+
+# A hex SHA-256 digest, as produced by the provider-profile digest.
+Sha256Digest = Annotated[
+    str,
+    StringConstraints(pattern=r"^[0-9a-f]{64}$", min_length=64, max_length=64),
+]
+
+# An ISO-8601 instant. Bounded and pattern-constrained so a timestamp field is
+# not a place free text can be parked.
+IsoTimestamp = Annotated[
+    str,
+    StringConstraints(
+        pattern=(
+            r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+            r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?$"
+        ),
+        min_length=19,
+        max_length=40,
+    ),
+]
+
+
+# One allow-list entry: an exact host or a single-level vendor wildcard
+# (``*.provider.com``). Deliberately not free text, so a projected allow-list
+# cannot describe a pattern the reviewed browser policy would never produce.
+HostPattern = Annotated[
+    str,
+    StringConstraints(
+        pattern=(
+            r"^(?:\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+            r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+        ),
+        min_length=4,
+        max_length=255,
+    ),
+]
+
+# The canonical app slug ``ops.providers.profile`` already enforces at construction.
+AppSlug = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$", min_length=1, max_length=120),
+]
+
+# A cited evidence value: a URL, a registrable domain, or an enum member. The
+# whitespace-free character class is what keeps a page excerpt or a prose
+# justification out of the field, which ``str`` alone would admit.
+EvidenceValue = Annotated[
+    str,
+    StringConstraints(pattern=r"^\S{1,2000}$", min_length=1, max_length=2000),
+]
+
+# One non-secret flow step label, bounded exactly as ``ops.providers.profile``
+# bounds it (``MAX_FLOW_STEP_CHARACTERS``).
+FlowStepText = Annotated[str, StringConstraints(min_length=1, max_length=200)]
 
 
 def _validate_http_url(value: str) -> str:
@@ -187,6 +280,17 @@ class CreateRunRequest(StrictApiModel):
     # creation. The reusable pair may be retained in the encrypted account vault,
     # but never in run state, checkpoints, logs, or the IntegratorBundle.
     browser_login: BrowserLoginInput | None = None
+    # Opt into the autonomous onboarding driver (design LL-6.3). Additive and
+    # default-false, so an existing client's request keeps its current meaning.
+    onboarding: bool = False
+    # Optional operator hint for provider research. A bounded HTTPS URL, never a
+    # search phrase, so a hint cannot smuggle prose into the research prompt.
+    provider_hint_url: BoundedHttpUrl | None = None
+
+    @field_validator("provider_hint_url")
+    @classmethod
+    def provider_hint_is_https(cls, value: str | None) -> str | None:
+        return _validate_http_url(value) if value is not None else None
 
     @model_validator(mode="after")
     def _reject_conflicting_dry_run_alias(self) -> CreateRunRequest:
@@ -377,6 +481,161 @@ class BrowserUiState(StrictApiModel):
     reason_code: ReasonCode | None = None
 
 
+# The step an operator may retry: the subset of phases whose work can be
+# re-attempted in place. A terminal or gate phase is deliberately absent, so the
+# controls view cannot offer a retry the backend would refuse.
+RetryableStep = Literal[
+    "research",
+    "signup",
+    "email_verification",
+    "developer_app",
+    "credential_generation",
+    "credential_validation",
+]
+
+
+class OnboardingStateView(StrictApiModel):
+    """The onboarding sub-state projected onto the run detail response.
+
+    Every field is either a closed vocabulary, a digest, a bounded identifier, a
+    counter, or one of three short decision-shaped labels. There is no field for a
+    prompt, a reasoning trace, or page content, so Requirement 19.13 holds by
+    construction rather than by review.
+    """
+
+    phase: OnboardingPhase
+    phase_at_pause: OnboardingPhase | None = None
+    profile_digest: Sha256Digest
+    reason_code: OnboardingReasonCode | None = None
+    goal: str = Field(default="", max_length=200)
+    step: str = Field(default="", max_length=200)
+    # Decision-shaped ("Opening the developer portal"), never chain-of-thought.
+    latest_decision: str = Field(default="", max_length=300)
+    attempt: int = Field(ge=0, le=1_000)
+    admission_prompts: int = Field(ge=0, le=1)
+    captcha_prompts: int = Field(ge=0, le=1_000)
+    correlation_id: BoundedIdentifier
+
+
+class OnboardingControlsView(StrictApiModel):
+    """Capability projected by the backend, following the ``BrowserUiState`` pattern.
+
+    The console never infers a control's availability from status: each flag is a
+    backend decision and is false unless the backend can prove otherwise.
+    """
+
+    can_decide_admission: bool = False
+    can_pause: bool = False
+    can_resume: bool = False
+    can_cancel: bool = False
+    can_reset: bool = False
+    can_retry_step: bool = False
+    retryable_step: RetryableStep | None = None
+    reason_code: OnboardingReasonCode | None = None
+
+    @model_validator(mode="after")
+    def _retry_names_its_step(self) -> OnboardingControlsView:
+        # A retry control the console cannot name is a control it cannot render,
+        # and a named step with the control disabled would invite a 409.
+        if self.can_retry_step != (self.retryable_step is not None):
+            raise ValueError("a retryable step is named exactly when retry is available")
+        return self
+
+
+class AutonomyOutcomeView(StrictApiModel):
+    """The durable per-run autonomy record, projected once the run is terminal."""
+
+    verdict: Literal["fully_autonomous", "operator_assisted", "blocked", "cancelled"]
+    terminal_phase: OnboardingPhase
+    reason_code: OnboardingReasonCode
+    admission_prompts: int = Field(ge=0, le=1)
+    captcha_prompts: int = Field(ge=0, le=1_000)
+    duration_seconds: int = Field(ge=0, le=86_400)
+
+    @model_validator(mode="after")
+    def _fully_autonomous_had_no_captcha_prompt(self) -> AutonomyOutcomeView:
+        # Requirement 20.7, enforced at the wire: the measured rate is only
+        # trustworthy if the verdict cannot disagree with the counters beside it.
+        if self.verdict == "fully_autonomous" and self.captcha_prompts != 0:
+            raise ValueError("a fully autonomous run prompted the operator for no CAPTCHA")
+        return self
+
+
+class FieldEvidenceView(StrictApiModel):
+    """Why one profile field is believed. Carries the citation, never the excerpt."""
+
+    field: ProfileField
+    # A URL, a registrable domain, or an enum member — never prose.
+    value: EvidenceValue
+    source_url: BoundedHttpUrl
+    source_digest: Sha256Digest
+    adapters: list[AdapterName] = Field(max_length=8)
+    corroborations: int = Field(ge=1, le=64)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("source_url")
+    @classmethod
+    def source_is_https(cls, value: str) -> str:
+        return _validate_http_url(value)
+
+
+class FlowSpecView(StrictApiModel):
+    """One credential-producing path through the provider's own site."""
+
+    kind: FlowKind
+    supported: bool
+    entry_url: BoundedHttpUrl | None = None
+    steps: list[FlowStepText] = Field(default_factory=list, max_length=8)
+    produces: list[CredentialKind] = Field(default_factory=list, max_length=4)
+    requires_approval: bool = False
+    requires_billing: bool = False
+
+    @field_validator("entry_url")
+    @classmethod
+    def entry_is_https(cls, value: str | None) -> str | None:
+        return _validate_http_url(value) if value is not None else None
+
+
+class AuxiliaryHostView(StrictApiModel):
+    """A typed non-primary host. Never a second primary domain."""
+
+    host: HostName
+    kind: AuxiliaryHostKind
+
+
+class ProviderProfileView(StrictApiModel):
+    """Sanitized profile. Deliberately omits: raw evidence excerpts, prompts,
+    adapter API responses, and anything that could carry page content."""
+
+    run_id: BoundedIdentifier
+    profile_digest: Sha256Digest
+    provider_name: str = Field(max_length=200)
+    app_slug: AppSlug
+    registrable_domain: HostName
+    allowed_host_patterns: list[HostPattern] = Field(max_length=32)
+    auxiliary_hosts: list[AuxiliaryHostView] = Field(default_factory=list, max_length=16)
+    developer_portal_url: BoundedHttpUrl | None = None
+    signup_url: BoundedHttpUrl | None = None
+    login_url: BoundedHttpUrl | None = None
+    developer_docs_url: BoundedHttpUrl | None = None
+    flows: list[FlowSpecView] = Field(max_length=5)
+    approval_requirement: ApprovalRequirement
+    billing_requirement: BillingRequirement
+    evidence: list[FieldEvidenceView] = Field(max_length=64)
+    confidence: float = Field(ge=0.0, le=1.0)
+    built_at: IsoTimestamp
+
+    @field_validator(
+        "developer_portal_url",
+        "signup_url",
+        "login_url",
+        "developer_docs_url",
+    )
+    @classmethod
+    def profile_urls_are_https(cls, value: str | None) -> str | None:
+        return _validate_http_url(value) if value is not None else None
+
+
 class RunDetailResponse(StrictApiModel):
     run: RunSummary
     research: OperationalResearch | None
@@ -390,6 +649,11 @@ class RunDetailResponse(StrictApiModel):
     # existing clients, but always populated by this API.
     browser: BrowserUiState | None = None
     primary_action: PrimaryAction | None = None
+    # Onboarding projections (design LL-6.3). All three are absent on a legacy
+    # (non-onboarding) run; ``autonomy`` is present only once the run is terminal.
+    onboarding: OnboardingStateView | None = None
+    controls: OnboardingControlsView | None = None
+    autonomy: AutonomyOutcomeView | None = None
 
 
 class ManagedConnectionResponse(StrictApiModel):
@@ -414,12 +678,80 @@ class RunListResponse(StrictApiModel):
     offset: int = Field(ge=0)
 
 
+class TimelineCorrelation(StrictApiModel):
+    """The correlation set carried by every onboarding timeline event.
+
+    Note what is absent: no vault reference VALUE, no live URL, no page text.
+    ``vault_reference_id`` is the opaque id segment of ``vault://app/kind/ID``,
+    which is a random identifier and not derived from the secret.
+    """
+
+    run_id: BoundedIdentifier
+    correlation_id: BoundedIdentifier
+    onboarding_phase: OnboardingPhase
+    profile_digest: Sha256Digest
+    attempt: int = Field(ge=0, le=1_000)
+    reason_code: OnboardingReasonCode
+    browser_session_id: BoundedIdentifier | None = None
+    vault_reference_id: BoundedIdentifier | None = None
+
+
+class TimelineDetail(StrictApiModel):
+    """A closed union of non-secret detail fields.
+
+    ``extra="forbid"`` plus the absence of any free-text field is what makes "no
+    page content, no prompts, no reasoning traces" structurally true rather than
+    review-enforced. Every string field here is an enum, a hostname, a domain, an
+    HTTPS URL, a bounded identifier, or a timestamp.
+    """
+
+    # Research
+    adapters_engaged: list[AdapterName] | None = Field(default=None, max_length=8)
+    registrable_domain: HostName | None = None
+    evidence_count: int | None = Field(default=None, ge=0, le=64)
+    # Admission
+    credentials_present: bool | None = None
+    decision: Literal["create_account", "cancel"] | None = None
+    decided_by: Literal["system", "operator"] | None = None
+    # Navigation / hosts
+    host: HostName | None = None
+    # Verification
+    sender_domain: HostName | None = None
+    verification_kind: Literal["link", "code"] | None = None
+    # Developer app / credentials
+    developer_app_id: BoundedIdentifier | None = None
+    credential_kind: (
+        Literal[
+            "oauth_client_id",
+            "oauth_client_secret",
+            "api_key",
+            "personal_access_token",
+            "client_credentials_pair",
+        ]
+        | None
+    ) = None
+    validation_endpoint: BoundedHttpUrl | None = None
+    validation_http_status: int | None = Field(default=None, ge=100, le=599)
+    checked_at: IsoTimestamp | None = None
+    # Terminal
+    duration_seconds: int | None = Field(default=None, ge=0, le=86_400)
+    verdict: Literal["fully_autonomous", "operator_assisted", "blocked", "cancelled"] | None = None
+
+    @field_validator("validation_endpoint")
+    @classmethod
+    def validation_endpoint_is_https(cls, value: str | None) -> str | None:
+        return _validate_http_url(value) if value is not None else None
+
+
 class TimelineEvent(StrictApiModel):
     event_id: int = Field(gt=0)
     event_type: str
     summary: str
     status: Literal["recorded", "completed", "blocked", "failed"]
     created_at: str
+    # Onboarding attribution. Both are absent on legacy (non-onboarding) events.
+    correlation: TimelineCorrelation | None = None
+    detail: TimelineDetail | None = None
 
 
 class TimelineResponse(StrictApiModel):
@@ -559,9 +891,132 @@ class RetryRequest(StrictApiModel):
 
 class ActionReceipt(StrictApiModel):
     run_id: str
-    action: Literal["resume", "poll_email", "retry", "send_outreach"]
+    # ``cancel`` is additive: cancelling an onboarding run releases its browser
+    # session and reports through the same receipt (design LL-6.3).
+    action: Literal["resume", "poll_email", "retry", "send_outreach", "cancel"]
     status: Literal["accepted", "configuration_required", "no_change"] = "accepted"
     detail: str | None = None
+    # The phase the run resumed (or cancelled) into, so the console does not have
+    # to re-fetch the run to learn what its command did. Omitted for legacy runs.
+    onboarding: OnboardingStateView | None = None
+
+
+# --- Onboarding operator controls (design LL-6.3) ----------------------------
+#
+# One request and one response model per control. Every field is a closed
+# vocabulary, a digest, a bounded identifier, a counter, or a boolean: there is no
+# free-text field on any response here, so a credential value, a one-time code, a
+# verification link, a signed live URL, a prompt, and a page excerpt are all
+# unrepresentable rather than merely absent (Requirement 19.13).
+
+
+# An operator-supplied replay token. Bounded and whitespace-free, so it can be
+# compared and logged as an identifier without carrying anything else.
+IdempotencyToken = Annotated[
+    str,
+    StringConstraints(pattern=r"^[A-Za-z0-9._:-]{8,128}$", min_length=8, max_length=128),
+]
+
+# Mirrors ``ops.runs.reconciliation.ExpectedRoute``. Restated rather than imported
+# so the model module keeps its light import graph.
+ExpectedRestartRoute = Literal["login", "signup", "undetermined"]
+
+
+class AdmissionDecisionRequest(StrictApiModel):
+    """The operator's answer to the one admission prompt.
+
+    ``profile_digest`` is optimistic concurrency, not decoration: the operator
+    decides about the profile they were shown, so a decision that names a
+    different digest is refused rather than silently applied to another profile.
+    """
+
+    decision: AdmissionInput
+    profile_digest: Sha256Digest
+    idempotency_key: IdempotencyToken | None = None
+
+
+class AdmissionDecisionResponse(StrictApiModel):
+    """The decision as it was durably recorded (Requirements 3.8, 3.9, 3.11)."""
+
+    run_id: BoundedIdentifier
+    route: AdmissionRoute
+    reason_code: OnboardingReasonCode
+    decided_by: AdmissionDecider
+    decided_at: IsoTimestamp
+    # True when the run already held a decision, in which case the body above is
+    # the ORIGINAL record and nothing was rewritten.
+    replayed: bool = False
+    onboarding: OnboardingStateView
+
+
+class PauseRequest(StrictApiModel):
+    """An optional operator note. Deliberately never persisted — see api/service.py."""
+
+    reason: str | None = Field(default=None, max_length=200)
+
+
+class PauseResponse(StrictApiModel):
+    """Where the pause takes effect, and the guarantee that the session stayed up."""
+
+    run_id: BoundedIdentifier
+    accepted: bool
+    # Pause stops the run at the next safe boundary; this names the phase it
+    # stops after (Requirement 14.2).
+    pausing_after_phase: OnboardingPhase
+    reason_code: OnboardingReasonCode
+    # Always false: a pause keeps the authenticated session the operator will
+    # come back to. Projected so the console reads the guarantee off the response.
+    browser_session_released: Literal[False] = False
+    onboarding: OnboardingStateView
+
+
+class ResetRequest(StrictApiModel):
+    """Reset is destructive to workflow state, so the acknowledgement is explicit.
+
+    ``confirm`` has no default and admits only ``True``, which is what makes an
+    unconfirmed reset a validation error before any side effect runs
+    (Requirement 14.12).
+    """
+
+    confirm: Literal[True]
+
+
+class ResetResponse(StrictApiModel):
+    """The four facts an operator needs to trust a reset (Requirement 14.11)."""
+
+    run_id: BoundedIdentifier
+    reason_code: OnboardingReasonCode
+    phase: OnboardingPhase
+    browser_session_released: bool
+    workflow_state_cleared: bool
+    # Property 13, surfaced: reset never destroys credentials.
+    vault_references_preserved: int = Field(ge=0, le=64)
+    expected_route_on_restart: ExpectedRestartRoute
+
+
+class RetryStepRequest(StrictApiModel):
+    """Retry the CURRENT failed step only.
+
+    The phase is not a parameter. ``expected_phase`` is an optimistic check the
+    backend compares against the run's committed phase, so a client cannot name a
+    step whose effect already completed and have it re-attempted.
+    """
+
+    expected_phase: OnboardingPhase
+    idempotency_key: IdempotencyToken | None = None
+
+
+class RetryStepResponse(StrictApiModel):
+    """What the retry re-attempted, and what the ledger proved it must skip."""
+
+    run_id: BoundedIdentifier
+    accepted: bool
+    phase: OnboardingPhase
+    attempt: int = Field(ge=0, le=1_000)
+    reason_code: OnboardingReasonCode
+    # Property 1 made observable: an operator sees that the signup form will not
+    # be submitted twice (Requirement 14.14).
+    skipped_effects: list[OnboardingEffect] = Field(default_factory=list, max_length=8)
 
 
 class IntegratorBundleView(StrictApiModel):
@@ -710,6 +1165,10 @@ class PhaseUnavailableResponse(StrictApiModel):
     run_id: str
     action: str
     available_in: list[str] = Field(min_length=1, max_length=8)
+    # The refusal's own code, drawn from the closed onboarding vocabulary
+    # (design LL-6.4). Omitted entirely for a refusal that predates the
+    # onboarding surface, so the legacy 409 body is unchanged.
+    reason_code: OnboardingReasonCode | None = None
     external_actions: Literal[False] = False
 
 

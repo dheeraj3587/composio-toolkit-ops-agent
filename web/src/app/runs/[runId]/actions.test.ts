@@ -53,6 +53,7 @@ const initialState: LiveViewState = {
   interactivePath: null,
   capturedAt: null,
   interactionAvailable: false,
+  reasonCode: null,
   message: null,
   tone: "neutral",
 }

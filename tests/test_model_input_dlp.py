@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from ops.model_input_dlp import (
+from ops.core.model_input_dlp import (
+    DLP_REFUSAL_REASON_CODE,
     DROPPED,
     REDACTED,
     contains_secret_material,
@@ -20,6 +21,7 @@ from ops.model_input_dlp import (
     sanitize_page_text,
     sanitize_reason,
     sanitize_url,
+    screen_model_input,
 )
 
 # Canaries are ASSEMBLED AT RUNTIME from harmless fragments. They have the exact
@@ -192,3 +194,25 @@ def test_sanitized_output_passes_the_boundary_assertion() -> None:
     # what lets the caller refuse to send anything that still trips it.
     for canary in ALL_CANARIES:
         assert contains_secret_material(redact_secrets(f"token {canary}")) is False
+
+
+# --- Refusal path at the inference boundary ------------------------------------
+
+
+def test_a_projection_carrying_secret_material_is_refused_not_sent() -> None:
+    """A projection that still trips the DLP check is refused as a typed signal.
+
+    The loop consumes this as discard-and-reobserve, so the refusal is a value the
+    caller branches on rather than a raised error, and the refused text is not
+    handed back — there is nothing left to forward by accident.
+    """
+
+    refused = screen_model_input(f"Page shows the key {CANARY_STRIPE}")
+    assert refused.allowed is False
+    assert refused.reason_code == DLP_REFUSAL_REASON_CODE == "dlp_prompt_refused"
+    assert refused.prompt == ""
+
+    admitted = screen_model_input("Open Personal preferences then the API tab")
+    assert admitted.allowed is True
+    assert admitted.reason_code is None
+    assert admitted.prompt == "Open Personal preferences then the API tab"

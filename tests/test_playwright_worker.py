@@ -15,9 +15,9 @@ from unittest.mock import patch
 
 import pytest
 
-from ops.browser_worker import BrowserObservation
-from ops.config import Settings
-from ops.playwright_worker import (
+from ops.browser.worker import BrowserObservation
+from ops.core.config import Settings
+from ops.playwright.worker import (
     PlaywrightBrowserWorker,
     _blocked,
     make_route_handler,
@@ -166,7 +166,7 @@ def test_live_lifecycle_and_secret_injection() -> None:
         registered = context.session_id in worker._sessions
         session = worker._sessions[context.session_id]
 
-        from ops.playwright_worker import _has_password_field, _inject_login
+        from ops.playwright.worker import _has_password_field, _inject_login
 
         async def _drive() -> tuple[bool, str, str]:
             # A controlled local login form (no external network).
@@ -208,8 +208,8 @@ def test_factory_selects_the_browser_service_for_playwright(tmp_path: object) ->
 
     from pydantic import SecretStr
 
-    from ops.provider_errors import ConfigurationRequiredError
-    from ops.run_service import RunService
+    from ops.providers.errors import ConfigurationRequiredError
+    from ops.runs.service import RunService
 
     settings = Settings(allow_live_browser=True, browser_provider="playwright")
     svc = RunService.from_paths(db_path=Path(str(tmp_path)) / "ops.db", settings=settings)

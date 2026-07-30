@@ -12,6 +12,80 @@ The canonical production runtime uses:
 
 Browser Use and You.com are not runtime providers in this rollout. Production disables both; they are not fallback paths for canonical runs.
 
+## How the pieces fit
+
+One operator opens the UI, picks an app, and starts a run. Everything after that
+happens inside the private network. Only Caddy is reachable from the internet.
+
+```mermaid
+flowchart LR
+    Operator(["Operator browser"])
+
+    subgraph Public["Public internet"]
+        Caddy["Caddy edge<br/>TLS, the only open door"]
+    end
+
+    subgraph Private["Private Docker network"]
+        Web["Next.js UI<br/>web/"]
+        API["FastAPI control plane<br/>api/ + ops/"]
+        BrowserSvc["Browser service<br/>isolated Chromium"]
+        Store[("SQLite in private/<br/>runs, checkpoints,<br/>vault, effects")]
+    end
+
+    subgraph External["External providers"]
+        Composio["Composio<br/>managed OAuth"]
+        Gmail["Gmail<br/>via Composio"]
+        Vendor["Vendor web app"]
+    end
+
+    Operator -->|HTTPS| Caddy
+    Caddy -->|"pages and /api/*"| Web
+    Caddy -->|"live view only"| BrowserSvc
+    Web -->|"internal token, server side"| API
+    API --> Store
+    API -->|"authenticated RPC"| BrowserSvc
+    API --> Composio
+    API --> Gmail
+    BrowserSvc --> Vendor
+```
+
+Who does what:
+
+| Piece | Job |
+| --- | --- |
+| **Caddy** | Terminates TLS, serves the UI, and forwards the live-view stream. Nothing else is public. |
+| **Next.js UI** (`web/`) | Operator screens. It never holds provider keys; it calls the API server side with an internal token. |
+| **FastAPI + `ops/`** (`api/`, `ops/`) | Decides what a run may do, records every state change, and talks to providers. |
+| **Browser service** (`browser_service/`) | Runs Chromium in its own container with its own policy, so a vendor page never shares a process with the control plane. |
+| **SQLite under `private/`** | Run ledger, encrypted workflow checkpoints, Fernet-encrypted credential vault, and effect receipts. Owner-only files. |
+
+### What happens during a run
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant O as Operator
+    participant A as API + ops/
+    participant P as Provider
+    participant V as Vault
+
+    O->>A: Start a run for one app
+    A->>A: Resolve the immutable recipe and route
+    A->>A: Record research and routing (no side effects yet)
+    alt Managed auth route
+        A->>P: Create an authorization link, poll the connection
+    else Browser route
+        A->>P: Drive the reviewed sign-in trace in the isolated browser
+    else Gated route
+        A->>P: Send reviewed outreach, or stop and ask for review
+    end
+    A->>V: Store any credential encrypted
+    A-->>O: Sanitized timeline plus vault:// references
+```
+
+Anything uncertain stops the run instead of guessing. The rules for that are in
+the run model below.
+
 ## Current readiness
 
 Catalog membership is not a claim that every app is fully autonomous or live-verified. The 50 recipes have four deliberately different capabilities:
@@ -33,6 +107,50 @@ See [docs/APP_RECIPES.md](docs/APP_RECIPES.md) for the exact app matrix and prom
 4. CAPTCHA, MFA, passkeys, account selection, billing, legal consent, and ambiguous steps pause or fail closed.
 5. External actions use durable effect identities so retries do not silently create duplicate work.
 6. Outputs contain provider identifiers and `vault://` references, never raw credential values.
+
+## Where the code lives
+
+```
+composio-toolkit-ops-agent/
+├── api/                 FastAPI control plane: routes, request models, service wiring
+├── ops/                 all business logic, grouped by domain (see below)
+├── browser_service/     the isolated Chromium container's own service
+├── web/                 Next.js operator UI
+├── data/p1/             locked, hash-verified research snapshot
+├── deploy/              Caddyfile, seccomp and AppArmor profiles
+├── docker/              container entrypoints
+├── docs/                app recipe matrix and operations runbook
+├── scripts/             deploy, backup, restore, and security gate scripts
+├── tests/               offline-by-default test suite (live tests are opt-in)
+└── private/             runtime state, never committed
+```
+
+`ops/` is split by domain, so you can find a subject without reading the whole
+package. Only the CLI sits at the top level.
+
+```
+ops/
+├── cli.py               local operator CLI
+├── core/                settings, models, run state, storage, vault, redaction
+├── recipes/             the immutable 50-app catalog and its validation
+├── access/              routing rules, gate policy, gated routes
+├── runs/                the run boundary: create, advance, resume, project, query
+├── workflow/            LangGraph graph, canonical runtime, integrator bundle
+├── onboarding/          admission, phases, leases, effects, driver loop
+├── browser/             browser decisions: host policy, egress, risk, sessions
+├── playwright/          the Playwright driver: session, actions, gates, masking
+├── credentials/         capture specs, capture boundary, validation
+├── providers/           Composio boundaries and provider profiles
+├── gmail/               Gmail contract, queries, validation, worker
+├── email/               outreach, verification, reply classification
+├── research/            operational research, baselines, cache, P1 adapter
+├── you/                 You.com research provider (opt-in, off in production)
+└── deploy/              deployment acceptance markers
+```
+
+Naming rule: a module drops the prefix that repeats its folder
+(`browser/worker.py`, not `browser/browser_worker.py`) and keeps a prefix that
+adds meaning (`workflow/graph_checkpoints.py`).
 
 ## Local startup
 
@@ -80,19 +198,30 @@ cp .env.production.example .env.production
 sudo ./scripts/deploy-droplet.sh
 ```
 
-Before deploying, configure the domain and application login (including its
-independent Base32 TOTP secret), one shared internal API token, the stable
-private keys required by the credential, browser-storage, and recovery
-boundaries, the browser-service token and owner, and only the providers you
-intend to use. Managed routes require Composio configuration and a public HTTPS
-callback base. Live Playwright additionally requires `ALLOW_LIVE_BROWSER=true`
-and at least one configured browser-decision model.
+Set these before you deploy:
 
-The deployment helper refuses a dirty worktree, installs the browser-only
-AppArmor policy required by Chromium's sandbox on Ubuntu, validates bounded
-Playwright capacity, proves the candidate browser on the real host before
-downtime, builds the exact Git revision, waits for all four services, verifies
-image revisions, and proves public TLS plus the application-auth boundary.
+- the domain and the application login, including its own Base32 TOTP secret;
+- one shared internal API token;
+- the stable private keys for the credential, browser-storage, and recovery boundaries;
+- the browser-service token and owner;
+- only the providers you actually intend to use.
+
+Managed routes also need Composio configuration and a public HTTPS callback base.
+Live Playwright also needs `ALLOW_LIVE_BROWSER=true` and at least one configured
+browser-decision model.
+
+The deploy script does the careful parts for you. It refuses a dirty worktree,
+installs the browser-only AppArmor policy Chromium's sandbox needs on Ubuntu,
+checks that Playwright capacity is bounded, proves the candidate browser works on
+the real host before any downtime, builds the exact Git revision, waits for all
+four services, verifies the running image revisions, and finally proves public
+TLS and the application-auth boundary.
+
+One host, on purpose: the stores under `private/` are SQLite, and SQLite allows
+writers on a single host only. Onboarding workers therefore run on exactly one
+host. Spreading workers across hosts would mean swapping in a shared store and a
+shared queue, which this implementation does not include. Browser capacity still
+scales inside the single host through the bounded browser pool.
 
 Operational verification and incident commands are in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 

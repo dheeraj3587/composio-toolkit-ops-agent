@@ -9,7 +9,7 @@ payload sent to the provider must use those same keys.
 
 from __future__ import annotations
 
-from ops.browser_worker import _render_browser_task, to_browser_sensitive_data
+from ops.browser.worker import _render_browser_task, to_browser_sensitive_data
 
 
 def test_mapper_renames_typed_keys_and_drops_non_typed() -> None:

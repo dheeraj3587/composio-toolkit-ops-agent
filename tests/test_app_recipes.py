@@ -10,7 +10,11 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from ops.app_recipes import (
+from ops.browser.api_trace_catalog import get_browser_api_trace
+from ops.browser.host_policy import get_browser_policy
+from ops.credentials.capture_specs import get_capture_spec
+from ops.credentials.validator import pipedrive_validation_policy
+from ops.recipes.app_recipes import (
     GATED_SLUGS,
     MANAGED_AUTH_SLUGS,
     PLAYWRIGHT_SLUGS,
@@ -21,13 +25,9 @@ from ops.app_recipes import (
     recipe_to_operational_research,
     recipes_for_route,
 )
-from ops.browser_api_trace_catalog import get_browser_api_trace
-from ops.browser_host_policy import get_browser_policy
-from ops.credential_capture_specs import get_capture_spec
-from ops.credential_validator import pipedrive_validation_policy
 
 _ROOT = Path(__file__).resolve().parents[1]
-_CATALOG_PATH = _ROOT / "ops" / "app_recipes.json"
+_CATALOG_PATH = _ROOT / "ops" / "recipes" / "app_recipes.json"
 _P1_PATH = _ROOT / "data" / "p1" / "results.json"
 _COMPOSIO_PATH = _ROOT / "data" / "p1" / "composio_coverage.json"
 
@@ -113,26 +113,71 @@ def test_pipedrive_recipe_matches_reviewed_trace_capture_host_and_validation() -
     assert recipe.validation.header_name == validation.header_name
 
 
-def test_other_playwright_routes_are_entry_only_and_owner_submitted() -> None:
+def test_playwright_routes_match_their_declared_readiness_tier() -> None:
+    """Every Playwright route must honour the contract of the tier it claims.
+
+    Asserted per tier rather than as a fixed head count, so promoting an app from
+    owner-submit to browser-ready is a recipe change rather than a test edit — while
+    still failing closed on a recipe that claims automation it does not implement.
+    """
+
     recipes = recipes_for_route("playwright")
-    assert Counter(recipe.readiness_tier for recipe in recipes) == {
-        "browser_ready": 1,
-        "owner_submit_ready": 13,
-    }
+    tiers = Counter(recipe.readiness_tier for recipe in recipes)
+    assert set(tiers) <= {"browser_ready", "owner_submit_ready"}
+    assert tiers["browser_ready"] >= 1
+    assert sum(tiers.values()) == len(PLAYWRIGHT_SLUGS)
 
     for recipe in recipes:
         assert recipe.urls.login is not None
         assert recipe.browser is not None
         assert recipe.browser.steps[0].action == "navigate"
         assert recipe.browser.steps[0].target_url == recipe.urls.login
-        if recipe.app_slug == "pipedrive":
+        assert urlsplit(recipe.urls.login).hostname in recipe.browser.exact_hosts
+
+        if recipe.readiness_tier == "browser_ready":
+            # The credential surface is automated, so the whole secret boundary
+            # must be declared: a reachable page, a capture spec confined to the
+            # reviewed sensitive selectors, and a validation endpoint.
+            assert recipe.browser.scope == "credential_surface"
+            assert recipe.capture.mode == "automatic"
+            assert recipe.urls.credential_management is not None
+            assert recipe.validation is not None
+            assert recipe.browser_ready is True
+            field_names = {field.name for field in recipe.credential_fields}
+            assert recipe.capture.field_name in field_names
+            assert recipe.validation.credential_field in field_names
+            assert set(recipe.capture.selectors) <= set(recipe.browser.sensitive_selectors)
             continue
+
+        # Owner-submit routes must not claim any credential automation.
         assert recipe.browser.exact_hosts == (urlsplit(recipe.urls.login).hostname,)
         assert recipe.browser.scope == "entry_only"
         assert recipe.capture.mode == "owner_submit"
         assert recipe.validation is None
         assert recipe.urls.credential_management is None
         assert recipe.browser_ready is False
+
+
+def test_apify_recipe_declares_a_complete_automated_secret_boundary() -> None:
+    recipe = get_app_recipe("apify")
+    assert recipe is not None
+    assert recipe.readiness_tier == "browser_ready"
+    assert recipe.browser is not None
+    assert recipe.browser.scope == "credential_surface"
+    assert recipe.urls.login == "https://console.apify.com/sign-in"
+    assert recipe.urls.credential_management == "https://console.apify.com/settings/integrations"
+    # Login entry, authenticated navigation to the token page, then capture.
+    assert tuple(step.action for step in recipe.browser.steps) == (
+        "navigate",
+        "authenticate_then_navigate",
+        "capture_boundary",
+    )
+    assert recipe.capture.field_name == "api_token"
+    assert recipe.capture.expected_path_prefix == "/settings/integrations"
+    assert recipe.validation is not None
+    assert recipe.validation.endpoint == "https://api.apify.com/v2/users/me"
+    assert recipe.validation.auth_scheme == "bearer"
+    assert recipe.validation.header_name == "Authorization"
 
 
 def test_gated_routes_expose_only_reviewed_email_outreach() -> None:

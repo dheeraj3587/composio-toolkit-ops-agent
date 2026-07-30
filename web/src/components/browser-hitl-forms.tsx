@@ -2,21 +2,27 @@
 
 import { useActionState, useState } from "react"
 import { useFormStatus } from "react-dom"
-import { KeyRound, LogIn, MailCheck } from "lucide-react"
+import { KeyRound, LogIn, MailCheck, ShieldQuestion, UserPlus } from "lucide-react"
 
 import {
+  decideAdmissionAction,
+  runOnboardingControlAction,
   submitBrowserLoginAction,
   submitBrowserVerificationAction,
   submitCredentialAction,
+  type AdmissionDecisionState,
   type BrowserLoginState,
   type BrowserVerificationState,
   type CredentialSubmitState,
+  type OnboardingControlState,
 } from "@/app/runs/[runId]/actions"
 import { Button } from "@/components/ui/button"
 
 const initialSubmit: CredentialSubmitState = { message: null, tone: "neutral", status: null }
 const initialLogin: BrowserLoginState = { message: null, tone: "neutral" }
 const initialVerification: BrowserVerificationState = { message: null, tone: "neutral" }
+const initialAdmission: AdmissionDecisionState = { message: null, tone: "neutral", route: null }
+const initialControl: OnboardingControlState = { message: null, tone: "neutral", control: null }
 
 const FIELD_CLASS =
   "h-10 w-full rounded-md border border-input bg-card px-3 py-2 text-xs shadow-[0_1px_1px_rgba(15,16,20,0.02)] transition-[border-color,box-shadow] focus-visible:border-ring focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/20"
@@ -27,6 +33,136 @@ function FormSubmitButton({ label, pendingLabel }: { label: string; pendingLabel
     <Button type="submit" variant="outline" size="sm" disabled={pending} className="rounded-md">
       {pending ? pendingLabel : label}
     </Button>
+  )
+}
+
+function ActionMessage({
+  message,
+  tone,
+}: {
+  message: string | null
+  tone: "neutral" | "error"
+}) {
+  if (!message) return null
+  return (
+    <p
+      className={tone === "error" ? "text-xs text-destructive" : "text-xs text-muted-foreground"}
+      role={tone === "error" ? "alert" : "status"}
+    >
+      {message}
+    </p>
+  )
+}
+
+/**
+ * Decision surface 1 of 2: the admission prompt (Requirements 18.4, 18.6).
+ *
+ * Creating an account on a provider is the one judgement this feature refuses to
+ * make on its own, so it is asked once, here. The committed profile digest travels
+ * with the answer: the operator decides about the profile they were shown, and the
+ * backend refuses a decision that names any other profile.
+ *
+ * Rendered only while the backend projects `can_decide_admission`.
+ */
+export function AdmissionDecisionForm({
+  runId,
+  profileDigest,
+  providerName,
+}: {
+  runId: string
+  profileDigest: string
+  providerName?: string | null
+}) {
+  const [decisionState, decisionAction] = useActionState(decideAdmissionAction, initialAdmission)
+  const subject = providerName?.trim() || "this provider"
+
+  return (
+    <div className="space-y-3" data-testid="admission-prompt">
+      <p className="flex items-center gap-1.5 data-label">
+        <UserPlus className="size-3 text-brand-600" aria-hidden="true" />
+        Admission decision
+      </p>
+      <p className="text-[10px] leading-4 text-muted-foreground">
+        No credential for {subject} is in the vault. Creating an account is the one decision the
+        agent never makes for you. Approving it lets the agent sign up on the provider&apos;s own
+        site; cancelling ends the run without creating anything.
+      </p>
+      <div className="flex flex-wrap gap-2">
+        {(
+          [
+            { decision: "create_account", label: "Create an account", pending: "Recording…" },
+            { decision: "cancel", label: "Cancel this run", pending: "Cancelling…" },
+          ] as const
+        ).map((choice) => (
+          // Both forms share one action state, so the recorded outcome is
+          // reported once no matter which answer the operator gives.
+          <form key={choice.decision} action={decisionAction}>
+            <input type="hidden" name="run_id" value={runId} />
+            <input type="hidden" name="profile_digest" value={profileDigest} />
+            <input type="hidden" name="decision" value={choice.decision} />
+            <FormSubmitButton label={choice.label} pendingLabel={choice.pending} />
+          </form>
+        ))}
+      </div>
+      <p className="font-mono text-[9px] uppercase tracking-[0.1em] text-muted-foreground">
+        Profile digest · {profileDigest.slice(0, 12)}
+      </p>
+      <ActionMessage message={decisionState.message} tone={decisionState.tone} />
+    </div>
+  )
+}
+
+/**
+ * Decision surface 2 of 2: the CAPTCHA prompt (Requirements 18.4, 18.6).
+ *
+ * A human-only challenge is on screen. The operator solves it in the live browser
+ * and hands the same session back, or cancels the run. Both buttons appear only
+ * when the backend projects the matching capability.
+ */
+export function CaptchaResumeForm({
+  runId,
+  canResume,
+  canCancel,
+  onResumeSubmit,
+}: {
+  runId: string
+  canResume: boolean
+  canCancel: boolean
+  // Interactive sessions hand remote control back before the resume request, so
+  // the caller can drop its noVNC connection first.
+  onResumeSubmit?: () => void
+}) {
+  const [controlState, controlAction] = useActionState(runOnboardingControlAction, initialControl)
+
+  return (
+    <div className="space-y-3" data-testid="captcha-prompt">
+      <p className="flex items-center gap-1.5 data-label">
+        <ShieldQuestion className="size-3 text-brand-600" aria-hidden="true" />
+        Human verification required
+      </p>
+      <p className="text-[10px] leading-4 text-muted-foreground">
+        The provider is showing a challenge only a person may complete. Solve it in the live browser
+        above, then hand the same session back to the agent. Nothing you type there is read by the
+        agent or stored on the run.
+      </p>
+      <div className="flex flex-wrap gap-2">
+        {canResume ? (
+          <form action={controlAction} onSubmit={onResumeSubmit}>
+            <input type="hidden" name="run_id" value={runId} />
+            <input type="hidden" name="control" value="resume" />
+            <FormSubmitButton label="I solved it, continue" pendingLabel="Resuming…" />
+          </form>
+        ) : null}
+        {canCancel ? (
+          <form action={controlAction}>
+            <input type="hidden" name="run_id" value={runId} />
+            <input type="hidden" name="control" value="cancel" />
+            <FormSubmitButton label="Cancel this run" pendingLabel="Cancelling…" />
+          </form>
+        ) : null}
+      </div>
+      <ActionMessage message={controlState.message} tone={controlState.tone} />
+    </div>
   )
 }
 

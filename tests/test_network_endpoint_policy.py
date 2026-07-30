@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ops.network_endpoint_policy import (
+from ops.core.network_endpoint_policy import (
     NetworkEndpointError,
     get_network_policy,
     is_allowed_network_endpoint,

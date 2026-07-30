@@ -4,7 +4,85 @@ from __future__ import annotations
 
 import pytest
 
-from ops.state import IllegalStatusTransition, validate_status_transition
+from ops.core.state import (
+    _LEGAL_STATUS_TRANSITIONS,
+    IllegalStatusTransition,
+    RunStatus,
+    validate_status_transition,
+)
+
+# The full table, pinned. Duplication is deliberate: the point of this snapshot is
+# that widening the machine for one flow cannot silently widen it for another, so
+# an edge added or removed anywhere fails here and has to be argued for.
+_EXPECTED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
+    "created": frozenset(
+        {
+            "researching",
+            "route_selected",
+            "connection_required",
+            "configuration_required",
+            "blocked",
+            "failed",
+        }
+    ),
+    "researching": frozenset(
+        {"researching", "route_selected", "configuration_required", "blocked", "failed"}
+    ),
+    "route_selected": frozenset(
+        {
+            "connection_required",
+            "browser_running",
+            "outreach_sent",
+            "waiting_for_hitl",
+            "configuration_required",
+            "blocked",
+            "failed",
+        }
+    ),
+    "connection_required": frozenset(
+        {"connection_required", "completed", "configuration_required", "blocked", "failed"}
+    ),
+    "browser_running": frozenset(
+        {
+            "waiting_for_hitl",
+            "outreach_sent",
+            "waiting_for_reply",
+            "credentials_ready",
+            "configuration_required",
+            "blocked",
+            "failed",
+        }
+    ),
+    "waiting_for_hitl": frozenset(
+        {"browser_running", "configuration_required", "blocked", "failed"}
+    ),
+    "outreach_sent": frozenset({"waiting_for_reply", "configuration_required", "failed"}),
+    "waiting_for_reply": frozenset(
+        {
+            "waiting_for_reply",
+            "browser_running",
+            "credentials_ready",
+            "configuration_required",
+            "blocked",
+            "failed",
+        }
+    ),
+    "credentials_ready": frozenset({"completed", "failed"}),
+    "configuration_required": frozenset(
+        {
+            "researching",
+            "route_selected",
+            "browser_running",
+            "outreach_sent",
+            "waiting_for_reply",
+            "blocked",
+            "failed",
+        }
+    ),
+    "blocked": frozenset(),
+    "failed": frozenset({"researching", "browser_running", "outreach_sent"}),
+    "completed": frozenset(),
+}
 
 
 def test_representative_legal_transitions_are_accepted() -> None:
@@ -42,3 +120,28 @@ def test_illegal_transition_is_rejected() -> None:
         validate_status_transition("created", "completed", "create")
     with pytest.raises(IllegalStatusTransition):
         validate_status_transition("researching", "completed", "workflow")
+
+
+def test_admission_pause_is_representable_from_route_selected() -> None:
+    """An onboarding run holding a profile and no session pauses for admission."""
+
+    assert (
+        validate_status_transition("route_selected", "waiting_for_hitl", "onboarding_admission")
+        == "waiting_for_hitl"
+    )
+
+
+def test_the_admission_pause_still_resumes_and_cancels() -> None:
+    """The pause is only usable because its two outgoing edges already exist."""
+
+    assert (
+        validate_status_transition("waiting_for_hitl", "browser_running", "resume")
+        == "browser_running"
+    )
+    assert validate_status_transition("waiting_for_hitl", "blocked", "cancel") == "blocked"
+
+
+def test_the_table_holds_exactly_the_declared_edges() -> None:
+    """No source status gained or lost an edge beyond the admission pause."""
+
+    assert _LEGAL_STATUS_TRANSITIONS == _EXPECTED_TRANSITIONS

@@ -15,13 +15,13 @@ from typing import Any
 
 from pydantic import SecretStr
 
-from ops.config import Settings
-from ops.email_verification import (
+from ops.core.config import Settings
+from ops.email.verification import (
     ResolvedVerification,
     VerificationDecision,
     VerificationEvidence,
 )
-from ops.run_service import RunService, _verification_backoff
+from ops.runs.service import RunService, _verification_backoff
 
 _LOGIN_EMAIL = "ops.signup+pipedrive@gmail.com"
 _ACCOUNT_REF = "acct_0123456789abcdef0123456789abcdef"

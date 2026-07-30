@@ -10,15 +10,15 @@ import types
 import pytest
 from pydantic import SecretStr
 
-import ops.gmail_worker as gmail_worker
-from ops.attachment_extract import (
+import ops.gmail.worker as gmail_worker
+from ops.core.config import Settings
+from ops.email.attachment_extract import (
     AttachmentRef,
     extract_secret_pairs,
     is_text_like,
     parse_attachment_list,
 )
-from ops.config import Settings
-from ops.gmail_worker import GmailWorker
+from ops.gmail.worker import GmailWorker
 
 
 # --- Pure core: attachment list projection ------------------------------------
@@ -195,7 +195,7 @@ def test_harvest_attachment_credentials_vaults_only_text_secrets(
 
 
 def test_harvest_requires_secret_store() -> None:
-    from ops.provider_errors import ConfigurationRequiredError
+    from ops.providers.errors import ConfigurationRequiredError
 
     worker = GmailWorker(settings=_settings(), sdk_client=_FakeComposio())
     with pytest.raises(ConfigurationRequiredError):

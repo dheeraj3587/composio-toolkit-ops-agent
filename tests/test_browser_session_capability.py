@@ -15,16 +15,16 @@ from pydantic import SecretStr, ValidationError
 from browser_service.main import _storage_binding, create_app
 from browser_service.models import CreateSessionRequest
 from browser_service.settings import BrowserServiceSettings
-from ops.app_recipes import get_app_recipe
-from ops.browser_service_client import BrowserServiceClient
-from ops.browser_session_capability import (
+from ops.browser.service_client import BrowserServiceClient
+from ops.browser.session_capability import (
     CAPABILITY_HEADER,
     capability_digest,
     derive_browser_session_capability,
 )
-from ops.browser_worker import BrowserSessionContext
-from ops.config import Settings
-from ops.provider_errors import ConfigurationRequiredError
+from ops.browser.worker import BrowserSessionContext
+from ops.core.config import Settings
+from ops.providers.errors import ConfigurationRequiredError
+from ops.recipes.app_recipes import get_app_recipe
 
 RPC_TOKEN = "browser-rpc-token-that-is-long-enough"
 CAPABILITY_KEY = "browser-session-capability-test-key-32-chars"

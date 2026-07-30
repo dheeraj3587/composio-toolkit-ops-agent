@@ -12,12 +12,12 @@ from pydantic import SecretStr
 from browser_service.main import create_app
 from browser_service.session_manager import SessionManager, SessionUnavailable
 from browser_service.settings import BrowserServiceSettings
-from ops.app_recipes import get_app_recipe
-from ops.browser_session_capability import (
+from ops.browser.session_capability import (
     CAPABILITY_HEADER,
     capability_digest,
     derive_browser_session_capability,
 )
+from ops.recipes.app_recipes import get_app_recipe
 
 RPC_TOKEN = "drain-test-browser-rpc-token-32-characters"
 CAPABILITY_KEY = "drain-test-session-capability-key-32-chars"

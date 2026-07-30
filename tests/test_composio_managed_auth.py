@@ -10,15 +10,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from ops.composio_managed_auth import (
+from ops.core.config import Settings
+from ops.core.effect_ledger import SQLiteEffectStore
+from ops.providers.composio_managed_auth import (
     MANAGED_AUTH_EFFECT_PROVIDER,
     MANAGED_AUTH_LINK_ACTION,
     ComposioManagedAuthProvider,
     validate_managed_auth_callback_base_url,
 )
-from ops.config import Settings
-from ops.effect_ledger import SQLiteEffectStore
-from ops.provider_errors import (
+from ops.providers.errors import (
     ConfigurationRequiredError,
     ProviderContractError,
     ProviderOperationError,

@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from ops.models import CompanyProfile, OperationsRequest
-from ops.run_service import RunConflictError, RunService
+from ops.core.models import CompanyProfile, OperationsRequest
+from ops.runs.service import RunConflictError, RunService
 
 
 def _request(app_name: str = "HubSpot") -> OperationsRequest:

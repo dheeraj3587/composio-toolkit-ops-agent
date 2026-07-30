@@ -20,9 +20,9 @@ from api.models import (
     HitlRequestView,
     LiveViewMode,
 )
-from ops.browser_readiness import browser_configuration_state
-from ops.config import Settings
-from ops.state import BrowserProvider
+from ops.browser.readiness import browser_configuration_state
+from ops.core.config import Settings
+from ops.core.state import BrowserProvider
 
 # A credential may be submitted only after THIS trusted event was recorded. A
 # running session proves nothing about having reached the credential page.

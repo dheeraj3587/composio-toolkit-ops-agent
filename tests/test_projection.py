@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from ops.models import CompanyProfile, OperationsRequest
-from ops.run_service import RunService
-from ops.state import IllegalStatusTransition
+from ops.core.models import CompanyProfile, OperationsRequest
+from ops.core.state import IllegalStatusTransition
+from ops.runs.service import RunService
 
 
 def _request(app_name: str = "HubSpot") -> OperationsRequest:

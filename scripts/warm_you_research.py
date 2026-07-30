@@ -27,14 +27,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from ops.config import Settings  # noqa: E402
-from ops.p1_adapter import (  # noqa: E402
+from ops.core.config import Settings  # noqa: E402
+from ops.research.cache import SqliteResearchCache  # noqa: E402
+from ops.research.p1_adapter import (  # noqa: E402
     P1AppRecord,
     load_verified_snapshot,
     to_operational_research,
 )
-from ops.research_cache import SqliteResearchCache  # noqa: E402
-from ops.run_service import RunService  # noqa: E402
+from ops.runs.service import RunService  # noqa: E402
 
 
 class _ForceRefreshCache:
@@ -182,7 +182,7 @@ def _summary_row(
 
 
 def _traced_apps() -> frozenset[str]:
-    from ops.browser_api_trace_catalog import load_browser_api_trace_catalog
+    from ops.browser.api_trace_catalog import load_browser_api_trace_catalog
 
     return frozenset(app.app_slug for app in load_browser_api_trace_catalog().apps)
 

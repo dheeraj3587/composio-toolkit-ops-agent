@@ -6,23 +6,43 @@ import { redirect } from "next/navigation"
 import {
   ApiError,
   connectManagedRun,
+  decideAdmission,
   getLiveView,
   getRun,
+  pauseOnboarding,
   pollManagedConnection,
   performPhaseAction,
   PhaseConflictError,
+  resetOnboarding,
+  resumeOnboarding,
   resumeWithBrowserLogin,
   resumeWithBrowserVerification,
+  retryOnboardingStep,
   submitCredentials,
 } from "@/lib/api"
+import { onboardingPhaseSchema } from "@/lib/api-schemas"
+import { humanize } from "@/lib/format"
+import { maskedScreenshotPath, SECRET_CAPTURE_BOUNDARY } from "@/lib/live-view"
 import { sameOriginInteractivePath } from "@/lib/live-view-grant"
 import type {
+  AdmissionInput,
+  AdmissionRoute,
   BrowserProvider,
   BrowserVerificationInput,
   LiveViewMode,
+  OnboardingPhase,
   RetryCapability,
   RunPhaseAction,
 } from "@/lib/types"
+
+const RUN_ID_PATTERN = /^run_[0-9a-f]{32}$/
+const ONBOARDING_CONTROLS = [
+  "pause",
+  "resume",
+  "cancel",
+  "reset",
+  "retry-step",
+] as const
 
 export interface ManagedConnectionActionState {
   message: string | null
@@ -156,6 +176,170 @@ export async function runPhaseAction(
   }
 }
 
+// --- Onboarding operator controls (design LL-6.3) ----------------------------
+//
+// One action per decision surface, one action for the projected control strip.
+// Every one of them refuses a request the backend has not projected as legal, so
+// a control that is rendered is a control the backend named.
+
+export interface AdmissionDecisionState {
+  message: string | null
+  tone: "neutral" | "error"
+  route: AdmissionRoute | null
+}
+
+/**
+ * Record the operator's one admission decision (Requirement 18.6, surface 1 of 2).
+ *
+ * The profile digest travels with the decision because the operator decides about
+ * the profile they were shown: a digest the run has not committed is refused by
+ * the backend rather than applied to a different profile.
+ */
+export async function decideAdmissionAction(
+  _previousState: AdmissionDecisionState,
+  formData: FormData,
+): Promise<AdmissionDecisionState> {
+  const runId = String(formData.get("run_id") ?? "").slice(0, 180)
+  const decisionValue = String(formData.get("decision") ?? "")
+  const decision: AdmissionInput | null =
+    decisionValue === "create_account" || decisionValue === "cancel" ? decisionValue : null
+  const profileDigest = String(formData.get("profile_digest") ?? "").slice(0, 64)
+
+  if (!RUN_ID_PATTERN.test(runId) || !decision || !/^[0-9a-f]{64}$/.test(profileDigest)) {
+    return { message: "The admission decision request is invalid.", tone: "error", route: null }
+  }
+
+  let recorded
+  try {
+    recorded = await decideAdmission(runId, decision, profileDigest)
+  } catch (error) {
+    if (error instanceof PhaseConflictError) {
+      return {
+        message: "This run is no longer waiting for an admission decision.",
+        tone: "error",
+        route: null,
+      }
+    }
+    return {
+      message:
+        error instanceof ApiError
+          ? "The admission decision was not accepted."
+          : "The admission decision could not be recorded.",
+      tone: "error",
+      route: null,
+    }
+  }
+
+  revalidatePath(`/runs/${encodeURIComponent(runId)}`)
+  const outcome =
+    recorded.route === "cancelled"
+      ? "The run is cancelled and no account will be created."
+      : recorded.route === "signup"
+        ? "The agent will create an account on the provider."
+        : "The agent will sign in with the existing account."
+  return {
+    message: recorded.replayed
+      ? `This run already held a decision, so nothing was rewritten. ${outcome}`
+      : `Decision recorded. ${outcome}`,
+    tone: "neutral",
+    route: recorded.route,
+  }
+}
+
+export type OnboardingControl = "pause" | "resume" | "cancel" | "reset" | "retry-step"
+
+export interface OnboardingControlState {
+  message: string | null
+  tone: "neutral" | "error"
+  control: OnboardingControl | null
+}
+
+/**
+ * Run one backend-projected onboarding control.
+ *
+ * Reset carries an explicit acknowledgement because it clears workflow state;
+ * the backend refuses an unconfirmed reset as a validation error, and this action
+ * refuses it before the request is even made.
+ */
+export async function runOnboardingControlAction(
+  _previousState: OnboardingControlState,
+  formData: FormData,
+): Promise<OnboardingControlState> {
+  const runId = String(formData.get("run_id") ?? "").slice(0, 180)
+  const controlValue = String(formData.get("control") ?? "")
+  const control = ONBOARDING_CONTROLS.includes(controlValue as OnboardingControl)
+    ? (controlValue as OnboardingControl)
+    : null
+
+  if (!RUN_ID_PATTERN.test(runId) || !control) {
+    return { message: "The onboarding control request is invalid.", tone: "error", control: null }
+  }
+
+  if (control === "reset" && String(formData.get("confirm") ?? "") !== "true") {
+    return {
+      message: "Confirm the reset first. It clears workflow state; vault references are preserved.",
+      tone: "error",
+      control,
+    }
+  }
+
+  let expectedPhase: OnboardingPhase | null = null
+  if (control === "retry-step") {
+    const parsed = onboardingPhaseSchema.safeParse(String(formData.get("expected_phase") ?? ""))
+    if (!parsed.success) {
+      return { message: "The retry does not name a known phase.", tone: "error", control }
+    }
+    expectedPhase = parsed.data
+  }
+
+  let message: string
+  try {
+    if (control === "pause") {
+      const paused = await pauseOnboarding(runId)
+      message = paused.accepted
+        ? `Pausing after ${humanize(paused.pausing_after_phase)}. The browser session stays open.`
+        : "The backend did not accept a pause for this run."
+    } else if (control === "reset") {
+      const reset = await resetOnboarding(runId)
+      message =
+        `Reset to ${humanize(reset.phase)}. ${reset.vault_references_preserved} vault reference(s) preserved; ` +
+        `expected route on restart: ${humanize(reset.expected_route_on_restart)}.`
+    } else if (expectedPhase !== null) {
+      const retried = await retryOnboardingStep(runId, expectedPhase)
+      const skipped = retried.skipped_effects.map(humanize).join(", ")
+      message =
+        `Retrying ${humanize(retried.phase)} (attempt ${retried.attempt}).` +
+        (skipped ? ` Already-completed effects are skipped: ${skipped}.` : "")
+    } else {
+      const receipt = await resumeOnboarding(runId, control === "cancel" ? "cancelled" : "completed")
+      message =
+        receipt.detail ??
+        (control === "cancel"
+          ? "Cancellation accepted; the browser session was released."
+          : "Resume accepted on the same browser session.")
+    }
+  } catch (error) {
+    if (error instanceof PhaseConflictError) {
+      return {
+        message: "The backend no longer authorizes this control for the run's current phase.",
+        tone: "error",
+        control,
+      }
+    }
+    return {
+      message:
+        error instanceof ApiError
+          ? "The operations API did not accept this control."
+          : "The control could not be completed.",
+      tone: "error",
+      control,
+    }
+  }
+
+  revalidatePath(`/runs/${encodeURIComponent(runId)}`)
+  return { message, tone: "neutral", control }
+}
+
 export interface LiveViewState {
   provider: BrowserProvider | null
   mode: LiveViewMode
@@ -164,11 +348,14 @@ export interface LiveViewState {
   interactivePath: string | null
   capturedAt: string | null
   interactionAvailable: boolean
+  // The backend's reason for the projected mode. The console reads it only to
+  // separate "no embed right now" from the one closed-view case below.
+  reasonCode: string | null
   message: string | null
   tone: "neutral" | "error"
 }
 
-function unavailableLiveView(message: string): LiveViewState {
+function unavailableLiveView(message: string, reasonCode: string | null = null): LiveViewState {
   return {
     provider: null,
     mode: "unavailable",
@@ -177,6 +364,7 @@ function unavailableLiveView(message: string): LiveViewState {
     interactivePath: null,
     capturedAt: null,
     interactionAvailable: false,
+    reasonCode,
     message,
     tone: "error",
   }
@@ -195,9 +383,28 @@ export async function openLiveView(
     const result = await getLiveView(runId)
 
     if (!result.available || result.mode === "unavailable") {
+      if (result.reason_code === SECRET_CAPTURE_BOUNDARY) {
+        // Requirement 18.8: the view is closed, not masked. No screenshot is
+        // requested here, so no frame of a credential surface can render.
+        return {
+          ...unavailableLiveView(
+            "The live view is closed while this run is on a credential surface.",
+            SECRET_CAPTURE_BOUNDARY,
+          ),
+          provider: result.provider,
+        }
+      }
+
+      // Requirement 18.3: an unavailable embed degrades to the masked frame
+      // rather than to a blank panel. The frame endpoint is independent of the
+      // embed grant, and the panel reports the truth if it has nothing to serve.
       return {
-        ...unavailableLiveView("No live browser session is currently available for this run."),
+        ...unavailableLiveView(
+          "No live browser embed is available for this run; showing the latest masked frame instead.",
+          result.reason_code ?? null,
+        ),
         provider: result.provider,
+        screenshotUrl: maskedScreenshotPath(runId, Date.now().toString()),
       }
     }
 
@@ -210,22 +417,22 @@ export async function openLiveView(
         interactivePath: null,
         capturedAt: result.captured_at ?? null,
         interactionAvailable: result.interaction_available,
+        reasonCode: result.reason_code ?? null,
         message: "Interactive hosted browser session ready.",
         tone: "neutral",
       }
     }
 
     if (result.mode === "screenshot" && result.screenshot_url) {
-      const version = encodeURIComponent(result.captured_at ?? Date.now().toString())
       return {
         provider: result.provider,
         mode: result.mode,
         liveUrl: null,
-        screenshotUrl:
-          `/api/control/runs/${encodeURIComponent(runId)}/live-view/screenshot?v=${version}`,
+        screenshotUrl: maskedScreenshotPath(runId, result.captured_at ?? Date.now().toString()),
         interactivePath: null,
         capturedAt: result.captured_at ?? null,
         interactionAvailable: false,
+        reasonCode: result.reason_code ?? null,
         message: "Latest Playwright browser frame loaded. This view is read-only.",
         tone: "neutral",
       }
@@ -240,6 +447,7 @@ export async function openLiveView(
         interactivePath: sameOriginInteractivePath(result.interactive_url),
         capturedAt: result.captured_at ?? null,
         interactionAvailable: result.interaction_available,
+        reasonCode: result.reason_code ?? null,
         message: result.interaction_available
           ? "Interactive Playwright session ready."
           : "Live Playwright session ready in view-only mode.",
@@ -247,9 +455,15 @@ export async function openLiveView(
       }
     }
 
+    // A projected embed the console cannot render is still an unavailable embed,
+    // so it degrades to the masked frame rather than to a blank panel (18.3).
     return {
-      ...unavailableLiveView("The selected interactive browser view is not available in this control plane."),
+      ...unavailableLiveView(
+        "The projected live browser embed cannot be rendered here; showing the latest masked frame instead.",
+        result.reason_code ?? null,
+      ),
       provider: result.provider,
+      screenshotUrl: maskedScreenshotPath(runId, Date.now().toString()),
     }
   } catch (error) {
     const message =
