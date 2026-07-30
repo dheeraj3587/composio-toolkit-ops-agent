@@ -68,10 +68,15 @@ def test_container_defaults_disable_live_actions_and_bind_host_ports_to_loopback
 
     assert "ALLOW_LIVE_BROWSER: ${ALLOW_LIVE_BROWSER:-false}" in production
     assert "ALLOW_LIVE_VENDOR_EMAIL: ${ALLOW_LIVE_VENDOR_EMAIL:-false}" in production
-    assert 'BROWSER_USE_COMPATIBILITY_ENABLED: "false"' in production
-    assert 'YOU_SEARCH_ENABLED: "false"' in production
-    assert 'YOU_CONTENTS_ENABLED: "false"' in production
-    assert 'YOU_RESEARCH_ENABLED: "false"' in production
+    # These are configurable now, but every one of them still defaults to off, so
+    # a deployment that says nothing gets no live provider.
+    assert (
+        "BROWSER_USE_COMPATIBILITY_ENABLED: ${BROWSER_USE_COMPATIBILITY_ENABLED:-false}"
+        in production
+    )
+    assert "YOU_SEARCH_ENABLED: ${YOU_SEARCH_ENABLED:-false}" in production
+    assert "YOU_CONTENTS_ENABLED: ${YOU_CONTENTS_ENABLED:-false}" in production
+    assert "YOU_RESEARCH_ENABLED: ${YOU_RESEARCH_ENABLED:-false}" in production
     assert 'PLAYWRIGHT_MAX_SESSIONS: "${PLAYWRIGHT_MAX_SESSIONS:-2}"' in production
     assert "BROWSER_DISPLAY_SLOTS:" not in production
     assert "PLAYWRIGHT_DISABLE_SANDBOX: ${PLAYWRIGHT_DISABLE_SANDBOX:-false}" in production

@@ -125,6 +125,10 @@ class Settings(BaseModel):
     you_api_key: SecretStr | None = Field(default=None, repr=False)
     google_genai_api_key: SecretStr | None = Field(default=None, repr=False)
     openrouter_api_key: SecretStr | None = Field(default=None, repr=False)
+    # Inception's Mercury diffusion models. First in the browser-decision chain
+    # because the action loop is latency bound: every page state costs one
+    # decision, and a faster first token shortens the whole run.
+    mercury_api_key: SecretStr | None = Field(default=None, repr=False)
     groq_api_key: SecretStr | None = Field(default=None, repr=False)
     cerebras_api_key: SecretStr | None = Field(default=None, repr=False)
     composio_api_key: SecretStr | None = Field(default=None, repr=False)
@@ -174,6 +178,12 @@ class Settings(BaseModel):
     # with "openai/" while Cerebras does not (verified against both vendors' docs).
     groq_model: str = "openai/gpt-oss-120b"
     cerebras_model: str = "gpt-oss-120b"
+    # Mercury 2 is Inception's chat model and supports strict json_schema.
+    mercury_model: str = "mercury-2"
+    # Inception exposes a reasoning dial. The action loop wants latency over
+    # deliberation on a page it can already see, so default to the low setting;
+    # "instant", "medium", and "high" are the other documented values.
+    mercury_reasoning_effort: str = "low"
 
     # Session count is the real quota (not dollars), so use the most capable
     # Browser Use model for reliable multi-step onboarding navigation. The latest
@@ -580,8 +590,19 @@ class Settings(BaseModel):
             "openrouter_api_key": _secret(source.get("OPENROUTER_API_KEY")),
             "groq_api_key": _secret(source.get("GROQ_API_KEY")),
             "cerebras_api_key": _secret(source.get("CEREBRAS_API_KEY")),
+            # MERCURY_API_KEY is canonical. INCEPTION_API_KEY is accepted because
+            # that is the name Inception's own documentation exports.
+            "mercury_api_key": _secret(
+                source.get("MERCURY_API_KEY") or source.get("INCEPTION_API_KEY")
+            ),
             "groq_model": _optional(source.get("GROQ_MODEL")) or "openai/gpt-oss-120b",
             "cerebras_model": _optional(source.get("CEREBRAS_MODEL")) or "gpt-oss-120b",
+            "mercury_model": _optional(source.get("MERCURY_MODEL")) or "mercury-2",
+            "mercury_reasoning_effort": _choice(
+                source.get("MERCURY_REASONING_EFFORT"),
+                ("instant", "low", "medium", "high"),
+                default="low",
+            ),
             "openrouter_model": _optional(source.get("OPENROUTER_MODEL"))
             or "nvidia/nemotron-3-ultra-550b-a55b:free",
             "composio_api_key": _secret(source.get("COMPOSIO_API_KEY")),

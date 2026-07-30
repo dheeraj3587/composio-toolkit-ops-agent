@@ -1257,9 +1257,12 @@ for name in (
     "BROWSER_STORAGE_STATE_KEY",
     "CEREBRAS_API_KEY",
     "GROQ_API_KEY",
+    "MERCURY_API_KEY",
 ):
     if api.get(name):
         raise SystemExit(f"{name} must not be available to the API container")
+if not services["browser-worker"]["environment"].get("MERCURY_MODEL"):
+    raise SystemExit("MERCURY_MODEL must be available to browser-worker")
 # Browser Use runs in Browser Use Cloud, so unlike the Chromium-only credentials
 # above its key has to live in the control plane. Tie the key to the explicit
 # compatibility opt-in instead of banning it outright: a key without the flag is

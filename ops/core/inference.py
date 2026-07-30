@@ -5,8 +5,13 @@ schema. Providers are tried in a fixed order and the first schema-valid response
 wins; a rate limit (429) or transient error advances to the next provider, so a
 free-tier quota on one vendor never stalls a run.
 
-Contracts below were verified against the vendors' official docs (2026-07-25):
+Contracts below were verified against the vendors' official docs (2026-07-25,
+Inception added 2026-07-31):
 
+* Inception Mercury — ``https://api.inceptionlabs.ai/v1/chat/completions``,
+  OpenAI-shaped, model ``mercury-2``, strict ``json_schema`` documented, and
+  ``max_tokens`` rather than ``max_completion_tokens``. A ``reasoning_effort``
+  dial trades deliberation for latency ("instant"/"low" are the fast settings).
 * OpenRouter — ``https://openrouter.ai/api/v1/chat/completions``, OpenAI-shaped,
   ``response_format={"type":"json_object"}``.
 * Groq — ``https://api.groq.com/openai/v1/chat/completions``. Strict
@@ -110,6 +115,7 @@ class _OpenAICompatibleBackend:
         strict_models: Sequence[str] = (),
         use_max_completion_tokens: bool = True,
         max_completion_tokens: int = _MAX_COMPLETION_TOKENS,
+        extra_payload: Mapping[str, object] | None = None,
     ) -> None:
         self._api_key = api_key
         self._url = url
@@ -117,6 +123,9 @@ class _OpenAICompatibleBackend:
         self._strict_models = tuple(strict_models)
         self._use_max_completion_tokens = use_max_completion_tokens
         self._max_completion_tokens = max_completion_tokens
+        # Vendor-specific, non-secret request fields (for example Inception's
+        # reasoning dial). Kept separate so the shared request shape stays honest.
+        self._extra_payload = dict(extra_payload or {})
 
     def _response_format(self, schema: Mapping[str, object] | None) -> dict[str, object]:
         # Strict constrained decoding when the vendor documents it for this model;
@@ -129,7 +138,7 @@ class _OpenAICompatibleBackend:
             }
         return {"type": "json_object"}
 
-    def generate_json(self, prompt: str, schema: Mapping[str, object] | None) -> dict[str, object]:
+    def _payload(self, prompt: str, response_format: Mapping[str, object]) -> dict[str, object]:
         payload: dict[str, object] = {
             "model": self._model,
             "messages": [
@@ -137,17 +146,33 @@ class _OpenAICompatibleBackend:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.1,
-            "stream": False,  # both vendors forbid streaming with their JSON modes
-            "response_format": self._response_format(schema),
+            "stream": False,  # every vendor here forbids streaming with JSON modes
+            "response_format": dict(response_format),
+            **self._extra_payload,
         }
         token_key = "max_completion_tokens" if self._use_max_completion_tokens else "max_tokens"
         payload[token_key] = self._max_completion_tokens
+        return payload
+
+    def generate_json(self, prompt: str, schema: Mapping[str, object] | None) -> dict[str, object]:
         headers = {
             "Authorization": f"Bearer {self._api_key.get_secret_value()}",
             "Content-Type": "application/json",
         }
+        strict = self._response_format(schema)
         with httpx.Client(timeout=_TIMEOUT_SECONDS) as client:
-            response = client.post(self._url, headers=headers, json=payload)
+            response = client.post(self._url, headers=headers, json=self._payload(prompt, strict))
+            # A vendor that documents strict schemas can still reject a specific
+            # one (unsupported keyword, nesting depth, or a model that quietly
+            # lost the capability). That is a 400, not a provider outage, so retry
+            # once in plain JSON mode rather than dropping to the next provider:
+            # the prompt already names the schema, and the caller validates.
+            if response.status_code == 400 and strict.get("type") == "json_schema":
+                response = client.post(
+                    self._url,
+                    headers=headers,
+                    json=self._payload(prompt, {"type": "json_object"}),
+                )
             if response.status_code == 429:
                 raise RateLimited(f"{self.name} rate limited")
             response.raise_for_status()
@@ -175,6 +200,40 @@ class OpenRouterJsonBackend(_OpenAICompatibleBackend):
             strict_models=(),  # varies by upstream model: use plain JSON mode
             use_max_completion_tokens=False,
             max_completion_tokens=max_completion_tokens,
+        )
+
+
+class MercuryJsonBackend(_OpenAICompatibleBackend):
+    """Inception Mercury (diffusion LLM), OpenAI-shaped and strict-schema capable.
+
+    Verified against Inception's documentation (2026-07-31):
+    ``https://api.inceptionlabs.ai/v1/chat/completions``, bearer key, model
+    ``mercury-2``, and ``response_format={"type":"json_schema","json_schema":
+    {"name":..., "strict":true, "schema":...}}``. Inception documents
+    ``max_tokens`` rather than ``max_completion_tokens``, and exposes
+    ``reasoning_effort`` where "low"/"instant" are the low-latency settings.
+    """
+
+    name = "mercury"
+
+    def __init__(
+        self,
+        api_key: SecretStr,
+        *,
+        model: str,
+        reasoning_effort: str = "low",
+        max_completion_tokens: int = _MAX_COMPLETION_TOKENS,
+    ) -> None:
+        super().__init__(
+            api_key,
+            url="https://api.inceptionlabs.ai/v1/chat/completions",
+            model=model,
+            # Strict schemas are documented for the chat models, and the shared
+            # 400 fallback covers a schema this account or model will not take.
+            strict_models=(model,),
+            use_max_completion_tokens=False,
+            max_completion_tokens=max_completion_tokens,
+            extra_payload={"reasoning_effort": reasoning_effort},
         )
 
 
@@ -445,13 +504,29 @@ def build_json_inference(
     budget: DecisionBudget | None = None,
     max_completion_tokens: int = _MAX_COMPLETION_TOKENS,
 ) -> JsonInference | None:
-    """Build the ordered free-tier chain, skipping unconfigured providers.
+    """Build the ordered chain, skipping unconfigured providers.
 
-    Order favours strict-schema-capable, high-throughput free tiers first:
-    Groq -> Cerebras -> OpenRouter -> Gemini. Returns None when no key is set.
+    Order favours latency first, then strict-schema-capable high-throughput free
+    tiers: Mercury -> Groq -> Cerebras -> OpenRouter -> Gemini. Mercury leads
+    because the autonomous action loop pays one decision per page state, so token
+    latency, not raw capability, is what bounds a run. Returns None when no key is
+    set, and every later provider still runs unchanged when Mercury is absent,
+    rate limited, or fails its schema.
     """
 
     backends: list[JsonBackend] = []
+
+    mercury_key = getattr(settings, "mercury_api_key", None)
+    if isinstance(mercury_key, SecretStr):
+        model = getattr(settings, "mercury_model", "") or "mercury-2"
+        backends.append(
+            MercuryJsonBackend(
+                mercury_key,
+                model=model,
+                reasoning_effort=getattr(settings, "mercury_reasoning_effort", "") or "low",
+                max_completion_tokens=max_completion_tokens,
+            )
+        )
 
     groq_key = getattr(settings, "groq_api_key", None)
     if isinstance(groq_key, SecretStr):
@@ -506,6 +581,7 @@ __all__ = [
     "InferenceResult",
     "JsonBackend",
     "JsonInference",
+    "MercuryJsonBackend",
     "OpenRouterJsonBackend",
     "RateLimited",
     "build_json_inference",

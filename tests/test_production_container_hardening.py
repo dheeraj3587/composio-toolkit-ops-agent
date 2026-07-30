@@ -154,11 +154,34 @@ def test_api_does_not_receive_browser_only_credentials() -> None:
 
     for name in (
         "BROWSER_STORAGE_STATE_KEY",
-        "BROWSER_USE_API_KEY",
         "CEREBRAS_API_KEY",
         "GROQ_API_KEY",
+        # Mercury leads the browser-decision chain, so like the other decision
+        # providers its key belongs to browser-worker, not the control plane.
+        "MERCURY_API_KEY",
     ):
         assert environment[name] == ""
+
+    # Browser Use is the exception: it executes in Browser Use Cloud rather than in
+    # Chromium here, so its key can only live in the control plane. It stays empty
+    # unless the deployment opts in, and deploy-droplet.sh refuses a key without
+    # BROWSER_USE_COMPATIBILITY_ENABLED=true.
+    assert environment["BROWSER_USE_API_KEY"] == "${BROWSER_USE_API_KEY:-}"
+    assert (
+        environment["BROWSER_USE_COMPATIBILITY_ENABLED"]
+        == "${BROWSER_USE_COMPATIBILITY_ENABLED:-false}"
+    )
+
+
+def test_browser_decision_providers_reach_the_browser_worker() -> None:
+    """The action loop cannot resolve an ambiguous page without a backend."""
+
+    environment = _compose()["services"]["browser-worker"]["environment"]
+
+    assert environment["MERCURY_API_KEY"] == "${MERCURY_API_KEY:-}"
+    assert environment["MERCURY_MODEL"] == "${MERCURY_MODEL:-mercury-2}"
+    assert environment["MERCURY_REASONING_EFFORT"] == "${MERCURY_REASONING_EFFORT:-low}"
+    assert environment["GROQ_API_KEY"] == "${GROQ_API_KEY:-}"
 
 
 def test_production_python_dependencies_use_the_hashed_transitive_lock() -> None:

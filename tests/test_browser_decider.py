@@ -8,6 +8,8 @@ text cannot inject instructions, and provider fallback advances past rate limits
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 from pydantic import SecretStr
 
@@ -27,6 +29,7 @@ from ops.browser.worker import is_allowed_browser_url
 from ops.core.config import Settings
 from ops.core.inference import (
     JsonInference,
+    MercuryJsonBackend,
     RateLimited,
     _loads_json_object,
     build_json_inference,
@@ -317,6 +320,80 @@ def test_builder_orders_free_tiers_and_skips_missing() -> None:
     inference = build_json_inference(settings)
     assert inference is not None
     assert inference.provider_names == ("groq", "cerebras", "openrouter")
+
+
+def test_builder_puts_mercury_first_for_latency() -> None:
+    settings = Settings(
+        mercury_api_key=SecretStr("m"),  # pragma: allowlist secret
+        groq_api_key=SecretStr("g"),  # pragma: allowlist secret
+        cerebras_api_key=SecretStr("c"),  # pragma: allowlist secret
+    )
+    inference = build_json_inference(settings)
+    assert inference is not None
+    assert inference.provider_names == ("mercury", "groq", "cerebras")
+
+
+def test_mercury_request_matches_the_documented_inception_contract() -> None:
+    backend = MercuryJsonBackend(
+        SecretStr("m"),  # pragma: allowlist secret
+        model="mercury-2",
+        reasoning_effort="low",
+    )
+    schema = {"type": "object", "properties": {"kind": {"type": "string"}}}
+    payload = backend._payload("decide", backend._response_format(schema))
+
+    assert backend._url == "https://api.inceptionlabs.ai/v1/chat/completions"
+    assert payload["model"] == "mercury-2"
+    assert payload["reasoning_effort"] == "low"
+    # Inception documents max_tokens, not max_completion_tokens.
+    assert "max_tokens" in payload and "max_completion_tokens" not in payload
+    assert payload["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "decision", "strict": True, "schema": schema},
+    }
+
+
+def test_mercury_falls_back_to_json_object_when_a_strict_schema_is_refused() -> None:
+    attempts: list[dict[str, object]] = []
+
+    class _Response:
+        def __init__(self, status_code: int, payload: dict[str, object] | None = None) -> None:
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise RuntimeError(f"status {self.status_code}")
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _Client:
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def post(self, _url: str, *, headers: dict[str, str], json: dict[str, object]):
+            del headers
+            attempts.append(json)
+            if len(attempts) == 1:
+                return _Response(400)
+            return _Response(
+                200,
+                {"choices": [{"message": {"content": '{"kind": "click"}'}}]},
+            )
+
+    backend = MercuryJsonBackend(SecretStr("m"), model="mercury-2")  # pragma: allowlist secret
+    with patch("ops.core.inference.httpx.Client", lambda *_a, **_k: _Client()):
+        assert backend.generate_json("decide", {"type": "object"}) == {"kind": "click"}
+
+    assert attempts[0]["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "decision", "strict": True, "schema": {"type": "object"}},
+    }
+    assert attempts[1]["response_format"] == {"type": "json_object"}
 
 
 def test_builder_includes_only_configured_provider() -> None:
