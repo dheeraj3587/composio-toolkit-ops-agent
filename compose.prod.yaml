@@ -60,15 +60,21 @@ services:
       # isolated RPC client in production, so it has no reason to hold Chromium
       # storage encryption or browser-decision-provider credentials.
       BROWSER_STORAGE_STATE_KEY: ""
-      BROWSER_USE_API_KEY: ""
       CEREBRAS_API_KEY: ""
       GROQ_API_KEY: ""
+      # Browser Use is a REMOTE provider: its work happens in Browser Use Cloud,
+      # not in Chromium here, so its key can only live in the control plane. It
+      # stays empty unless the deployment explicitly enables the compatibility
+      # path, and the release refuses a key without that opt-in.
+      BROWSER_USE_API_KEY: ${BROWSER_USE_API_KEY:-}
+      BROWSER_USE_MODEL: ${BROWSER_USE_MODEL:-}
+      BROWSER_USE_MAX_COST_USD: ${BROWSER_USE_MAX_COST_USD:-}
       # Owner-only credential submission / autonomous-login / reveal are gated by
       # this flag. It MUST be true for those operator actions to work; default
       # false keeps them disabled until explicitly enabled.
       ALLOW_LOCAL_CREDENTIAL_SUBMISSION: ${ALLOW_LOCAL_CREDENTIAL_SUBMISSION:-false}
       BROWSER_PROVIDER: ${BROWSER_PROVIDER:-playwright}
-      BROWSER_USE_COMPATIBILITY_ENABLED: "false"
+      BROWSER_USE_COMPATIBILITY_ENABLED: ${BROWSER_USE_COMPATIBILITY_ENABLED:-false}
       BROWSER_SERVICE_URL: http://browser-worker:8081
       BROWSER_SERVICE_TOKEN: ${BROWSER_SERVICE_TOKEN:?BROWSER_SERVICE_TOKEN is required}
       # API-only master key. The API derives one run-bound capability and sends
@@ -101,9 +107,13 @@ services:
       OPS_DEPLOY_ACCEPTANCE_NONCE: ${OPS_DEPLOY_ACCEPTANCE_NONCE:-manual-unaccepted}
       OPS_DEPLOY_ACCEPTANCE_MARKER_PATH: /data/deploy-acceptance.json
       RUN_LIVE_TESTS: "0"
-      YOU_SEARCH_ENABLED: "false"
-      YOU_CONTENTS_ENABLED: "false"
-      YOU_RESEARCH_ENABLED: "false"
+      # You.com evidence discovery. Each surface is separately opt-in and each
+      # one only becomes active with YDC_API_KEY configured, so an unset key
+      # leaves all three inert regardless of the flags.
+      YDC_API_KEY: ${YDC_API_KEY:-}
+      YOU_SEARCH_ENABLED: ${YOU_SEARCH_ENABLED:-false}
+      YOU_CONTENTS_ENABLED: ${YOU_CONTENTS_ENABLED:-false}
+      YOU_RESEARCH_ENABLED: ${YOU_RESEARCH_ENABLED:-false}
       OPS_INTERNAL_API_TOKEN: ${OPS_INTERNAL_API_TOKEN:?OPS_INTERNAL_API_TOKEN is required}
       # Dedicated write/one-time-consume capability for browser-worker. This is
       # deliberately not OPS_INTERNAL_API_TOKEN and exposes no durable reads.

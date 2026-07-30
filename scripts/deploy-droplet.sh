@@ -1255,12 +1255,19 @@ for name in (
         raise SystemExit(f"{name} must not be available to the API container")
 for name in (
     "BROWSER_STORAGE_STATE_KEY",
-    "BROWSER_USE_API_KEY",
     "CEREBRAS_API_KEY",
     "GROQ_API_KEY",
 ):
     if api.get(name):
         raise SystemExit(f"{name} must not be available to the API container")
+# Browser Use runs in Browser Use Cloud, so unlike the Chromium-only credentials
+# above its key has to live in the control plane. Tie the key to the explicit
+# compatibility opt-in instead of banning it outright: a key without the flag is
+# a configuration mistake, and the flag without a key can never execute.
+if api.get("BROWSER_USE_API_KEY") and api.get("BROWSER_USE_COMPATIBILITY_ENABLED") != "true":
+    raise SystemExit(
+        "BROWSER_USE_API_KEY requires BROWSER_USE_COMPATIBILITY_ENABLED=true"
+    )
 if not api.get("BROWSER_SESSION_CAPABILITY_KEY"):
     raise SystemExit("BROWSER_SESSION_CAPABILITY_KEY must be available to API")
 if not web.get("OPS_AUTH_TOTP_SECRET"):
