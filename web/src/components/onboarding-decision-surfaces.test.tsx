@@ -75,6 +75,7 @@ describe("OnboardingControlBar", () => {
         state={admissionState}
         controls={admissionControls}
         providerName="Acme"
+        admissionProfileAvailable
       />,
     )
 

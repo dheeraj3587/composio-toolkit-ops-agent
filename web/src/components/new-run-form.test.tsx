@@ -100,7 +100,8 @@ describe("NewRunForm", () => {
     expect(screen.getByText(/vault destination is created automatically/i)).toBeInTheDocument()
   })
 
-  it("falls back to Browser Use and keeps unavailable engines visible", () => {
+  it("falls back to Browser Use and keeps unavailable engines visible", async () => {
+    const user = userEvent.setup()
     render(
       <NewRunForm
         providerStates={[
@@ -111,8 +112,9 @@ describe("NewRunForm", () => {
     )
 
     expect(screen.getByRole("radio", { name: /playwright/i })).toBeDisabled()
-    expect(screen.getByText("Service token missing.")).toBeVisible()
     expect(screen.getByRole("radio", { name: /browser use/i })).toBeChecked()
+    await user.click(screen.getByText("Advanced settings"))
+    expect(screen.getByText("Service token missing.")).toBeVisible()
   })
 
   it("leaves the group unselected when neither provider is available", () => {

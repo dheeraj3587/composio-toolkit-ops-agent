@@ -24,10 +24,13 @@ export function Providers({ children }: { children: React.ReactNode }) {
     <QueryClientProvider client={queryClient}>
       {children}
       <Toaster
-        position="bottom-right"
-        richColors
+        position="top-right"
+        theme="dark"
+        visibleToasts={3}
+        duration={5_000}
+        gap={8}
         closeButton
-        toastOptions={{ className: "font-sans text-sm" }}
+        toastOptions={{ className: "ops-toast font-sans text-sm" }}
       />
     </QueryClientProvider>
   )

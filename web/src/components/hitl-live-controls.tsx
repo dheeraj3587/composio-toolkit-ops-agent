@@ -340,11 +340,13 @@ export function OnboardingControlBar({
   state,
   controls,
   providerName,
+  admissionProfileAvailable,
 }: {
   runId: string
   state: OnboardingStateView
   controls: OnboardingControlsView
   providerName?: string | null
+  admissionProfileAvailable: boolean
 }) {
   const [controlState, controlAction] = useActionState(runOnboardingControlAction, initialControl)
   const captchaPaused = state.phase === "captcha_paused"
@@ -382,12 +384,19 @@ export function OnboardingControlBar({
       </p>
 
       <div className="mt-5 space-y-4 border-t border-border pt-4">
-        {controls.can_decide_admission ? (
+        {controls.can_decide_admission && admissionProfileAvailable ? (
           <AdmissionDecisionForm
             runId={runId}
             profileDigest={state.profile_digest}
             providerName={providerName}
           />
+        ) : controls.can_decide_admission ? (
+          <div className="rounded-md border border-amber-400/30 bg-amber-400/[0.08] p-3" role="status">
+            <p className="text-sm font-medium text-amber-950">Admission approval unavailable</p>
+            <p className="mt-1 text-xs leading-5 text-amber-800">
+              The exact committed provider profile could not be loaded. Approval stays withheld until its digest and details are visible.
+            </p>
+          </div>
         ) : null}
 
         {simpleControls.length || controls.can_retry_step ? (

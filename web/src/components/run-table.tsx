@@ -12,55 +12,55 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import type { RunSummary } from "@/lib/types"
 import { formatTimestamp, humanize, relativeTimestamp } from "@/lib/format"
+import type { RunSummary } from "@/lib/types"
 
 export function RunTable({ runs }: { runs: RunSummary[] }) {
   if (runs.length === 0) {
     return (
       <EmptyState
-        title="The ledger is blank"
-        description="Create a local dry run to establish a sanitized record. No provider, browser, or email action will be implied."
+        title="No integration runs yet"
+        description="Start an integration to create the first backend-reported run."
         action
       />
     )
   }
 
   return (
-    <div className="overflow-x-auto rounded-md border border-border bg-card">
+    <div className="overflow-x-auto rounded-lg border border-border bg-card">
       <Table>
         <TableHeader>
-          <TableRow className="border-border bg-muted/45 hover:bg-muted/45">
-            <TableHead className="font-mono text-[10px] uppercase tracking-[0.14em]">Application</TableHead>
-            <TableHead className="font-mono text-[10px] uppercase tracking-[0.14em]">Route</TableHead>
-            <TableHead className="font-mono text-[10px] uppercase tracking-[0.14em]">Status</TableHead>
-            <TableHead className="hidden font-mono text-[10px] uppercase tracking-[0.14em] lg:table-cell">
+          <TableRow className="border-border bg-secondary/45 hover:bg-secondary/45">
+            <TableHead className="px-4 font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Application</TableHead>
+            <TableHead className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Route</TableHead>
+            <TableHead className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">Status</TableHead>
+            <TableHead className="hidden font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground lg:table-cell">
               Updated · UTC
             </TableHead>
-            <TableHead className="w-20"><span className="sr-only">Open run</span></TableHead>
+            <TableHead className="w-16"><span className="sr-only">Open run</span></TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
           {runs.map((run) => (
-            <TableRow key={run.run_id} className="border-border hover:bg-brand-50/35">
-              <TableCell>
-                <span className="block text-sm font-semibold leading-tight">{run.app_name}</span>
+            <TableRow key={run.run_id} className="border-border hover:bg-secondary/35">
+              <TableCell className="px-4 py-3">
+                <span className="block text-sm font-medium leading-tight">{run.app_name}</span>
                 <span className="mt-1 block max-w-64 truncate font-mono text-[10px] text-muted-foreground">
                   {humanize(run.browser_provider)} · recipe {run.recipe_version ?? "legacy"}
                 </span>
               </TableCell>
-              <TableCell>
-                <span className="block font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
+              <TableCell className="py-3">
+                <span className="block font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
                   {humanize(run.route_kind ?? run.access_route)}
                 </span>
                 <StatusBadge status={run.readiness_tier} className="mt-1" />
               </TableCell>
-              <TableCell><StatusBadge status={run.status} /></TableCell>
-              <TableCell className="hidden text-xs text-muted-foreground lg:table-cell" title={formatTimestamp(run.updated_at)}>
+              <TableCell className="py-3"><StatusBadge status={run.status} /></TableCell>
+              <TableCell className="hidden py-3 text-xs text-muted-foreground lg:table-cell" title={formatTimestamp(run.updated_at)}>
                 {relativeTimestamp(run.updated_at)}
               </TableCell>
-              <TableCell className="text-right">
-                <Button asChild variant="ghost" size="icon" className="rounded-md" aria-label={`Open ${run.app_name} run`}>
+              <TableCell className="py-3 text-right">
+                <Button asChild variant="ghost" size="icon" aria-label={`Open ${run.app_name} run`}>
                   <Link href={`/runs/${encodeURIComponent(run.run_id)}`}>
                     <ArrowUpRight aria-hidden="true" />
                   </Link>

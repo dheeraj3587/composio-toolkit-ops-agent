@@ -114,7 +114,7 @@ function PrimaryActionControl({ runId, action }: { runId: string; action: Primar
   const target = actionTargets[action.kind]
   if (target) {
     return action.enabled ? (
-      <Button asChild size="sm" className="w-full rounded-none md:w-auto">
+      <Button asChild size="sm" className="w-full rounded-md md:w-auto">
         <a href={target}>
           {action.kind === "review_outreach" ? (
             <ExternalLink aria-hidden="true" />
@@ -173,7 +173,7 @@ function ManagedSubmitButton({
   const { pending } = useFormStatus()
   const Icon = operation === "connect" ? Cable : RefreshCcw
   return (
-    <Button type="submit" size="sm" disabled={!enabled || pending} className="w-full rounded-none md:w-auto">
+    <Button type="submit" size="sm" disabled={!enabled || pending} className="w-full rounded-md md:w-auto">
       <Icon
         className={pending && operation === "poll" ? "animate-spin motion-reduce:animate-none" : ""}
         aria-hidden="true"
@@ -186,7 +186,7 @@ function ManagedSubmitButton({
 function DisabledAction({ label, icon }: { label: string; icon?: "off" }) {
   const Icon = icon === "off" ? CircleOff : Cable
   return (
-    <Button type="button" size="sm" variant="outline" disabled className="w-full rounded-none md:w-auto">
+    <Button type="button" size="sm" variant="outline" disabled className="w-full rounded-md md:w-auto">
       <Icon aria-hidden="true" />
       {label}
     </Button>

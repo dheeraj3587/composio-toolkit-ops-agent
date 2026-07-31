@@ -1,20 +1,9 @@
 import Link from "next/link"
 import { connection } from "next/server"
-import {
-  Activity,
-  ArrowRight,
-  Boxes,
-  CheckCircle2,
-  CircleOff,
-  Database,
-  LockKeyhole,
-  RadioTower,
-  ShieldCheck,
-} from "lucide-react"
+import { Activity, ArrowRight, CheckCircle2, CircleOff, Database, RadioTower } from "lucide-react"
 
 import { AppSearch } from "@/components/app-search"
 import { EmptyState } from "@/components/empty-state"
-import { ProvenanceCard } from "@/components/provenance-card"
 import { RunTable } from "@/components/run-table"
 import { StatusBadge } from "@/components/status-badge"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -30,10 +19,13 @@ export default async function DashboardPage() {
   const health: HealthResponse | null = healthResult.status === "fulfilled" ? healthResult.value : null
   const runs: RunListResponse | null = runsResult.status === "fulfilled" ? runsResult.value : null
   const unavailable = health === null || runs === null
-  const externalActionCount = runs?.items.filter((run) => run.external_actions).length ?? null
   const passedChecks = health?.checks.filter((check) => check.status === "pass").length ?? null
-  const waitingRuns = runs?.items.filter((run) =>
-    ["waiting_for_hitl", "outreach_sent", "waiting_for_reply", "configuration_required"].includes(run.status),
+  const attentionRuns = runs?.items.filter((run) =>
+    ["waiting_for_hitl", "outreach_sent", "waiting_for_reply", "configuration_required", "blocked", "failed"].includes(run.status),
+  ).length ?? null
+  const activeRuns = runs?.items.filter((run) =>
+    run.execution_mode !== "plan_only" &&
+    !["completed", "failed", "blocked", "configuration_required"].includes(run.status),
   ).length ?? null
 
   return (
@@ -44,47 +36,38 @@ export default async function DashboardPage() {
             <p className="eyebrow">Integration workspace</p>
             <StatusBadge status={health?.status ?? "unavailable"} />
           </div>
-          <h1 className="mt-3 text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">Set up apps without the busywork</h1>
+          <h1 className="mt-3 text-3xl tracking-[-0.035em] sm:text-4xl">Integration operations</h1>
           <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground">
-            Start an integration, watch the agent work in real time, and step in only when a website needs you.
+            Create, monitor, and hand off secure app setup from one focused workspace.
           </p>
         </div>
-        <Button asChild className="h-10 w-fit rounded-md bg-primary px-4 text-primary-foreground">
-          <Link href="/runs/new">Start an integration <ArrowRight aria-hidden="true" /></Link>
+        <Button asChild className="h-10 w-fit px-4">
+          <Link href="/runs/new">New integration <ArrowRight aria-hidden="true" /></Link>
         </Button>
       </header>
 
       {unavailable ? (
-        <Alert className="rounded-md border-amber-300 bg-amber-50 text-amber-950">
-          <RadioTower className="text-amber-700" aria-hidden="true" />
+        <Alert className="border-amber-400/30 bg-amber-400/[0.08] text-amber-950">
+          <RadioTower className="text-amber-300" aria-hidden="true" />
           <AlertTitle>Backend state is partially unavailable</AlertTitle>
-          <AlertDescription>
-            No run or health state is inferred while the backend is unavailable. Start the operations API configured by the server-only OPS_API_URL.
+          <AlertDescription className="text-amber-800">
+            Run and health state remain unreported until the operations API is available.
           </AlertDescription>
         </Alert>
       ) : null}
 
-      <section aria-labelledby="system-pulse">
+      <section aria-labelledby="workspace-summary">
         <div className="mb-3 flex items-center justify-between gap-4">
-          <h2 id="system-pulse" className="text-sm font-semibold">System pulse</h2>
-          <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.12em]">Backend reported</Badge>
+          <h2 id="workspace-summary" className="text-sm font-medium">Workspace summary</h2>
+          <Button asChild variant="ghost" size="sm" className="font-mono text-[10px] uppercase tracking-[0.1em]">
+            <Link href="/system">System details <ArrowRight aria-hidden="true" /></Link>
+          </Button>
         </div>
-        <div className="grid overflow-hidden rounded-md border border-border bg-border sm:grid-cols-2 xl:grid-cols-4">
-          <Metric icon={Database} label="Integrations" value={runs ? String(runs.total) : "—"} note="Saved runs" />
-          <Metric icon={Activity} label="System" value={health ? humanize(health.status) : "Unavailable"} note={health ? `API ${health.version}` : "No response"} />
-          <Metric icon={ShieldCheck} label="Ready checks" value={passedChecks == null ? "—" : `${passedChecks}/${health?.checks.length ?? 0}`} note="Security and connections" />
-          <Metric icon={waitingRuns === 0 ? CheckCircle2 : CircleOff} label="Needs attention" value={waitingRuns == null ? "—" : String(waitingRuns)} note={externalActionCount == null ? "Live state unavailable" : `${externalActionCount} live runs`} />
-        </div>
-      </section>
-
-      <AppSearch />
-
-      <section className="grid items-stretch gap-6 xl:grid-cols-2">
-        <ProvenanceCard snapshot={health?.snapshot ?? null} />
-        <div className="panel grid sm:grid-cols-3">
-          <PostureCard icon={Boxes} title="Research" status={health ? `phase_${health.phase}` : "unavailable"} copy="P1 evidence remains immutable; enrichment is stored separately." />
-          <PostureCard icon={LockKeyhole} title="Security" status={health ? "backend_reported" : "unavailable"} copy="Credential values stay behind exact vault references." />
-          <PostureCard icon={RadioTower} title="Providers" status={providerSummary(health)} copy="Provider availability is configuration-derived, never inferred from the UI." />
+        <div className="grid overflow-hidden rounded-lg border border-border bg-border sm:grid-cols-2 xl:grid-cols-4">
+          <Metric icon={Database} label="Integrations" value={runs ? String(runs.total) : "—"} note="Recorded runs" />
+          <Metric icon={Activity} label="Recent active" value={activeRuns == null ? "—" : String(activeRuns)} note={runs ? `Live runs among latest ${runs.items.length}` : "Live runs in current page"} />
+          <Metric icon={attentionRuns === 0 ? CheckCircle2 : CircleOff} label="Needs attention" value={attentionRuns == null ? "—" : String(attentionRuns)} note="Human or configuration step" />
+          <Metric icon={RadioTower} label="Ready checks" value={passedChecks == null ? "—" : `${passedChecks}/${health?.checks.length ?? 0}`} note={health ? `API ${health.version} · ${humanize(health.status)}` : "No response"} />
         </div>
       </section>
 
@@ -92,50 +75,27 @@ export default async function DashboardPage() {
         <div className="mb-3 flex items-end justify-between gap-4">
           <div>
             <p className="eyebrow">Recent activity</p>
-            <h2 id="recent-runs" className="mt-1 text-xl font-semibold tracking-[-0.02em]">Integration runs</h2>
+            <h2 id="recent-runs" className="mt-1 text-xl font-medium tracking-[-0.02em]">Integration runs</h2>
           </div>
-          <Button asChild variant="ghost" size="sm" className="font-mono text-[10px] uppercase tracking-[0.1em]">
-            <Link href="/runs/new">New integration <ArrowRight aria-hidden="true" /></Link>
-          </Button>
+          <Badge variant="outline" className="font-mono text-[9px] uppercase tracking-[0.1em]">Backend reported</Badge>
         </div>
         {runs ? <RunTable runs={runs.items} /> : <EmptyState title="Run register unavailable" description="The backend could not return the run list. No run data is inferred or fabricated." />}
       </section>
+
+      <AppSearch />
     </div>
   )
 }
 
-function providerSummary(health: HealthResponse | null): string {
-  if (!health) return "unavailable"
-  if (!health.providers?.length) return "not_reported"
-  if (health.providers.some((provider) => provider.status === "configuration_required")) return "configuration_required"
-  if (health.providers.every((provider) => ["ready", "configured"].includes(provider.status))) return "configured"
-  return "partial"
-}
-
 function Metric({ icon: Icon, label, value, note }: { icon: typeof Database; label: string; value: string; note: string }) {
   return (
-    <article className="min-h-32 bg-card p-5 [&:not(:last-child)]:border-b [&:not(:last-child)]:border-border sm:[&:not(:last-child)]:border-b-0 sm:[&:not(:last-child)]:border-r">
-      <div className="flex items-center justify-between">
+    <article className="bg-card p-4 [&:not(:last-child)]:border-b [&:not(:last-child)]:border-border sm:[&:not(:last-child)]:border-b-0 sm:[&:not(:last-child)]:border-r">
+      <div className="flex items-center justify-between gap-3">
         <span className="data-label">{label}</span>
-        <Icon className="size-4 text-brand-500" aria-hidden="true" />
+        <Icon className="size-3.5 text-muted-foreground" aria-hidden="true" />
       </div>
-      <p className="metric-value mt-6">{value}</p>
+      <p className="metric-value mt-4">{value}</p>
       <p className="mt-1 text-xs text-muted-foreground">{note}</p>
-    </article>
-  )
-}
-
-function PostureCard({ icon: Icon, title, status, copy }: { icon: typeof Boxes; title: string; status: string; copy: string }) {
-  return (
-    <article className="flex min-h-56 flex-col justify-between border-b border-border p-5 last:border-0 sm:border-b-0 sm:border-r sm:last:border-r-0">
-      <div className="flex items-start justify-between gap-3">
-        <span className="grid size-8 place-items-center rounded-md bg-secondary"><Icon className="size-4" aria-hidden="true" /></span>
-        <StatusBadge status={status} />
-      </div>
-      <div>
-        <h3 className="text-base font-semibold">{title}</h3>
-        <p className="mt-2 text-xs leading-5 text-muted-foreground">{copy}</p>
-      </div>
     </article>
   )
 }

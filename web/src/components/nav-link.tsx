@@ -19,7 +19,8 @@ export function NavLink({
 }) {
   const pathname = usePathname()
   const route = href.split("#")[0]
-  const active = route === "/" ? pathname === "/" : pathname === route || pathname.startsWith(`${route}/`)
+  const anchorOnly = href.includes("#")
+  const active = !anchorOnly && (route === "/" ? pathname === "/" : pathname === route || pathname.startsWith(`${route}/`))
 
   return (
     <Link
@@ -30,12 +31,12 @@ export function NavLink({
         "group flex items-center gap-3 rounded-md text-sm transition-colors",
         compact
           ? "size-9 justify-center text-muted-foreground hover:bg-secondary hover:text-foreground"
-          : "min-h-10 px-3 text-white/55 hover:bg-white/[0.055] hover:text-white",
-        active && !compact && "bg-white/[0.075] text-white shadow-[inset_2px_0_0_#0007cd]",
+          : "min-h-9 px-3 text-muted-foreground hover:bg-secondary/65 hover:text-foreground",
+        active && !compact && "bg-secondary text-foreground shadow-[inset_2px_0_0_#0007cd]",
         active && compact && "bg-secondary text-foreground",
       )}
     >
-      <Icon className={cn("size-4", active && !compact ? "text-brand-300" : "")} aria-hidden="true" />
+      <Icon className={cn("size-4", active ? "text-brand-300" : "")} aria-hidden="true" />
       {compact ? <span className="sr-only">{label}</span> : <span>{label}</span>}
     </Link>
   )

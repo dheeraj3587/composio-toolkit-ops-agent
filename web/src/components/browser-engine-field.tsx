@@ -31,15 +31,17 @@ export function BrowserEngineField<TValues extends BrowserEngineValues>({
   serverInvalid: boolean
 }) {
   const invalid = Boolean(error) || serverInvalid
-  const providerState = (provider: BrowserProvider) =>
-    providerStates.find((state) => state.provider === provider)
+  const providerState = (provider: BrowserProvider) => providerStates.find((state) => state.provider === provider)
 
   return (
     <fieldset
+      id="browser_provider"
+      tabIndex={-1}
       className="space-y-2"
       aria-describedby="browser-provider-message"
       aria-errormessage={invalid ? "browser-provider-message" : undefined}
       aria-invalid={invalid}
+      aria-required="true"
     >
       <legend className="flex w-full items-center justify-between gap-3 text-sm font-medium">
         Browser engine
@@ -49,7 +51,7 @@ export function BrowserEngineField<TValues extends BrowserEngineValues>({
         name={"browser_provider" as Path<TValues>}
         control={control}
         render={({ field }) => (
-          <div className="grid gap-3 sm:grid-cols-2">
+          <div className="grid gap-2 sm:grid-cols-2">
             {([
               {
                 value: "playwright" as const,
@@ -62,7 +64,7 @@ export function BrowserEngineField<TValues extends BrowserEngineValues>({
                 value: "browser_use" as const,
                 title: "Browser Use",
                 eyebrow: "Managed cloud",
-                description: "Hosted browser agent with an interactive live session.",
+                description: "Hosted browser runtime with an interactive live session.",
                 icon: CloudCog,
               },
             ]).map((option) => {
@@ -73,56 +75,25 @@ export function BrowserEngineField<TValues extends BrowserEngineValues>({
               return (
                 <label
                   key={option.value}
-                  className={`group relative rounded-lg border p-4 outline-none transition-[border-color,box-shadow,background-color] ${
-                    selected
-                      ? "border-brand-500 bg-brand-50/80 shadow-[0_0_0_1px_var(--color-brand-500)]"
-                      : "border-border bg-white"
-                  } ${selectable ? "cursor-pointer hover:border-brand-300" : "cursor-not-allowed opacity-60"}`}
+                  className={`group relative rounded-lg border p-3.5 outline-none transition-colors ${selected ? "border-brand-400/60 bg-brand-50" : "border-border bg-field"} ${selectable ? "cursor-pointer hover:border-[#484848]" : "cursor-not-allowed opacity-55"}`}
                 >
-                  <input
-                    type="radio"
-                    name={field.name}
-                    value={option.value}
-                    checked={selected}
-                    disabled={!selectable}
-                    onBlur={field.onBlur}
-                    onChange={() => field.onChange(option.value)}
-                    className="peer sr-only"
-                  />
-                  <span className="flex items-start justify-between gap-3 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-4 peer-focus-visible:outline-brand-600">
-                    <span className="grid size-8 place-items-center rounded-md border border-border bg-white text-brand-700">
-                      <Icon className="size-4" aria-hidden="true" />
-                    </span>
-                    <span
-                      className={`mt-1 size-3.5 rounded-full border ${selected ? "border-[4px] border-brand-600" : "border-muted-foreground/40"}`}
-                      aria-hidden="true"
-                    />
+                  <input type="radio" name={field.name} value={option.value} checked={selected} disabled={!selectable} required onBlur={field.onBlur} onChange={() => field.onChange(option.value)} className="peer sr-only" />
+                  <span className="flex items-start justify-between gap-3 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-4 peer-focus-visible:outline-ring">
+                    <Icon className={`size-4 ${selected ? "text-brand-300" : "text-muted-foreground"}`} aria-hidden="true" />
+                    <span className={`mt-0.5 size-3.5 rounded-full border ${selected ? "border-[4px] border-brand-400" : "border-muted-foreground/40"}`} aria-hidden="true" />
                   </span>
-                  <span className="mt-4 block font-mono text-[9px] uppercase tracking-[0.13em] text-muted-foreground">
-                    {option.eyebrow}
-                  </span>
-                  <span className="mt-1 block text-sm font-semibold">{option.title}</span>
-                  <span className="mt-1 block text-[11px] leading-5 text-muted-foreground">
-                    {option.description}
-                  </span>
-                  {!selectable ? (
-                    <span className="mt-3 block border-t border-border pt-3 text-[10px] leading-4 text-amber-800">
-                      {state?.detail ?? "Provider readiness could not be confirmed."}
-                    </span>
-                  ) : null}
+                  <span className="mt-3 block font-mono text-[9px] uppercase tracking-[0.11em] text-muted-foreground">{option.eyebrow}</span>
+                  <span className="mt-1 block text-sm font-medium">{option.title}</span>
+                  <span className="mt-1 block text-[11px] leading-5 text-muted-foreground">{option.description}</span>
+                  {!selectable ? <span className="mt-3 block border-t border-border pt-3 text-[10px] leading-4 text-amber-300">{state?.detail ?? "Provider readiness could not be confirmed."}</span> : null}
                 </label>
               )
             })}
           </div>
         )}
       />
-      <p
-        id="browser-provider-message"
-        className={invalid ? "text-xs leading-5 text-destructive" : "text-xs leading-5 text-muted-foreground"}
-      >
-        {error?.message
-          ?? (serverInvalid ? "The backend rejected this field." : undefined)
-          ?? "The selected engine is frozen for this run; retries and resumes never switch providers."}
+      <p id="browser-provider-message" className={invalid ? "text-xs leading-5 text-destructive" : "text-xs leading-5 text-muted-foreground"}>
+        {error?.message ?? (serverInvalid ? "The backend rejected this field." : undefined) ?? "The selected engine is fixed for this run; retries and resumes never switch providers."}
       </p>
     </fieldset>
   )

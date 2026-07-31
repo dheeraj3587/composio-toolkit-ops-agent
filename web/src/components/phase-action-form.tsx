@@ -16,7 +16,7 @@ const initialPhaseActionState: PhaseActionState = {
 function ActionButton({ label }: { label: string }) {
   const { pending } = useFormStatus()
   return (
-    <Button type="submit" variant="outline" size="sm" disabled={pending} className="rounded-none">
+    <Button type="submit" variant="outline" size="sm" disabled={pending} className="rounded-md">
       <RefreshCcw className={pending ? "animate-spin motion-reduce:animate-none" : ""} aria-hidden="true" />
       {pending ? "Requesting…" : label}
     </Button>

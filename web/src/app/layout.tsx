@@ -43,7 +43,7 @@ export const metadata: Metadata = {
 }
 
 export const viewport: Viewport = {
-  colorScheme: "light",
+  colorScheme: "dark",
   themeColor: "#0f0f0f",
 }
 
@@ -51,7 +51,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
   const demoMode = process.env.OPS_DEMO_MODE === "true"
 
   return (
-    <html lang="en" className={`${diatype.variable} ${jetBrainsMono.variable}`} suppressHydrationWarning>
+    <html lang="en" className={`dark ${diatype.variable} ${jetBrainsMono.variable}`} suppressHydrationWarning>
       {/* suppressHydrationWarning: browser extensions (password managers, etc.)
           inject attributes like bis_register/__processed_* onto <body> before
           React hydrates. This suppresses that one-level attribute mismatch; it

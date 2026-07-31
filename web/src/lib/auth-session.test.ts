@@ -5,31 +5,18 @@ import { authConfigurationValid } from "@/lib/auth-session"
 const USERNAME = "operator"
 const PASSWORD = "correct-password-for-ops-that-is-long" // pragma: allowlist secret
 const SESSION_SECRET = "test-session-secret-that-is-longer-than-thirty-two-characters" // pragma: allowlist secret
-const TOTP_SECRET = "JBSWY3DPEHPK3PXP" // pragma: allowlist secret
 
 describe("operator authentication configuration", () => {
-  it("accepts four independently configured authentication values", () => {
-    expect(
-      authConfigurationValid(USERNAME, PASSWORD, SESSION_SECRET, TOTP_SECRET),
-    ).toBe(true)
+  it("accepts three independently configured authentication values", () => {
+    expect(authConfigurationValid(USERNAME, PASSWORD, SESSION_SECRET)).toBe(true)
   })
 
   it.each([
-    ["password as the session signing key", PASSWORD, PASSWORD, TOTP_SECRET],
-    [
-      "TOTP seed as the password",
-      "jbs wy3d pehpk3pxp jbs wy3d pehpk3pxp",
-      SESSION_SECRET,
-      `${TOTP_SECRET}${TOTP_SECRET}`,
-    ],
-    [
-      "TOTP seed as the session signing key",
-      PASSWORD,
-      `${TOTP_SECRET}${TOTP_SECRET}`,
-      `${TOTP_SECRET} ${TOTP_SECRET}`,
-    ],
-  ])("fails closed when authentication reuses %s", (_label, password, secret, totp) => {
-    expect(authConfigurationValid(USERNAME, password, secret, totp)).toBe(false)
+    ["password as the session signing key", PASSWORD, PASSWORD],
+    ["public username as the password", USERNAME, SESSION_SECRET],
+    ["public username as the session signing key", PASSWORD, USERNAME],
+  ])("fails closed when authentication reuses %s", (_label, password, secret) => {
+    expect(authConfigurationValid(USERNAME, password, secret)).toBe(false)
   })
 
   it("rejects a public username reused as a secret", () => {
@@ -39,7 +26,6 @@ describe("operator authentication configuration", () => {
         publicIdentifier,
         `${publicIdentifier}-password`,
         publicIdentifier,
-        TOTP_SECRET,
       ),
     ).toBe(false)
   })

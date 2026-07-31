@@ -16,11 +16,10 @@ vi.mock("next/navigation", () => ({
 
 import { loginAction } from "@/app/login/actions"
 
-function loginForm(password: string, totp = "000000"): FormData {
+function loginForm(password: string): FormData {
   const form = new FormData()
   form.set("username", "operator")
   form.set("password", password)
-  form.set("totp", totp)
   form.set("next", "/")
   return form
 }
@@ -33,7 +32,6 @@ describe("loginAction throttling", () => {
       "OPS_AUTH_SESSION_SECRET",
       "test-session-secret-that-is-longer-than-thirty-two-characters",
     )
-    vi.stubEnv("OPS_AUTH_TOTP_SECRET", "JBSWY3DPEHPK3PXP")
     mocks.cookies.mockReset()
     mocks.headers.mockReset()
     mocks.redirect.mockReset()
@@ -66,24 +64,27 @@ describe("loginAction throttling", () => {
     expect(mocks.cookies).not.toHaveBeenCalled()
   })
 
-  it("requires the second factor and rejects replay of an accepted TOTP step", async () => {
+  it("creates a server-signed session after valid credentials", async () => {
     vi.useFakeTimers()
     vi.setSystemTime(59_000)
-    vi.stubEnv("OPS_AUTH_TOTP_SECRET", "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
     mocks.headers.mockResolvedValue(
       new Headers({ "x-forwarded-for": "203.0.113.88" }),
     )
     const setCookie = vi.fn()
     mocks.cookies.mockResolvedValue({ set: setCookie })
 
-    await expect(
-      loginAction(loginForm("correct-password-for-ops", "287082")),
-    ).rejects.toThrow("NEXT_REDIRECT:/")
+    await expect(loginAction(loginForm("correct-password-for-ops"))).rejects.toThrow(
+      "NEXT_REDIRECT:/",
+    )
     expect(setCookie).toHaveBeenCalledOnce()
-
-    await expect(
-      loginAction(loginForm("correct-password-for-ops", "287082")),
-    ).rejects.toThrow("error=invalid")
-    expect(setCookie).toHaveBeenCalledOnce()
+    expect(setCookie).toHaveBeenCalledWith(
+      "ops_session",
+      expect.any(String),
+      expect.objectContaining({
+        httpOnly: true,
+        secure: true,
+        sameSite: "strict",
+      }),
+    )
   })
 })

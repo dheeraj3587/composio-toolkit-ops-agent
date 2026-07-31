@@ -370,12 +370,32 @@ export function CredentialSubmitForm({
       <input type="hidden" name="field_name" value={fieldName} />
 
       <p className="data-label">Owner context (required by the API contract)</p>
-      <div className="grid gap-2 sm:grid-cols-2">
-        <input name="legal_name" required placeholder="Company legal name" autoComplete="off" className={FIELD_CLASS} aria-label="Company legal name" />
-        <input name="website" required placeholder="https://company.example" autoComplete="off" className={FIELD_CLASS} aria-label="Company website" />
-        <input name="callback_urls" placeholder="OAuth callback URLs (comma-separated)" autoComplete="off" className={FIELD_CLASS} aria-label="OAuth callback URLs" />
+      <div className="grid gap-3 sm:grid-cols-2">
+        <label className="space-y-1.5 text-xs" htmlFor={`owner-name-${runId}`}>
+          <span className="data-label">Company legal name</span>
+          <input id={`owner-name-${runId}`} name="legal_name" required placeholder="Example Labs Ltd." autoComplete="off" className={FIELD_CLASS} />
+        </label>
+        <label className="space-y-1.5 text-xs" htmlFor={`owner-site-${runId}`}>
+          <span className="data-label">Company website</span>
+          <input id={`owner-site-${runId}`} name="website" required placeholder="https://company.example" autoComplete="off" className={FIELD_CLASS} />
+        </label>
+        <label className="space-y-1.5 text-xs sm:col-span-2" htmlFor={`owner-callback-${runId}`}>
+          <span className="data-label">OAuth callback URLs <span className="normal-case text-muted-foreground" aria-hidden="true">(optional)</span></span>
+          <input
+            id={`owner-callback-${runId}`}
+            name="callback_urls"
+            placeholder="Comma-separated HTTPS URLs"
+            autoComplete="off"
+            aria-describedby={`owner-callback-${runId}-optional`}
+            className={FIELD_CLASS}
+          />
+        </label>
+        <span id={`owner-callback-${runId}-optional`} className="sr-only">OAuth callback URLs are optional.</span>
+        <label className="space-y-1.5 text-xs sm:col-span-2" htmlFor={`owner-use-case-${runId}`}>
+          <span className="data-label">Integration use case</span>
+          <input id={`owner-use-case-${runId}`} name="use_case" required placeholder="Describe the approved integration use" autoComplete="off" className={FIELD_CLASS} />
+        </label>
       </div>
-      <input name="use_case" required placeholder="Integration use case" autoComplete="off" className={FIELD_CLASS} aria-label="Integration use case" />
 
       <label htmlFor={`credential-${runId}`} className="flex items-center gap-1.5 data-label">
         <KeyRound className="size-3 text-brand-600" aria-hidden="true" />

@@ -29,6 +29,7 @@ export function AppNameField<TValues extends FieldValues>({
   invalid,
   describedBy,
   errorMessage,
+  required = false,
 }: {
   // Generic over the parent form's values (rather than `any`) so the field stays
   // type-checked against whatever schema owns app_name.
@@ -36,6 +37,7 @@ export function AppNameField<TValues extends FieldValues>({
   invalid?: boolean
   describedBy?: string
   errorMessage?: string
+  required?: boolean
 }) {
   const catalog = useAppCatalog()
   const groups = useMemo(() => groupAppsByCategory(catalog.data?.items ?? []), [catalog.data])
@@ -61,10 +63,11 @@ export function AppNameField<TValues extends FieldValues>({
             >
               <SelectTrigger
                 id="app_name"
-                className="w-full rounded-md bg-white"
+                className="w-full"
                 aria-invalid={invalid}
                 aria-describedby={describedBy}
                 aria-errormessage={errorMessage}
+                aria-required={required}
                 disabled={catalog.isPending}
               >
                 <SelectValue

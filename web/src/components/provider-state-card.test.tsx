@@ -24,8 +24,8 @@ describe("ProviderStateCard", () => {
 
     expect(html).toContain("Readiness")
     expect(html).toContain("Awaiting run evidence")
-    expect(html).toContain("text-sky-800")
-    expect(html).not.toContain("text-red-800")
+    expect(html).toContain("text-sky-300")
+    expect(html).not.toContain("text-red-300")
   })
 
   it("renders ready adapters as runtime initialized", () => {
@@ -40,7 +40,7 @@ describe("ProviderStateCard", () => {
 
     expect(html).toContain("Runtime initialized")
     expect(html).toContain("Runtime wiring plus run timeline")
-    expect(html).toContain("text-emerald-800")
+    expect(html).toContain("text-emerald-300")
   })
 
   it("does not contain stale LIVE TESTED wording", () => {
@@ -76,8 +76,8 @@ describe("ProviderStateCard", () => {
     })
 
     expect(html).toContain("Policy disabled")
-    expect(html).toContain("text-indigo-800")
-    expect(html).not.toContain("text-red-800")
+    expect(html).toContain("text-indigo-300")
+    expect(html).not.toContain("text-red-300")
   })
 
   it("does not infer configuration presence from disabled status", () => {

@@ -2,13 +2,22 @@ import type { Metadata } from "next"
 import Link from "next/link"
 import { notFound } from "next/navigation"
 import { connection } from "next/server"
-import { ArrowLeft, CircleOff, Clock3, Fingerprint, Globe2, Mail, Route, Settings2 } from "lucide-react"
+import {
+  ArrowLeft,
+  ChevronDown,
+  CircleOff,
+  Clock3,
+  Globe2,
+  Mail,
+  Route,
+  Settings2,
+  type LucideIcon,
+} from "lucide-react"
 
-import { HitlLiveControls, OnboardingControlBar } from "@/components/hitl-live-controls"
 import { CanonicalPrimaryAction } from "@/components/canonical-primary-action"
+import { HitlLiveControls, OnboardingControlBar } from "@/components/hitl-live-controls"
 import { PhaseActionForm } from "@/components/phase-action-form"
 import { ProviderStateCard } from "@/components/provider-state-card"
-import { RunProgress } from "@/components/run-progress"
 import {
   CapabilityPanel,
   HitlPanel,
@@ -19,6 +28,7 @@ import {
   ResearchPanel,
   SecurityPanel,
 } from "@/components/run-detail-panels"
+import { RunProgress } from "@/components/run-progress"
 import { StatusBadge } from "@/components/status-badge"
 import { Timeline } from "@/components/timeline"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -42,9 +52,6 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
     return <BackendUnavailable />
   }
 
-  // The profile route answers 409 until a profile is committed, so it is only
-  // requested for a run the backend reports as an onboarding run, and a
-  // rejection is rendered as "not reported" rather than filled in.
   const onboarding = detail.onboarding ?? null
   const [timelineResult, outputResult, profileResult] = await Promise.allSettled([
     getTimeline(runId),
@@ -64,20 +71,14 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
   const researchPhase = phases.get("research")
   const browser = detail.browser ?? null
   const primaryAction = detail.primary_action ?? null
-  // Backend-projected onboarding capability. Present only for an onboarding run,
-  // and the sole authority for that run's controls (Requirement 18.4): the
-  // status-derived controls below stay in place for legacy runs only.
   const controls = detail.controls ?? null
 
-  // The backend owns every browser permission. A run status alone does not prove
-  // that a session is live, a credential page is verified, or a resume is legal.
   const hasBrowserSession =
     !isPlanOnly &&
     (browser
       ? ["running", "waiting_for_hitl", "credential_page_ready"].includes(browser.lifecycle)
       : ["waiting_for_hitl", "browser_running"].includes(detail.run.status))
 
-  // Interactive Playwright HITL has priority over generic controls.
   const interactivePlaywrightResume = Boolean(
     browser?.can_resume &&
     browser.provider === "playwright" &&
@@ -85,8 +86,6 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
     browser.interaction_available,
   )
 
-  // Do not show generic Resume beside interactive Playwright HITL
-  // or another specific credential action.
   const canResume = browser
     ? Boolean(
         browser.can_resume &&
@@ -94,50 +93,52 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
           !browser.can_submit_login &&
           !browser.can_submit_otp,
       )
-    : detail.run.status === "waiting_for_hitl" &&
-      detail.hitl_request?.resumable === true
+    : detail.run.status === "waiting_for_hitl" && detail.hitl_request?.resumable === true
 
-  // Status-derived controls are the legacy path. An onboarding run takes every
-  // control from `controls` instead, so none of them is offered twice.
   const legacyControls = controls === null
   const verificationPending =
     legacyControls &&
     !isPlanOnly &&
     detail.run.status === "waiting_for_hitl" &&
     detail.hitl_request?.action_type === "email_otp"
-  const canPollOutreach =
+  const canPoll =
     legacyControls &&
     !primaryAction &&
     !isPlanOnly &&
     ["outreach_sent", "waiting_for_reply"].includes(detail.run.status)
-  const canPoll = canPollOutreach
   const missingFields = Array.from(new Set([
     ...(detail.missing_fields ?? []),
     ...(detail.research?.missing_fields ?? []),
   ]))
+  const retryControlsVisible = legacyControls && !primaryAction
+  const researchRetryAvailable = retryControlsVisible && !isPlanOnly && isRetryable(researchPhase)
+  const validationRetryAvailable = retryControlsVisible && !isPlanOnly && isRetryable(outputPhase)
+  const retryActionAvailable = researchRetryAvailable || validationRetryAvailable
 
   return (
     <div className="page-enter page-stack">
-      <Button asChild variant="ghost" size="sm" className="-ml-2 font-mono text-[10px] uppercase tracking-[0.1em]"><Link href="/"><ArrowLeft aria-hidden="true" /> Overview</Link></Button>
+      <Button asChild variant="ghost" size="sm" className="-ml-2 font-mono text-[10px] uppercase tracking-[0.1em]">
+        <Link href="/"><ArrowLeft aria-hidden="true" /> Overview</Link>
+      </Button>
 
       <header className="flex flex-col gap-6 border-b border-border pb-7 xl:flex-row xl:items-end xl:justify-between">
         <div>
-          <div className="flex flex-wrap items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2.5">
             <p className="eyebrow">Run · {detail.run.app_slug}</p>
             <StatusBadge status={detail.run.status} />
-            <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">
+            <Badge variant="outline" className="font-mono text-[9px] uppercase tracking-[0.08em]">
               {isPlanOnly ? "Plan only" : "Live run"}
             </Badge>
             {onboarding ? (
-              <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">
+              <Badge variant="outline" className="font-mono text-[9px] uppercase tracking-[0.08em]">
                 Phase · {humanize(onboarding.phase)}
               </Badge>
             ) : null}
           </div>
-          <h1 className="mt-3 text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">{detail.run.app_name}</h1>
-          <p className="mt-3 break-all font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">{detail.run.run_id}</p>
+          <h1 className="mt-3 text-3xl tracking-[-0.035em] sm:text-4xl">{detail.run.app_name}</h1>
+          <p className="mt-3 break-all font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">{detail.run.run_id}</p>
         </div>
-        <div className="grid overflow-hidden rounded-xl border border-border bg-border sm:grid-cols-2 xl:min-w-[660px] xl:grid-cols-4">
+        <div className="grid overflow-hidden rounded-lg border border-border bg-border sm:grid-cols-2 xl:min-w-[620px] xl:grid-cols-4">
           <Meta icon={Route} label="Access route" value={humanize(detail.run.route_kind ?? detail.run.access_route)} />
           <Meta icon={Settings2} label="Account" value={detail.run.account_mode ? humanize(detail.run.account_mode) : "Not reported"} />
           <Meta icon={Globe2} label="Browser" value={humanize(detail.run.browser_provider)} />
@@ -153,159 +154,251 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         hitlAction={detail.hitl_request?.action_type}
       />
 
+      {isPlanOnly ? (
+        <Alert className="border-brand-400/25 bg-brand-400/[0.07]">
+          <AlertTitle>Planning completed</AlertTitle>
+          <AlertDescription>
+            Browser, email, HITL, and credential validation were not attempted. Start an execute-mode run to request approved provider actions.
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {missingFields.length ? (
+        <Alert className="border-amber-400/30 bg-amber-400/[0.08] text-amber-950">
+          <AlertTitle>{isPlanOnly ? "Baseline planning completed" : "Configuration or evidence is incomplete"}</AlertTitle>
+          <AlertDescription className="text-amber-800">
+            {isPlanOnly
+              ? `Operational fields were not enriched in Plan Only mode: ${missingFields.map(humanize).join(", ")}.`
+              : `Missing fields: ${missingFields.map(humanize).join(", ")}. Blocked capabilities are not presented as successful.`}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {primaryAction ? <CanonicalPrimaryAction runId={runId} action={primaryAction} /> : null}
+
       {onboarding ? (
         <section aria-labelledby="onboarding-console">
           <div className="mb-3 flex items-end justify-between gap-4">
             <div>
-              <p className="eyebrow">Autonomous onboarding</p>
-              <h2 id="onboarding-console" className="mt-1 text-xl font-semibold">What the agent is doing now</h2>
+              <p className="eyebrow">Current activity</p>
+              <h2 id="onboarding-console" className="mt-1 text-xl font-medium">What is happening now</h2>
             </div>
-            <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">Backend projection</Badge>
+            <Badge variant="outline" className="font-mono text-[9px] uppercase tracking-[0.08em]">Backend projection</Badge>
           </div>
-          <div className="grid items-stretch gap-6 xl:grid-cols-2">
-            <OnboardingFocusPanel state={onboarding} />
-            <ProviderProfilePanel profile={profile} />
-          </div>
+          <OnboardingFocusPanel state={onboarding} />
+          {controls?.can_decide_admission ? (
+            <div className="mt-4 space-y-3">
+              <div>
+                <p className="eyebrow">Review before approval</p>
+                <h3 className="mt-1 text-base font-medium">Committed provider profile</h3>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  Admission is bound to this exact profile digest. Review it before choosing an account path.
+                </p>
+              </div>
+              <ProviderProfilePanel profile={profile} />
+            </div>
+          ) : null}
           {controls ? (
-            <div className="mt-6">
+            <div className="mt-4">
               <OnboardingControlBar
                 runId={runId}
                 state={onboarding}
                 controls={controls}
                 providerName={profile?.provider_name ?? detail.run.app_name}
+                admissionProfileAvailable={profile?.profile_digest === onboarding.profile_digest}
               />
             </div>
           ) : null}
         </section>
       ) : null}
 
-      {isPlanOnly ? (
-        <Alert className="rounded-md border-sky-300 bg-sky-50 text-sky-950">
-          <AlertTitle>Planning completed</AlertTitle>
-          <AlertDescription>
-            Browser, email, HITL, and credential validation were not attempted. Create a new run with Execute when configured to request approved provider actions.
-          </AlertDescription>
-        </Alert>
-      ) : null}
-
-      {missingFields.length ? (
-        <Alert className="rounded-md border-amber-300 bg-amber-50 text-amber-950">
-          <AlertTitle>{isPlanOnly ? "Baseline planning completed" : "Configuration or evidence is incomplete"}</AlertTitle>
-          <AlertDescription>
-            {isPlanOnly
-              ? `Operational fields were not enriched in Plan Only mode: ${missingFields.map(humanize).join(", ")}.`
-              : `Missing fields: ${missingFields.map(humanize).join(", ")}. The interface does not mark blocked capabilities as successful.`}
-          </AlertDescription>
-        </Alert>
-      ) : null}
-
-      {primaryAction ? (
-        <CanonicalPrimaryAction runId={runId} action={primaryAction} />
-      ) : null}
-
-      <section aria-labelledby="phase-map">
-        <div className="mb-3 flex items-end justify-between gap-4"><div><p className="eyebrow">Durable workflow</p><h2 id="phase-map" className="mt-1 text-xl font-semibold">Operational phases</h2></div><Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">Backend state</Badge></div>
-        <PhaseGrid phases={displayPhases} />
-      </section>
-
-      <section className="grid items-stretch gap-6 xl:grid-cols-2">
-        <ResearchPanel research={detail.research} />
-        <div className="grid gap-6">
-          <RouteCard decision={detail.route_decision ?? null} fallbackRoute={detail.run.access_route ?? null} />
-          <SecurityPanel security={detail.security} />
-        </div>
-      </section>
-
-      <section id="browser-session" aria-labelledby="execution-surfaces" className="scroll-mt-6">
-        <div className="mb-3"><p className="eyebrow">Execution surfaces</p><h2 id="execution-surfaces" className="mt-1 text-xl font-semibold">Provider and human gates</h2></div>
-        <div className={hasBrowserSession ? "grid gap-6 lg:grid-cols-2" : "grid gap-6 lg:grid-cols-3"}>
-          <div className={hasBrowserSession ? "lg:col-span-2" : "h-full"}>
-            <CapabilityPanel title="Browser onboarding" icon={Globe2} phase={browserPhase}>
-              {hasBrowserSession ? (
-                <div id="credential-submission" className="scroll-mt-6">
-                  <HitlLiveControls
-                    runId={runId}
-                    browser={browser}
-                    browserStateVersion={detail.run.updated_at}
-                    canResumeInteractive={interactivePlaywrightResume}
-                    fieldName={detail.research?.credential_fields?.[0] ?? "api_token"}
-                    fieldLabel={humanize(detail.research?.credential_fields?.[0] ?? "API token")}
-                    onboarding={onboarding}
-                    controls={controls}
-                  />
-                </div>
-              ) : legacyControls && !primaryAction && isRetryable(browserPhase) ? (
-                <PhaseActionForm runId={runId} action="retry" capability="browser" label="Retry browser phase" />
-              ) : (
-                <ControlUnavailable />
-              )}
-            </CapabilityPanel>
+      {!isPlanOnly ? (
+        <section id="browser-session" aria-labelledby="execution-surfaces" className="scroll-mt-6">
+          <div className="mb-3">
+            <p className="eyebrow">Live execution</p>
+            <h2 id="execution-surfaces" className="mt-1 text-xl font-medium">Browser and human handoff</h2>
           </div>
-          <HitlPanel
-            request={isPlanOnly ? null : detail.hitl_request}
-            action={
-              !legacyControls
-                ? undefined
-                : verificationPending
-                  ? <PhaseActionForm runId={runId} action="poll-email" label="Check verification email" />
-                  : canResume && !interactivePlaywrightResume
-                    ? <PhaseActionForm runId={runId} action="resume" label="Resume after human action" />
-                    : undefined
-            }
-          />
-          <div id="outreach-review" className="h-full scroll-mt-6">
-            <CapabilityPanel title={verificationPending ? "Verification inbox" : "Provider email"} icon={Mail} phase={emailPhase}>
-              {verificationPending ? (
-                <p className="text-xs leading-5 text-muted-foreground">
-                  The connected inbox is being checked automatically. Use the verification action beside the live browser to check immediately.
-                </p>
-              ) : canPoll ? (
-                <PhaseActionForm
-                  runId={runId}
-                  action="poll-email"
-                  label="Check controlled inbox"
-                />
-              ) : legacyControls && !primaryAction && isRetryable(emailPhase) ? (
-                <PhaseActionForm runId={runId} action="retry" capability="email" label="Retry email phase" />
-              ) : (
-                <ControlUnavailable />
-              )}
-            </CapabilityPanel>
-          </div>
-        </div>
-      </section>
-
-      {detail.provider_states?.length ? (
-        <section aria-labelledby="run-providers">
-          <div className="mb-3"><p className="eyebrow">Configuration and policy</p><h2 id="run-providers" className="mt-1 text-xl font-semibold">Run-level configuration and policy</h2></div>
-          <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
-            {detail.provider_states.map((provider) => (
-              <ProviderStateCard key={provider.provider} provider={provider} evidenceScope="run" />
-            ))}
+          <div className={hasBrowserSession ? "grid gap-4 lg:grid-cols-2" : "grid gap-4 lg:grid-cols-3"}>
+            <div className={hasBrowserSession ? "lg:col-span-2" : "h-full"}>
+              <CapabilityPanel title="Browser onboarding" icon={Globe2} phase={browserPhase}>
+                {hasBrowserSession ? (
+                  <div id="credential-submission" className="scroll-mt-6">
+                    <HitlLiveControls
+                      runId={runId}
+                      browser={browser}
+                      browserStateVersion={detail.run.updated_at}
+                      canResumeInteractive={interactivePlaywrightResume}
+                      fieldName={detail.research?.credential_fields?.[0] ?? "api_token"}
+                      fieldLabel={humanize(detail.research?.credential_fields?.[0] ?? "API token")}
+                      onboarding={onboarding}
+                      controls={controls}
+                    />
+                  </div>
+                ) : legacyControls && !primaryAction && isRetryable(browserPhase) ? (
+                  <PhaseActionForm runId={runId} action="retry" capability="browser" label="Retry browser phase" />
+                ) : (
+                  <ControlUnavailable />
+                )}
+              </CapabilityPanel>
+            </div>
+            <HitlPanel
+              request={detail.hitl_request}
+              action={
+                !legacyControls
+                  ? undefined
+                  : verificationPending
+                    ? <PhaseActionForm runId={runId} action="poll-email" label="Check verification email" />
+                    : canResume && !interactivePlaywrightResume
+                      ? <PhaseActionForm runId={runId} action="resume" label="Resume after human action" />
+                      : undefined
+              }
+            />
+            <div id="outreach-review" className="h-full scroll-mt-6">
+              <CapabilityPanel title={verificationPending ? "Verification inbox" : "Provider email"} icon={Mail} phase={emailPhase}>
+                {verificationPending ? (
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    The connected inbox is checked automatically. Use the verification action to check immediately.
+                  </p>
+                ) : canPoll ? (
+                  <PhaseActionForm runId={runId} action="poll-email" label="Check controlled inbox" />
+                ) : legacyControls && !primaryAction && isRetryable(emailPhase) ? (
+                  <PhaseActionForm runId={runId} action="retry" capability="email" label="Retry email phase" />
+                ) : (
+                  <ControlUnavailable />
+                )}
+              </CapabilityPanel>
+            </div>
           </div>
         </section>
       ) : null}
 
-      <section className={primaryAction || !legacyControls ? "grid items-stretch gap-6" : "grid items-stretch gap-6 lg:grid-cols-2"}>
-        <OutputPanel output={output} />
-        {legacyControls && !primaryAction ? <div className="panel rounded-md p-5">
-          <p className="eyebrow">Bounded controls</p>
-          <h2 className="mt-1 text-lg font-semibold">Retry authority</h2>
-          <p className="mt-2 text-xs leading-5 text-muted-foreground">Retries are idempotent backend commands. A configuration-required or no-change receipt is shown as such, never as success.</p>
-          <div className="mt-5 space-y-3 border-t border-border pt-4">
-            <RetryControl label="Research" runId={runId} capability="research" enabled={!isPlanOnly && isRetryable(researchPhase)} />
-            <RetryControl label="Credential validation" runId={runId} capability="validation" enabled={!isPlanOnly && isRetryable(outputPhase)} />
+      {output ? (
+        <section aria-labelledby="validated-output">
+          <div className="mb-3">
+            <p className="eyebrow">Validated output</p>
+            <h2 id="validated-output" className="mt-1 text-xl font-medium">Integration result</h2>
           </div>
-        </div> : null}
-      </section>
+          <OutputPanel output={output} />
+        </section>
+      ) : null}
 
-      <section aria-labelledby="timeline">
-        <div className="mb-3"><p className="eyebrow">Sanitized audit</p><h2 id="timeline" className="mt-1 text-xl font-semibold">Run timeline</h2></div>
+      <DetailDisclosure
+        eyebrow="Workflow context"
+        title="Workflow and evidence"
+        description="Operational phases, reviewed research, and the deterministic route decision."
+      >
+        <div className="space-y-6">
+          <section aria-labelledby="phase-map">
+            <div className="mb-3 flex items-center justify-between gap-4">
+              <h3 id="phase-map" className="text-sm font-medium">Operational phases</h3>
+              <Badge variant="outline" className="font-mono text-[9px] uppercase tracking-[0.08em]">Backend state</Badge>
+            </div>
+            <PhaseGrid phases={displayPhases} />
+          </section>
+          <div className="grid items-stretch gap-4 xl:grid-cols-2">
+            <ResearchPanel research={detail.research} />
+            <RouteCard decision={detail.route_decision ?? null} fallbackRoute={detail.run.access_route ?? null} />
+          </div>
+        </div>
+      </DetailDisclosure>
+
+      <DetailDisclosure
+        eyebrow="Configuration context"
+        title="Providers and security"
+        description="Sanitized provider profile, security controls, and run-scoped configuration state."
+      >
+        <div className="space-y-6">
+          <div className={`grid items-stretch gap-4 ${onboarding && !controls?.can_decide_admission ? "xl:grid-cols-2" : ""}`}>
+            <SecurityPanel security={detail.security} />
+            {onboarding && !controls?.can_decide_admission ? <ProviderProfilePanel profile={profile} /> : null}
+          </div>
+          {detail.provider_states?.length ? (
+            <section aria-labelledby="run-providers">
+              <h3 id="run-providers" className="mb-3 text-sm font-medium">Run-level configuration</h3>
+              <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-3">
+                {detail.provider_states.map((provider) => (
+                  <ProviderStateCard key={provider.provider} provider={provider} evidenceScope="run" />
+                ))}
+              </div>
+            </section>
+          ) : null}
+        </div>
+      </DetailDisclosure>
+
+      {retryControlsVisible || !output ? (
+        <DetailDisclosure
+          eyebrow="Bounded operations"
+          title="Output and retry authority"
+          description={retryActionAvailable
+            ? "A backend-authorized recovery action is available. Expand to review and retry."
+            : "Reference-only output state and idempotent backend retry commands."}
+          initiallyOpen={retryActionAvailable}
+        >
+          <div className={retryControlsVisible ? "grid items-stretch gap-4 lg:grid-cols-2" : "grid gap-4"}>
+            {!output ? <OutputPanel output={null} /> : null}
+            {retryControlsVisible ? (
+              <div className="panel p-5">
+                <p className="eyebrow">Bounded controls</p>
+                <h3 className="mt-1 text-lg font-medium">Retry authority</h3>
+                <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                  Retries are idempotent backend commands. A no-change receipt is never presented as success.
+                </p>
+                <div className="mt-5 space-y-3 border-t border-border pt-4">
+                  <RetryControl label="Research" runId={runId} capability="research" enabled={researchRetryAvailable} />
+                  <RetryControl label="Credential validation" runId={runId} capability="validation" enabled={validationRetryAvailable} />
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </DetailDisclosure>
+      ) : null}
+
+      <DetailDisclosure
+        eyebrow="Sanitized audit"
+        title="Run timeline"
+        description={timelineUnavailable
+          ? "Sanitized audit events are currently unavailable. Expand for details."
+          : "Backend-reported events with sensitive values removed."}
+        initiallyOpen={timelineUnavailable}
+      >
         {timelineUnavailable ? (
-          <Alert className="rounded-md border-amber-300 bg-amber-50"><AlertTitle>Timeline unavailable</AlertTitle><AlertDescription>The backend could not return sanitized events. This is not treated as an empty timeline.</AlertDescription></Alert>
-        ) : <Timeline items={timeline} />}
-      </section>
+          <Alert className="border-amber-400/30 bg-amber-400/[0.08]">
+            <AlertTitle>Timeline unavailable</AlertTitle>
+            <AlertDescription>The backend could not return sanitized events. This is not treated as an empty timeline.</AlertDescription>
+          </Alert>
+        ) : (
+          <Timeline items={timeline} />
+        )}
+      </DetailDisclosure>
     </div>
+  )
+}
+
+function DetailDisclosure({
+  eyebrow,
+  title,
+  description,
+  initiallyOpen = false,
+  children,
+}: {
+  eyebrow: string
+  title: string
+  description: string
+  initiallyOpen?: boolean
+  children: React.ReactNode
+}) {
+  return (
+    <details className="disclosure group" open={initiallyOpen || undefined}>
+      <summary>
+        <div>
+          <p className="eyebrow">{eyebrow}</p>
+          <h2 className="mt-1 text-base font-medium">{title}</h2>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">{description}</p>
+        </div>
+        <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" />
+      </summary>
+      <div className="disclosure-body">{children}</div>
+    </details>
   )
 }
 
@@ -334,40 +427,58 @@ function isRetryable(phase: PhaseState | undefined): boolean {
 }
 
 function RetryControl({ label, runId, capability, enabled }: { label: string; runId: string; capability: RetryCapability; enabled: boolean }) {
-  return <div className="flex items-center justify-between gap-3"><span className="text-xs font-medium">{label}</span>{enabled ? <PhaseActionForm runId={runId} action="retry" capability={capability} label={`Retry ${label.toLowerCase()}`} /> : <StatusBadge status="not_available" />}</div>
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <span className="text-xs font-medium">{label}</span>
+      {enabled ? <PhaseActionForm runId={runId} action="retry" capability={capability} label={`Retry ${label.toLowerCase()}`} /> : <StatusBadge status="not_available" />}
+    </div>
+  )
 }
 
 function ControlUnavailable() {
-  return <p className="font-mono text-[9px] uppercase tracking-[0.1em] text-muted-foreground">No action available in current state</p>
+  return <p className="font-mono text-[9px] uppercase tracking-[0.08em] text-muted-foreground">No action available in current state</p>
 }
 
-function Meta({ icon: Icon, label, value }: { icon: typeof Fingerprint; label: string; value: string }) {
-  return <div className="bg-card p-4 [&:not(:last-child)]:border-b [&:not(:last-child)]:border-border sm:[&:not(:last-child)]:border-b-0 sm:[&:not(:last-child)]:border-r"><span className="flex items-center gap-1.5 data-label"><Icon className="size-3 text-brand-600" aria-hidden="true" />{label}</span><p className="mt-2 text-xs leading-5">{value}</p></div>
+function Meta({ icon: Icon, label, value }: { icon: LucideIcon; label: string; value: string }) {
+  return (
+    <div className="bg-card p-3.5 [&:not(:last-child)]:border-b [&:not(:last-child)]:border-border sm:[&:not(:last-child)]:border-b-0 sm:[&:not(:last-child)]:border-r">
+      <span className="flex items-center gap-1.5 data-label"><Icon className="size-3 text-muted-foreground" aria-hidden="true" />{label}</span>
+      <p className="mt-2 text-xs leading-5">{value}</p>
+    </div>
+  )
 }
 
 function RouteCard({ decision, fallbackRoute }: { decision: { route: string; reason_code: string; explanation: string; is_final?: boolean } | null; fallbackRoute: string | null }) {
   const reportedRoute = decision?.route ?? fallbackRoute ?? "unknown"
   return (
-    <div className="panel rounded-md p-5">
+    <div className="panel h-full p-5">
       <div className="flex items-start justify-between gap-3">
-        <span className="grid size-8 place-items-center rounded-md bg-secondary"><Route className="size-4 text-brand-600" aria-hidden="true" /></span>
+        <Route className="size-4 text-muted-foreground" aria-hidden="true" />
         <div className="flex flex-wrap justify-end gap-2">
           <StatusBadge status={reportedRoute} />
-          <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">
+          <Badge variant="outline" className="font-mono text-[9px] uppercase tracking-[0.08em]">
             {decision?.is_final ? "Final decision" : "Evidence input"}
           </Badge>
         </div>
       </div>
       <p className="mt-5 data-label">Deterministic route</p>
-      <h3 className="mt-1 text-base font-semibold">{humanize(reportedRoute)}</h3>
+      <h3 className="mt-1 text-base font-medium">{humanize(reportedRoute)}</h3>
       <p className="mt-2 text-xs leading-5 text-muted-foreground">{decision?.explanation ?? "The backend has not reported a final route decision."}</p>
-      {decision?.reason_code ? <p className="mt-3 font-mono text-[9px] uppercase tracking-[0.1em] text-muted-foreground">Route reason code · {humanize(decision.reason_code)}</p> : null}
+      {decision?.reason_code ? <p className="mt-3 font-mono text-[9px] uppercase tracking-[0.08em] text-muted-foreground">Route reason code · {humanize(decision.reason_code)}</p> : null}
     </div>
   )
 }
 
 function BackendUnavailable() {
   return (
-    <div className="mx-auto grid min-h-[65vh] max-w-xl place-items-center text-center"><div><CircleOff className="mx-auto size-6 text-muted-foreground" aria-hidden="true" /><p className="eyebrow mt-4">Run unavailable</p><h1 className="mt-2 text-2xl font-semibold">The ledger could not read this run.</h1><p className="mt-3 text-sm leading-6 text-muted-foreground">No run state is fabricated. Confirm the server-only API origin and retry.</p><Button asChild variant="outline" className="mt-6 rounded-md"><Link href="/"><ArrowLeft aria-hidden="true" /> Overview</Link></Button></div></div>
+    <div className="mx-auto grid min-h-[65vh] max-w-xl place-items-center text-center">
+      <div>
+        <CircleOff className="mx-auto size-6 text-muted-foreground" aria-hidden="true" />
+        <p className="eyebrow mt-4">Run unavailable</p>
+        <h1 className="mt-2 text-2xl">The ledger could not read this run.</h1>
+        <p className="mt-3 text-sm leading-6 text-muted-foreground">No run state is fabricated. Confirm the server-only API origin and retry.</p>
+        <Button asChild variant="outline" className="mt-6"><Link href="/"><ArrowLeft aria-hidden="true" /> Overview</Link></Button>
+      </div>
+    </div>
   )
 }
