@@ -50,6 +50,7 @@ returns a classified outcome and commits nothing (Requirement 4.20).
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from time import monotonic
@@ -79,6 +80,7 @@ from ops.core.model_input_dlp import (
     sanitize_url,
     screen_model_input,
 )
+from ops.core.storage import LOOP_STAGE_VALUES
 from ops.onboarding.phase import (
     ONBOARDING_REASON_CODES,
     SESSION_BEARING_PHASES,
@@ -108,6 +110,12 @@ MAX_CANDIDATES: Final = 8
 
 LoopOutcome = Literal["done", "gate", "exhausted", "denied_fatal"]
 LOOP_OUTCOMES: Final[tuple[LoopOutcome, ...]] = get_args(LoopOutcome)
+
+# Where one iteration ended (reliability R4.1). Asserted equal to the durable
+# column's vocabulary, so a stage added here cannot fail a CHECK on a live run.
+LoopStage = Literal["observe", "candidates", "decide", "act", "verify", "gate", "exhausted"]
+LOOP_STAGES: Final[tuple[LoopStage, ...]] = get_args(LoopStage)
+assert LOOP_STAGES == LOOP_STAGE_VALUES, "loop stages must match the progress table's vocabulary"
 
 # The bound a counter reached, in the loop's own words. Used as the key of the
 # bound → reason-code mapping so the two cannot drift apart.
@@ -197,6 +205,40 @@ class LoopBudget:
     def exhaustion_reason(bound: BudgetBound) -> OnboardingReasonCode:
         """The reason code that names ``bound`` (Requirements 4.11-4.14)."""
         return _EXHAUSTION_REASONS[bound]
+
+
+@dataclass(frozen=True, slots=True)
+class StepDeadlines:
+    """A wall-clock bound on each step of one browser operation (R4.7).
+
+    Defaults mirror the ``Settings.onboarding_step_*_timeout_seconds`` defaults; a
+    caller holding a ``Settings`` builds these with :meth:`from_settings`.
+    """
+
+    observe_seconds: float = 20.0
+    decide_seconds: float = 20.0
+    act_seconds: float = 40.0
+    verify_seconds: float = 20.0
+
+    def __post_init__(self) -> None:
+        if (
+            min(self.observe_seconds, self.decide_seconds, self.act_seconds, self.verify_seconds)
+            <= 0
+        ):
+            raise ValueError("every per-step deadline must be positive")
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> StepDeadlines:
+        """The deadlines as the deployment configured them (bounds enforced there)."""
+        return cls(
+            observe_seconds=float(settings.onboarding_step_observe_timeout_seconds),
+            decide_seconds=float(settings.onboarding_step_decide_timeout_seconds),
+            act_seconds=float(settings.onboarding_step_act_timeout_seconds),
+            verify_seconds=float(settings.onboarding_step_verify_timeout_seconds),
+        )
+
+
+DEFAULT_STEP_DEADLINES: Final = StepDeadlines()
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +431,9 @@ class LoopTelemetry(Protocol):
     def model_call(self, *, model_calls: int) -> None:
         """Record one model call and the running count."""
 
+    def progress(self, *, step_index: int, stage: LoopStage, elapsed_ms: int) -> None:
+        """Record that one iteration completed, and where it ended (R4.1)."""
+
 
 # --- the loop ---------------------------------------------------------------
 # Candidate actions that move the page. Only these are checked against the
@@ -509,6 +554,7 @@ async def run_action_loop(
     budget: LoopBudget,
     decider: CandidateDecider,
     telemetry: LoopTelemetry,
+    deadlines: StepDeadlines = DEFAULT_STEP_DEADLINES,
     clock: Callable[[], float] = monotonic,
 ) -> LoopResult:
     """Drive one phase to a classified outcome, or exhaust a bound and stop.
@@ -537,6 +583,10 @@ async def run_action_loop(
           asked to go there.
       I3. no-progress resets only on newly satisfied postconditions.
       I4. the ids the model may return are exactly this iteration's candidates.
+      I5. every iteration reports exactly one progress event, including the ones
+          that acted on nothing — those are what a stuck run consists of (R4.1).
+      I6. every observe, decide, act and verify step is bounded by ``deadlines``,
+          so no single step can freeze the phase (R4.7).
     """
 
     if goal.phase != phase:  # P3
@@ -546,195 +596,254 @@ async def run_action_loop(
     actions = model_calls = denials = no_progress = 0
     satisfied_before: tuple[str, ...] = ()
     iteration = 0
-    seen = await session.observe()
+    step_started = started
+    stage: LoopStage = "observe"
+
+    def report(ended_at: LoopStage) -> None:
+        """One progress row per iteration, so a stalled loop is visible (I5)."""
+
+        progress = getattr(telemetry, "progress", None)
+        if callable(progress):
+            progress(
+                step_index=iteration,
+                stage=ended_at,
+                elapsed_ms=max(int((clock() - step_started) * 1000), 0),
+            )
+
+    async def observe(seconds: float) -> LoopObservation:
+        return await asyncio.wait_for(session.observe(), seconds)
+
+    seen = await observe(deadlines.observe_seconds)
 
     while True:
         observation = seen.observation
         iteration += 1
+        step_started = clock()
+        stage = "observe"
 
-        # --- I1: budgets, fail-closed ---------------------------------------
-        bound = budget.exhausted_bound(
-            actions=actions,
-            model_calls=model_calls,
-            no_progress=no_progress,
-            elapsed_seconds=clock() - started,
-        )
-        if bound is not None:
-            return _result(
-                "exhausted",
-                observation,
-                LoopBudget.exhaustion_reason(bound),
-                actions=actions,
-                model_calls=model_calls,
-                denials=denials,
-            )
-
-        # --- I2: where we actually are, not where we asked to be -------------
-        here = evaluate_navigation(observation.current_url, allowed)
-        if not here.allowed:
-            reason = _host_reason(here.reason_code)
-            denials += 1
-            telemetry.denial(reason)
-            return _result(
-                "denied_fatal",
-                observation,
-                reason,
-                actions=actions,
-                model_calls=model_calls,
-                denials=denials,
-            )
-
-        # --- candidates from policy, never from the model --------------------
-        elements = build_snapshot(seen.raw_elements)
-        candidates = generate_candidates(
-            elements=elements,
-            checkpoint_signals=goal.signals,
-            checkpoint_order=iteration,
-            trace_version=f"phase:{goal.phase}",
-            expected_postcondition=goal.postconditions[0],
-            reviewed_goto_urls=goal.reviewed_goto_urls,
-            allow_value_refs=goal.allow_value_refs,
-            max_candidates=goal.max_candidates,
-        )
-        if not candidates:  # Requirement 4.9: no action executed, observe again
-            no_progress += 1
-            seen = await session.observe()
-            continue
-        options = executable_candidates(candidates)
-        if not options:
-            # Every option on this page is an irreversible or privilege-changing
-            # control. Requirement 4.18: hand it to a human, unexecuted.
-            return _gate(
-                candidates[0],
-                observation,
-                actions=actions,
-                model_calls=model_calls,
-                denials=denials,
-            )
-
-        # --- DLP: the ONLY path from page to model ---------------------------
-        prompt = build_choice_prompt(
-            app_name=goal.provider_name,
-            credential_goal=goal.description,
-            checkpoint_instruction=goal.instruction,
-            checkpoint_signals=goal.signals,
-            current_url=sanitize_url(observation.current_url),
-            page_title=sanitize_page_text(observation.page_title, origin="title"),
-            rendered_candidates=render_candidates(options),
-            rendered_page=render_snapshot(_sanitized(elements)),
-        )
-        screened = screen_model_input(prompt)
-        if not screened.allowed:  # Requirement 4.19, Q5
-            telemetry.dlp_refusal()
-            no_progress += 1
-            seen = await session.observe()
-            continue
-
-        # --- I4: the model may only name an id generated right here -----------
-        candidate_ids = [candidate.candidate_id for candidate in candidates]
-        payload = await decider.choose(
-            screened.prompt, schema=candidate_choice_schema(candidate_ids)
-        )
-        model_calls += 1
-        telemetry.model_call(model_calls=model_calls)
         try:
-            choice = validate_choice(payload, candidate_ids=candidate_ids)
-        except ValueError:  # Requirement 4.5
-            telemetry.reject("action_not_in_candidate_set")
-            no_progress += 1
-            seen = await session.observe()
-            continue
-
-        if choice.decision == "report_hitl":
-            return _gate(
-                None, observation, actions=actions, model_calls=model_calls, denials=denials
-            )
-        if choice.decision == "report_blocked":
-            return _result(
-                "exhausted",
-                observation,
-                "postcondition_failed",
+            # --- I1: budgets, fail-closed -----------------------------------
+            bound = budget.exhausted_bound(
                 actions=actions,
                 model_calls=model_calls,
-                denials=denials,
+                no_progress=no_progress,
+                elapsed_seconds=clock() - started,
             )
-
-        assert choice.candidate_id is not None  # guaranteed by validate_choice
-        selected = _by_id(candidates, choice.candidate_id)
-        if selected is None:  # unreachable while validate_choice holds
-            telemetry.reject("action_not_in_candidate_set")
-            no_progress += 1
-            seen = await session.observe()
-            continue
-        if not selected.executable:  # Requirement 4.18, left unexecuted
-            return _gate(
-                selected, observation, actions=actions, model_calls=model_calls, denials=denials
-            )
-        # Re-checks executability at the policy boundary rather than trusting the
-        # branch above.
-        candidate = select_candidate(candidates, choice.candidate_id)
-
-        # --- re-resolve against THIS iteration's snapshot --------------------
-        if candidate.identity is not None:  # Requirement 4.6
-            resolution, _ = resolve_identity(candidate.identity, elements)
-            if resolution != "resolved":  # Requirements 4.7, 4.8
-                telemetry.reject(
-                    "candidate_identity_not_found"
-                    if resolution == "not_found"
-                    else "candidate_identity_ambiguous"
+            if bound is not None:
+                report("exhausted")
+                return _result(
+                    "exhausted",
+                    observation,
+                    LoopBudget.exhaustion_reason(bound),
+                    actions=actions,
+                    model_calls=model_calls,
+                    denials=denials,
                 )
-                no_progress += 1
-                seen = await session.observe()
-                continue
 
-        if candidate.action in NAVIGATION_ACTIONS:
-            decision = evaluate_navigation(candidate.url or "", allowed)
-            if not decision.allowed:  # Q4: a denial never becomes an allow
-                reason = _host_reason(decision.reason_code)
+            # --- I2: where we actually are, not where we asked to be ---------
+            here = evaluate_navigation(observation.current_url, allowed)
+            if not here.allowed:
+                reason = _host_reason(here.reason_code)
                 denials += 1
                 telemetry.denial(reason)
-                if denials >= budget.max_navigation_denials:
-                    return _result(
-                        "denied_fatal",
-                        observation,
-                        reason,
-                        actions=actions,
-                        model_calls=model_calls,
-                        denials=denials,
-                    )
+                report("observe")
+                return _result(
+                    "denied_fatal",
+                    observation,
+                    reason,
+                    actions=actions,
+                    model_calls=model_calls,
+                    denials=denials,
+                )
+
+            # --- candidates from policy, never from the model ----------------
+            stage = "candidates"
+            elements = build_snapshot(seen.raw_elements)
+            candidates = generate_candidates(
+                elements=elements,
+                checkpoint_signals=goal.signals,
+                checkpoint_order=iteration,
+                trace_version=f"phase:{goal.phase}",
+                expected_postcondition=goal.postconditions[0],
+                reviewed_goto_urls=goal.reviewed_goto_urls,
+                allow_value_refs=goal.allow_value_refs,
+                max_candidates=goal.max_candidates,
+            )
+            if not candidates:  # Requirement 4.9: no action executed, observe again
                 no_progress += 1
-                seen = await session.observe()
+                report("candidates")
+                seen = await observe(deadlines.observe_seconds)
+                continue
+            options = executable_candidates(candidates)
+            if not options:
+                # Every option on this page is an irreversible or privilege-changing
+                # control. Requirement 4.18: hand it to a human, unexecuted.
+                report("gate")
+                return _gate(
+                    candidates[0],
+                    observation,
+                    actions=actions,
+                    model_calls=model_calls,
+                    denials=denials,
+                )
+
+            # --- DLP: the ONLY path from page to model -----------------------
+            stage = "decide"
+            prompt = build_choice_prompt(
+                app_name=goal.provider_name,
+                credential_goal=goal.description,
+                checkpoint_instruction=goal.instruction,
+                checkpoint_signals=goal.signals,
+                current_url=sanitize_url(observation.current_url),
+                page_title=sanitize_page_text(observation.page_title, origin="title"),
+                rendered_candidates=render_candidates(options),
+                rendered_page=render_snapshot(_sanitized(elements)),
+            )
+            screened = screen_model_input(prompt)
+            if not screened.allowed:  # Requirement 4.19, Q5
+                telemetry.dlp_refusal()
+                no_progress += 1
+                report("decide")
+                seen = await observe(deadlines.observe_seconds)
                 continue
 
-        # --- act, then classify against a FRESH observation -------------------
-        await session.act(candidate)
-        actions += 1
-        telemetry.action(candidate_id=candidate.candidate_id, actions_executed=actions)
+            # --- I4: the model may only name an id generated right here -------
+            candidate_ids = [candidate.candidate_id for candidate in candidates]
+            payload = await asyncio.wait_for(
+                decider.choose(screened.prompt, schema=candidate_choice_schema(candidate_ids)),
+                deadlines.decide_seconds,
+            )
+            model_calls += 1
+            telemetry.model_call(model_calls=model_calls)
+            try:
+                choice = validate_choice(payload, candidate_ids=candidate_ids)
+            except ValueError:  # Requirement 4.5
+                telemetry.reject("action_not_in_candidate_set")
+                no_progress += 1
+                report("decide")
+                seen = await observe(deadlines.observe_seconds)
+                continue
 
-        seen = await session.observe()
-        check = check_postconditions(goal, seen.observation, previously_satisfied=satisfied_before)
-        if check.all_met:  # Q1
-            return _result(
-                "done",
-                seen.observation,
-                goal.success_reason_code,
-                actions=actions,
-                model_calls=model_calls,
-                denials=denials,
+            if choice.decision == "report_hitl":
+                report("gate")
+                return _gate(
+                    None, observation, actions=actions, model_calls=model_calls, denials=denials
+                )
+            if choice.decision == "report_blocked":
+                # The chain answered and named no candidate action: unusable, not a
+                # spent bound (reliability R4.6).
+                report("decide")
+                return _result(
+                    "exhausted",
+                    observation,
+                    "decision_unusable",
+                    actions=actions,
+                    model_calls=model_calls,
+                    denials=denials,
+                )
+
+            assert choice.candidate_id is not None  # guaranteed by validate_choice
+            selected = _by_id(candidates, choice.candidate_id)
+            if selected is None:  # unreachable while validate_choice holds
+                telemetry.reject("action_not_in_candidate_set")
+                no_progress += 1
+                report("decide")
+                seen = await observe(deadlines.observe_seconds)
+                continue
+            if not selected.executable:  # Requirement 4.18, left unexecuted
+                report("gate")
+                return _gate(
+                    selected, observation, actions=actions, model_calls=model_calls, denials=denials
+                )
+            # Re-checks executability at the policy boundary rather than trusting the
+            # branch above.
+            candidate = select_candidate(candidates, choice.candidate_id)
+
+            # --- re-resolve against THIS iteration's snapshot ----------------
+            if candidate.identity is not None:  # Requirement 4.6
+                resolution, _ = resolve_identity(candidate.identity, elements)
+                if resolution != "resolved":  # Requirements 4.7, 4.8
+                    telemetry.reject(
+                        "candidate_identity_not_found"
+                        if resolution == "not_found"
+                        else "candidate_identity_ambiguous"
+                    )
+                    no_progress += 1
+                    report("decide")
+                    seen = await observe(deadlines.observe_seconds)
+                    continue
+
+            stage = "act"
+            if candidate.action in NAVIGATION_ACTIONS:
+                decision = evaluate_navigation(candidate.url or "", allowed)
+                if not decision.allowed:  # Q4: a denial never becomes an allow
+                    reason = _host_reason(decision.reason_code)
+                    denials += 1
+                    telemetry.denial(reason)
+                    if denials >= budget.max_navigation_denials:
+                        report("act")
+                        return _result(
+                            "denied_fatal",
+                            observation,
+                            reason,
+                            actions=actions,
+                            model_calls=model_calls,
+                            denials=denials,
+                        )
+                    no_progress += 1
+                    report("act")
+                    seen = await observe(deadlines.observe_seconds)
+                    continue
+
+            # --- act, then classify against a FRESH observation ---------------
+            await asyncio.wait_for(session.act(candidate), deadlines.act_seconds)
+            actions += 1
+            telemetry.action(candidate_id=candidate.candidate_id, actions_executed=actions)
+
+            stage = "verify"
+            seen = await observe(deadlines.verify_seconds)
+            check = check_postconditions(
+                goal, seen.observation, previously_satisfied=satisfied_before
             )
-        if seen.observation.human_action_type is not None:
-            # The page itself now needs a human. Its own reason code is kept when it
-            # is one of ours (`captcha_detected`, …) so the driver can act on it.
-            return _result(
-                "gate",
-                seen.observation,
-                _page_gate_reason(seen.observation),
-                actions=actions,
-                model_calls=model_calls,
-                denials=denials,
-            )
-        no_progress = 0 if check.any_progress else no_progress + 1  # I3
-        satisfied_before = check.satisfied
+            if check.all_met:  # Q1
+                report("verify")
+                return _result(
+                    "done",
+                    seen.observation,
+                    goal.success_reason_code,
+                    actions=actions,
+                    model_calls=model_calls,
+                    denials=denials,
+                )
+            if seen.observation.human_action_type is not None:
+                # The page itself now needs a human. Its own reason code is kept when
+                # it is one of ours (`captcha_detected`, …) so the driver can act.
+                report("gate")
+                return _result(
+                    "gate",
+                    seen.observation,
+                    _page_gate_reason(seen.observation),
+                    actions=actions,
+                    model_calls=model_calls,
+                    denials=denials,
+                )
+            no_progress = 0 if check.any_progress else no_progress + 1  # I3
+            satisfied_before = check.satisfied
+            report("verify")
+        except TimeoutError:
+            # I6: a step that outran its deadline. Only ``act`` may have landed a
+            # side effect we cannot see, so only it ends the phase.
+            report(stage)
+            if stage == "act":
+                return _result(
+                    "exhausted",
+                    observation,
+                    "outcome_unknown",
+                    actions=actions,
+                    model_calls=model_calls,
+                    denials=denials,
+                )
+            no_progress += 1
 
 
 def _result(
@@ -849,7 +958,9 @@ def _host_reason(reason_code: str) -> OnboardingReasonCode:
 
 
 __all__ = [
+    "DEFAULT_STEP_DEADLINES",
     "LOOP_OUTCOMES",
+    "LOOP_STAGES",
     "MAX_ACTIONS",
     "NAVIGATION_ACTIONS",
     "MAX_CANDIDATES",
@@ -865,9 +976,11 @@ __all__ = [
     "LoopOutcome",
     "LoopResult",
     "LoopSession",
+    "LoopStage",
     "LoopTelemetry",
     "PhaseGoal",
     "PostconditionCheck",
+    "StepDeadlines",
     "check_postconditions",
     "run_action_loop",
 ]

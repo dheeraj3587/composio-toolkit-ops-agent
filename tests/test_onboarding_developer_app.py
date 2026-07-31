@@ -156,6 +156,9 @@ class _Telemetry:
     def model_call(self, *, model_calls: int) -> None:
         return None
 
+    def progress(self, *, step_index: int, stage: str, elapsed_ms: int) -> None:
+        return None
+
 
 def _deps(sessions: _Sessions) -> OnboardingDeps:
     """The driver's dep bundle, wired only where this phase reads it."""

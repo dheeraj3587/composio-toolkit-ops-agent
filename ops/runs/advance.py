@@ -59,6 +59,8 @@ class RunAdvanceContext(Protocol):
 
     def reconcile_idle_browser_runs(self, *, limit: int = 100) -> int: ...
 
+    def mark_stale_runs(self, *, limit: int = 100) -> int: ...
+
     def _reconcile_stranded_runs(self) -> None: ...
 
 
@@ -115,6 +117,10 @@ class RunAdvanceService:
                 pass
             try:
                 self._context.reconcile_idle_browser_runs()
+            except Exception:  # pragma: no cover - the loop must never die
+                pass
+            try:
+                self._context.mark_stale_runs()
             except Exception:  # pragma: no cover - the loop must never die
                 pass
 

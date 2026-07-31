@@ -71,6 +71,7 @@ def test_a_denied_navigation_leaves_a_durable_fact(storage, tmp_path) -> None:
         run_id="run-denied",
         phase="developer_app",
         profile_digest=DIGEST,
+        correlation_id="a" * 32,
     )
     goal = PhaseGoal.for_phase(
         "developer_app",
@@ -117,6 +118,7 @@ def test_denial_facts_accumulate_and_refuse_a_code_outside_the_vocabulary(storag
         run_id="run-denied",
         phase="signup",
         profile_digest=DIGEST,
+        correlation_id="a" * 32,
     )
 
     telemetry.denial("browser_host_not_in_app_policy")

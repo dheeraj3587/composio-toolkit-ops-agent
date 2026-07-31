@@ -64,6 +64,13 @@ class RunQueryService:
             return []
         return self.storage.list_audit_events(run_id)
 
+    def get_progress_events(self, run_id: str, *, limit: int) -> list[dict[str, Any]]:
+        """The run's loop progress events, newest first (Requirement 4.2)."""
+
+        if self.storage.get_run(run_id) is None:
+            return []
+        return self.storage.list_progress_events(run_id, limit=limit)
+
     def get_research(self, run_id: str) -> OperationalResearch | None:
         """Return the persisted sanitized research projection for a run."""
 
