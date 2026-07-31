@@ -16,8 +16,11 @@ Risk levels:
 * ``state_changing`` — submits/navigates in a way the vendor may act on
   (click, press, goto). Allowed autonomously only when the reviewed checkpoint
   authorizes progressing here.
-* ``irreversible`` — creates, destroys, authorizes, spends, publishes, or
-  reveals a credential. NEVER autonomous.
+* ``irreversible`` — destroys credentials or accounts, authorizes privilege,
+  spends, publishes, or exposes a credential. These actions are never autonomous.
+  Credential creation/generation and the save that commits that reviewed flow are
+  the narrow exception: they may run only when the immutable run policy explicitly
+  authorizes ``create_if_missing``.
 """
 
 from __future__ import annotations
@@ -76,9 +79,12 @@ class BrowserActionRiskPolicy:
         candidate: ActionCandidate,
         checkpoint: BrowserApiTraceStep,
         element: SnapshotElement | None,
+        credential_creation_authorized: bool = False,
     ) -> RiskDecision:
         # 1) The candidate generator may already have flagged the intent as
-        # requiring a human; that verdict is never downgraded here.
+        # requiring a human; that verdict is never downgraded here. Credential
+        # create/generate/save candidates are deliberately not pre-flagged, so
+        # their explicit run authority is evaluated by the verb policy below.
         if candidate.risk == "requires_hitl":
             return RiskDecision(
                 level="irreversible",
@@ -89,14 +95,37 @@ class BrowserActionRiskPolicy:
         label = f"{candidate.semantic_target} {element.name if element is not None else ''}"
         lowered = label.casefold()
 
-        # 2) An irreversible VERB on an actual control (we only ever inspect the
-        # control's own label, never page prose) is never autonomous.
+        # 2) Consequential VERBS are matched only on the actual control label,
+        # never page prose. Creation/generation and its persistence step are
+        # allowed solely under the immutable create-if-missing run authority.
+        # Exposure, destructive, privilege, money, legal, and outbound effects
+        # remain denied regardless of that authority.
         for pattern, category in _IRREVERSIBLE_VERBS:
             if re.search(pattern, lowered):
                 # A read-only action (focus/scroll) on such a control does not
                 # trigger it, so it stays safe.
                 if candidate.action in READ_ONLY_ACTIONS:
                     break
+                if credential_creation_authorized and category in {"creation", "persist"}:
+                    candidate_names = {
+                        " ".join(candidate.semantic_target.casefold().split()),
+                        " ".join((element.name if element is not None else "").casefold().split()),
+                    }
+                    reviewed_names = {
+                        " ".join(name.casefold().split())
+                        for name in checkpoint.credential_creation_controls
+                    }
+                    if candidate_names & reviewed_names:
+                        return RiskDecision(
+                            level="state_changing",
+                            autonomous_allowed=True,
+                            reason_code=f"authorized_credential_{category}",
+                        )
+                    return RiskDecision(
+                        level="irreversible",
+                        autonomous_allowed=False,
+                        reason_code="credential_creation_control_not_reviewed",
+                    )
                 return RiskDecision(
                     level="irreversible",
                     autonomous_allowed=False,

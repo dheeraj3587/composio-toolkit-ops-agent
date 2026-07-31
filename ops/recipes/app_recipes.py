@@ -13,8 +13,10 @@ from urllib.parse import parse_qsl, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from ops.browser.setup_values import APPROVED_BROWSER_VALUE_REFS
+
 if TYPE_CHECKING:
-    from ops.browser.api_trace_catalog import BrowserApiTrace
+    from ops.browser.api_trace_catalog import BrowserApiTrace, CheckpointPredicate
     from ops.core.models import OperationalResearch
     from ops.credentials.capture_specs import CredentialCaptureSpec
     from ops.credentials.validator import CredentialValidationPolicy
@@ -47,6 +49,7 @@ CredentialFieldKind = Literal[
     "client_secret",
 ]
 CaptureMode = Literal["managed_connection", "automatic", "owner_submit", "none"]
+CaptureSource = Literal["input_value", "text"]
 BrowserRecipeScope = Literal["entry_only", "credential_surface"]
 BrowserAction = Literal["navigate", "authenticate_then_navigate", "capture_boundary"]
 SignupFlow = Literal["email_first"]
@@ -224,17 +227,38 @@ class SuccessPredicate(_RecipeModel):
 
 
 class BrowserStep(_RecipeModel):
-    order: int = Field(ge=1, le=12)
+    order: int = Field(ge=1, le=20)
     action: BrowserAction
     target_url: str | None
     instruction: str = Field(min_length=1, max_length=2_000)
     completion: SuccessPredicate
     hitl_gates: tuple[HitlGate, ...] = Field(default=(), max_length=10)
+    # Exact non-secret references this step may place into provider controls.
+    # Values are resolved only from immutable run input; page text and model
+    # output can never become a form value.
+    allowed_value_refs: tuple[str, ...] = Field(default=(), max_length=20)
+    # Exact accessible names of reviewed Create/Generate/Save controls. Merely
+    # setting create_if_missing on a run is insufficient: both the run and this
+    # recipe-owned allowlist must authorize the control.
+    credential_creation_controls: tuple[str, ...] = Field(default=(), max_length=20)
 
     @field_validator("target_url")
     @classmethod
     def validate_target(cls, value: str | None) -> str | None:
         return None if value is None else _https_url(value, "browser step target")
+
+    @field_validator("allowed_value_refs")
+    @classmethod
+    def validate_value_refs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        refs = _unique(value, "browser step value references", 20)
+        if set(refs) - APPROVED_BROWSER_VALUE_REFS:
+            raise ValueError("browser step contains an unapproved value reference")
+        return refs
+
+    @field_validator("credential_creation_controls")
+    @classmethod
+    def validate_creation_controls(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _unique(value, "browser step creation controls", 20)
 
     @model_validator(mode="after")
     def validate_step(self) -> Self:
@@ -242,6 +266,8 @@ class BrowserStep(_RecipeModel):
             raise ValueError("browser step needs a positive predicate")
         if len(self.hitl_gates) != len(set(self.hitl_gates)):
             raise ValueError("HITL gates contain duplicates")
+        if self.credential_creation_controls and self.action != "capture_boundary":
+            raise ValueError("credential creation controls require a capture-boundary step")
         return self
 
 
@@ -355,36 +381,70 @@ class CredentialField(_RecipeModel):
     secret: bool
 
 
+class CaptureFieldSpec(_RecipeModel):
+    """One exact field read by the trusted capture boundary."""
+
+    field_name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,99}$")
+    selectors: tuple[str, ...] = Field(min_length=1, max_length=20)
+    value_pattern: str = Field(min_length=1, max_length=500)
+    source: CaptureSource = "input_value"
+    reveal_selector: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_field(self) -> Self:
+        _unique(self.selectors, "capture field selectors", 20)
+        try:
+            re.compile(self.value_pattern)
+        except re.error as exc:
+            raise ValueError("capture pattern is invalid") from exc
+        return self
+
+
 class CaptureSpec(_RecipeModel):
     mode: CaptureMode
+    # Legacy single-field representation. It remains readable for checked-in
+    # snapshots while new recipes use ``fields`` for one or more values.
     field_name: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,99}$")
     selectors: tuple[str, ...] = Field(default=(), max_length=20)
     value_pattern: str | None = Field(default=None, max_length=500)
+    reveal_selector: str | None = Field(default=None, max_length=500)
+    fields: tuple[CaptureFieldSpec, ...] = Field(default=(), max_length=20)
     expected_path_prefix: str | None = Field(default=None, max_length=300)
     expected_heading: str | None = Field(default=None, max_length=200)
-    reveal_selector: str | None = Field(default=None, max_length=500)
+
+    @property
+    def capture_fields(self) -> tuple[CaptureFieldSpec, ...]:
+        if self.fields:
+            return self.fields
+        if self.field_name and self.selectors and self.value_pattern:
+            return (
+                CaptureFieldSpec(
+                    field_name=self.field_name,
+                    selectors=self.selectors,
+                    value_pattern=self.value_pattern,
+                    reveal_selector=self.reveal_selector,
+                ),
+            )
+        return ()
 
     @model_validator(mode="after")
     def validate_capture(self) -> Self:
         _unique(self.selectors, "capture selectors", 20)
-        detailed = (
-            self.field_name,
-            self.selectors,
-            self.value_pattern,
-            self.expected_path_prefix,
-            self.expected_heading,
-            self.reveal_selector,
-        )
+        legacy = (self.field_name, self.selectors, self.value_pattern, self.reveal_selector)
+        common = (self.expected_path_prefix, self.expected_heading)
         if self.mode != "automatic":
-            if any(detailed):
+            if self.fields or any(legacy) or any(common):
                 raise ValueError("non-automatic capture has extra fields")
             return self
-        if not all(detailed[:5]):
+        if not all(common):
+            raise ValueError("automatic capture page contract is incomplete")
+        if self.fields and any(legacy):
+            raise ValueError("automatic capture cannot mix legacy and multi-field shapes")
+        if not self.fields and not all(legacy[:3]):
             raise ValueError("automatic capture spec is incomplete")
-        try:
-            re.compile(self.value_pattern or "")
-        except re.error as exc:
-            raise ValueError("capture pattern is invalid") from exc
+        names = tuple(field.field_name for field in self.capture_fields)
+        if len(names) != len(set(names)):
+            raise ValueError("automatic capture field names contain duplicates")
         return self
 
 
@@ -564,10 +624,17 @@ class AppRecipe(_RecipeModel):
         ):
             raise ValueError("browser-ready contract is incomplete")
         field_names = {field.name for field in self.credential_fields}
+        capture_fields = self.capture.capture_fields
+        captured_names = {field.field_name for field in capture_fields}
+        validation_fields = {self.validation.credential_field}
+        if self.validation.username_field is not None:
+            validation_fields.add(self.validation.username_field)
+        capture_selectors = {selector for field in capture_fields for selector in field.selectors}
         if (
-            self.capture.field_name not in field_names
-            or self.validation.credential_field not in field_names
-            or not set(self.capture.selectors) <= set(self.browser.sensitive_selectors)
+            not capture_fields
+            or not captured_names <= field_names
+            or not validation_fields <= captured_names
+            or not capture_selectors <= set(self.browser.sensitive_selectors)
         ):
             raise ValueError("secret boundary is inconsistent")
         return self
@@ -734,14 +801,24 @@ def get_app_browser_trace(app_slug: str) -> BrowserApiTrace | None:
     return recipe_to_browser_trace(recipe) if recipe is not None else None
 
 
+def recipe_predicate(value: SuccessPredicate) -> CheckpointPredicate:
+    """Convert one reviewed recipe predicate into the execution DTO's predicate."""
+
+    from ops.browser.api_trace_catalog import CheckpointPredicate
+
+    return CheckpointPredicate(
+        url_path_contains=value.url_path_contains,
+        title_contains=value.title_contains,
+        visible_text_contains=value.visible_text_contains,
+        required_accessible_names=value.required_accessible_names,
+        forbidden_text=value.forbidden_text,
+    )
+
+
 def recipe_to_browser_trace(recipe: AppRecipe) -> BrowserApiTrace | None:
     """Project one already-bound recipe without consulting the live catalog."""
 
-    from ops.browser.api_trace_catalog import (
-        BrowserApiTrace,
-        BrowserApiTraceStep,
-        CheckpointPredicate,
-    )
+    from ops.browser.api_trace_catalog import BrowserApiTrace, BrowserApiTraceStep
 
     if recipe.route_kind != "playwright" or recipe.browser is None:
         return None
@@ -755,15 +832,7 @@ def recipe_to_browser_trace(recipe: AppRecipe) -> BrowserApiTrace | None:
     if start_url is None:  # guarded by AppRecipe validation
         return None
 
-    def predicate(value: SuccessPredicate) -> CheckpointPredicate:
-        return CheckpointPredicate(
-            url_path_contains=value.url_path_contains,
-            title_contains=value.title_contains,
-            visible_text_contains=value.visible_text_contains,
-            required_accessible_names=value.required_accessible_names,
-            forbidden_text=value.forbidden_text,
-        )
-
+    predicate = recipe_predicate
     relevant_steps = browser.steps[1:] if browser.scope == "credential_surface" else browser.steps
     checkpoints = tuple(
         BrowserApiTraceStep(
@@ -781,7 +850,8 @@ def recipe_to_browser_trace(recipe: AppRecipe) -> BrowserApiTrace | None:
             )
             or (step.instruction,),
             completion=predicate(step.completion),
-            allowed_value_refs=(),
+            allowed_value_refs=step.allowed_value_refs,
+            credential_creation_controls=step.credential_creation_controls,
             # Recipe HITL gates describe conditions that trigger a pause; they are
             # not unconditional manual checkpoints. The deterministic gate detector
             # enforces them when they are actually present on the page.
@@ -822,31 +892,48 @@ def get_app_capture_spec(app_slug: str) -> CredentialCaptureSpec | None:
 
 
 def recipe_to_capture_spec(recipe: AppRecipe) -> CredentialCaptureSpec | None:
-    """Project capture policy from an immutable run recipe."""
+    """Project the immutable recipe into a code-owned capture contract."""
 
-    from ops.credentials.capture_specs import CredentialCaptureSpec
+    from ops.credentials.capture_specs import (
+        CredentialCaptureFieldSpec,
+        CredentialCaptureSpec,
+    )
 
+    fields = recipe.capture.capture_fields
     if (
         recipe.route_kind != "playwright"
         or recipe.capture.mode != "automatic"
         or recipe.urls.credential_management is None
-        or recipe.capture.field_name is None
-        or recipe.capture.value_pattern is None
+        or not fields
     ):
         return None
     hostname = (urlsplit(recipe.urls.credential_management).hostname or "").casefold()
     if not hostname:  # guarded by URL validation
         return None
+    projected = tuple(
+        CredentialCaptureFieldSpec(
+            field_kind=field.field_name,
+            value_pattern=field.value_pattern,
+            selectors=field.selectors,
+            source=field.source,
+            reveal_selector=field.reveal_selector,
+        )
+        for field in fields
+    )
+    # Populate the legacy properties only for a single field so old direct
+    # callers remain source-compatible. Execution consumes ``capture_fields``.
+    only = projected[0] if len(projected) == 1 else None
     return CredentialCaptureSpec(
         app_slug=recipe.app_slug,
         url=recipe.urls.credential_management,
         vendor_domain=hostname,
-        field_kind=recipe.capture.field_name,
-        value_pattern=recipe.capture.value_pattern,
-        selectors=recipe.capture.selectors,
+        field_kind=(only.field_kind if only is not None else None),
+        value_pattern=(only.value_pattern if only is not None else None),
+        selectors=(only.selectors if only is not None else ()),
         expected_path_prefix=recipe.capture.expected_path_prefix,
         expected_heading=recipe.capture.expected_heading,
-        reveal_selector=recipe.capture.reveal_selector,
+        reveal_selector=(only.reveal_selector if only is not None else None),
+        fields=projected,
     )
 
 
@@ -887,6 +974,8 @@ __all__ = [
     "BrowserRecipeScope",
     "BrowserStep",
     "CaptureMode",
+    "CaptureSource",
+    "CaptureFieldSpec",
     "CaptureSpec",
     "CredentialField",
     "CredentialFieldKind",
@@ -906,6 +995,7 @@ __all__ = [
     "get_app_validation_policy",
     "load_app_recipe_catalog",
     "parse_app_recipe_catalog",
+    "recipe_predicate",
     "recipe_to_browser_trace",
     "recipe_to_capture_spec",
     "recipe_to_operational_research",

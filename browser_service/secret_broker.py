@@ -189,15 +189,21 @@ class BrokerCaptureStore:
         self,
         *,
         broker: BrowserSecretBrokerClient,
-        grant: str,
+        grant: str | None = None,
+        grants: dict[str, str] | None = None,
         app_slug: str,
         scope_id: str,
         session_id: str,
         owner: str,
         capability: str,
     ) -> None:
+        if grant is not None and grants:
+            raise ValueError("capture store accepts one grant representation")
+        if grant is None and not grants:
+            raise ValueError("capture store requires a broker grant")
         self._broker = broker
         self._grant = grant
+        self._grants = dict(grants or {})
         self._app_slug = app_slug
         self._scope_id = scope_id
         self._session_id = session_id
@@ -210,8 +216,14 @@ class BrokerCaptureStore:
                 capability="browser secret broker",
                 reason_code="browser_capture_not_authorized",
             )
+        grant = self._grants.get(kind) if self._grants else self._grant
+        if grant is None:
+            raise ProviderOperationError(
+                capability="browser secret broker",
+                reason_code="browser_capture_not_authorized",
+            )
         return self._broker.capture(
-            grant=self._grant,
+            grant=grant,
             app_slug=self._app_slug,
             kind=kind,
             scope_id=self._scope_id,

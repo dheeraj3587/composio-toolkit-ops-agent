@@ -6,10 +6,10 @@
   "navigation_mode": "strict_ordered_checkpoints",
   "divergence_action": "If a named checkpoint is absent, the account or workspace is ambiguous, or the next action would leave the approved host allowlist, stop with human_action_required for provider_verification. Do not explore unrelated settings, use a search engine, or guess another route.",
   "global_hard_stops": [
-    "Stop before entering or reading a password, credential value, cookie, API key, token, client secret, authorization code, OTP, TOTP, passkey, or private key.",
-    "Stop for CAPTCHA, email or phone verification, MFA, passkey, security key, device approval, account selection, legal consent, billing, provider review, or an irreversible confirmation.",
-    "Search for an existing developer application before opening a creation flow, and never create, modify, or delete an application unless the run supplies an exact idempotent name and explicit authorization.",
-    "Stop when the credential page or credential field labels are visible; never reveal, generate, copy, transcribe, summarize, or return a credential value."
+    "Passwords, OTPs, cookies, authorization codes, and credential values may be submitted or consumed only through approved code-owned secret placeholders and broker operations; never place plaintext in a model prompt, log, screenshot, summary, audit event, or API response.",
+    "Pause only for a genuine provider-imposed challenge that has no approved code-owned continuation, such as an interactive CAPTCHA, passkey or hardware-key ceremony, device approval, legal consent, billing, provider review, or ambiguous account selection; passive badges and ordinary credential fields are not human gates.",
+    "Search for an existing developer application first. When the run supplies an exact idempotent name and credential_creation_policy=create_if_missing, autonomously create the missing application or credential and commit its reviewed save step; never modify or delete an unrelated application.",
+    "When the reviewed credential surface or field labels are visible, enter the secret-capture boundary instead of requesting a human. The trusted broker may reveal, generate, and capture the value directly into the vault; never transcribe or return plaintext, and expose only a vault reference outside that boundary."
   ],
   "apps": [
     {
