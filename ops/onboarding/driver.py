@@ -108,6 +108,7 @@ from ops.browser.host_policy import BrowserAllowedHosts, evaluate_navigation
 from ops.browser.metrics import OnboardingCorrelation
 from ops.browser.worker import BrowserObservation, HumanActionType
 from ops.core.effect_ledger import EffectStore
+from ops.core.inference import DecisionFailed, DecisionReasonCode
 from ops.core.model_input_dlp import sanitize_url
 from ops.core.models import HitlRequest
 from ops.core.private_files import finalize_private_database, prepare_private_database
@@ -131,6 +132,7 @@ from ops.onboarding.action_loop import (
     LoopSession,
     LoopTelemetry,
     PhaseGoal,
+    StepDeadlines,
     check_postconditions,
     run_action_loop,
 )
@@ -179,6 +181,15 @@ from ops.onboarding.phase import (
     legal_phase_targets,
     validate_phase_transition,
 )
+from ops.planner.decide import PlanOutcome
+from ops.planner.plan import RunPlan
+from ops.planner.store import RunPlanStore
+from ops.planner.validator import (
+    CREDENTIAL_SURFACE_ORDINAL,
+    PLAN_REFUSAL_REASON_CODE,
+    PlanRefusal,
+    validate_plan,
+)
 from ops.providers.profile import (
     APPROVAL_REQUIREMENTS,
     BILLING_REQUIREMENTS,
@@ -192,6 +203,7 @@ from ops.providers.profile import (
     ProviderProfile,
 )
 from ops.providers.profile_store import ProviderProfileStore
+from ops.recipes.app_recipes import AppRecipe, get_app_recipe
 
 if TYPE_CHECKING:  # pragma: no cover - imported for typing only
     # Typing-only so the driver stays free of the settings/pydantic-settings
@@ -1879,6 +1891,19 @@ class LoginReferenceBinder(Protocol):
         """
 
 
+class RunPlanner(Protocol):
+    """Produce a pre-flight plan for one reviewed recipe."""
+
+    def plan_for(self, *, recipe: AppRecipe, revision: int) -> PlanOutcome | PlanRefusal:
+        """Return a plan outcome or a typed refusal."""
+
+
+class RunPlanValidator(Protocol):
+    """Validate a plan against its reviewed recipe."""
+
+    def __call__(self, plan: RunPlan, *, recipe: AppRecipe) -> PlanRefusal | None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class OnboardingDeps:
     """Everything :func:`drive_run` needs, injected at the composition root.
@@ -1934,11 +1959,21 @@ class OnboardingDeps:
     # Where a one-time verification code is staged so it resolves inside the
     # browser process rather than here (Requirement 7.32).
     vault: VerificationSecretVault | None = None
+    # Where the run's plan is recorded and read back, and where it comes from.
+    # Both optional, and either one missing leaves planning inert: no plan row is
+    # written, adherence has nothing to compare against, and the run is driven
+    # exactly as a deployment without a planner drives it.
+    plans: RunPlanStore | None = None
+    planner: RunPlanner | None = None
+    plan_validator: RunPlanValidator = validate_plan
     # The run's standing effect reservations, read-only. Feeds the duplicate-skip
     # and ambiguous-outcome counters on the autonomy outcome; nothing on this port
     # can reserve or complete an effect.
     effects: RecoveryEffectReader | None = None
     budget: LoopBudget = field(default_factory=LoopBudget)
+    # The per-step bound on one browser operation, so a hung step cannot freeze a
+    # phase (reliability R4.7).
+    deadlines: StepDeadlines = field(default_factory=StepDeadlines)
     # ``None`` means the module default, resolved where it is used rather than
     # here: both budget types are declared further down the module, next to the
     # ladders they bound.
@@ -2022,6 +2057,29 @@ def _standing_reservations(
     if phase is None:
         return records
     return tuple(record for record in records if record.phase == phase)
+
+
+# The two decision causes a raised chain can report, kept apart because they ask
+# different things of the operator: a transport failure is a quota or an outage,
+# an unusable payload is a provider that answered badly (R4.5, R4.6). The third
+# cause — no provider key configured — is named where the chain is built, by
+# ``ops.onboarding.composition.DECIDER_UNAVAILABLE`` (R4.4).
+_DECISION_PAUSE_REASONS: Final[dict[DecisionReasonCode, OnboardingReasonCode]] = {
+    "rate_limited": "decision_provider_failed",
+    "authentication_failed": "decision_provider_failed",
+    "provider_timeout": "decision_provider_failed",
+    "all_providers_failed": "decision_provider_failed",
+    "invalid_json": "decision_unusable",
+    "schema_invalid": "decision_unusable",
+}
+
+
+def step_for_decision_failure(failure: DecisionFailed) -> PhaseStep:
+    """Pause naming which decision cause stopped the phase (R4.5, R4.6, R4.11)."""
+
+    return PhaseStep.pause(
+        _DECISION_PAUSE_REASONS.get(failure.reason_code, "decision_provider_failed")
+    )
 
 
 def step_for_loop_result(phase: OnboardingPhase, result: LoopResult) -> PhaseStep:
@@ -2144,6 +2202,100 @@ def resumption_phase(history: Sequence[PhaseTransition]) -> tuple[OnboardingPhas
     return (INITIAL_PHASE, 0)
 
 
+def has_entered_a_session(history: Sequence[PhaseTransition]) -> bool:
+    """Whether the run is already past admission — past its first session phase.
+
+    A run that is already there when planning is introduced keeps the behaviour it
+    started with: nothing is planned for it and adherence stays inert, because a
+    plan produced mid-walk would be compared against steps the run already took.
+    """
+
+    return any(boundary.to_phase in SESSION_BEARING_PHASES for boundary in history)
+
+
+class RunPlanningPorts(Protocol):
+    """The three pre-flight planning dependencies shared by both runtimes."""
+
+    @property
+    def plans(self) -> RunPlanStore | None: ...
+
+    @property
+    def planner(self) -> RunPlanner | None: ...
+
+    @property
+    def plan_validator(self) -> RunPlanValidator: ...
+
+
+def _catalog_recipe(app_slug: str) -> AppRecipe | None:
+    """The immutable Recipe_Catalog entry bound to ``app_slug``, if present."""
+
+    return get_app_recipe(app_slug)
+
+
+def _catalog_plan_refusal() -> PlanRefusal:
+    """The fail-closed answer when admission has no catalog route to validate."""
+
+    return PlanRefusal(
+        reason_code=PLAN_REFUSAL_REASON_CODE,
+        detail="recipe_route_not_browser",
+        ordinal=CREDENTIAL_SURFACE_ORDINAL,
+    )
+
+
+def plan_admission(
+    *,
+    run_id: str,
+    profile: ProviderProfile | None,
+    deps: RunPlanningPorts,
+    recipe: AppRecipe | None = None,
+) -> PlanRefusal | None:
+    """Produce, reuse, and validate a plan before the run's first session.
+
+    An unwired plan store is deliberately inert: without durable plan state there
+    is no honest expectation for route adherence to compare against.  With a store
+    wired, an existing active plan is validated and reused before a planner is
+    consulted, so re-queuing performs no second planning call.  A new run with no
+    catalog recipe, an unplannable recipe, or any invalid planned surface is
+    refused with ``plan_surface_not_in_catalog`` before session creation.
+    """
+
+    plans = deps.plans
+    if plans is None:
+        return None
+
+    selected_recipe = recipe
+    if selected_recipe is None and profile is not None:
+        selected_recipe = _catalog_recipe(profile.app_slug)
+    if selected_recipe is None:
+        return _catalog_plan_refusal()
+
+    existing = plans.read_active_plan(run_id=run_id)
+    if existing is not None:
+        return deps.plan_validator(existing, recipe=selected_recipe)
+
+    planner = deps.planner
+    if planner is None:
+        # The storage port is the adherence authority.  If its producing port is
+        # absent, leave the run unplanned rather than inventing a route here.
+        return None
+
+    outcome = planner.plan_for(recipe=selected_recipe, revision=1)
+    if isinstance(outcome, PlanRefusal):
+        return outcome
+
+    refusal = deps.plan_validator(outcome.plan, recipe=selected_recipe)
+    if refusal is not None:
+        return refusal
+    recorded = plans.record_initial_plan(
+        run_id=run_id,
+        plan=outcome.plan,
+        reason_code=outcome.reason_code,
+    )
+    # A concurrent admission may have won the initial-plan race.  Validate the
+    # durable winner rather than assuming it is the plan this caller proposed.
+    return deps.plan_validator(recorded, recipe=selected_recipe)
+
+
 def phase_correlation_id(*, run_id: str, phase: OnboardingPhase, attempt: int) -> str:
     """A bounded, deterministic correlation id for one phase attempt.
 
@@ -2193,6 +2345,10 @@ async def drive_run(*, run_id: str, worker_id: str, deps: OnboardingDeps) -> Aut
           re-route has its stored signup references adopted as login references
           before the phase is driven, and that recovery emits no operator prompt
           (Requirements 6.7, 6.8).
+      I5. a run entering its first session-bearing phase has a validated plan
+          recorded before any session exists, or is planned inertly; a plan the
+          catalog does not declare pauses the run there with
+          ``plan_surface_not_in_catalog`` and no session (Requirements 5.1, 5.6).
     """
 
     lease = deps.leases.claim(
@@ -2218,6 +2374,9 @@ async def drive_run(*, run_id: str, worker_id: str, deps: OnboardingDeps) -> Aut
     # login references before the phase is driven (I4). Derived from the committed
     # boundary, so a crash between the commit and the adoption is recovered here.
     reroute_pending = is_duplicate_account_reroute(history[-1] if history else None)
+    # Admission is the moment before the run's first session-bearing phase (I5).
+    # A run already past it is left unplanned.
+    planning_settled = has_entered_a_session(history)
 
     with LeaseGuard(
         store=deps.leases, lease=lease, timings=deps.timings, clock=deps.clock
@@ -2263,8 +2422,19 @@ async def drive_run(*, run_id: str, worker_id: str, deps: OnboardingDeps) -> Aut
                 )
                 reroute_pending = False
 
-            step = await _drive_phase(
-                run_id=run_id, phase=phase, profile=profile, lease=held, deps=deps, tally=tally
+            refusal: PlanRefusal | None = None
+            if phase in SESSION_BEARING_PHASES and not planning_settled:
+                # I5: the plan exists before the first session does, because this
+                # runs ahead of ``_drive_phase``, which is what creates one.
+                refusal = plan_admission(run_id=run_id, profile=profile, deps=deps)
+                planning_settled = True
+
+            step = (
+                PhaseStep.pause(refusal.reason_code)
+                if refusal is not None
+                else await _drive_phase(
+                    run_id=run_id, phase=phase, profile=profile, lease=held, deps=deps, tally=tally
+                )
             )
             reason_code = step.reason_code
 
@@ -3381,15 +3551,21 @@ async def drive_developer_app(
 
     goal = developer_app_goal(profile=profile, request=request, flows=flows)
     session = await deps.sessions.session_for(run_id=run_id, phase=DEVELOPER_APP_PHASE, lease=lease)
-    result = await run_action_loop(
-        phase=DEVELOPER_APP_PHASE,
-        goal=goal,
-        session=session,
-        allowed=profile.allowed_hosts(),
-        budget=deps.budget,
-        decider=deps.decider,
-        telemetry=deps.telemetry,
-    )
+    try:
+        result = await run_action_loop(
+            phase=DEVELOPER_APP_PHASE,
+            goal=goal,
+            session=session,
+            allowed=profile.allowed_hosts(),
+            budget=deps.budget,
+            decider=deps.decider,
+            telemetry=deps.telemetry,
+            deadlines=deps.deadlines,
+        )
+    except DecisionFailed as failure:
+        # The reservation stays open for the same reason it does below: nothing was
+        # observed after the decision stopped.
+        return step_for_decision_failure(failure)
     if result.outcome != "done":
         # The reservation is deliberately left open: a phase that stopped short may
         # still have created the application, so the next arrival reconciles rather
@@ -4897,15 +5073,21 @@ async def _drive_phase(
 
     goal = deps.goals.goal_for(phase=phase, profile=profile)
     session = await deps.sessions.session_for(run_id=run_id, phase=phase, lease=lease)
-    result = await run_action_loop(
-        phase=phase,
-        goal=goal,
-        session=session,
-        allowed=profile.allowed_hosts(),
-        budget=deps.budget,
-        decider=deps.decider,
-        telemetry=deps.telemetry,
-    )
+    try:
+        result = await run_action_loop(
+            phase=phase,
+            goal=goal,
+            session=session,
+            allowed=profile.allowed_hosts(),
+            budget=deps.budget,
+            decider=deps.decider,
+            telemetry=deps.telemetry,
+            deadlines=deps.deadlines,
+        )
+    except DecisionFailed as failure:
+        # The chain was called and could not answer usably: pause naming which of
+        # the causes it was rather than letting the phase look slow (R4.5, R4.6).
+        return step_for_decision_failure(failure)
     tally.record(result)
     # The one mid-flight operator prompt is taken through the pause path, which
     # records where it paused and counts it before the driver commits the boundary.
@@ -5157,6 +5339,9 @@ __all__ = [
     "RecoveryTrigger",
     "ReleasableSession",
     "RenewalCheck",
+    "RunPlanner",
+    "RunPlanningPorts",
+    "RunPlanValidator",
     "ReservedPhaseCommit",
     "SQLitePhaseHistoryStore",
     "VerificationBinding",
@@ -5180,11 +5365,14 @@ __all__ = [
     "midflight_prompt_count",
     "operator_prompts",
     "pause_for_captcha",
+    "has_entered_a_session",
     "phase_correlation_id",
+    "plan_admission",
     "recover_run",
     "recover_runs",
     "resume_from_captcha",
     "resumption_phase",
+    "step_for_decision_failure",
     "step_for_loop_outcome",
     "step_for_loop_result",
     "verification_backoff_seconds",

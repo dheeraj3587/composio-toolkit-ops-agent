@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -27,13 +27,20 @@ from ops.onboarding.driver import (
     OnboardingDeps,
     PhaseStep,
     PhaseTransition,
+    RunPlanner,
+    RunPlanningPorts,
+    RunPlanValidator,
     SQLitePhaseHistoryStore,
     drive_run,
+    plan_admission,
     resumption_phase,
 )
 from ops.onboarding.lease import Lease, deadline_after
 from ops.onboarding.lease_store import SQLiteLeaseStore, SQLiteRunQueue
 from ops.onboarding.phase import RESUMABLE_PHASES, OnboardingPhase, OnboardingReasonCode
+from ops.planner.plan import RunPlan
+from ops.planner.store import RunPlanStore
+from ops.planner.validator import PlanRefusal, validate_plan
 from ops.providers.profile import (
     FieldEvidence,
     FlowSpec,
@@ -41,6 +48,7 @@ from ops.providers.profile import (
     compute_profile_digest,
 )
 from ops.providers.profile_store import SQLiteProviderProfileStore
+from ops.recipes.app_recipes import AppRecipe, get_app_recipe
 
 RUN_ID = "run-driver-001"
 OWNER = "owner-onboarding"
@@ -189,6 +197,9 @@ class _Telemetry:
     def model_call(self, *, model_calls: int) -> None:
         return None
 
+    def progress(self, *, step_index: int, stage: str, elapsed_ms: int) -> None:
+        return None
+
 
 class _CountingLeaseStore(SQLiteLeaseStore):
     """The real store, plus a count of how many releases reached it."""
@@ -198,6 +209,51 @@ class _CountingLeaseStore(SQLiteLeaseStore):
     def release(self, *, lease: Lease) -> bool:
         self.releases += 1
         return super().release(lease=lease)
+
+
+class _EmptyPlanStore:
+    """An admission store that proves a refusal writes no plan row."""
+
+    def __init__(self) -> None:
+        self.records = 0
+
+    def record_initial_plan(
+        self, *, run_id: str, plan: RunPlan, reason_code: OnboardingReasonCode
+    ) -> RunPlan:
+        self.records += 1
+        return plan
+
+    def record_plan(
+        self, *, run_id: str, plan: RunPlan, reason_code: OnboardingReasonCode
+    ) -> RunPlan:
+        self.records += 1
+        return plan
+
+    def read_active_plan(self, *, run_id: str) -> RunPlan | None:
+        return None
+
+    def count_plans(self, *, run_id: str) -> int:
+        return 0
+
+
+class _RefusingPlanner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def plan_for(self, *, recipe: AppRecipe, revision: int) -> PlanRefusal:
+        self.calls += 1
+        return PlanRefusal(
+            reason_code="plan_surface_not_in_catalog",
+            detail="recipe_route_not_browser",
+            ordinal=0,
+        )
+
+
+@dataclass
+class _PlanningPorts:
+    plans: RunPlanStore | None
+    planner: RunPlanner | None
+    plan_validator: RunPlanValidator = validate_plan
 
 
 async def _defer_credential_generation(
@@ -211,6 +267,26 @@ async def _defer_credential_generation(
     """Stands in for the credential phase (task 17): asks to come back later."""
 
     return PhaseStep.defer(deadline_after(300), "step_retried")
+
+
+def test_plan_admission_propagates_a_planner_refusal_without_recording() -> None:
+    recipe = get_app_recipe("pipedrive")
+    assert recipe is not None
+    plans = _EmptyPlanStore()
+    planner = _RefusingPlanner()
+    ports: RunPlanningPorts = _PlanningPorts(plans=plans, planner=planner)
+
+    refusal = plan_admission(
+        run_id="run-plan-refused",
+        profile=None,
+        recipe=recipe,
+        deps=ports,
+    )
+
+    assert refusal is not None
+    assert refusal.reason_code == "plan_surface_not_in_catalog"
+    assert planner.calls == 1
+    assert plans.records == 0
 
 
 @pytest.fixture

@@ -43,7 +43,7 @@ from pathlib import Path
 import httpx
 
 from ops.core.config import Settings
-from ops.core.inference import JsonInference, build_json_inference
+from ops.core.inference import DecisionOutcome, JsonInference, build_json_inference
 from ops.core.redaction import install_redacting_filter
 from ops.core.secret_store import SQLiteSecretStore
 from ops.core.storage import OperationsStorage
@@ -52,8 +52,10 @@ from ops.gmail.verification_provider import default_verification_provider
 from ops.onboarding.action_loop import (
     CandidateDecider,
     LoopBudget,
+    LoopStage,
     LoopTelemetry,
     PhaseGoal,
+    StepDeadlines,
 )
 from ops.onboarding.credentials import (
     CredentialValidatorPort,
@@ -72,6 +74,8 @@ from ops.onboarding.driver import (
     PhaseHandler,
     PhaseHistoryStore,
     RecoveryEffectReader,
+    RunPlanner,
+    RunPlanValidator,
     SQLitePhaseHistoryStore,
     VerificationBinding,
     VerificationBudget,
@@ -85,6 +89,10 @@ from ops.onboarding.phase import (
     OnboardingPhase,
     OnboardingReasonCode,
 )
+from ops.planner.adherence import RouteAdherenceMonitor
+from ops.planner.decide import PlanOutcome, decide_run_plan
+from ops.planner.store import RunPlanStore, SQLiteRunPlanStore
+from ops.planner.validator import PlanRefusal, validate_plan
 from ops.providers.errors import ConfigurationRequiredError, PhaseUnavailableError
 from ops.providers.profile import ProviderProfile
 from ops.providers.profile_builder import (
@@ -94,6 +102,7 @@ from ops.providers.profile_builder import (
     research_adapters,
 )
 from ops.providers.profile_store import ProviderProfileStore, SQLiteProviderProfileStore
+from ops.recipes.app_recipes import AppRecipe
 
 LOGGER = logging.getLogger("composio_ops.onboarding_composition")
 
@@ -110,7 +119,9 @@ PROFILE_DATABASE_NAME = "provider_profiles.db"
 # vocabulary for "this deployment cannot do that".
 MAILBOX_UNAVAILABLE: OnboardingReasonCode = "verification_unresolved"
 VALIDATOR_UNAVAILABLE: OnboardingReasonCode = "capture_spec_unavailable"
-DECIDER_UNAVAILABLE: OnboardingReasonCode = "loop_model_call_budget_exhausted"
+# ``build_json_inference`` returned ``None``: no provider key is configured, which
+# is the cause Requirement 4.4 names rather than a spent model-call budget.
+DECIDER_UNAVAILABLE: OnboardingReasonCode = "decision_provider_unconfigured"
 RESEARCH_UNAVAILABLE: OnboardingReasonCode = "research_adapters_unavailable"
 
 assert {
@@ -194,6 +205,22 @@ class RunDenialTelemetry:
 
         self.model_calls = model_calls
 
+    def progress(self, *, step_index: int, stage: LoopStage, elapsed_ms: int) -> None:
+        """Record one completed loop iteration against the run's phase (R4.1)."""
+
+        durable = self._durable()
+        if durable is None:
+            return
+        durable.progress(step_index=step_index, stage=stage, elapsed_ms=elapsed_ms)
+
+    def record_attempt(self, *, provider: str, outcome: DecisionOutcome, latency_ms: int) -> None:
+        """Record one inference attempt against the run's phase (R4.3)."""
+
+        durable = self._durable()
+        if durable is None:
+            return
+        durable.record_attempt(provider=provider, outcome=outcome, latency_ms=latency_ms)
+
     def _durable(self) -> DurableLoopTelemetry | None:
         """The per-phase durable telemetry for where the run stands right now."""
 
@@ -206,6 +233,7 @@ class RunDenialTelemetry:
             run_id=self._run_id,
             phase=boundary.to_phase,
             profile_digest=boundary.profile_digest,
+            correlation_id=boundary.correlation_id,
         )
 
 
@@ -324,6 +352,29 @@ class InferenceCandidateDecider:
         return result.payload
 
 
+class SettingsRunPlanner:
+    """The planner bound to this deployment's settings and provider chain.
+
+    The decision, the budget and the recipe-only fallback all live in
+    ``ops.planner.decide``; this is the transport that supplies the settings the
+    driver has no business holding.
+    """
+
+    def __init__(self, settings: Settings, *, inference: JsonInference | None = None) -> None:
+        self._settings = settings
+        self._inference = inference
+
+    def plan_for(self, *, recipe: AppRecipe, revision: int) -> PlanOutcome | PlanRefusal:
+        """Plan ``recipe``'s route, falling back to the reviewed route as decided."""
+
+        return decide_run_plan(
+            recipe=recipe,
+            settings=self._settings,
+            revision=revision,
+            inference=self._inference,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ProfileResearchPorts:
     """The three research ports, bound together because a build needs all three.
@@ -370,6 +421,18 @@ class OnboardingPorts:
     captcha_budget: CaptchaBudget
     verification_budget: VerificationBudget
     research: ProfileResearchPorts
+    deadlines: StepDeadlines = field(default_factory=StepDeadlines)
+    # The chain behind ``decider``, kept so each run's decider can be bound to that
+    # run's attempt sink (Requirement 4.3).
+    inference: JsonInference | None = None
+    # The pre-flight plan: where it is recorded, where it comes from, and the
+    # monitor that compares an observed surface against it. All three are
+    # optional, and an unwired plan store leaves both planning and adherence inert
+    # rather than guessing a route.
+    plans: RunPlanStore | None = None
+    planner: RunPlanner | None = None
+    plan_validator: RunPlanValidator = validate_plan
+    adherence: RouteAdherenceMonitor | None = None
     verification: VerificationProvider | None = None
     vault: VerificationSecretVault | None = None
     validator: CredentialValidatorPort | None = None
@@ -382,6 +445,17 @@ class OnboardingPorts:
     # Owned only when this root created it, so a caller that supplied its own
     # client keeps its lifecycle.
     _owned_http_client: httpx.AsyncClient | None = None
+
+    def __post_init__(self) -> None:
+        """Keep adherence disabled unless its durable plan authority is wired.
+
+        A monitor without the corresponding store could only infer an expectation
+        from transient state.  Dropping it here makes the degraded composition
+        explicit and inert instead of allowing a caller to guess a route.
+        """
+
+        if self.plans is None and self.adherence is not None:
+            object.__setattr__(self, "adherence", None)
 
     def deps_for(
         self,
@@ -414,8 +488,19 @@ class OnboardingPorts:
             raise PhaseUnavailableError(
                 phase=4,
                 capability="onboarding action loop",
-                reason_code="inference_backend_not_configured",
+                reason_code=DECIDER_UNAVAILABLE,
             )
+        sink = telemetry or RunDenialTelemetry(store=self.ledger, phases=self.phases, run_id=run_id)
+        # Each attempt is recorded against the run it was made for, which is only
+        # possible once the run's telemetry exists (Requirement 4.3). A decider
+        # substituted by a caller is left exactly as it was given.
+        decider = self.decider
+        if (
+            isinstance(decider, InferenceCandidateDecider)
+            and isinstance(sink, RunDenialTelemetry)
+            and self.inference is not None
+        ):
+            decider = InferenceCandidateDecider(self.inference.with_attempts(sink))
         return OnboardingDeps(
             leases=self.leases,
             phases=self.phases,
@@ -423,9 +508,8 @@ class OnboardingPorts:
             queue=self.queue,
             goals=self.goals,
             sessions=sessions,
-            decider=self.decider,
-            telemetry=telemetry
-            or RunDenialTelemetry(store=self.ledger, phases=self.phases, run_id=run_id),
+            decider=decider,
+            telemetry=sink,
             logins=logins,
             verification=self.verification,
             handlers=dict(handlers or {}),
@@ -434,7 +518,11 @@ class OnboardingPorts:
             verification_binding=verification_binding,
             vault=self.vault,
             effects=_effect_reader(self.phases),
+            plans=self.plans,
+            planner=self.planner,
+            plan_validator=self.plan_validator,
             budget=self.budget,
+            deadlines=self.deadlines,
             captcha_budget=self.captcha_budget,
             verification_budget=self.verification_budget,
             timings=self.timings,
@@ -513,6 +601,10 @@ def build_onboarding_ports(
     if not research.is_complete:
         unavailable["research"] = RESEARCH_UNAVAILABLE
 
+    # The plan lives in the run ledger's own file, so the plan rows and the phase
+    # boundaries are one durable view of the run.
+    plans = SQLiteRunPlanStore(path)
+
     return OnboardingPorts(
         settings=settings,
         ledger=ledger,
@@ -526,6 +618,15 @@ def build_onboarding_ports(
         outcomes=LedgerAutonomyOutcomes(ledger),
         timings=LeaseTimings.from_settings(settings),
         budget=LoopBudget.from_settings(settings),
+        deadlines=StepDeadlines.from_settings(settings),
+        inference=inference,
+        plans=plans,
+        # The planner builds its own bounded decision chain so planning uses the
+        # plan budget/provider order from ops.planner.decide rather than borrowing
+        # the action loop's per-page chain.
+        planner=SettingsRunPlanner(settings),
+        plan_validator=validate_plan,
+        adherence=RouteAdherenceMonitor(plans=plans, audit=ledger),
         captcha_budget=CaptchaBudget(max_pauses=settings.onboarding_captcha_pause_budget),
         verification_budget=VerificationBudget.from_settings(settings),
         research=research,
@@ -586,6 +687,12 @@ def _decider_conformance(decider: InferenceCandidateDecider) -> CandidateDecider
     return decider
 
 
+def _planner_conformance(planner: SettingsRunPlanner) -> RunPlanner:
+    """Typecheck-only proof that the planner adapter satisfies the driver's port."""
+
+    return planner
+
+
 def _goals_conformance(goals: ProfileGoals) -> PhaseGoalFactory:
     """Typecheck-only proof that the goal factory satisfies the driver's port."""
 
@@ -609,5 +716,6 @@ __all__ = [
     "ProfileGoals",
     "ProfileResearchPorts",
     "RunDenialTelemetry",
+    "SettingsRunPlanner",
     "build_onboarding_ports",
 ]
