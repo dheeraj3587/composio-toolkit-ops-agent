@@ -39,6 +39,7 @@ from ops.browser.pages import (
     DialogRecord,
     DownloadRecord,
 )
+from ops.browser.session_liveness import session_expiry
 
 _INACTIVITY_WINDOW = timedelta(minutes=15)
 _MAXIMUM_WINDOW = timedelta(hours=4)
@@ -56,6 +57,7 @@ class _PwSession:
     operation_lock: asyncio.Lock
     patterns: tuple[str, ...] = ()
     app_slug: str = ""
+    approved_values: dict[str, str] = field(default_factory=dict)
     # The opaque worker-side handle (pw_...), used only to correlate sanitized
     # decision events for one session. Never a URL, account or credential.
     handle: str = ""
@@ -117,10 +119,30 @@ class _PwSession:
     # The reviewed post-login target is retried at most once in this session.
     post_login_target_retried: bool = False
 
-    def is_expired(self, now: datetime) -> bool:
+    def is_expired(self, now: datetime, *, hitl_attached: bool = False) -> bool:
+        """Whether this session may be reaped, per the ONE shared liveness rule.
+
+        The policy itself lives in ``ops/browser/session_liveness.py`` and this
+        method keeps no copy of it: the service janitor calls the same function, so
+        the two processes cannot drift back into the disagreement that closed a
+        browser under an operator solving a CAPTCHA. Only the worker's own windows
+        are supplied from here.
+
+        ``hitl_attached`` defaults to False, which is exactly what every existing
+        caller already meant — a worker with no attachment probe installed knows of
+        no human inside the session — so the default keeps current behaviour.
+        """
+
         return (
-            now - self.last_active_at > _INACTIVITY_WINDOW
-            or now - self.created_at > _MAXIMUM_WINDOW
+            session_expiry(
+                now=now,
+                created_at=self.created_at,
+                last_active_at=self.last_active_at,
+                inactivity=_INACTIVITY_WINDOW,
+                maximum_age=_MAXIMUM_WINDOW,
+                hitl_attached=hitl_attached,
+            )
+            is not None
         )
 
 

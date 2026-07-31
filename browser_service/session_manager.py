@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import hmac
 import threading
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -33,6 +34,7 @@ from ops.browser.host_policy import (
     BrowserHostDecision,
     evaluate_navigation,
 )
+from ops.browser.session_liveness import session_expiry
 
 
 class SessionUnavailable(RuntimeError):
@@ -77,6 +79,17 @@ SESSION_CONTINUITY_EVENTS: frozenset[str] = frozenset(
 _IDLE_REFRESHING_CONTINUITY_EVENTS: frozenset[str] = SESSION_CONTINUITY_EVENTS - {
     "live_view_client_disconnect"
 }
+
+# How many closed session ids keep their reason code in memory. Small on purpose:
+# this is a diagnostic ring for the sessions a caller may still ask about moments
+# after they were reaped, not a history.
+_RECENT_CLOSURE_CAPACITY = 64
+
+# A bound the shared lifetime rule can never reach. The two single-question
+# delegations on ManagedSession pass it for the bound they are NOT asking about, so
+# each one still answers exactly the question its name asks. The ranking of the two
+# bounds against one another is made once, in SessionManager.expired_session_ids.
+_UNREACHABLE_WINDOW: timedelta = timedelta.max
 
 
 @dataclass(slots=True)
@@ -145,6 +158,15 @@ class ManagedSession:
     hitl_generation: int = 0
     live_view_mode: LiveViewMode = "screenshot"
     hitl_reason_code: str = ""
+    # One post-detach observation is owed when the LAST live-view client leaves a
+    # session that is still paused on a human gate: the operator may have cleared
+    # the gate and then closed the tab, and nobody would look again. Bound to the
+    # exact HITL generation so debt from an earlier challenge cannot authorize a
+    # later one. Cleared on every HITL transition and by the observation that
+    # answers it. PROCESS-LOCAL: this is never persisted and never leaves the
+    # container except as a generation-matched boolean on the clearance report,
+    # so no durable store gains a record that a human was attached (R2.8).
+    takeover_final_probe_generation: int | None = None
     # Timestamps.
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     last_active_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -185,11 +207,58 @@ class ManagedSession:
             ),
         )
 
+    @property
+    def maximum_age_window(self) -> timedelta:
+        """This session's absolute ceiling expressed as a window from creation.
+
+        The manager precomputes the ceiling as :attr:`maximum_expires_at`, while the
+        shared rule takes a window measured from :attr:`created_at`. Deriving the
+        window from the two timestamps keeps the precomputed ceiling authoritative —
+        ``now - created_at >= maximum_age_window`` is exactly
+        ``now >= maximum_expires_at`` — so moving the ceiling on one session still
+        moves that session's expiry.
+        """
+
+        return self.maximum_expires_at - self.created_at
+
     def is_idle_expired(self, now: datetime, inactivity: timedelta) -> bool:
-        return now - self.last_active_at > inactivity
+        """Whether the idle window has elapsed, ignoring the attachment exemption.
+
+        A thin delegation to ``ops.browser.session_liveness.session_expiry`` so this
+        service holds no second copy of the comparison. The maximum age is passed as
+        an unreachable window because this method answers the idle question alone.
+        """
+
+        return (
+            session_expiry(
+                now=now,
+                created_at=self.created_at,
+                last_active_at=self.last_active_at,
+                inactivity=inactivity,
+                maximum_age=_UNREACHABLE_WINDOW,
+                hitl_attached=False,
+            )
+            == "session_idle_expired"
+        )
 
     def is_age_expired(self, now: datetime) -> bool:
-        return now >= self.maximum_expires_at
+        """Whether the absolute ceiling has been reached.
+
+        The same thin delegation, with the idle window made unreachable: the ceiling
+        is absolute and takes no attachment fact, so this answers on age alone.
+        """
+
+        return (
+            session_expiry(
+                now=now,
+                created_at=self.created_at,
+                last_active_at=self.last_active_at,
+                inactivity=_UNREACHABLE_WINDOW,
+                maximum_age=self.maximum_age_window,
+                hitl_attached=False,
+            )
+            == "session_max_age_exceeded"
+        )
 
     def summary(self) -> SessionSummary:
         return SessionSummary(
@@ -206,6 +275,7 @@ class ManagedSession:
             live_view_available=self.screenshot_available
             or (self.interactive_ready and self.live_view_allowed),
             hitl_pending=self.hitl_pending,
+            hitl_generation=self.hitl_generation,
             # Distinct capability facts. The build includes the interactive relay;
             # availability remains session-specific and false unless enabled.
             screenshot_supported=True,
@@ -255,6 +325,12 @@ class SessionManager:
         # Answers "is a human attached to this session's interactive relay right
         # now?". Injected so the manager needs no knowledge of the WebSocket layer.
         self._attachment_probe = attachment_probe
+        # The last few closures, id -> closure reason code, newest last. In memory
+        # and bounded at _RECENT_CLOSURE_CAPACITY, holding closed reason codes and
+        # nothing else. Without it a session this janitor reaped at max age and an
+        # id that never existed are the same absent session, so a caller asking
+        # about a paused run's session would attribute the wrong cause.
+        self._recent_closures: OrderedDict[str, str] = OrderedDict()
         self.janitor_running = False
 
     def set_attachment_probe(self, probe: Callable[[str], bool]) -> None:
@@ -461,6 +537,18 @@ class SessionManager:
         with self._lock:
             return tuple(self._sessions.values())
 
+    def recent_closure_reason(self, session_id: str) -> str | None:
+        """Why this id was closed, for the last few closures, or ``None``.
+
+        ``None`` means "not one of the recent closures": either the id is still live,
+        or it was closed longer than :data:`_RECENT_CLOSURE_CAPACITY` closures ago, or
+        it never existed. A caller that needs to distinguish a live session from a
+        reaped one asks :meth:`get_if_present` first and this second.
+        """
+
+        with self._lock:
+            return self._recent_closures.get(session_id)
+
     # --- operation leases -----------------------------------------------------
     @contextlib.contextmanager
     def lease(self, session_id: str) -> Iterator[ManagedSession]:
@@ -605,9 +693,24 @@ class SessionManager:
         with self._lock:
             session.lifecycle = "CLOSED"
             session.pages.clear()
+            # Record WHY, immediately before the id stops resolving: after the pop
+            # there is nothing left to read the reason from. The bare argument is
+            # recorded rather than session.reason_code, whose ":operations_cancelled"
+            # suffix describes the teardown rather than the cause.
+            self._record_closure(session_id, reason_code)
             self._sessions.pop(session_id, None)
         self._release_capacity(session)
         return session.reason_code or "closed"
+
+    def _record_closure(self, session_id: str, reason_code: str) -> None:
+        """Add one closure to the bounded ring. Caller MUST hold ``self._lock``."""
+
+        # Re-insert so a re-closed id moves to the newest end instead of keeping an
+        # older position and being evicted early.
+        self._recent_closures.pop(session_id, None)
+        self._recent_closures[session_id] = reason_code
+        while len(self._recent_closures) > _RECENT_CLOSURE_CAPACITY:
+            self._recent_closures.popitem(last=False)
 
     # --- janitor --------------------------------------------------------------
     def expired_session_ids(self, now: datetime | None = None) -> tuple[tuple[str, str], ...]:
@@ -620,6 +723,11 @@ class SessionManager:
         of a failed teardown are the ONLY grounds on which this sweep expires a
         session. No continuity event (verification, CAPTCHA pause, navigation retry,
         worker or API restart, live-view disconnect) is ever an expiry reason.
+
+        The idle/max-age/exemption decision itself is not made here. It is
+        ``ops.browser.session_liveness.session_expiry``, the one rule the in-worker
+        lifetime check reads too, so the janitor and the worker cannot disagree about
+        whether an attached human keeps a paused session alive.
         """
 
         moment = now or datetime.now(UTC)
@@ -642,20 +750,24 @@ class SessionManager:
                     continue
                 if session.lifecycle != "ACTIVE":
                     continue
-                if session.is_age_expired(moment):
-                    # The maximum-age ceiling is absolute: it bounds even a session
-                    # a human is still attached to, so a slot can never be held for
-                    # ever.
-                    expired.append((session.session_id, "session_max_age_exceeded"))
-                elif session.is_idle_expired(moment, self._inactivity):
-                    # "Idle" means no autonomous operation ran recently, which is
-                    # precisely the state of a waiting_for_hitl session while a
-                    # person works in the interactive view. Reaping that would close
-                    # the browser under the human it is waiting for, so a pending
-                    # HITL gate with an attached client is not idle.
-                    if session.hitl_pending and self.is_attached(session.session_id):
-                        continue
-                    expired.append((session.session_id, "session_idle_expired"))
+                expiry = session_expiry(
+                    now=moment,
+                    created_at=session.created_at,
+                    last_active_at=session.last_active_at,
+                    inactivity=self._inactivity,
+                    maximum_age=session.maximum_age_window,
+                    # The exemption is this conjunction, and it is resolved HERE
+                    # rather than inside the rule: the rule reads one boolean and
+                    # imports no settings, so nothing on the exemption path can
+                    # observe whether the takeover watcher is enabled. "Idle" means
+                    # no autonomous operation ran recently, which is precisely the
+                    # state of a paused session a person is working inside, so a
+                    # pending HITL gate with an attached client is not idle. The
+                    # maximum age stays absolute and bounds this session anyway.
+                    hitl_attached=(session.hitl_pending and self.is_attached(session.session_id)),
+                )
+                if expiry is not None:
+                    expired.append((session.session_id, expiry))
         return tuple(expired)
 
     async def sweep(self) -> tuple[str, ...]:
