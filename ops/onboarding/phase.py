@@ -236,6 +236,20 @@ OnboardingReasonCode = Literal[
     "signup_authorization_required",
     "operator_approved_signup",
     "operator_cancelled",
+    # --- pre-flight plan ----------------------------------------------------
+    # Raised by the plan validator before any browser session exists: a surface
+    # the plan would drive is absent from the recipe catalog, so the run is
+    # refused here rather than failing mid-walk (reliability R5.6).
+    "plan_surface_not_in_catalog",
+    # The three ways a plan lands recipe-only — the plan carries the recipe's
+    # declared surfaces and nothing inferred. Kept apart because each names a
+    # different thing to fix: configuration, the provider chain, or the answer.
+    "plan_provider_unconfigured",  # no provider key is configured (reliability R5.8)
+    "plan_decision_failed",  # every configured provider was called and none was usable
+    "plan_decision_unusable",  # the chain answered and the decision was unusable
+    # --- route adherence ----------------------------------------------------
+    "route_replanned",  # the one authorized re-plan (reliability R6.2, R6.4)
+    "route_divergence_unresolved",  # divergence after that re-plan (reliability R6.5)
     # --- action loop / navigation ------------------------------------------
     "host_in_app_policy",  # from BrowserHostDecision
     "browser_host_not_in_app_policy",  # from BrowserHostDecision
@@ -250,9 +264,21 @@ OnboardingReasonCode = Literal[
     "loop_wallclock_budget_exhausted",
     "loop_model_call_budget_exhausted",
     "postcondition_failed",
+    # Loop liveness and per-attempt decision telemetry: a run that is not
+    # deciding says so, rather than looking identical to one that is working.
+    "run_progress_stale",  # no progress event inside the staleness window (reliability R4.9)
+    "decision_provider_unconfigured",  # the inference builder returned None in the loop
+    "decision_provider_failed",  # every configured provider was called, none was usable
+    "decision_unusable",  # schema-invalid, or a decision naming no candidate action
     # --- signup / verification ---------------------------------------------
     "signup_submitted",
     "signup_rejected_duplicate_account",
+    # Signup reached for an app whose recipe declares no signup policy: nothing
+    # was submitted, so an operator reads this as a recipe gap (reliability R7.2).
+    "signup_policy_absent",
+    # The recipe-declared observable postcondition for signup did not hold, so
+    # the submission is not treated as successful (reliability R7.6).
+    "signup_postcondition_unmet",
     "verification_email_found",
     "verification_unresolved",
     "verification_link_blocked",
@@ -290,12 +316,26 @@ OnboardingReasonCode = Literal[
     "captcha_detected",
     "captcha_resolved",
     "captcha_attempt_budget_exhausted",
+    # A human cleared the gate and the clearance was observed, but the re-entry
+    # into the phase recorded at pause is not committable, so the run stays
+    # paused rather than continuing into a phase the transition table refuses
+    # (reliability R1.11). Distinct from ``captcha_resolved``: the gate is gone,
+    # the continuation is what is unavailable.
+    "takeover_step_unavailable",
+    # --- operator control surface -------------------------------------------
+    # The total fallback for a capability projection that withholds a control:
+    # the console renders the humanized code where the button would be, never an
+    # empty panel with no explanation (reliability R3.2).
+    "control_withheld",
     # --- lifecycle ----------------------------------------------------------
     "lease_claimed",
     "lease_expired_recovered",
     "session_reattached",
     "session_recreated",
     "session_unreattachable",
+    # Max-age closure of a paused session a human is attached to: idle expiry is
+    # skipped while the human works, the absolute lifetime is not (reliability R2.5).
+    "session_lifetime_exceeded",
     "outcome_unknown",
     "phase_replay_noop",
     "run_paused_by_operator",
