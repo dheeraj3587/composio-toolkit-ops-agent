@@ -107,8 +107,6 @@ python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().
 # LANGGRAPH_AES_KEY (exactly 32 UTF-8 bytes; recovery/legacy tooling only)
 python3 -c 'import secrets; print(secrets.token_hex(16))'
 
-# OPS_AUTH_TOTP_SECRET (160-bit Base32, enroll in the operator authenticator)
-python3 -c 'import base64,secrets; print(base64.b32encode(secrets.token_bytes(20)).decode().rstrip("="))'
 ```
 
 Configure these groups before deployment:
@@ -116,7 +114,7 @@ Configure these groups before deployment:
 | Group | Required values |
 | --- | --- |
 | Edge | `DOMAIN` and optional `ACME_EMAIL` |
-| Application auth | `OPS_AUTH_USERNAME`, a unique `OPS_AUTH_PASSWORD` of at least 20 characters, a stable random `OPS_AUTH_SESSION_SECRET` of at least 32 characters, and an independent Base32 `OPS_AUTH_TOTP_SECRET` enrolled in the operator authenticator |
+| Application auth | `OPS_AUTH_USERNAME`, a unique `OPS_AUTH_PASSWORD` of at least 20 characters, and a stable random `OPS_AUTH_SESSION_SECRET` of at least 32 characters |
 | Internal trust | one random `OPS_INTERNAL_API_TOKEN` shared by API and web |
 | Stored-state keys | a stable `SECRET_VAULT_KEY` for credential ciphertext; optional `BROWSER_STORAGE_STATE_KEY` for encrypted browser storage state; and the stable `LANGGRAPH_AES_KEY` currently required by recovery tooling for legacy checkpoint artifacts |
 | Playwright RPC | one random `BROWSER_SERVICE_TOKEN`; one independent stable `BROWSER_SESSION_CAPABILITY_KEY` available only to API; and the same tenant/storage `BROWSER_SERVICE_OWNER` for API, worker, and Caddy |
@@ -190,20 +188,94 @@ Browser timeout ordering is intentional and must remain nested:
 This ordering ensures the inner service returns a structured timeout result
 before an outer transport aborts the request.
 
+### Autonomous onboarding reliability
+
+Release 2 adds the following bounded settings. Invalid values are rejected at
+configuration load rather than silently replaced with defaults.
+
+| Environment setting | Default | Allowed range | Operator purpose |
+| --- | ---: | ---: | --- |
+| `ONBOARDING_TAKEOVER_ENABLED` | `true` | boolean | Enables observation-only autonomous continuation after a human clears a gate. This is not a live-capability flag and remains gated by startup automation and deployment acceptance. |
+| `ONBOARDING_TAKEOVER_INTERVAL_SECONDS` | `5` | 1–30 seconds | Maximum interval between clearance polls for an attached paused run. |
+| `ONBOARDING_TAKEOVER_PROBE_TIMEOUT_SECONDS` | `5.0` | 1.0–15.0 seconds | Bounds one clearance probe; a timeout keeps the run waiting rather than treating the gate as cleared. |
+| `ONBOARDING_PROGRESS_STALE_SECONDS` | `180` | 30–1800 seconds | Marks a non-terminal, non-waiting run stale after this long without progress. |
+| `ONBOARDING_PROGRESS_WINDOW` | `50` | 1–200 events | Caps the newest-first progress events returned with a run timeline. |
+| `ONBOARDING_STEP_OBSERVE_TIMEOUT_SECONDS` | `20` | 5–60 seconds | Deadline for the observation step of one browser operation. |
+| `ONBOARDING_STEP_DECIDE_TIMEOUT_SECONDS` | `20` | 5–60 seconds | Deadline for the decision step; it must also be at least the 15-second loop decision budget. |
+| `ONBOARDING_STEP_ACT_TIMEOUT_SECONDS` | `40` | 5–90 seconds | Deadline for the browser action and navigation settle. |
+| `ONBOARDING_STEP_VERIFY_TIMEOUT_SECONDS` | `20` | 5–60 seconds | Deadline for the fresh post-action verification. |
+| `ONBOARDING_PLAN_DECISION_TOTAL_SECONDS` | `20.0` | 5.0–60.0 seconds | Total inference budget for the one pre-browser plan decision. |
+| `ONBOARDING_PLAN_DECISION_PROVIDER_SECONDS` | `8.0` | 2.0–30.0 seconds | Per-provider cap inside the plan decision budget. |
+| `ONBOARDING_PLAN_MAX_PROVIDERS` | `3` | 1–5 providers | Maximum providers attempted for one plan decision. |
+
+The four browser-step deadlines default to 100 seconds in total. Their sum
+must remain below `BROWSER_SERVICE_CLIENT_TIMEOUT_SECONDS` and the decide
+step must remain at least the loop decision budget; configuration loading
+names and rejects the conflicting values. Keep the defaults below the tighter
+120-second browser-service operation ceiling as well as the 315-second client
+budget.
+
+The timeline exposes progress separately from audit items, newest first, and
+returns at most `ONBOARDING_PROGRESS_WINDOW` entries: 50 by default and never
+more than 200. Each entry contains only the step index, closed loop stage
+(`observe`, `candidates`, `decide`, `act`, `verify`, `gate`, or `exhausted`),
+elapsed milliseconds, onboarding phase, and recorded time. It contains no
+prompt, page content, provider payload, or credential material.
+
+Use these new reason codes as follows:
+
+| Reason code | Operator meaning and action |
+| --- | --- |
+| `takeover_step_unavailable` | The human gate cleared, but the recorded phase could not be re-entered. Inspect the timeline, then reset or retry the current step. |
+| `session_lifetime_exceeded` | The attached paused browser reached its absolute maximum age and was closed. Reset the run so it can create a new session. |
+| `run_progress_stale` | No progress event arrived within the configured stale window. Inspect recent progress and decision attempts; retry only after confirming no worker still holds the run. |
+| `decision_provider_unconfigured` | No inference provider key is configured for the action loop. Configure a supported provider before retrying. |
+| `decision_provider_failed` | Configured action-loop providers were called but none returned a usable decision. Check quota, authentication, outage, and attempt telemetry, then retry the step. |
+| `decision_unusable` | A provider response failed schema validation or selected no candidate action. Inspect attempt outcomes and retry the step; do not infer an action manually from provider text. |
+| `plan_surface_not_in_catalog` | Pre-flight planning named no complete catalog-approved route or a surface outside the reviewed recipe. Fix or extend the recipe; no browser session was started. |
+| `plan_provider_unconfigured` | No planning provider key is configured, so the run used the reviewed recipe-only plan. No intervention is required unless model planning is expected. |
+| `plan_decision_failed` | Planning providers were called and failed, so the run used the reviewed recipe-only plan. Inspect provider health if model planning is expected. |
+| `plan_decision_unusable` | The planning response was invalid or named no surface, so the run used the reviewed recipe-only plan. Inspect decision telemetry if this repeats. |
+| `route_replanned` | The observed route diverged and the run consumed its single automatic re-plan and one attempt. Monitor the replacement route; no immediate action is required. |
+| `route_divergence_unresolved` | The route diverged again after the one allowed re-plan, or the observed surface could not be safely recorded. Inspect the reviewed recipe and decide whether to reset or update it. |
+| `signup_policy_absent` | The app recipe declares no reviewed signup policy. Do not retry signup; add and review recipe policy first. |
+| `signup_postcondition_unmet` | Signup submitted, but a fresh observation did not satisfy the recipe postcondition. Inspect the provider state; a retry skips the already-recorded submission rather than creating another account. |
+| `control_withheld` | A paused run's capability could not be proven and no more specific closed reason applied. Inspect the run phase, bound session, and attempt budget before resetting or retrying. |
+
+The seven new sanitized timeline event types are:
+
+| Event type | Operator meaning |
+| --- | --- |
+| `onboarding_takeover_continued` | Clearance was observed and the API committed autonomous continuation. |
+| `onboarding_takeover_withheld` | Takeover did not continue because a closed safety condition withheld it. |
+| `onboarding_attachment_changed` | A live-view client attached or detached from the bound session. |
+| `onboarding_route_divergence` | The observed bounded host/path differed from the active plan. |
+| `onboarding_progress_stale` | The liveness sweep marked the run stale. |
+| `onboarding_plan_recorded` | A validated plan revision became active. |
+| `onboarding_plan_superseded` | A re-plan replaced the prior active plan revision. |
+
+These events use fixed timeline summaries. Their payloads are restricted to
+run id, gate type, phase, reason code, session id, attachment outcome, plan
+revision, and bounded divergence fields; they never contain full URLs, signed
+live-view grants, page text, or credentials.
+
+### Application authentication
+
 Application auth is the single human login boundary. Caddy handles TLS and
-routing; it does not add a second browser password prompt. The login requires
-the configured username and password plus a six-digit TOTP. Generate an
-independent 160-bit Base32 secret, enroll it in the operator's authenticator, and
-store the same stable value only in the production secret manager and private
-`.env.production`:
+routing; it does not add another browser password prompt. Release 3 makes this
+boundary single-factor: one leaked operator password grants full control-plane
+access, including the live browser view and live email, with no compensating
+second factor in the application.
 
-```bash
-python3 -c 'import base64,secrets; print(base64.b32encode(secrets.token_bytes(20)).decode().rstrip("="))'
-```
+Retained controls are address and identity throttles with escalating lockout,
+the 20-character deploy-side password minimum, HMAC-signed sessions with an
+exact 12-hour lifetime, and owner-only and loopback-only surfaces. These controls
+reduce exposure but do not make a leaked password safe; rotate a suspected
+password immediately and terminate its sessions.
 
-Set that output as `OPS_AUTH_TOTP_SECRET`. Deployment rejects missing, malformed,
-placeholder, or reused TOTP secrets. The value is available only to the web
-container; API, browser-worker, and Caddy never receive it.
+`OPS_AUTH_TOTP_SECRET` is no longer read by the application. During migration it
+may remain harmlessly in a deployed `.env.production` until the next secret
+rotation.
 
 Caddy sends a one-year HSTS policy after a successful HTTPS visit. Container
 JSON logs rotate at 10 MiB with five files per service by default; tune
