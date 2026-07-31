@@ -243,16 +243,22 @@ def test_api_uses_delayed_bounded_startup_automation_in_production() -> None:
     assert template_environment["GMAIL_VERIFICATION_REQUIRE_AUTHENTICATED_SENDER"] == "true"
 
 
-def test_totp_secret_is_web_only_in_the_production_topology() -> None:
+def test_totp_secret_is_withheld_from_the_api_and_optional_for_web() -> None:
     services = _compose()["services"]
     template_environment = _production_env()
 
-    assert services["web"]["environment"]["OPS_AUTH_TOTP_SECRET"] == (
-        "${OPS_AUTH_TOTP_SECRET:?OPS_AUTH_TOTP_SECRET is required}"
-    )
+    # Containment is the durable rule: the secret is never available to the API
+    # container, and no other service sees it at all.
     assert services["api"]["environment"]["OPS_AUTH_TOTP_SECRET"] == ""
     assert "OPS_AUTH_TOTP_SECRET" not in services["browser-worker"]["environment"]
     assert "OPS_AUTH_TOTP_SECRET" not in services["caddy"]["environment"]
+    # The web passthrough is optional, so a deployment that omits the variable
+    # renders and deploys exactly the same. The required `:?` form is refused.
+    assert services["web"]["environment"].get("OPS_AUTH_TOTP_SECRET") in (
+        None,
+        "",
+        "${OPS_AUTH_TOTP_SECRET:-}",
+    )
     assert template_environment["OPS_AUTH_TOTP_SECRET"] == ("replace-with-base32-totp-secret")
 
 

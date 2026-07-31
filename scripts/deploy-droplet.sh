@@ -1100,12 +1100,6 @@ BROWSER_PIDS_LIMIT_VALUE="$(read_env_value BROWSER_PIDS_LIMIT || printf '768')"
 [ "${#APP_AUTH_PASSWORD_VALUE}" -ge 20 ] || fail "OPS_AUTH_PASSWORD must be at least 20 characters."
 [ "${#APP_AUTH_SESSION_SECRET_VALUE}" -ge 32 ] \
 	|| fail "OPS_AUTH_SESSION_SECRET must be at least 32 characters."
-APP_AUTH_TOTP_NORMALIZED="${APP_AUTH_TOTP_SECRET_VALUE// /}"
-APP_AUTH_TOTP_NORMALIZED="${APP_AUTH_TOTP_NORMALIZED^^}"
-[ "${#APP_AUTH_TOTP_NORMALIZED}" -ge 16 ] \
-	&& [ "${#APP_AUTH_TOTP_NORMALIZED}" -le 128 ] \
-	&& [[ "$APP_AUTH_TOTP_NORMALIZED" =~ ^[A-Z2-7]+={0,6}$ ]] \
-	|| fail "OPS_AUTH_TOTP_SECRET must be a valid Base32 secret of 16 to 128 characters."
 [ "${#INTERNAL_API_TOKEN_VALUE}" -ge 32 ] \
 	|| fail "OPS_INTERNAL_API_TOKEN must be at least 32 characters."
 [ "${#BROWSER_SERVICE_TOKEN_VALUE}" -ge 32 ] \
@@ -1139,22 +1133,8 @@ for other_value in \
 	[ "$BROWSER_SESSION_CAPABILITY_KEY_VALUE" != "$other_value" ] \
 		|| fail "BROWSER_SESSION_CAPABILITY_KEY must be independent from every internal/browser token."
 done
-[ "$APP_AUTH_TOTP_SECRET_VALUE" != "$APP_AUTH_PASSWORD_VALUE" ] \
-	|| fail "OPS_AUTH_TOTP_SECRET must differ from OPS_AUTH_PASSWORD."
-[ "$APP_AUTH_TOTP_SECRET_VALUE" != "$APP_AUTH_SESSION_SECRET_VALUE" ] \
-	|| fail "OPS_AUTH_TOTP_SECRET must differ from OPS_AUTH_SESSION_SECRET."
 [ "$APP_AUTH_PASSWORD_VALUE" != "$APP_AUTH_SESSION_SECRET_VALUE" ] \
 	|| fail "OPS_AUTH_PASSWORD must differ from OPS_AUTH_SESSION_SECRET."
-for other_value in \
-	"$INTERNAL_API_TOKEN_VALUE" \
-	"$BROWSER_SERVICE_TOKEN_VALUE" \
-	"$BROWSER_SECRET_BROKER_TOKEN_VALUE" \
-	"$BROWSER_SESSION_CAPABILITY_KEY_VALUE" \
-	"$SECRET_VAULT_KEY_VALUE" \
-	"$LANGGRAPH_AES_KEY_VALUE"; do
-	[ "$APP_AUTH_TOTP_SECRET_VALUE" != "$other_value" ] \
-		|| fail "OPS_AUTH_TOTP_SECRET must be independent from application and encryption secrets."
-done
 [ "$BROWSER_SECRET_BROKER_TOKEN_VALUE" != "$INTERNAL_API_TOKEN_VALUE" ] \
 	|| fail "BROWSER_SECRET_BROKER_TOKEN must differ from OPS_INTERNAL_API_TOKEN."
 [ "$BROWSER_SECRET_BROKER_TOKEN_VALUE" != "$BROWSER_SERVICE_TOKEN_VALUE" ] \
@@ -1273,8 +1253,6 @@ if api.get("BROWSER_USE_API_KEY") and api.get("BROWSER_USE_COMPATIBILITY_ENABLED
     )
 if not api.get("BROWSER_SESSION_CAPABILITY_KEY"):
     raise SystemExit("BROWSER_SESSION_CAPABILITY_KEY must be available to API")
-if not web.get("OPS_AUTH_TOTP_SECRET"):
-    raise SystemExit("OPS_AUTH_TOTP_SECRET must be available to web")
 if api.get("OPS_STARTUP_AUTOMATION_ENABLED") != "true":
     raise SystemExit("OPS_STARTUP_AUTOMATION_ENABLED must enable delayed production maintenance")
 if not 60 <= automation_delay <= 300:
@@ -1408,7 +1386,6 @@ mark_current_release_accepted \
 	|| fail "Could not persist and verify the exact deployment acceptance marker."
 
 unset APP_AUTH_PASSWORD_VALUE APP_AUTH_SESSION_SECRET_VALUE APP_AUTH_TOTP_SECRET_VALUE
-unset APP_AUTH_TOTP_NORMALIZED
 unset INTERNAL_API_TOKEN_VALUE BROWSER_SERVICE_TOKEN_VALUE
 unset BROWSER_SECRET_BROKER_TOKEN_VALUE BROWSER_SESSION_CAPABILITY_KEY_VALUE
 unset SECRET_VAULT_KEY_VALUE LANGGRAPH_AES_KEY_VALUE
