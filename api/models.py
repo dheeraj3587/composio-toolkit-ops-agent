@@ -16,8 +16,10 @@ from pydantic import (
     model_validator,
 )
 
+from ops.browser.setup_values import normalize_provider_setup_fields
 from ops.core.models import AccountMode, OperationalResearch
 from ops.core.state import AccessRoute, BrowserProvider, CredentialCreationPolicy, RunStatus
+from ops.onboarding.action_loop import LoopStage
 from ops.onboarding.admission import AdmissionDecider, AdmissionInput, AdmissionRoute
 from ops.onboarding.effects import OnboardingEffect
 from ops.onboarding.phase import OnboardingPhase, OnboardingReasonCode
@@ -271,6 +273,7 @@ class CreateRunRequest(StrictApiModel):
     execution_mode: Literal["plan_only", "execute_when_configured"] = "plan_only"
     browser_provider: BrowserProvider = "browser_use"
     credential_creation_policy: CredentialCreationPolicy = "reuse_only"
+    provider_setup: dict[str, str] = Field(default_factory=dict, max_length=20)
     # Deprecated compatibility alias for execution_mode="plan_only". Only an
     # explicitly supplied dry_run=true carries intent; execution_mode is the single
     # canonical control and dry_run is never rewritten from it.
@@ -286,6 +289,11 @@ class CreateRunRequest(StrictApiModel):
     # Optional operator hint for provider research. A bounded HTTPS URL, never a
     # search phrase, so a hint cannot smuggle prose into the research prompt.
     provider_hint_url: BoundedHttpUrl | None = None
+
+    @field_validator("provider_setup")
+    @classmethod
+    def provider_setup_is_reviewed(cls, value: dict[str, str]) -> dict[str, str]:
+        return normalize_provider_setup_fields(value)
 
     @field_validator("provider_hint_url")
     @classmethod
@@ -532,6 +540,9 @@ class OnboardingControlsView(StrictApiModel):
     can_retry_step: bool = False
     retryable_step: RetryableStep | None = None
     reason_code: OnboardingReasonCode | None = None
+    # Why the resume control is absent from a run paused on a human-only gate, so
+    # the console can say that rather than render nothing.
+    resume_withheld_reason: OnboardingReasonCode | None = None
 
     @model_validator(mode="after")
     def _retry_names_its_step(self) -> OnboardingControlsView:
@@ -754,9 +765,22 @@ class TimelineEvent(StrictApiModel):
     detail: TimelineDetail | None = None
 
 
+class RunProgressEventView(StrictApiModel):
+    """One completed loop iteration, over the bounded window (Requirement 4.2)."""
+
+    step_index: int = Field(ge=1, le=100_000)
+    stage: LoopStage
+    elapsed_ms: int = Field(ge=0, le=3_600_000)
+    onboarding_phase: OnboardingPhase
+    recorded_at: IsoTimestamp
+
+
 class TimelineResponse(StrictApiModel):
     run_id: str
     items: list[TimelineEvent]
+    # Newest first, capped by ``onboarding_progress_window``. A separate field
+    # rather than rows in ``items``, which keeps ``event_id`` uniqueness intact.
+    progress: list[RunProgressEventView] = []
 
 
 class LiveViewResponse(StrictApiModel):

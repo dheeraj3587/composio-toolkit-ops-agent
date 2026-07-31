@@ -49,6 +49,7 @@ import pytest
 from cryptography.fernet import Fernet
 from pydantic import SecretStr
 
+from ops.browser import signup as signup_phase
 from ops.browser.candidates import ActionCandidate
 from ops.browser.signup import (
     SignupIdentity,
@@ -93,6 +94,7 @@ from ops.onboarding.phase import OnboardingPhase
 from ops.providers.profile import ProfileField, ProviderProfile
 from ops.providers.profile_builder import ProfileClaim, build_profile, discovery_adapter
 from ops.providers.profile_store import ProviderProfileStore
+from ops.recipes.app_recipes import SignupPolicy
 from ops.research.operational_research import EvidenceDocument
 
 # The run and its bindings. Both identifiers are the opaque forms the vault's own
@@ -656,7 +658,20 @@ class _Walkthrough:
 
 
 @pytest.fixture
-def walkthrough(tmp_path: Path) -> Iterator[_Walkthrough]:
+def walkthrough(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Walkthrough]:
+    # The fake provider has no catalog entry, so the reviewed signup policy the
+    # catalog would return for it is supplied here: signup is admitted only where
+    # a policy exists (Requirement 7.1).
+    monkeypatch.setattr(
+        signup_phase,
+        "declared_signup_policy",
+        lambda app_slug: SignupPolicy(
+            flow="email_first",
+            entry_path_prefixes=("/signup",),
+            entry_submit_labels=("Create account",),
+            entry_submit_implies_legal_acceptance=False,
+        ),
+    )
     db_path = tmp_path / "private" / "ops.db"
     settings = Settings(
         ops_db_path=db_path,

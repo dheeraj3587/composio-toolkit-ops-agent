@@ -14,11 +14,32 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ops.browser.host_policy import MAX_ALLOWED_HOST_PATTERNS
+from ops.browser.worker import HumanActionType
 from ops.core.models import validate_vault_reference
 
 SessionLifecycle = Literal["ACTIVE", "CLOSING", "CLOSED"]
 LiveViewMode = Literal["screenshot", "interactive_remote"]
 _BROKER_GRANT_PATTERN = re.compile(r"^bsg_[A-Za-z0-9_-]{43}$")
+
+# Why a gate clearance answer can name only these four causes. A free-form string
+# would let page-derived text ride out of the container on the one field nobody
+# checks, so the reason is closed data like every other reason code on this
+# boundary: the page was read, the operation lock was held so nothing was read, the
+# read could not complete, or the session was already closed by the absolute
+# lifetime bound.
+#
+# ``ops/browser/takeover.py::ClearanceProbeReason`` is the API-side set and is a
+# strict SUPERSET of this one: it adds ``session_not_found``, because a 404 never
+# produces a report at all, so this service can never name it — it can only
+# describe a session it still has. Every member here is spelled identically
+# there, and the two must stay in step: a member added to one and not the other
+# is a contract break, not a widening.
+ClearanceProbeReason = Literal[
+    "observed",
+    "operation_in_flight",
+    "probe_failed",
+    "session_max_age_exceeded",
+]
 
 # Health states for the Playwright provider path (no Browser Use wording).
 ProviderHealthState = Literal[
@@ -121,6 +142,9 @@ class SessionSummary(_Strict):
     live_view_mode: LiveViewMode
     live_view_available: bool
     hitl_pending: bool
+    # Monotonic browser-service pause generation. Zero is reserved for sessions
+    # that have never entered HITL and cannot authorize canonical takeover.
+    hitl_generation: int = Field(default=0, ge=0)
     # Four DISTINCT capability facts, so a caller is never misled by one boolean:
     #   screenshot_supported   - the worker can produce screenshots at all
     #   screenshot_available   - a current, non-sensitive frame exists right now
@@ -136,6 +160,33 @@ class SessionSummary(_Strict):
     # so a caller can verify enforcement rather than assume it; empty means the
     # session carries no run allow-list.
     allowed_host_patterns: tuple[str, ...] = ()
+
+
+class GateClearanceReport(_Strict):
+    """Whether the human gate a paused run is waiting on is still on the page.
+
+    This is an OBSERVATION with no verb on it: the API decides what a cleared gate
+    means for a run, and this container only reports what it saw. ``_Strict``
+    forbids extra fields, so a future field cannot arrive here unreviewed.
+
+    It carries NO URL, NO page text and NO prompt — deliberately, because it is
+    read on a 5 second interval while a person may be typing inside the session,
+    and a report that carried page content would turn a watcher into a leak. What
+    is left is a closed gate type, four booleans, a closed probe reason code, and a
+    count.
+    """
+
+    session_id: str
+    lifecycle: SessionLifecycle
+    hitl_pending: bool
+    attached: bool
+    final_probe_owed: bool
+    gate: HumanActionType | None
+    cleared: bool
+    probe_reason_code: ClearanceProbeReason
+    # The pause this observation belongs to, so an answer cannot be attributed to a
+    # later gate. A count, never a timestamp of a human's presence.
+    hitl_generation: int = Field(ge=0)
 
 
 class NavigateRequest(_Strict):
@@ -157,7 +208,15 @@ class NavigateRequest(_Strict):
     # Strictly approved non-secret OperationsRequest projections. Raw credentials
     # remain vault references in ``credential_refs``.
     signup_fields: dict[str, str] = Field(default_factory=dict)
+    setup_fields: dict[str, str] = Field(default_factory=dict, max_length=20)
     credential_creation_policy: Literal["reuse_only", "create_if_missing"] = "reuse_only"
+
+    @field_validator("setup_fields")
+    @classmethod
+    def _approved_setup_fields(cls, values: dict[str, str]) -> dict[str, str]:
+        from ops.browser.setup_values import normalize_browser_setup_fields
+
+        return normalize_browser_setup_fields(values)
 
     @field_validator("signup_fields")
     @classmethod
@@ -185,7 +244,19 @@ class ResumeRequest(_Strict):
     secret_grants: dict[str, str] = Field(default_factory=dict)
     account_creation_requested: bool = False
     signup_fields: dict[str, str] = Field(default_factory=dict)
+    setup_fields: dict[str, str] = Field(default_factory=dict, max_length=20)
     credential_creation_policy: Literal["reuse_only", "create_if_missing"] = "reuse_only"
+    # Optional for owner/manual resumes; canonical takeover supplies the positive
+    # generation it observed so the service can reject a race into a later gate
+    # before any browser action runs.
+    expected_hitl_generation: int | None = Field(default=None, ge=1)
+
+    @field_validator("setup_fields")
+    @classmethod
+    def _approved_setup_fields(cls, values: dict[str, str]) -> dict[str, str]:
+        from ops.browser.setup_values import normalize_browser_setup_fields
+
+        return normalize_browser_setup_fields(values)
 
     @field_validator("signup_fields")
     @classmethod
@@ -241,15 +312,32 @@ class CaptureCredentialsResponse(_Strict):
 
 
 class CaptureCredentialsRequest(_Strict):
-    """Creation-time recipe needed for selector-bound deterministic capture."""
+    """Creation-time recipe plus one exact broker grant per captured field."""
 
     recipe_snapshot: dict[str, object] | None = None
-    broker_grant: str = Field(
+    # Compatibility for older single-field callers.
+    broker_grant: str | None = Field(
+        default=None,
         min_length=47,
         max_length=47,
         pattern=r"^bsg_[A-Za-z0-9_-]{43}$",
         repr=False,
     )
+    broker_grants: dict[str, str] = Field(default_factory=dict, max_length=20, repr=False)
+
+    @model_validator(mode="after")
+    def _exact_capture_grants(self) -> CaptureCredentialsRequest:
+        if self.broker_grant is not None and self.broker_grants:
+            raise ValueError("use either a single or per-field capture grant")
+        if self.broker_grant is None and not self.broker_grants:
+            raise ValueError("at least one capture grant is required")
+        for kind, grant in self.broker_grants.items():
+            if (
+                re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,99}", kind) is None
+                or re.fullmatch(r"bsg_[A-Za-z0-9_-]{43}", grant) is None
+            ):
+                raise ValueError("capture grant binding is invalid")
+        return self
 
 
 class LiveViewGrant(_Strict):
@@ -302,9 +390,11 @@ class ErrorResponse(_Strict):
 
 __all__ = [
     "CaptureCredentialsResponse",
+    "ClearanceProbeReason",
     "CreateSessionRequest",
     "DrainStatus",
     "ErrorResponse",
+    "GateClearanceReport",
     "HealthResponse",
     "LiveViewGrant",
     "LiveViewMode",

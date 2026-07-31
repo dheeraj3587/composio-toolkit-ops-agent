@@ -37,12 +37,14 @@ from browser_service.auth import (
     require_session_capability_value,
     token_dependency,
 )
+from browser_service.clearance import observe_gate_clearance
 from browser_service.display_pool import DisplayPool, DisplayUnavailable
 from browser_service.models import (
     CaptureCredentialsRequest,
     CaptureCredentialsResponse,
     CreateSessionRequest,
     DrainStatus,
+    GateClearanceReport,
     HealthResponse,
     LiveViewGrant,
     NavigateRequest,
@@ -315,9 +317,12 @@ def make_session_closer(
 
 
 def _set_hitl_pending(session: ManagedSession, pending: bool) -> None:
-    """Cross a HITL boundary while revoking grants from earlier pauses."""
+    """Cross a HITL boundary while revoking grants and final-probe debt."""
 
-    if pending and not session.hitl_pending:
+    if pending == session.hitl_pending:
+        return
+    session.takeover_final_probe_generation = None
+    if pending:
         session.hitl_generation += 1
     session.hitl_pending = pending
 
@@ -668,6 +673,51 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         )
         return session.summary()
 
+    def _clearance_absent(session_id: str) -> HTTPException:
+        """410 for a session the absolute lifetime bound closed, else 404.
+
+        The closure ring is what tells the two causes apart; the API pauses the
+        run with ``session_lifetime_exceeded`` (R2.5) or ``session_unreattachable``
+        (R2.6) accordingly.
+        """
+
+        if manager.recent_closure_reason(session_id) == "session_max_age_exceeded":
+            return HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail="session_max_age_exceeded",
+            )
+        return HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="session_not_found",
+        )
+
+    @app.get(
+        "/internal/browser/sessions/{session_id}/gate-clearance",
+        response_model=GateClearanceReport,
+    )
+    async def gate_clearance(session_id: str, auth: AuthContext = _AUTH) -> GateClearanceReport:
+        """Report whether the human gate a paused run waits on is still present.
+
+        Read-only and clock-neutral: no lease, so polling never keeps the session
+        alive (R2.4). Authorization matches the sibling internal session routes.
+        """
+
+        caller_capability_digest = require_session_capability(auth)
+        session = manager.get_if_present(session_id)
+        if session is None:
+            raise _clearance_absent(session_id)
+        assert_session_access(
+            session_owner=session.owner,
+            caller_owner=auth.owner,
+            session_capability_digest=session.session_capability_digest,
+            caller_capability_digest=caller_capability_digest,
+        )
+        try:
+            return await observe_gate_clearance(manager, _worker(), session_id)
+        except SessionUnavailable:
+            # Reaped between the authorization above and the observation itself.
+            raise _clearance_absent(session_id) from None
+
     @app.post(
         "/internal/browser/sessions/{session_id}/navigate", response_model=ObservationResponse
     )
@@ -703,6 +753,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                     resume_signal=None,
                     account_creation_requested=payload.account_creation_requested,
                     signup_fields=payload.signup_fields,
+                    setup_fields=payload.setup_fields,
                     credential_creation_policy=payload.credential_creation_policy,
                 )
                 if observation.status == "credential_page_ready":
@@ -730,6 +781,14 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             caller_capability_digest=caller_capability_digest,
         )
         caller_capability = require_session_capability_value(auth)
+        if (
+            payload.expected_hitl_generation is not None
+            and session.hitl_generation != payload.expected_hitl_generation
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="hitl_generation_mismatch",
+            )
         if not session.hitl_pending:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="hitl_not_pending")
         # Revoke stale grants before closing attachments. A socket racing this
@@ -759,6 +818,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                     resume_signal=payload.signal,
                     account_creation_requested=payload.account_creation_requested,
                     signup_fields=payload.signup_fields,
+                    setup_fields=payload.setup_fields,
                     credential_creation_policy=payload.credential_creation_policy,
                 )
                 if observation.status == "credential_page_ready":
@@ -831,6 +891,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                     session=leased,
                     broker=_secret_broker(),
                     grant=payload.broker_grant,
+                    grants=payload.broker_grants,
                     owner=auth.owner,
                     capability=caller_capability,
                 )
@@ -1099,6 +1160,13 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 session_attachments.pop(attachment_task, None)
                 if not session_attachments:
                     live_attachments.pop(session_id, None)
+                    if session is not None and session.hitl_pending:
+                        # The last client left a session still at a human gate who
+                        # may have cleared it before closing the tab. Exactly one
+                        # post-detach observation is owed; the clearance route
+                        # discharges it (R1.12). Process-local, never persisted
+                        # (R2.8).
+                        session.takeover_final_probe_generation = session.hitl_generation
             with contextlib.suppress(Exception):
                 await websocket.close()
             # Close is audited too, so an interactive attachment is never silent.
@@ -1302,6 +1370,7 @@ async def _drive(
     resume_signal: str | None,
     account_creation_requested: bool = False,
     signup_fields: dict[str, str] | None = None,
+    setup_fields: dict[str, str] | None = None,
     credential_creation_policy: str = "reuse_only",
 ) -> ObservationResponse:
     """Run one navigate/resume operation and project a sanitized observation.
@@ -1372,6 +1441,8 @@ async def _drive(
                 "sensitive_data": sensitive,
                 "credential_creation_policy": credential_creation_policy,
             }
+            if setup_fields:
+                navigate_kwargs["setup_fields"] = setup_fields
             if recipe is not None:
                 navigate_kwargs["recipe"] = recipe
             if account_creation_requested:
@@ -1386,6 +1457,8 @@ async def _drive(
                 "sensitive_data": sensitive,
                 "credential_creation_policy": credential_creation_policy,
             }
+            if setup_fields:
+                resume_kwargs["setup_fields"] = setup_fields
             if recipe is not None:
                 resume_kwargs["recipe"] = recipe
             if account_creation_requested:
@@ -1467,7 +1540,8 @@ def _credential_capture_store(
     *,
     session: ManagedSession,
     broker: BrowserSecretBrokerClient,
-    grant: str,
+    grant: str | None,
+    grants: dict[str, str],
     owner: str,
     capability: str,
 ) -> BrokerCaptureStore:
@@ -1476,6 +1550,7 @@ def _credential_capture_store(
     return BrokerCaptureStore(
         broker=broker,
         grant=grant,
+        grants=grants,
         app_slug=session.app_slug,
         scope_id=session.secret_scope,
         session_id=session.session_id,

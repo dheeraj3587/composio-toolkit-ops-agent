@@ -14,8 +14,8 @@ import secrets
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
-from typing import Any, Literal, Protocol, cast, get_args
+from datetime import UTC, datetime, timedelta
+from typing import Any, Final, Literal, Protocol, cast, get_args
 from uuid import uuid4
 
 from pydantic import SecretStr
@@ -27,6 +27,7 @@ from ops.browser.account_binding import (
 )
 from ops.browser.link_log import log_event
 from ops.browser.readiness import browser_configuration_state
+from ops.browser.setup_values import browser_setup_values
 from ops.browser.signup import normalize_signup_fields
 from ops.browser.worker import (
     BrowserObservation,
@@ -39,6 +40,9 @@ from ops.core.secret_store import AccountLoginStateError, SQLiteSecretStore, par
 from ops.core.state import BrowserProvider, RunStatus
 from ops.core.storage import OperationsStorage
 from ops.onboarding.composition import OnboardingPorts, build_onboarding_ports
+from ops.onboarding.driver import RunPlanningPorts, plan_admission
+from ops.planner.adherence import AdherenceOutcome
+from ops.planner.plan import RunPlan, canonical_surface
 from ops.providers.composio_managed_auth import (
     ComposioManagedAuthProvider,
     validate_managed_auth_callback_base_url,
@@ -76,6 +80,7 @@ ExecutionMode = Literal["plan_only", "execute_when_configured"]
 # hand-listed, so a gate added in ops.browser.worker stays recognized here instead
 # of being downgraded to ``provider_verification`` by the resume path below.
 _HUMAN_ACTION_TYPES: frozenset[str] = frozenset(get_args(HumanActionType))
+_STALE_ROUTE_OBSERVATION: Final = object()
 
 
 class CanonicalRuntimeContext(Protocol):
@@ -159,6 +164,19 @@ class CanonicalRuntimeContext(Protocol):
         reason: str,
     ) -> None: ...
 
+    def observe_run_surface(
+        self, *, run_id: str, step_index: int, observed_url: str
+    ) -> AdherenceOutcome: ...
+
+    def replan_run_route(
+        self,
+        *,
+        run_id: str,
+        recipe: AppRecipe,
+        expected_state_revision: int,
+        expected_effect_identity: str | None,
+    ) -> bool | None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class _AppliedBrowserOutcome:
@@ -170,9 +188,19 @@ class _AppliedBrowserOutcome:
     # response arriving after another operation took ownership of the run is
     # discarded instead of overwriting newer state.
     effect_identity: str | None = None
+    # Only the exact run revision evaluated by this observation may be projected.
+    expected_state_revision: int | None = None
     hitl: dict[str, object] | None = None
     changes: Mapping[str, object] | None = None
     events: tuple[tuple[str, Mapping[str, object]], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _RouteAdherenceOverride:
+    """Adherence override plus the run revision it leaves authoritative."""
+
+    outcome: _AppliedBrowserOutcome | None
+    expected_state_revision: int
 
 
 def _recipe_version() -> str:
@@ -224,11 +252,32 @@ def _signup_fields_for(request: OperationsRequest) -> dict[str, str]:
     return normalize_signup_fields(values)
 
 
+def _setup_fields_for(request: OperationsRequest, recipe: AppRecipe) -> dict[str, str]:
+    """Project immutable non-secret values into browser setup references."""
+
+    company = request.company
+    return browser_setup_values(
+        request.provider_setup,
+        company_name=company.legal_name,
+        company_website=company.website,
+        use_case=company.use_case,
+        expected_volume=company.expected_volume,
+        callback_urls=company.callback_urls,
+        app_slug=recipe.app_slug,
+    )
+
+
 class CanonicalRuntime:
     """Execute managed, Playwright and gated recipes without LangGraph."""
 
-    def __init__(self, context: CanonicalRuntimeContext) -> None:
+    def __init__(
+        self,
+        context: CanonicalRuntimeContext,
+        *,
+        planning: RunPlanningPorts | None = None,
+    ) -> None:
         self._context = context
+        self._planning = planning
         self._onboarding_ports: OnboardingPorts | None = None
 
     def onboarding_ports(self) -> OnboardingPorts:
@@ -332,7 +381,7 @@ class CanonicalRuntime:
             )
         return grants
 
-    def _reserve_capture_grant_locked(
+    def _reserve_capture_grants_locked(
         self,
         *,
         worker: object,
@@ -340,23 +389,26 @@ class CanonicalRuntime:
         run_id: str,
         session_id: str,
         recipe: AppRecipe,
-    ) -> str | None:
-        """Reserve one idempotent automatic-capture grant under the run lock."""
+    ) -> dict[str, str]:
+        """Reserve one idempotent broker grant for every captured field."""
 
         if not self._requires_broker_grants(worker):
-            return None
+            return {}
         store = self._context._secret_store
-        field_kind = recipe.capture.field_name
-        if store is None or not field_kind:
+        field_kinds = tuple(field.field_name for field in recipe.capture.capture_fields)
+        if store is None or not field_kinds:
             raise CredentialSubmissionError("automatic_capture_grant_unavailable")
-        return store.reserve_browser_secret_grant(
-            operation_key=f"{operation_key}:capture:{field_kind}",
-            run_id=run_id,
-            session_id=session_id,
-            app_slug=recipe.app_slug,
-            kind=field_kind,
-            action="capture",
-        )
+        return {
+            field_kind: store.reserve_browser_secret_grant(
+                operation_key=f"{operation_key}:capture:{field_kind}",
+                run_id=run_id,
+                session_id=session_id,
+                app_slug=recipe.app_slug,
+                kind=field_kind,
+                action="capture",
+            )
+            for field_kind in field_kinds
+        }
 
     def _bound_browser_record_locked(
         self,
@@ -366,6 +418,7 @@ class CanonicalRuntime:
         statuses: frozenset[str],
         phases: frozenset[str] | None = None,
         effect_identity: str | None = None,
+        state_revision: int | None = None,
     ) -> dict[str, Any] | None:
         """Return the authoritative row only while the exact browser op owns it.
 
@@ -385,6 +438,10 @@ class CanonicalRuntime:
             or str(record.get("status") or "") not in statuses
             or (phases is not None and str(record.get("phase") or "") not in phases)
             or (effect_identity is not None and record.get("effect_identity") != effect_identity)
+            or (
+                state_revision is not None
+                and int(record.get("state_revision", 0) or 0) != state_revision
+            )
         ):
             return None
         return record
@@ -1027,6 +1084,34 @@ class CanonicalRuntime:
                 reason_code="browser_account_binding_missing",
             )
 
+        planning = self._planning
+        if planning is not None:
+            plans = planning.plans
+            active_plan = plans.read_active_plan(run_id=run_id) if plans is not None else None
+            # Release compatibility: a run that crossed the browser-admission
+            # boundary before plan storage existed is not retroactively refused.
+            # With no plan row, adherence remains inert for that already-advanced
+            # run.  Pristine attempt zero still plans before the first worker.start.
+            already_advanced_without_plan = active_plan is None and (
+                int(persisted.get("attempt", 0) or 0) > 0
+                or bool(persisted.get("browser_session_id"))
+                or bool(persisted.get("external_actions"))
+            )
+            if not already_advanced_without_plan:
+                refusal = plan_admission(
+                    run_id=run_id,
+                    profile=None,
+                    recipe=recipe,
+                    deps=planning,
+                )
+                if refusal is not None:
+                    return self._record_provider_failure(
+                        run_id,
+                        status="configuration_required",
+                        phase="plan_refused",
+                        reason_code=refusal.reason_code,
+                    )
+
         sensitive: dict[str, str] | None = None
         transient_secrets = self._requires_broker_grants(worker)
         if browser_login:
@@ -1382,6 +1467,117 @@ class CanonicalRuntime:
         finally:
             lock.release()
 
+    def _adherence_step_index(
+        self,
+        *,
+        run_id: str,
+        observation: BrowserObservation,
+    ) -> tuple[RunPlan, int] | None:
+        """Resolve the observed endpoint to one active-plan ordinal.
+
+        Exact planned surfaces are authoritative. A human-only challenge may
+        redirect within a reviewed provider host, so an unmatched HITL URL stays
+        inert instead of turning a solvable gate into a route failure. Successful
+        terminal observations are compared with the credential surface, and the
+        only other non-terminal worker outcome is compared with the route entry.
+        """
+
+        plans = self._planning.plans if self._planning is not None else None
+        if plans is None or observation.status in {"blocked", "failed"}:
+            return None
+        plan = plans.read_active_plan(run_id=run_id)
+        if plan is None:
+            return None
+        try:
+            observed = canonical_surface(observation.current_url, purpose="entry")
+        except ValueError:
+            observed = None
+        if observed is not None:
+            for index, surface in enumerate(plan.surfaces):
+                if (surface.host, surface.path) == (observed.host, observed.path):
+                    return plan, index
+        if observation.status == "human_action_required":
+            return None
+        if observation.status in {"credential_page_ready", "developer_console_ready"}:
+            for index, surface in enumerate(plan.surfaces):
+                if (surface.host, surface.path) == (
+                    plan.credential_surface.host,
+                    plan.credential_surface.path,
+                ):
+                    return plan, index
+            return plan, len(plan.surfaces) - 1
+        if observation.status == "navigating":
+            return plan, 0
+        return None
+
+    def _route_adherence_override(
+        self,
+        *,
+        run_id: str,
+        observation: BrowserObservation,
+        recipe: AppRecipe,
+        expected_state_revision: int,
+        expected_effect_identity: str | None,
+    ) -> _RouteAdherenceOverride | object:
+        resolved = self._adherence_step_index(run_id=run_id, observation=observation)
+        observer = getattr(self._context, "observe_run_surface", None)
+        if resolved is None or not callable(observer):
+            return _RouteAdherenceOverride(
+                outcome=None,
+                expected_state_revision=expected_state_revision,
+            )
+        _plan, step_index = resolved
+        projection_revision = expected_state_revision
+        outcome = observer(
+            run_id=run_id,
+            step_index=step_index,
+            observed_url=observation.current_url,
+        )
+        if outcome.action == "replan":
+            replanner = getattr(self._context, "replan_run_route", None)
+            replanned: bool | None = False
+            if callable(replanner):
+                replanned = replanner(
+                    run_id=run_id,
+                    recipe=recipe,
+                    expected_state_revision=expected_state_revision,
+                    expected_effect_identity=expected_effect_identity,
+                )
+            if replanned is None:
+                return _STALE_ROUTE_OBSERVATION
+            if replanned:
+                projection_revision += 1
+                replacement = self._adherence_step_index(
+                    run_id=run_id,
+                    observation=observation,
+                )
+                if replacement is None:
+                    return _RouteAdherenceOverride(
+                        outcome=None,
+                        expected_state_revision=projection_revision,
+                    )
+                _plan, step_index = replacement
+                outcome = observer(
+                    run_id=run_id,
+                    step_index=step_index,
+                    observed_url=observation.current_url,
+                )
+        if outcome.action == "proceed":
+            return _RouteAdherenceOverride(
+                outcome=None,
+                expected_state_revision=projection_revision,
+            )
+        return _RouteAdherenceOverride(
+            outcome=_AppliedBrowserOutcome(
+                status="blocked",
+                phase="blocked",
+                reason_code="route_divergence_unresolved",
+                provider_browser="blocked",
+                expected_state_revision=projection_revision,
+            ),
+            expected_state_revision=projection_revision,
+        )
+
     def _drive_browser(
         self,
         *,
@@ -1437,6 +1633,7 @@ class CanonicalRuntime:
                 "sensitive_data": sensitive,
                 "account_creation_requested": request.account_creation_requested,
                 "signup_fields": _signup_fields_for(request),
+                "setup_fields": _setup_fields_for(request, recipe),
                 "credential_creation_policy": request.credential_creation_policy,
             }
             if self._requires_broker_grants(worker):
@@ -1487,6 +1684,7 @@ class CanonicalRuntime:
         recipe: AppRecipe,
         context: BrowserSessionContext,
         expected_effect_identity: str | None = None,
+        expected_state_revision: int | None = None,
     ) -> _AppliedBrowserOutcome:
         if observation.status == "human_action_required":
             action_type = observation.human_action_type or "login_required"
@@ -1495,6 +1693,7 @@ class CanonicalRuntime:
                 "message": observation.human_instruction or "Complete the browser step.",
                 "expected_completion_signal": "human_completed",
                 "live_view_available": True,
+                "hitl_generation": observation.hitl_generation,
             }
             if action_type == "email_otp":
                 hitl["verification_requested_at"] = (
@@ -1590,7 +1789,7 @@ class CanonicalRuntime:
             )
 
         effect_identity = f"{run_id}:credential-capture:v1"
-        broker_grant: str | None = None
+        broker_grants: dict[str, str] = {}
         lock = self._context._run_lock(run_id)
         with lock:
             current = self._bound_browser_record_locked(
@@ -1598,6 +1797,7 @@ class CanonicalRuntime:
                 session_id=context.session_id,
                 statuses=frozenset({"browser_running", "waiting_for_hitl"}),
                 effect_identity=expected_effect_identity,
+                state_revision=expected_state_revision,
             )
             if current is None:
                 return _AppliedBrowserOutcome(
@@ -1609,14 +1809,36 @@ class CanonicalRuntime:
                     events=(ready_event,),
                 )
             with self._context.storage.unit_of_work() as transaction:
+                current = transaction.get_run(run_id)
+                if (
+                    current is None
+                    or current.get("state_engine") != "canonical_v1"
+                    or current.get("browser_provider") != "playwright"
+                    or current.get("browser_session_id") != context.session_id
+                    or str(current.get("status") or "")
+                    not in {"browser_running", "waiting_for_hitl"}
+                    or (
+                        expected_effect_identity is not None
+                        and current.get("effect_identity") != expected_effect_identity
+                    )
+                    or (
+                        expected_state_revision is not None
+                        and int(current.get("state_revision", 0) or 0) != expected_state_revision
+                    )
+                ):
+                    return _AppliedBrowserOutcome(
+                        status="configuration_required",
+                        phase="effect_reconciliation",
+                        reason_code="browser_observation_no_longer_current",
+                        provider_browser="outcome_unknown",
+                        effect_identity=expected_effect_identity,
+                        events=(ready_event,),
+                    )
                 _intent, reserved = transaction.reserve_side_effect(
                     run_id=run_id,
                     operation_key=effect_identity,
                     provider="playwright_vault",
                 )
-                current = transaction.get_run(run_id)
-                if current is None:
-                    raise KeyError("run was not found")
                 transaction.update_run(
                     run_id,
                     status="browser_running",
@@ -1633,7 +1855,7 @@ class CanonicalRuntime:
                 )
             if reserved:
                 try:
-                    broker_grant = self._reserve_capture_grant_locked(
+                    broker_grants = self._reserve_capture_grants_locked(
                         worker=worker,
                         operation_key=effect_identity,
                         run_id=run_id,
@@ -1672,9 +1894,12 @@ class CanonicalRuntime:
             if bool(getattr(worker, "requires_session_capability_scope", False)):
                 capture_scope_kwargs["capability_scope"] = run_id
             if self._requires_broker_grants(worker):
-                if broker_grant is None:  # pragma: no cover - reservation invariant
+                if not broker_grants:  # pragma: no cover - reservation invariant
                     raise CredentialSubmissionError("automatic_capture_grant_unavailable")
-                capture_scope_kwargs["broker_grant"] = broker_grant
+                if len(broker_grants) == 1:
+                    capture_scope_kwargs["broker_grant"] = next(iter(broker_grants.values()))
+                else:
+                    capture_scope_kwargs["broker_grants"] = broker_grants
             refs = asyncio.run(
                 capture(
                     context.session_id,
@@ -1774,17 +1999,27 @@ class CanonicalRuntime:
         # capture/validation so a broker callback can acquire it.
         lock = self._context._run_lock(run_id)
         with lock:
-            if (
-                self._bound_browser_record_locked(
-                    run_id=run_id,
-                    session_id=context.session_id,
-                    statuses=frozenset({"browser_running", "waiting_for_hitl"}),
-                    effect_identity=expected_effect_identity,
-                )
-                is None
-            ):
+            bound = self._bound_browser_record_locked(
+                run_id=run_id,
+                session_id=context.session_id,
+                statuses=frozenset({"browser_running", "waiting_for_hitl"}),
+                effect_identity=expected_effect_identity,
+            )
+            if bound is None:
                 return None
-        outcome = self._resolve_browser_outcome(
+            expected_state_revision = int(bound.get("state_revision", 0) or 0)
+        route_override = self._route_adherence_override(
+            run_id=run_id,
+            observation=observation,
+            recipe=recipe,
+            expected_state_revision=expected_state_revision,
+            expected_effect_identity=expected_effect_identity,
+        )
+        if route_override is _STALE_ROUTE_OBSERVATION:
+            return None
+        if not isinstance(route_override, _RouteAdherenceOverride):
+            return None
+        outcome = route_override.outcome or self._resolve_browser_outcome(
             run_id=run_id,
             observation=observation,
             research=research,
@@ -1792,7 +2027,15 @@ class CanonicalRuntime:
             recipe=recipe,
             context=context,
             expected_effect_identity=expected_effect_identity,
+            expected_state_revision=route_override.expected_state_revision,
         )
+        projection_revision = route_override.expected_state_revision
+        if (
+            outcome.effect_identity is not None
+            and outcome.effect_identity != expected_effect_identity
+        ):
+            projection_revision += 1
+        outcome = replace(outcome, expected_state_revision=projection_revision)
         projection_effect_identity = outcome.effect_identity or expected_effect_identity
         with lock:
             current = self._bound_browser_record_locked(
@@ -1800,6 +2043,7 @@ class CanonicalRuntime:
                 session_id=context.session_id,
                 statuses=frozenset({"browser_running", "waiting_for_hitl"}),
                 effect_identity=projection_effect_identity,
+                state_revision=outcome.expected_state_revision,
             )
             if current is None:
                 return None
@@ -1934,7 +2178,23 @@ class CanonicalRuntime:
                         )
             with self._context.storage.unit_of_work() as transaction:
                 record = transaction.get_run(run_id)
-                if record is None:
+                if (
+                    record is None
+                    or record.get("state_engine") != "canonical_v1"
+                    or record.get("browser_provider") != "playwright"
+                    or record.get("browser_session_id") != context.session_id
+                    or str(record.get("status") or "")
+                    not in {"browser_running", "waiting_for_hitl"}
+                    or (
+                        projection_effect_identity is not None
+                        and record.get("effect_identity") != projection_effect_identity
+                    )
+                    or (
+                        outcome.expected_state_revision is not None
+                        and int(record.get("state_revision", 0) or 0)
+                        != outcome.expected_state_revision
+                    )
+                ):
                     return None
                 revision = int(record.get("state_revision", 0) or 0) + 1
                 changes: dict[str, object] = {
@@ -1981,12 +2241,203 @@ class CanonicalRuntime:
         log_event("canonical.browser.applied", run_id=run_id, status=outcome.status)
         return _public_run(updated)
 
+    def resume_after_takeover(
+        self,
+        run_id: str,
+        *,
+        expected_state_revision: int,
+        expected_session_id: str,
+        expected_gate: HumanActionType,
+        expected_hitl_generation: int,
+    ) -> Mapping[str, object]:
+        """Continue only the exact canonical CAPTCHA pause that was observed."""
+
+        result = self.resume_run(
+            run_id,
+            signal="completed",
+            browser_login=None,
+            expected_state_revision=expected_state_revision,
+            expected_session_id=expected_session_id,
+            expected_gate=expected_gate,
+            expected_hitl_generation=expected_hitl_generation,
+        )
+        if result.get("reason_code") in {
+            "hitl_generation_mismatch",
+            "hitl_generation_invalid",
+        }:
+            raise RunConflictError(run_id, "takeover_generation")
+        return result
+
+    def _stop_canonical_browser(
+        self,
+        run_id: str,
+        *,
+        expected_status: RunStatus,
+        status: RunStatus,
+        phase: str,
+        reason_code: str,
+        expected_state_revision: int,
+        expected_session_id: str,
+        expected_gate: HumanActionType,
+        expected_hitl_generation: int,
+    ) -> bool:
+        """Guard and terminate one observed canonical state, then release its session."""
+
+        lock = self._context._run_lock(run_id)
+        context: BrowserSessionContext | None = None
+        with lock:
+            current = self._context.storage.get_run(run_id)
+            hitl = current.get("hitl_request") if current is not None else None
+            if (
+                current is None
+                or current.get("state_engine") != "canonical_v1"
+                or current.get("status") != expected_status
+                or int(current.get("state_revision", 0) or 0) != expected_state_revision
+                or str(current.get("browser_session_id") or "") != expected_session_id
+                or not isinstance(hitl, Mapping)
+                or hitl.get("type") != expected_gate
+                or hitl.get("hitl_generation") != expected_hitl_generation
+            ):
+                return False
+            context = self._context._session_context_for(run_id)
+            self._record_provider_failure(
+                run_id,
+                status=status,
+                phase=phase,
+                reason_code=reason_code,
+                external_actions=bool(current.get("external_actions")),
+            )
+        self._context._release_browser_session(
+            context,
+            "playwright",
+            reason=f"canonical_{reason_code}",
+        )
+        return True
+
+    def pause_after_takeover(
+        self,
+        run_id: str,
+        *,
+        reason_code: str,
+        expected_state_revision: int,
+        expected_session_id: str,
+        expected_gate: HumanActionType,
+        expected_hitl_generation: int,
+    ) -> bool:
+        """Stop polling an unrecoverable canonical human gate durably."""
+
+        phase = (
+            "session_lost"
+            if reason_code in {"session_lifetime_exceeded", "session_unreattachable"}
+            else "challenge_unavailable"
+        )
+        return self._stop_canonical_browser(
+            run_id,
+            expected_status="waiting_for_hitl",
+            status="configuration_required",
+            phase=phase,
+            reason_code=reason_code,
+            expected_state_revision=expected_state_revision,
+            expected_session_id=expected_session_id,
+            expected_gate=expected_gate,
+            expected_hitl_generation=expected_hitl_generation,
+        )
+
+    def pause_stale_run(
+        self,
+        run_id: str,
+        *,
+        reason_code: str,
+        expected_updated_at: str,
+        stale_seconds: int,
+    ) -> bool:
+        """Atomically fence a canonical browser RPC that is still stale."""
+
+        try:
+            last_updated = datetime.fromisoformat(expected_updated_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if last_updated.tzinfo is None:
+            last_updated = last_updated.replace(tzinfo=UTC)
+        if last_updated > datetime.now(UTC) - timedelta(seconds=stale_seconds):
+            return False
+
+        lock = self._context._run_lock(run_id)
+        context: BrowserSessionContext | None = None
+        with lock:
+            current = self._context.storage.get_run(run_id)
+            if (
+                current is None
+                or current.get("state_engine") != "canonical_v1"
+                or current.get("status") != "browser_running"
+                or str(current.get("updated_at") or "") != expected_updated_at
+            ):
+                return False
+            context = self._context._session_context_for(run_id)
+            with self._context.storage.unit_of_work() as transaction:
+                record = transaction.get_run(run_id)
+                if (
+                    record is None
+                    or record.get("state_engine") != "canonical_v1"
+                    or record.get("status") != "browser_running"
+                    or str(record.get("updated_at") or "") != expected_updated_at
+                ):
+                    return False
+                revision = int(record.get("state_revision", 0) or 0) + 1
+                transaction.update_run(
+                    run_id,
+                    status="failed",
+                    phase="failed",
+                    reason_code=reason_code,
+                    route_reason_code=reason_code,
+                    hitl_request=None,
+                    provider_status={
+                        "recipe": record.get("readiness_tier"),
+                        "composio": "not_started",
+                        "browser": "failed",
+                        "email": "not_started",
+                        "validation": "not_started",
+                    },
+                    external_actions=bool(record.get("external_actions")),
+                    state_revision=revision,
+                    last_projected_revision=revision,
+                )
+                transaction.append_audit_event(
+                    run_id=run_id,
+                    event_type="onboarding_progress_stale",
+                    payload={
+                        "reason_code": reason_code,
+                        "stale_seconds": stale_seconds,
+                        "external_actions": False,
+                    },
+                )
+                transaction.append_audit_event(
+                    run_id=run_id,
+                    event_type="provider_operation_failed",
+                    payload={
+                        "status": "failed",
+                        "phase": "failed",
+                        "reason_code": reason_code,
+                        "external_actions": bool(record.get("external_actions")),
+                    },
+                )
+        self._context._release_browser_session(
+            context,
+            "playwright",
+            reason=f"canonical_{reason_code}",
+        )
+        return True
+
     def resume_run(
         self,
         run_id: str,
         *,
         signal: str,
         browser_login: Mapping[str, SecretStr] | None,
+        expected_state_revision: int | None = None,
+        expected_session_id: str | None = None,
+        expected_gate: HumanActionType | None = None,
+        expected_hitl_generation: int | None = None,
     ) -> dict[str, Any]:
         lock = self._context._run_lock(run_id)
         if not lock.acquire(blocking=False):
@@ -1995,6 +2446,7 @@ class CanonicalRuntime:
         sensitive_app_slug: str | None = None
         transient_secrets = False
         secret_grants: dict[str, str] = {}
+        reserved_state_revision: int | None = None
         try:
             current = self._context.storage.get_run(run_id)
             if current is None:
@@ -2003,6 +2455,20 @@ class CanonicalRuntime:
                 raise CredentialSubmissionError("legacy_run_is_read_only")
             if current.get("status") != "waiting_for_hitl":
                 raise CredentialSubmissionError("run_not_waiting_for_hitl")
+            if expected_state_revision is not None:
+                hitl = current.get("hitl_request")
+                if (
+                    int(current.get("state_revision", 0) or 0) != expected_state_revision
+                    or str(current.get("browser_session_id") or "")
+                    != str(expected_session_id or "")
+                    or not isinstance(hitl, Mapping)
+                    or hitl.get("type") != expected_gate
+                    or (
+                        expected_hitl_generation is not None
+                        and hitl.get("hitl_generation") != expected_hitl_generation
+                    )
+                ):
+                    raise RunConflictError(run_id, "takeover_resume")
             if current.get("browser_provider") != "playwright":
                 raise CredentialSubmissionError("playwright_required_for_recipe")
             try:
@@ -2138,6 +2604,7 @@ class CanonicalRuntime:
                 record = transaction.get_run(run_id)
                 if record is None:
                     raise KeyError("run was not found")
+                reserved_state_revision = int(record.get("state_revision", 0) or 0) + 1
                 transaction.update_run(
                     run_id,
                     status="browser_running",
@@ -2146,7 +2613,7 @@ class CanonicalRuntime:
                     effect_identity=effect_identity,
                     attempt=attempt,
                     hitl_request=None,
-                    state_revision=int(record.get("state_revision", 0) or 0) + 1,
+                    state_revision=reserved_state_revision,
                 )
             if not reserved:
                 raise CredentialSubmissionError("resume_reconciliation_required")
@@ -2174,11 +2641,16 @@ class CanonicalRuntime:
                 "sensitive_data": sensitive,
                 "account_creation_requested": request.account_creation_requested,
                 "signup_fields": _signup_fields_for(request),
+                "setup_fields": _setup_fields_for(request, recipe),
                 "credential_creation_policy": request.credential_creation_policy,
                 "provider_session_id": str(current.get("provider_session_id") or "") or None,
             }
             if self._requires_broker_grants(worker):
                 resume_kwargs["secret_grants"] = secret_grants
+            if expected_hitl_generation is not None and bool(
+                getattr(worker, "supports_hitl_generation_cas", False)
+            ):
+                resume_kwargs["expected_hitl_generation"] = expected_hitl_generation
             resume = cast(Any, worker.resume_after_hitl)
             resume_call = resume(
                 context,
@@ -2195,7 +2667,10 @@ class CanonicalRuntime:
             )
         except Exception as exc:
             reason_code = _safe_reason(exc, "browser_resume_failed")
-            retryable_pre_action = reason_code.startswith("browser_secret_")
+            retryable_pre_action = reason_code.startswith("browser_secret_") or reason_code in {
+                "hitl_generation_mismatch",
+                "hitl_generation_invalid",
+            }
             with contextlib.suppress(Exception):
                 self._context.storage.update_side_effect(
                     run_id=run_id,

@@ -27,7 +27,8 @@ import contextlib
 import importlib
 import re
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -83,6 +84,7 @@ from ops.browser.process_hardening import (
     harden_playwright_parent_process,
 )
 from ops.browser.risk import BrowserActionRiskPolicy
+from ops.browser.setup_values import normalize_browser_setup_fields
 from ops.browser.signup import (
     SignupResult,
     SignupSessionState,
@@ -109,6 +111,7 @@ from ops.core.model_input_dlp import (
 )
 from ops.core.models import OperationalResearch, validate_vault_reference
 from ops.core.secret_store import SecretStore
+from ops.credentials.capture_specs import CredentialCaptureSpec
 from ops.playwright.actions import ActionExecutionResult as ActionExecutionResult
 from ops.playwright.actions import ActionReasonCode as ActionReasonCode
 from ops.playwright.actions import ApprovedBrowserValueResolver as ApprovedBrowserValueResolver
@@ -285,6 +288,34 @@ def _active_page(session: _PwSession) -> Any:
     return session.page
 
 
+@dataclass(frozen=True, slots=True)
+class _GateProbe:
+    """The whole answer of ONE read-only human-gate observation.
+
+    Internal to this module and deliberately tiny: the browser service's clearance
+    endpoint is the only caller, and it projects these three facts onto the strict
+    ``GateClearanceReport`` contract. There is no URL, no page text and no
+    instruction here, so nothing page-derived can leave the container through a
+    probe.
+
+    ``reason`` is drawn from the same closed set the report's ``probe_reason_code``
+    names, minus the two reasons only the session manager can know (an id that
+    never existed, an id the absolute lifetime bound closed): ``observed`` when the
+    page was read, ``operation_in_flight`` when the session's operation lock was
+    held and nothing was read at all, ``probe_failed`` when the read could not
+    complete. One spelling across the three modules that carry this vocabulary —
+    here, ``browser_service/models.py`` and ``ops/browser/takeover.py``.
+    """
+
+    gate: HumanActionType | None
+    reason: str
+    # True only when the page was actually READ. ``gate is None`` on its own does
+    # not mean the gate is gone: a held lock and a failed read also carry no gate,
+    # so the caller decides "cleared" from this AND the absent gate, never from the
+    # absent gate alone.
+    observed: bool = False
+
+
 class PlaywrightBrowserWorker:
     """BrowserProvider backed by local Chromium via Playwright."""
 
@@ -304,6 +335,7 @@ class PlaywrightBrowserWorker:
         headless: bool = True,
         service_mode: bool = False,
         event_sink: BrowserEventSink | None = None,
+        attachment_probe: Callable[[str], bool] | None = None,
     ) -> None:
         self._settings = settings or Settings.from_env()
         self._secret_store = secret_store
@@ -317,6 +349,13 @@ class PlaywrightBrowserWorker:
         self._service_mode = service_mode
         # Sanitized decision events from the REAL action loop (never page content).
         self._event_sink = event_sink
+        # Answers "is a human attached to this handle's session, which is paused on a
+        # human-only gate, right now?". Optional and injected, so the worker needs no
+        # knowledge of the live-view relay: the installer supplies the SAME
+        # conjunction the service janitor uses (``hitl_pending and is_attached(id)``)
+        # and owns the "a raising probe means attached" rule, exactly as
+        # ``SessionManager.is_attached`` does. Absent, the worker reaps as before.
+        self._attachment_probe = attachment_probe
         # All Playwright work runs on ONE persistent loop so a session survives
         # the orchestrator's separate per-node asyncio.run loops.
         self._loop = loop or shared_browser_loop()
@@ -410,6 +449,11 @@ class PlaywrightBrowserWorker:
         teardown of the reaped browsers is scheduled on the owning loop. In service
         mode this is a no-op: the manager owns expiry, and reaping here would close
         a session the manager still believes is alive.
+
+        The attachment fact is an INPUT to the lifetime rule rather than a branch
+        here, so an attached human postpones an idle reap and never postpones the
+        absolute maximum age. The rule is the one in
+        ``ops/browser/session_liveness.py`` that the service janitor also calls.
         """
 
         if self._service_mode:
@@ -417,7 +461,14 @@ class PlaywrightBrowserWorker:
         now = datetime.now(UTC)
         with self._registry_lock:
             expired = [
-                handle for handle, session in self._sessions.items() if session.is_expired(now)
+                handle
+                for handle, session in self._sessions.items()
+                if session.is_expired(
+                    now,
+                    hitl_attached=self._attachment_probe(handle)
+                    if self._attachment_probe
+                    else False,
+                )
             ]
             reaped = [(handle, self._sessions.pop(handle)) for handle in expired]
             for handle, _session in reaped:
@@ -591,6 +642,7 @@ class PlaywrightBrowserWorker:
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
         signup_fields: Mapping[str, str] | None = None,
+        setup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
         self._require_configuration()
@@ -612,6 +664,7 @@ class PlaywrightBrowserWorker:
         patterns = self._resolve_patterns(research, recipe=bound_recipe)
         session.patterns = patterns
         session.app_slug = research.app_slug
+        session.approved_values = normalize_browser_setup_fields(setup_fields)
         approved_signup_fields = (
             normalize_signup_fields(signup_fields) if account_creation_requested else {}
         )
@@ -699,6 +752,7 @@ class PlaywrightBrowserWorker:
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
         signup_fields: Mapping[str, str] | None = None,
+        setup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
@@ -733,6 +787,7 @@ class PlaywrightBrowserWorker:
         # A "cancelled" resume ends the run at a human gate rather than re-driving.
         if normalized_signal == "cancelled":
             return self._human_required(session, "The human cancelled the browser step.")
+        session.approved_values = normalize_browser_setup_fields(setup_fields)
         return await self._run_action_loop(
             session,
             resolved,
@@ -918,9 +973,10 @@ class PlaywrightBrowserWorker:
             # so a credential page is never screenshotted "just once" first. Success
             # is proven by the STRUCTURED predicate (an approved URL/path indicator
             # AND a specific label) — never by natural-language body text.
-            if trace.success.has_positive_condition() and predicate_satisfied(
+            success_proven = trace.success.has_positive_condition() and predicate_satisfied(
                 trace.success, inspection
-            ):
+            )
+            if success_proven:
                 entry_only = bool(
                     recipe.route_kind == "playwright"
                     and recipe.browser is not None
@@ -935,16 +991,35 @@ class PlaywrightBrowserWorker:
                         non_secret_notes=("Verified reviewed public-entry predicate.",),
                         reason_code="reviewed_public_entry_reached",
                     )
-                session.egress.advance_to(EgressStage.CREDENTIAL_SURFACE)
-                session.screenshots_disabled = True
-                session.screenshot = None
-                session.screenshot_at = None
-                return BrowserObservation(
-                    status="credential_page_ready",
-                    current_url=inspection.url,
-                    page_title=inspection.title or "Credential page",
-                    non_secret_notes=("Verified structured success predicate.",),
+
+                # A credential-management heading proves only that navigation
+                # succeeded. Under create_if_missing it must not end the action
+                # loop until every reviewed capture selector is structurally
+                # present; otherwise the worker would stop before clicking Create.
+                capture_spec = recipe_to_capture_spec(recipe)
+                creation_reviewed = any(
+                    checkpoint.credential_creation_controls for checkpoint in trace.checkpoints
                 )
+                capture_present = (
+                    await self._capture_contract_present(session, capture_spec)
+                    if capture_spec is not None
+                    else False
+                )
+                if (
+                    credential_creation_policy != "create_if_missing"
+                    or not creation_reviewed
+                    or capture_present
+                ):
+                    session.egress.advance_to(EgressStage.CREDENTIAL_SURFACE)
+                    session.screenshots_disabled = True
+                    session.screenshot = None
+                    session.screenshot_at = None
+                    return BrowserObservation(
+                        status="credential_page_ready",
+                        current_url=inspection.url,
+                        page_title=inspection.title or "Credential page",
+                        non_secret_notes=("Verified structured success predicate.",),
+                    )
             if _looks_credential_bearing(inspection):
                 # Not a reviewed success, but credential-shaped: suppress capture.
                 session.screenshots_disabled = True
@@ -989,30 +1064,50 @@ class PlaywrightBrowserWorker:
                 )
 
             checkpoint = current_checkpoint(trace, session.checkpoint_index)
+            # Authentication/direct navigation can land beyond one or more
+            # checkpoints before the action loop starts. Advance only predicates
+            # already proven on this fresh page. A credential-creation checkpoint
+            # deliberately stays active until its capture selectors exist; its
+            # management-page predicate alone is not proof that a key was issued.
+            while (
+                checkpoint is not None
+                and not checkpoint.credential_creation_controls
+                and checkpoint_satisfied(checkpoint, inspection)
+            ):
+                session.checkpoint_index += 1
+                session.attempted_checkpoint_index = session.checkpoint_index
+                checkpoint = current_checkpoint(trace, session.checkpoint_index)
             if checkpoint is None:
                 return self._human_required(session, "The reviewed navigation trace is exhausted.")
 
-            # A checkpoint whose completion cannot be reliably auto-verified escalates
-            # to a human rather than the agent inventing progress.
+            # Legacy traces may still mark an unprovable checkpoint as HITL. Do
+            # not turn that metadata into a blanket credential-creation veto:
+            # explicit create-if-missing authority may execute only the reviewed
+            # create/generate/save controls, while the normal structured success
+            # predicate still has to prove completion. Other unprovable steps,
+            # including reuse-only creation attempts, remain human-gated.
             if checkpoint.requires_hitl:
-                policy_note = ""
                 instruction = checkpoint.instruction.casefold()
                 is_creation_step = any(
                     marker in instruction
                     for marker in ("create", "generate", "new api", "new app", "new token")
                 )
-                if is_creation_step and credential_creation_policy == "reuse_only":
-                    policy_note = " The run policy permits reuse only; do not create anything."
-                elif is_creation_step and credential_creation_policy == "create_if_missing":
+                if not (
+                    is_creation_step
+                    and credential_creation_policy == "create_if_missing"
+                    and checkpoint.credential_creation_controls
+                ):
                     policy_note = (
-                        " Creation was requested, but this reviewed trace keeps the irreversible "
-                        "step human-authorized."
+                        " The run policy permits reuse only; do not create anything."
+                        if is_creation_step and credential_creation_policy == "reuse_only"
+                        else ""
                     )
-                return self._human_required(
-                    session,
-                    f"Checkpoint {checkpoint.order} requires a human: "
-                    f"{checkpoint.instruction}{policy_note}",
-                )
+                    return self._human_required(
+                        session,
+                        f"Checkpoint {checkpoint.order} requires a human because its "
+                        f"completion is not structurally provable: "
+                        f"{checkpoint.instruction}{policy_note}",
+                    )
 
             # Rank the NEXT snapshot by this checkpoint's signals.
             session.checkpoint_signals = tuple(checkpoint.expected_signals)
@@ -1040,12 +1135,16 @@ class PlaywrightBrowserWorker:
             selection_source: SelectionSource = "deterministic"
             decision_started = asyncio.get_running_loop().time()
             if deterministic is not None:
-                # Deterministic path: prefer the policy candidate whose identity is
-                # the unique checkpoint match, so even this path is policy-bounded.
-                for candidate in executable_candidates(candidates):
-                    if candidate.identity is not None and candidate.identity.matches(deterministic):
-                        chosen = candidate
-                        break
+                # A deterministic element may still map to several actions or
+                # approved values. Choose without a model only when the policy
+                # leaves exactly one executable candidate for that identity.
+                matches = tuple(
+                    candidate
+                    for candidate in executable_candidates(candidates)
+                    if candidate.identity is not None and candidate.identity.matches(deterministic)
+                )
+                if len(matches) == 1:
+                    chosen = matches[0]
             if chosen is None:
                 selection_source = "llm"
                 if self._inference is None:
@@ -1082,7 +1181,13 @@ class PlaywrightBrowserWorker:
                 status, target_element = resolve_identity(chosen.identity, inspection.elements)
                 del status  # execution re-resolves; this is only for risk context
             risk = self._risk_policy.classify(
-                candidate=chosen, checkpoint=checkpoint, element=target_element
+                candidate=chosen,
+                checkpoint=checkpoint,
+                element=target_element,
+                credential_creation_authorized=(
+                    credential_creation_policy == "create_if_missing"
+                    and bool(checkpoint.credential_creation_controls)
+                ),
             )
             if not risk.autonomous_allowed:
                 return self._human_required(
@@ -1143,10 +1248,16 @@ class PlaywrightBrowserWorker:
                 if not chosen.postcondition.is_empty()
                 else structural_change(inspection, fresh)
             )
-            if checkpoint_satisfied(checkpoint, fresh):
+            if (
+                checkpoint_satisfied(checkpoint, fresh)
+                and not checkpoint.credential_creation_controls
+            ):
                 session.checkpoint_index += 1
                 session.attempted_checkpoint_index = session.checkpoint_index
             else:
+                # Creation checkpoints stay active while a multi-step form is
+                # being filled. They complete only when the next loop observes
+                # all reviewed capture selectors and enters the secret boundary.
                 session.attempted_checkpoint_index = session.checkpoint_index + 1
                 if not transitioned:
                     # Nothing observably changed: count it so a control that does
@@ -1278,6 +1389,122 @@ class PlaywrightBrowserWorker:
                 )
 
         return await self._loop.run(_locked(), timeout=_OP_TIMEOUT_SECONDS)
+
+    async def probe_human_gate(self, session_id: str) -> _GateProbe:
+        """Say which human gate the page presents right now, changing nothing.
+
+        This is the observation half of the autonomous takeover. The watcher that
+        decides whether a paused run may continue lives in the API and cannot see
+        the page; the page lives here, next to the recipe-installed mask and the
+        gate classifier, so the reading happens here and only the reading.
+
+        ``session_id`` is the worker-side handle (``pw_...``), the same key
+        :meth:`provider_session_id` and :meth:`latest_screenshot` take. The work
+        runs on the one persistent browser loop like every other verb, because a
+        Playwright page belongs to the loop that created it.
+
+        **Lock politeness.** The session's operation lock is CHECKED and never
+        waited on. A probe that waited would deadlock against exactly the case it
+        exists for — an operation parked at the very gate it came to look at — and
+        would delay real work in every other case. A held lock is reported as
+        ``operation_in_flight`` and the next interval tries again.
+
+        **What it refreshes: nothing.** Every prohibition below holds by
+        construction, and each is named so a later edit has to argue with it:
+
+        * ``dom_generation`` is READ, never incremented. An execution that planned
+          against generation *N* must re-resolve when the DOM moves on, so a
+          watcher bumping it could force a replan of work a human is mid-way
+          through.
+        * ``last_active_at`` is not refreshed, on this session or on the managed
+          session in the service: the watcher must never become the thing keeping a
+          session alive, or the absolute lifetime bound stops meaning anything.
+        * no screenshot is taken and none is refreshed.
+        * ``checkpoint_index``, ``attempted_checkpoint_index``,
+          ``login_handoff_count``, ``hitl_generation``, ``hitl_pending``,
+          ``credential_surface_ready`` and ``secret_capture_boundary_entered`` are
+          not touched.
+        * no pause is raised. The probe never returns a ``human_action_required``
+          observation and never reaches the worker's human-gate handoff
+          (``_human_required`` / ``_bounded_login_handoff``, the
+          ``pause_for_captcha`` step in the design), so no CAPTCHA prompt is
+          counted and the pause budget cannot creep.
+        * no ``goto``, no click, no fill. The reads are ``page.title()``,
+          ``page.inner_text("body")`` and the snapshot's per-element
+          ``get_attribute`` / ``inner_text`` / ``input_value`` for non-secret
+          fields — none of which move focus or dispatch input, so a human typing in
+          the live view is undisturbed. Sanitization is inherited from
+          ``build_ranked_snapshot`` and ``sanitize_page_text`` rather than
+          re-implemented.
+        """
+
+        session = self._sessions.get(session_id)
+        if session is None:
+            # Telling "never existed" apart from "closed by the absolute bound" is
+            # the session manager's job, not the worker's: it keeps the closure
+            # ring. From here an absent session is only ever a read that could not
+            # happen, which the takeover state machine treats as "not cleared".
+            return _GateProbe(gate=None, reason="probe_failed")
+
+        async def _locked() -> _GateProbe:
+            # TRY-lock, not a wait. This check and the acquire below run in ONE
+            # browser-loop coroutine with NO await between them, and the lock is
+            # only ever acquired from a browser-loop coroutine, so nothing can take
+            # it in the gap and the acquire is uncontended by construction.
+            if session.operation_lock.locked():
+                return _GateProbe(gate=None, reason="operation_in_flight")
+            async with session.operation_lock:
+                page = _active_page(session)
+                try:
+                    raw_title = await page.title()
+                except Exception:
+                    raw_title = ""
+                raw_visible = await _visible_text(page)
+                # The same ranked, frame-aware snapshot the observe path builds,
+                # with the same reviewed-frame restriction. A collection failure is
+                # reported as a failed read below rather than falling back to a
+                # wider walk: a probe is allowed to know nothing.
+                elements, locators = await build_ranked_snapshot(
+                    page,
+                    reviewed_patterns=session.patterns,
+                    checkpoint_signals=session.checkpoint_signals,
+                    limit=MAX_ELEMENTS,
+                )
+                url = _page_url(page)
+                inspection = PageInspection(
+                    url=sanitize_url(url),
+                    title=sanitize_page_text(
+                        raw_title if isinstance(raw_title, str) else "", max_length=300
+                    )[:500],
+                    visible_text=sanitize_page_text(raw_visible),
+                    elements=elements,
+                    locators=locators,
+                    fingerprint=_fingerprint(url, elements),
+                    # READ, never ``session.dom_generation += 1``.
+                    generation=session.dom_generation,
+                )
+                gate = classify_structural_gate(inspection)
+                # Only the typed gate travels back; the classifier's instruction
+                # text stays here, because the report carries no prompt.
+                return _GateProbe(
+                    gate=gate[0] if gate is not None else None,
+                    reason="observed",
+                    observed=True,
+                )
+
+        try:
+            return await self._loop.run(
+                _locked(),
+                # The API applies the same bounded budget to the RPC, so a slow read
+                # is reported as a failed probe by whichever side notices first.
+                timeout=float(self._settings.onboarding_takeover_probe_timeout_seconds),
+            )
+        except (TypeError, AttributeError, AssertionError, NameError):
+            raise
+        except Exception:
+            # A raise or a timeout is a failed read, never clearance: the watcher
+            # must keep the run waiting rather than continue it on no evidence.
+            return _GateProbe(gate=None, reason="probe_failed")
 
     async def _choose_candidate(
         self,
@@ -1519,11 +1746,10 @@ class PlaywrightBrowserWorker:
         return _result("executed", sanitize_url(after_url), session.dom_generation)
 
     def _approved_value(self, session: _PwSession, value_ref: str) -> str:
-        """Resolve an approved NON-SECRET value reference from configuration."""
+        """Resolve a reviewed non-secret value reference."""
 
-        # Creation retries must search and fill the exact same name. Derive it
-        # solely from immutable reviewed run state, never page content or model
-        # output, so a restart cannot accidentally create a differently named app.
+        if value_ref in session.approved_values:
+            return session.approved_values[value_ref]
         if value_ref == "application_name" and session.app_slug:
             return f"composio-{session.app_slug}-integration"[:200]
         return self._value_resolver.resolve(value_ref) or ""
@@ -2100,6 +2326,42 @@ class PlaywrightBrowserWorker:
             ) from None
         return validate_allowed_domains(allowed.patterns())
 
+    async def _capture_contract_present(
+        self,
+        session: _PwSession,
+        spec: CredentialCaptureSpec,
+    ) -> bool:
+        """Prove all reviewed capture selectors exist without reading a value."""
+
+        async def _present() -> bool:
+            async with session.operation_lock:
+                page = _active_page(session)
+                parsed = urlsplit(_page_url(page))
+                host = (parsed.hostname or "").casefold()
+                if not (host == spec.vendor_domain or host.endswith("." + spec.vendor_domain)):
+                    return False
+                if spec.expected_path_prefix and not (parsed.path or "/").startswith(
+                    spec.expected_path_prefix
+                ):
+                    return False
+                for field in spec.capture_fields:
+                    found = False
+                    for selector in field.selectors:
+                        try:
+                            if int(await page.locator(selector).count()) == 1:
+                                found = True
+                                break
+                        except Exception:
+                            return False
+                    if not found:
+                        return False
+                return bool(spec.capture_fields)
+
+        try:
+            return bool(await self._loop.run(_present(), timeout=_OP_TIMEOUT_SECONDS))
+        except Exception:
+            return False
+
     async def auto_capture_credentials(
         self,
         handle: str,
@@ -2108,16 +2370,13 @@ class PlaywrightBrowserWorker:
         *,
         recipe: AppRecipe | None = None,
     ) -> dict[str, str] | None:
-        """Deterministically read the app's credential from the live page and vault it.
+        """Capture every reviewed field and return vault references only.
 
-        Reviewed and narrow, per the capture spec: navigate to the spec URL (inside
-        the allowlist), verify host AND path prefix AND expected heading, optionally
-        click the reviewed reveal control, then read ONLY the reviewed selectors and
-        require ``fullmatch`` on the value pattern. Generic input scanning is not used
-        — it can pick an unrelated field that happens to match. The value is never
-        returned, logged, or shown to an LLM; only a ``vault://`` reference leaves.
-        Returns None whenever capture is not possible so the caller can fall back to
-        owner submission.
+        If the session is already on the credential path, the page is never
+        reloaded: several providers display a secret once and a navigation would
+        irretrievably destroy it. All required values are extracted and pattern-
+        checked before the first vault write, preventing a selector miss from
+        producing a knowingly partial credential bundle.
         """
 
         store = secret_store or self._secret_store
@@ -2126,28 +2385,38 @@ class PlaywrightBrowserWorker:
         if bound_recipe is None or bound_recipe.app_slug != app_slug:
             return None
         spec = recipe_to_capture_spec(bound_recipe)
-        if session is None or spec is None or store is None:
+        if session is None or spec is None or store is None or not spec.capture_fields:
             return None
         if not navigation_allowed(spec.url, session.patterns):
             return None
-        pattern = re.compile(spec.value_pattern)
 
-        async def _capture() -> str | None:
+        async def _capture() -> dict[str, str] | None:
             async with session.operation_lock:
                 session.last_active_at = datetime.now(UTC)
                 page = _active_page(session)
-                try:
-                    await page.goto(
-                        spec.url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
-                    )
-                except Exception:
-                    return None
-                current = _page_url(page)
-                parsed = urlsplit(current)
-                host = parsed.hostname or ""
+                parsed = urlsplit(_page_url(page))
+                on_expected_surface = bool(
+                    (parsed.hostname or "").casefold() == spec.vendor_domain
+                    or (parsed.hostname or "").casefold().endswith("." + spec.vendor_domain)
+                ) and bool(
+                    not spec.expected_path_prefix
+                    or (parsed.path or "/").startswith(spec.expected_path_prefix)
+                )
+                if not on_expected_surface:
+                    try:
+                        await page.goto(
+                            spec.url,
+                            wait_until="domcontentloaded",
+                            timeout=_NAV_TIMEOUT_MS,
+                        )
+                    except Exception:
+                        return None
+
+                current = urlsplit(_page_url(page))
+                host = (current.hostname or "").casefold()
                 if not (host == spec.vendor_domain or host.endswith("." + spec.vendor_domain)):
                     return None
-                if spec.expected_path_prefix and not (parsed.path or "/").startswith(
+                if spec.expected_path_prefix and not (current.path or "/").startswith(
                     spec.expected_path_prefix
                 ):
                     return None
@@ -2155,33 +2424,70 @@ class PlaywrightBrowserWorker:
                     text = await _visible_text(page)
                     if spec.expected_heading.casefold() not in text.casefold():
                         return None
-                if spec.reveal_selector:
-                    try:
-                        reveal = page.locator(spec.reveal_selector)
-                        if await reveal.count() >= 1:
-                            await reveal.first.click(timeout=5_000)
-                    except Exception:
-                        pass
-                for selector in spec.selectors:
-                    try:
-                        locator = page.locator(selector)
-                        if await locator.count() < 1:
-                            continue
-                        value = await locator.first.input_value(timeout=2_000)
-                    except Exception:
-                        continue
-                    candidate = value.strip() if isinstance(value, str) else ""
-                    # fullmatch: a partial hit inside a longer string is not the token.
-                    if candidate and pattern.fullmatch(candidate):
-                        return candidate
-                return None
 
-        token = await self._loop.run(_capture(), timeout=_OP_TIMEOUT_SECONDS)
-        if token is None:
+                captured: dict[str, str] = {}
+                activated_reveals: set[str] = set()
+                for field in spec.capture_fields:
+                    if field.reveal_selector and field.reveal_selector not in activated_reveals:
+                        try:
+                            reveal = page.locator(field.reveal_selector)
+                            reveal_count = int(await reveal.count())
+                            if reveal_count > 1:
+                                return None
+                            if reveal_count == 1:
+                                await reveal.click(timeout=5_000)
+                            activated_reveals.add(field.reveal_selector)
+                        except Exception:
+                            return None
+
+                    pattern = re.compile(field.value_pattern)
+                    value: str | None = None
+                    for selector in field.selectors:
+                        try:
+                            locator = page.locator(selector)
+                            if int(await locator.count()) != 1:
+                                continue
+                            if field.source == "input_value":
+                                raw = await locator.input_value(timeout=2_000)
+                                candidate = raw.strip() if isinstance(raw, str) else ""
+                                if candidate and pattern.fullmatch(candidate):
+                                    value = candidate
+                                    break
+                            else:
+                                raw = await locator.text_content(timeout=2_000)
+                                candidate = raw.strip() if isinstance(raw, str) else ""
+                                match = pattern.search(candidate) if candidate else None
+                                if match is not None:
+                                    value = (
+                                        match.group(1) if pattern.groups == 1 else match.group(0)
+                                    )
+                                    break
+                        except Exception:
+                            continue
+                    if not value:
+                        captured.clear()
+                        return None
+                    captured[field.field_kind] = value
+                return captured
+
+        raw_values = await self._loop.run(_capture(), timeout=_OP_TIMEOUT_SECONDS)
+        if not raw_values:
             return None
-        reference = store.put(app_slug=app_slug, kind=spec.field_kind, value=token)
-        del token
-        return {spec.field_kind: validate_vault_reference(reference)}
+        references: dict[str, str] = {}
+        try:
+            for kind, raw_value in raw_values.items():
+                reference = store.put(app_slug=app_slug, kind=kind, value=raw_value)
+                references[kind] = validate_vault_reference(reference)
+            return references
+        except Exception:
+            delete = getattr(store, "delete", None)
+            if callable(delete):
+                for reference in references.values():
+                    with contextlib.suppress(Exception):
+                        delete(reference)
+            raise
+        finally:
+            raw_values.clear()
 
     async def refresh_live_view(self, session: _PwSession) -> bool:
         """Capture a PNG screenshot of the current page for the HITL live view.

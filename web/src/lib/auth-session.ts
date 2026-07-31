@@ -1,5 +1,3 @@
-import { totpConfigurationValid } from "@/lib/totp"
-
 export const AUTH_COOKIE_NAME = "ops_session"
 export const AUTH_SESSION_SECONDS = 60 * 60 * 12
 
@@ -49,24 +47,19 @@ async function signingKey(secret: string): Promise<CryptoKey> {
 export function authConfigurationValid(
   username: string | undefined,
   password: string | undefined,
-  secret: string | undefined,
-  totpSecret: string | undefined,
+  sessionSecret: string | undefined,
 ): boolean {
-  const configuredValues = [username?.trim(), password, secret, totpSecret?.trim()]
-  const canonicalValues = configuredValues.map((value) =>
-    value?.replaceAll(" ", "").toUpperCase(),
-  )
+  const configuredValues = [username, password, sessionSecret]
   const independent =
-    canonicalValues.every((value): value is string => Boolean(value)) &&
-    new Set(canonicalValues).size === canonicalValues.length
+    configuredValues.every((value): value is string => Boolean(value)) &&
+    new Set(configuredValues).size === configuredValues.length
 
   return Boolean(
     username?.trim() &&
       password &&
       password.length >= 8 &&
-      secret &&
-      secret.length >= 32 &&
-      totpConfigurationValid(totpSecret) &&
+      sessionSecret &&
+      sessionSecret.length >= 32 &&
       independent,
   )
 }

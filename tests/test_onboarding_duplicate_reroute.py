@@ -142,6 +142,9 @@ class _Telemetry:
     def model_call(self, *, model_calls: int) -> None:
         return None
 
+    def progress(self, *, step_index: int, stage: str, elapsed_ms: int) -> None:
+        return None
+
 
 @pytest.fixture
 def wired(tmp_path):

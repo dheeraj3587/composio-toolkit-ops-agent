@@ -314,10 +314,13 @@ def _capture_sync(
         raise BrowserCaptureNotAuthorized
     core, store = _core_and_store(service)
     spec = _resolve_capture_spec(core, payload)
-    if spec.field_kind != payload.kind:
+    # The requested kind must be one the reviewed contract declares; a contract
+    # that declares no pattern for it authorizes nothing.
+    field = spec.field(payload.kind)
+    if field is None:
         raise BrowserCaptureNotAuthorized
     value = payload.value.get_secret_value()
-    if re.fullmatch(spec.value_pattern, value) is None:
+    if re.fullmatch(field.value_pattern, value) is None:
         # The worker is trusted to transport a reviewed capture, not to redefine
         # its format. Re-apply the recipe's exact value contract at the API/vault
         # boundary so a compromised worker cannot persist arbitrary material.

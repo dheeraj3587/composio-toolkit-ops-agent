@@ -5,6 +5,12 @@ the order an operator would: read the run and see the projected state and contro
 read the sanitized profile, approve account creation (twice, to see the replay),
 retry the current step, pause, and reset.
 
+A second walk covers the resume route, which is the one route that now chooses its
+committer by phase: a run standing at a waiting onboarding phase is continued by
+the phase machine rather than by the LangGraph resume, and that continuation has to
+read back out of the timeline as itself rather than as the generic "run updated"
+projection — the precondition for every production check Requirement 10.2 asks for.
+
 What this asserts, in the order it appears:
 
 * the run detail response carries the additive onboarding and controls projections
@@ -21,6 +27,9 @@ What this asserts, in the order it appears:
 * a reset reports the preserved-reference count, the released-session and
   cleared-state indicators, and the expected restart route (Requirement 14.11),
   and the stored credentials still resolve afterwards (Requirement 14.9);
+* the resume route reaches the phase machine for a run parked at a CAPTCHA and is
+  refused there for a run parked by an operator pause (Requirements 1.9, 1.10);
+* the continuation projects a named timeline summary (Requirement 10.2);
 * no response body carries a credential value (Requirement 19.13).
 
 A real vault under ``tmp_path`` holds the login pair, because the claim reset makes
@@ -42,6 +51,7 @@ from api.app import create_app
 from api.service import LocalRunService
 from ops.core.config import Settings
 from ops.core.secret_store import SQLiteSecretStore
+from ops.core.storage import OperationsStorage
 from ops.onboarding.driver import SQLitePhaseHistoryStore
 from ops.onboarding.phase import OnboardingPhase
 from ops.providers.profile import (
@@ -73,6 +83,16 @@ WALK: tuple[tuple[OnboardingPhase | None, OnboardingPhase], ...] = (
 APPROVED: tuple[tuple[OnboardingPhase, OnboardingPhase], ...] = (
     ("awaiting_admission", "route_selected_signup"),
     ("route_selected_signup", "signup"),
+)
+
+# The walk that parks a run on the one mid-flight prompt that exists: the approved
+# route, the signup step, and the challenge that interrupts it. Committed straight
+# into the phase history, because the resume route's business is what it does with a
+# run already standing at ``captcha_paused``.
+PAUSED_AT_CAPTCHA: tuple[tuple[OnboardingPhase, OnboardingPhase, str], ...] = (
+    ("awaiting_admission", "route_selected_signup", "operator_approved_signup"),
+    ("route_selected_signup", "signup", "signup_submitted"),
+    ("signup", "captcha_paused", "captcha_detected"),
 )
 
 
@@ -144,6 +164,10 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClie
         app_name="Example Provider",
         app_slug=APP_SLUG,
         browser_account_ref=ACCOUNT_REF,
+        # How the run was started, which the resume route reads before it routes:
+        # the phase machine serves canonical runs that are actually executing.
+        state_engine="canonical_v1",
+        execution_mode="operations",
     )
     profile = _profile()
     SQLiteProviderProfileStore(
@@ -198,6 +222,7 @@ def test_onboarding_routes_project_state_decide_retry_pause_and_reset(
         "can_retry_step": False,
         "retryable_step": None,
         "reason_code": "credentials_missing",
+        "resume_withheld_reason": None,
     }
 
     profile = client.get(f"/api/runs/{RUN_ID}/profile")
@@ -285,5 +310,85 @@ def test_onboarding_routes_project_state_decide_retry_pause_and_reset(
 
     # Requirement 19.13: no body carried credential material.
     for response in (detail, profile, decision, retried, paused, reset):
+        assert LOGIN_PASSWORD not in response.text
+        assert "onboarding@example.invalid" not in response.text
+
+
+def test_resume_route_continues_a_paused_run_through_the_phase_machine(
+    client: TestClient,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "private" / "ops.db"
+    storage = OperationsStorage(db_path)
+    phases = SQLitePhaseHistoryStore(db_path)
+    digest = _profile().profile_digest
+    for index, (source, target, reason_code) in enumerate(PAUSED_AT_CAPTCHA):
+        assert phases.commit_phase(
+            run_id=RUN_ID,
+            from_phase=source,
+            to_phase=target,
+            reason_code=reason_code,
+            profile_digest=digest,
+            attempt=0,
+            correlation_id=f"captcha-{index}",
+        )
+    # The coarse status a run holds while a human works in its live view, which is
+    # the state the resume route is reachable in at all.
+    storage.update_run(RUN_ID, status="waiting_for_hitl")
+
+    resumed = client.post(f"/api/runs/{RUN_ID}/resume")
+    assert resumed.status_code == 200
+    receipt = resumed.json()
+    # Requirement 1.9: the phase machine answered. No workflow is configured for
+    # this run, so the LangGraph resume could only have reported ``no_change``, and
+    # it commits no phase boundary at all.
+    assert receipt["status"] == "accepted"
+    assert receipt["detail"].startswith("Re-entered signup on the same browser session")
+    assert receipt["onboarding"]["phase"] == "signup"
+    assert receipt["onboarding"]["reason_code"] == "captcha_resolved"
+    assert phases.current_phase(run_id=RUN_ID) == ("signup", 1)
+    # Requirement 10.2: the continuation is legible — the console's latest-decision
+    # line is the named continuation summary, not the generic run-updated one.
+    assert receipt["onboarding"]["latest_decision"] == "CAPTCHA resolved; run resumed."
+
+    timeline = client.get(f"/api/runs/{RUN_ID}/timeline")
+    assert timeline.status_code == 200
+    items = timeline.json()["items"]
+    # The continuation is this run's whole audit trail, and it projects as itself:
+    # the named event type and the named summary, not the generic ``run_updated``
+    # pair an event type absent from the allow-list degrades to.
+    assert [item["event_type"] for item in items] == ["onboarding_captcha_resolved"]
+    assert [item["summary"] for item in items] == ["CAPTCHA resolved; run resumed."]
+
+    # The other continuation event type the allow-list carries. The phase table
+    # gives ``paused`` no re-entry, so no transition writes this one today; its
+    # projection is pinned from a synthesized durable row rather than from an
+    # invented boundary.
+    storage.append_audit_event(run_id=RUN_ID, event_type="onboarding_resumed", payload={})
+    projected = client.get(f"/api/runs/{RUN_ID}/timeline").json()["items"][-1]
+    assert projected["event_type"] == "onboarding_resumed"
+    assert projected["summary"] == "Run continued from its pause."
+
+    # A run parked by an operator pause reaches the same committer and is refused
+    # there, before anything is written: ``paused`` fans out to ``research`` and
+    # ``cancelled`` only, so the phase it stopped in is not re-enterable.
+    assert phases.commit_phase(
+        run_id=RUN_ID,
+        from_phase="signup",
+        to_phase="paused",
+        reason_code="run_paused_by_operator",
+        profile_digest=digest,
+        attempt=1,
+        correlation_id="operator-pause",
+    )
+    storage.update_run(RUN_ID, status="waiting_for_hitl")
+    refused = client.post(f"/api/runs/{RUN_ID}/resume")
+    assert refused.status_code == 409
+    assert refused.json()["reason_code"] == "phase_replay_noop"
+    assert phases.current_phase(run_id=RUN_ID) == ("paused", 1)
+
+    # Requirement 19.13: neither the continuation nor its timeline carried
+    # credential material.
+    for response in (resumed, timeline, refused):
         assert LOGIN_PASSWORD not in response.text
         assert "onboarding@example.invalid" not in response.text

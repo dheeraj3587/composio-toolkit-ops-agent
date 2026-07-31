@@ -255,6 +255,24 @@ class SQLiteLeaseStore(_LedgerDatabase):
             ).rowcount
         return released == 1
 
+    def holds(self, *, run_id: str) -> bool:
+        """Whether a live (unexpired) lease owns the run right now.
+
+        The complement of :meth:`expired` for one run: a holder whose deadline has
+        passed is not proof that a worker is still driving it.
+        """
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM onboarding_leases
+                WHERE run_id = ? AND holder IS NOT NULL AND deadline >= ?
+                """,
+                (_identifier(run_id, field="run id"), self._now()),
+            ).fetchone()
+        return row is not None
+
     def expired(self, *, limit: int) -> tuple[str, ...]:
         """Run ids whose deadline has passed, earliest first — crash detection."""
 

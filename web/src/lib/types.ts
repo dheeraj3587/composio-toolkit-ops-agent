@@ -273,6 +273,7 @@ export interface OnboardingControlsView {
   can_retry_step: boolean
   retryable_step?: RetryableStep | null
   reason_code?: string | null
+  resume_withheld_reason?: string | null
 }
 
 /** The operator's answer to the one admission prompt (ops/onboarding/admission.py). */
@@ -481,9 +482,27 @@ export interface TimelineItem {
   detail?: TimelineDetail | null
 }
 
+export type LoopStage =
+  | "observe"
+  | "candidates"
+  | "decide"
+  | "act"
+  | "verify"
+  | "gate"
+  | "exhausted"
+
+export interface RunProgressEvent {
+  step_index: number
+  stage: LoopStage
+  elapsed_ms: number
+  onboarding_phase: OnboardingPhase
+  recorded_at: string
+}
+
 export interface TimelineResponse {
   run_id: string
   items: TimelineItem[]
+  progress: RunProgressEvent[]
 }
 
 export interface SnapshotHealth {

@@ -23,7 +23,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 import httpx
 from pydantic import SecretStr
@@ -38,8 +38,10 @@ from ops.browser.session_capability import (
     BrowserSessionCapabilityError,
     derive_browser_session_capability,
 )
+from ops.browser.setup_values import normalize_browser_setup_fields
 from ops.browser.signup import normalize_signup_fields
-from ops.browser.worker import BrowserObservation, BrowserSessionContext
+from ops.browser.takeover import ClearanceObservation, ClearanceProbeReason
+from ops.browser.worker import BrowserObservation, BrowserSessionContext, HumanActionType
 from ops.core.models import validate_vault_reference
 from ops.core.secret_store import parse_vault_reference
 from ops.providers.errors import ConfigurationRequiredError, ProviderOperationError
@@ -75,6 +77,12 @@ ProviderHealthState = Literal[
 # The RPC contract version this client speaks; a mismatch is reported, not guessed.
 SUPPORTED_SERVICE_MAJOR = 1
 _HEALTH_TIMEOUT_SECONDS = 2.0
+# Mirrors ``Settings.onboarding_takeover_probe_timeout_seconds`` — default and
+# bounds both. The value is clamped rather than trusted so an injected timeout
+# cannot make one clearance probe outlive the interval it is polled on.
+_DEFAULT_TAKEOVER_PROBE_TIMEOUT_SECONDS = 5.0
+_MIN_TAKEOVER_PROBE_TIMEOUT_SECONDS = 1.0
+_MAX_TAKEOVER_PROBE_TIMEOUT_SECONDS = 15.0
 _HEALTH_STATES = frozenset(
     {
         "disabled",
@@ -120,6 +128,9 @@ class BrowserServiceClient:
     # Canonical runtime uses this explicit marker to reserve and pass durable
     # one-operation broker grants. In-process providers never receive them.
     requires_secret_broker_grants = True
+    # Only the isolated service can compare a continuation against its live,
+    # process-local HITL generation at the same boundary that starts resume.
+    supports_hitl_generation_cas = True
 
     def __init__(
         self,
@@ -129,6 +140,7 @@ class BrowserServiceClient:
         owner: str,
         capability_key: SecretStr | str | None = None,
         timeout_seconds: float = 315.0,
+        takeover_probe_timeout_seconds: float = _DEFAULT_TAKEOVER_PROBE_TIMEOUT_SECONDS,
         client: httpx.AsyncClient | None = None,
         sync_client: httpx.Client | None = None,
     ) -> None:
@@ -147,6 +159,13 @@ class BrowserServiceClient:
         )
         self._owner = owner
         self._timeout = timeout_seconds
+        # A clearance probe is bounded on its own, far tighter than the operation
+        # budget above: it is polled on a 5 second interval, so a slow read must be
+        # abandoned and reported as unread rather than queue behind its own poll.
+        self._takeover_probe_timeout = max(
+            _MIN_TAKEOVER_PROBE_TIMEOUT_SECONDS,
+            min(float(takeover_probe_timeout_seconds), _MAX_TAKEOVER_PROBE_TIMEOUT_SECONDS),
+        )
         self._client = client
         self._sync_client = sync_client
         # Sanitized per-session bookkeeping (never a URL with a query string).
@@ -345,6 +364,7 @@ class BrowserServiceClient:
         secret_grants: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
         signup_fields: Mapping[str, str] | None = None,
+        setup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
         return await self._drive(
@@ -357,6 +377,7 @@ class BrowserServiceClient:
             signal=None,
             account_creation_requested=account_creation_requested,
             signup_fields=signup_fields,
+            setup_fields=setup_fields,
             credential_creation_policy=credential_creation_policy,
         )
 
@@ -371,8 +392,10 @@ class BrowserServiceClient:
         secret_grants: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
         signup_fields: Mapping[str, str] | None = None,
+        setup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
+        expected_hitl_generation: int | None = None,
     ) -> BrowserObservation:
         del provider_session_id  # the service session id IS the provider id here
         return await self._drive(
@@ -385,7 +408,9 @@ class BrowserServiceClient:
             signal=signal,
             account_creation_requested=account_creation_requested,
             signup_fields=signup_fields,
+            setup_fields=setup_fields,
             credential_creation_policy=credential_creation_policy,
+            expected_hitl_generation=expected_hitl_generation,
         )
 
     async def _drive(
@@ -400,7 +425,9 @@ class BrowserServiceClient:
         signal: str | None,
         account_creation_requested: bool = False,
         signup_fields: Mapping[str, str] | None = None,
+        setup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
+        expected_hitl_generation: int | None = None,
     ) -> BrowserObservation:
         # Caller-side half of confinement: refuse to spend an RPC on a payload
         # whose destinations are outside the run's allow-list. The service enforces
@@ -420,6 +447,13 @@ class BrowserServiceClient:
             "credential_refs": refs,
             "secret_grants": grants,
         }
+        try:
+            body["setup_fields"] = normalize_browser_setup_fields(setup_fields)
+        except ValueError:
+            raise ProviderOperationError(
+                capability="browser service",
+                reason_code="setup_fields_invalid",
+            ) from None
         if recipe is not None:
             body["recipe_snapshot"] = (
                 recipe.model_dump(mode="json") if hasattr(recipe, "model_dump") else recipe
@@ -444,6 +478,13 @@ class BrowserServiceClient:
             )
         if signal is not None:
             body["signal"] = signal
+        if expected_hitl_generation is not None:
+            if type(expected_hitl_generation) is not int or expected_hitl_generation <= 0:
+                raise ProviderOperationError(
+                    capability="browser service",
+                    reason_code="hitl_generation_invalid",
+                )
+            body["expected_hitl_generation"] = expected_hitl_generation
         try:
             response = await self._request(
                 "POST",
@@ -460,8 +501,23 @@ class BrowserServiceClient:
                 capability="browser service", reason_code=self._reason(response)
             )
         payload = response.json()
+        session_payload = payload.get("session")
+        raw_hitl_generation = (
+            session_payload.get("hitl_generation") if isinstance(session_payload, dict) else None
+        )
+        hitl_generation = (
+            raw_hitl_generation
+            if type(raw_hitl_generation) is int and raw_hitl_generation >= 0
+            else 0
+        )
+        observation_status = payload.get("status", "failed")
+        if observation_status == "human_action_required" and hitl_generation <= 0:
+            raise ProviderOperationError(
+                capability="browser service",
+                reason_code="hitl_generation_invalid",
+            )
         return BrowserObservation(
-            status=payload.get("status", "failed"),
+            status=observation_status,
             current_url=payload.get("current_url", "https://unknown.invalid/"),
             page_title=payload.get("page_title") or "Browser step",
             developer_app_id=payload.get("developer_app_id"),
@@ -470,6 +526,7 @@ class BrowserServiceClient:
             credential_field_labels=tuple(payload.get("credential_field_labels") or ()),
             non_secret_notes=tuple(payload.get("non_secret_notes") or ()),
             reason_code=payload.get("reason_code"),
+            hitl_generation=hitl_generation,
         )
 
     async def auto_capture_credentials(
@@ -480,7 +537,8 @@ class BrowserServiceClient:
         *,
         recipe: Any = None,
         capability_scope: str,
-        broker_grant: str,
+        broker_grants: Mapping[str, str] | None = None,
+        broker_grant: str | None = None,
     ) -> dict[str, str] | None:
         """Ask the service to capture into its vault; accept references only."""
 
@@ -491,16 +549,36 @@ class BrowserServiceClient:
                 capability="browser service credential capture",
                 reason_code="capture_app_mismatch",
             )
+        capture_body: dict[str, object] = {
+            "recipe_snapshot": (
+                recipe.model_dump(mode="json") if hasattr(recipe, "model_dump") else recipe
+            ),
+        }
+        if broker_grants:
+            validated_grants = {
+                kind: _validate_broker_grant(grant)
+                for kind, grant in broker_grants.items()
+                if isinstance(kind, str)
+                and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,99}", kind) is not None
+            }
+            if set(validated_grants) != set(broker_grants):
+                raise ProviderOperationError(
+                    capability="browser service credential capture",
+                    reason_code="browser_secret_grant_invalid",
+                )
+            capture_body["broker_grants"] = validated_grants
+        elif broker_grant is not None:
+            capture_body["broker_grant"] = _validate_broker_grant(broker_grant)
+        else:
+            raise ProviderOperationError(
+                capability="browser service credential capture",
+                reason_code="browser_secret_grant_invalid",
+            )
         try:
             response = await self._request(
                 "POST",
                 f"/internal/browser/sessions/{handle}/capture-credentials",
-                json_body={
-                    "broker_grant": _validate_broker_grant(broker_grant),
-                    "recipe_snapshot": (
-                        recipe.model_dump(mode="json") if hasattr(recipe, "model_dump") else recipe
-                    ),
-                },
+                json_body=capture_body,
                 capability_scope=capability_scope,
             )
         except httpx.RequestError:
@@ -559,6 +637,50 @@ class BrowserServiceClient:
         payload = response.json()
         lifecycle = str(payload.get("lifecycle") or "")
         return lifecycle == "ACTIVE", lifecycle.casefold() or "unknown"
+
+    async def probe_gate_clearance(
+        self, session_id: str, *, capability_scope: str
+    ) -> ClearanceObservation:
+        """Read whether the human gate a paused run waits on is still present.
+
+        Fail-closed mapping:
+
+        * ``404`` with detail exactly ``session_not_found`` — absent session
+          (pauses the run with ``session_unreattachable``, R2.6).
+        * any other ``404`` — an older worker without this route, so nothing was
+          read: ``probe_failed``, and the run keeps waiting.
+        * ``410`` — ``session_max_age_exceeded`` (R2.5).
+        * any other status, a bad body, a transport error, or the timeout —
+          ``probe_failed``, never clearance.
+        """
+
+        try:
+            response = await self._request(
+                "GET",
+                f"/internal/browser/sessions/{session_id}/gate-clearance",
+                timeout=self._takeover_probe_timeout,
+                capability_scope=capability_scope,
+            )
+        except (TypeError, AttributeError, AssertionError, NameError):
+            raise  # a programming error must surface, never look like a probe result
+        except Exception:
+            # A transport error, the bounded timeout, or a configuration refusal
+            # while building the request: nothing was read either way.
+            return _unread_clearance()
+        if response.status_code == 404:
+            if self._reason(response) == "session_not_found":
+                return _absent_clearance("session_not_found")
+            return _unread_clearance()
+        if response.status_code == 410:
+            return _absent_clearance("session_max_age_exceeded")
+        if response.status_code >= 400:
+            return _unread_clearance()
+        try:
+            payload = response.json()
+        except ValueError:
+            return _unread_clearance()
+        observation = _clearance_observation(payload)
+        return observation if observation is not None else _unread_clearance()
 
     async def reconcile_session(
         self, session_id: str | None, *, capability_scope: str
@@ -882,6 +1004,105 @@ class BrowserServiceClient:
             capacity_in_use=payload["capacity_in_use"],
             janitor_running=payload["janitor_running"],
         )
+
+
+# The lifecycle values a clearance report may name, and the probe reasons the
+# SERVICE side may name (``session_not_found`` is the client's own answer to a 404
+# and can never arrive in a body). Both are membership tables rather than sets so
+# a validated value keeps its closed type: an unrecognised spelling is refused,
+# not passed through.
+_CLEARANCE_LIFECYCLES: frozenset[str] = frozenset({"ACTIVE", "CLOSING", "CLOSED"})
+_SERVICE_PROBE_REASONS: dict[str, ClearanceProbeReason] = {
+    "observed": "observed",
+    "operation_in_flight": "operation_in_flight",
+    "probe_failed": "probe_failed",
+    "session_max_age_exceeded": "session_max_age_exceeded",
+}
+# A gate value the decision function does not recognise would compare unequal to
+# the gate that parked the run and be read as "the gate is gone", so an unknown
+# gate is refused here instead of becoming a continuation.
+_CLEARANCE_GATES: dict[str, HumanActionType] = {
+    str(value): value for value in get_args(HumanActionType)
+}
+_CLEARANCE_BOOLEAN_FIELDS = ("hitl_pending", "attached", "final_probe_owed", "cleared")
+
+
+def _unread_clearance() -> ClearanceObservation:
+    """The observation for a read that could not happen.
+
+    ``lifecycle``/``hitl_pending`` restate what the run is already known to be, so
+    an unread probe never pauses it for a session state nobody observed.
+    """
+
+    return ClearanceObservation(
+        session_present=True,
+        lifecycle="ACTIVE",
+        hitl_pending=True,
+        attached=False,
+        final_probe_owed=False,
+        gate=None,
+        probe_reason_code="probe_failed",
+        hitl_generation=0,
+    )
+
+
+def _absent_clearance(reason: ClearanceProbeReason) -> ClearanceObservation:
+    """The observation for a session the service no longer has.
+
+    One shape for both causes; the ``reason`` is what the decision reads.
+    """
+
+    return ClearanceObservation(
+        session_present=False,
+        lifecycle="",
+        hitl_pending=False,
+        attached=False,
+        final_probe_owed=False,
+        gate=None,
+        probe_reason_code=reason,
+        hitl_generation=0,
+    )
+
+
+def _clearance_observation(payload: object) -> ClearanceObservation | None:
+    """Validate one clearance report, or ``None`` when it cannot be trusted.
+
+    ``cleared`` must agree with "the page was read and no gate was on it"; a body
+    that disagrees with itself is refused rather than reconciled.
+    """
+
+    if not isinstance(payload, dict):
+        return None
+    if any(type(payload.get(name)) is not bool for name in _CLEARANCE_BOOLEAN_FIELDS):
+        return None
+    lifecycle = payload.get("lifecycle")
+    if not isinstance(lifecycle, str) or lifecycle not in _CLEARANCE_LIFECYCLES:
+        return None
+    raw_reason = payload.get("probe_reason_code")
+    reason_code = _SERVICE_PROBE_REASONS.get(raw_reason) if isinstance(raw_reason, str) else None
+    if reason_code is None:
+        return None
+    generation = payload.get("hitl_generation")
+    if type(generation) is not int or generation < 0:
+        return None
+    raw_gate = payload.get("gate")
+    gate: HumanActionType | None = None
+    if raw_gate is not None:
+        gate = _CLEARANCE_GATES.get(raw_gate) if isinstance(raw_gate, str) else None
+        if gate is None:
+            return None
+    if payload["cleared"] is not (reason_code == "observed" and gate is None):
+        return None
+    return ClearanceObservation(
+        session_present=True,
+        lifecycle=lifecycle,
+        hitl_pending=payload["hitl_pending"],
+        attached=payload["attached"],
+        final_probe_owed=payload["final_probe_owed"],
+        gate=gate,
+        probe_reason_code=reason_code,
+        hitl_generation=generation,
+    )
 
 
 # The only credential field names that may cross the RPC boundary. An unknown name

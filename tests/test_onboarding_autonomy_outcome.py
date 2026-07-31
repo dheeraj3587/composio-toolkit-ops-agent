@@ -134,6 +134,9 @@ class _Unused:
     def model_call(self, *, model_calls: int) -> None:  # pragma: no cover
         return None
 
+    def progress(self, *, step_index: int, stage: str, elapsed_ms: int) -> None:  # pragma: no cover
+        return None
+
 
 async def _validate_credential(
     *,

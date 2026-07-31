@@ -340,6 +340,15 @@ export async function runOnboardingControlAction(
   return { message, tone: "neutral", control }
 }
 
+/**
+ * Re-render the run detail route so an autonomous phase change appears without a
+ * reload. Reads nothing and grants nothing: revalidation only.
+ */
+export async function refreshRunDetailAction(runId: string): Promise<void> {
+  if (!/^run_[0-9a-f]{32}$/.test(runId)) return
+  revalidatePath(`/runs/${encodeURIComponent(runId)}`)
+}
+
 export interface LiveViewState {
   provider: BrowserProvider | null
   mode: LiveViewMode

@@ -7,6 +7,15 @@ for, a ``completed`` resume re-enters the recorded phase, a second CAPTCHA is a
 new boundary rather than a swallowed replay, and a ``cancelled`` resume ends the
 run and releases the session.
 
+The second walk takes the same pause out through the committer the owner's resume
+signal now reaches. ``POST /api/runs/{id}/resume`` no longer drives the LangGraph
+resume for an onboarding run standing at a waiting phase: it reaches
+``OnboardingRunControlService.resume_from_pause`` through the run-service
+boundary, and that path has to commit the boundary this file already pins —
+``captcha_paused -> phase_at_pause`` at ``captcha_resolved`` and ``attempt + 1``
+— or the owner signal and the autonomous takeover would be two mechanisms rather
+than one (Requirements 1.9, 1.10).
+
 The phase-history store is the real SQLite one in ``tmp_path`` — the commit, the
 replay refusal, and the durable prompt count are properties of its SQL — while
 the session is a fake whose only interesting property is whether anything
@@ -22,6 +31,7 @@ import pytest
 from ops.core.storage import OperationsStorage
 from ops.onboarding.driver import (
     MIDFLIGHT_OPERATOR_PROMPTS,
+    PHASE_REPLAY_NOOP,
     CaptchaPause,
     OnboardingDeps,
     PhaseStep,
@@ -34,6 +44,11 @@ from ops.onboarding.driver import (
 from ops.onboarding.lease_store import SQLiteLeaseStore, SQLiteRunQueue
 from ops.onboarding.phase import OnboardingPhase, OnboardingReasonCode
 from ops.providers.profile import ProviderProfile
+from ops.runs.resume import (
+    CAPTCHA_RESOLVED_EVENT,
+    CAPTCHA_RESUME_REASON_CODE,
+    OnboardingRunControlService,
+)
 
 RUN_ID = "run-captcha-001"
 APP_SLUG = "example-provider"
@@ -93,6 +108,16 @@ def _commit(phases: SQLitePhaseHistoryStore, *, phase: OnboardingPhase, attempt:
         profile_digest=DIGEST,
         attempt=attempt,
         correlation_id=phase_correlation_id(run_id=RUN_ID, phase=phase, attempt=attempt),
+    )
+
+
+def _continuations(storage: OperationsStorage) -> int:
+    """How many CAPTCHA continuations the run's durable audit trail carries."""
+
+    return sum(
+        1
+        for event in storage.list_audit_events(RUN_ID)
+        if str(event.get("event_type") or "") == CAPTCHA_RESOLVED_EVENT
     )
 
 
@@ -187,3 +212,51 @@ def test_captcha_pause_records_the_phase_and_resume_re_enters_it(wired) -> None:
     assert MIDFLIGHT_OPERATOR_PROMPTS == frozenset({"captcha"})
     assert midflight_gate_disposition("legal_acceptance", app_slug=APP_SLUG) == "human_only"
     assert midflight_gate_disposition("login_required", app_slug=APP_SLUG) == "reusable_login"
+
+
+def test_the_owner_resume_signal_commits_the_same_boundary_and_replays_into_nothing(
+    wired, tmp_path
+) -> None:
+    deps, session = wired
+    phases = deps.phases
+    storage = OperationsStorage(tmp_path / "private" / "ops.db")
+
+    # The same pause the walk above records, so the two ways out of it are
+    # compared from identical durable state.
+    assert asyncio.run(
+        pause_for_captcha(
+            run_id=RUN_ID, phase_at_pause="developer_app", session=session, pauses=phases
+        )
+    ) == PhaseStep.advance("captcha_paused", "captcha_detected")
+    _commit(phases, phase="developer_app", attempt=0)
+
+    # The committer the resume route reaches, wired the way the run-service
+    # boundary wires it: the phase history is both ports, and no session port is
+    # supplied because a continuation must not hand the session back.
+    controls = OnboardingRunControlService(storage=storage, phases=phases, effects=phases)
+    resumed = controls.resume_from_pause(RUN_ID)
+
+    # Requirement 1.9: re-entry into the recorded phase at the advanced attempt,
+    # with the reason code the driver's own resume writes — the same boundary, not
+    # a second one that happens to look similar.
+    assert (resumed.accepted, resumed.committed) == (True, True)
+    assert resumed.phase_at_pause == "developer_app"
+    assert resumed.resumed_phase == "developer_app"
+    assert resumed.reason_code == CAPTCHA_RESUME_REASON_CODE
+    assert phases.current_phase(run_id=RUN_ID) == ("developer_app", 1)
+    # Selected by the waiting phase: a CAPTCHA pause continues as itself, which is
+    # what the timeline reads it back as.
+    assert _continuations(storage) == 1
+    # Nothing released the session, so the continuation costs no re-authentication.
+    assert (session.session_id, session.releases) == (SESSION_ID, 0)
+
+    committed = phases.history(run_id=RUN_ID)
+    replayed = controls.resume_from_pause(RUN_ID)
+
+    # Requirement 1.10: the run has left its waiting phase, so a second owner
+    # signal is a replay — no boundary, no audit row, nothing committed twice.
+    assert (replayed.accepted, replayed.committed) == (False, False)
+    assert replayed.reason_code == PHASE_REPLAY_NOOP
+    assert replayed.resumed_phase is None
+    assert phases.history(run_id=RUN_ID) == committed
+    assert _continuations(storage) == 1

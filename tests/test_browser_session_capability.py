@@ -345,6 +345,7 @@ def test_every_session_rpc_requires_the_matching_tenant_and_capability() -> None
                 {"broker_grant": "bsg_" + ("g" * 43)},
             ),
             ("GET", f"/internal/browser/sessions/{session_b}/screenshot", None),
+            ("GET", f"/internal/browser/sessions/{session_b}/gate-clearance", None),
             ("POST", f"/internal/browser/sessions/{session_b}/live-view", {}),
             ("DELETE", f"/internal/browser/sessions/{session_b}", None),
         )

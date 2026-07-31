@@ -14,10 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 CANDIDATE_REVISION = "a" * 40
 PREVIOUS_REVISION = "b" * 40
 
+# OPS_AUTH_TOTP_SECRET is deliberately absent: the release validator no longer
+# requires it, no longer checks its Base32 shape, and no longer checks it against
+# the other secrets, so a production environment without it must still deploy.
 _SECRETS = {
     "OPS_AUTH_PASSWORD": "auth-password-Q7p4v9K2m8N5s3W6",  # pragma: allowlist secret
     "OPS_AUTH_SESSION_SECRET": "auth-session-X4n8V2c6L9q3R7t5Y1p0",  # pragma: allowlist secret
-    "OPS_AUTH_TOTP_SECRET": "JBSWY3DPEHPK3PXP",  # pragma: allowlist secret
     "OPS_INTERNAL_API_TOKEN": "internal-token-A1b2C3d4E5f6G7h8I9j0",  # pragma: allowlist secret
     "BROWSER_SERVICE_TOKEN": "browser-service-K9j8H7g6F5e4D3c2B1a0",  # pragma: allowlist secret
     "BROWSER_SECRET_BROKER_TOKEN": "broker-token-Z1x2C3v4B5n6M7k8J9h0",  # pragma: allowlist secret
@@ -268,6 +270,8 @@ print(json.dumps({
                 "APP_REVISION": revision,
                 "OPS_DEPLOY_ACCEPTANCE_NONCE": acceptance_nonce,
                 "OPS_DEPLOY_ACCEPTANCE_MARKER_PATH": "/data/deploy-acceptance.json",
+                # Operator credentials, including the TOTP secret, stay withheld
+                # from the API container: that containment rule is retained.
                 "OPS_AUTH_USERNAME": "",
                 "OPS_AUTH_PASSWORD": "",
                 "OPS_AUTH_SESSION_SECRET": "",
@@ -282,11 +286,12 @@ print(json.dumps({
                 "BROWSER_SERVICE_OWNER": "production-owner",
             },
         },
+        # The web service carries no TOTP secret, which the release validator
+        # must now admit: the variable is an optional passthrough, not a demand.
         "web": {
             "image": f"composio-ops-web:{revision}",
             "environment": {
                 "OPS_RUN_ACTION_TIMEOUT_MS": "330000",
-                "OPS_AUTH_TOTP_SECRET": "configured",  # pragma: allowlist secret
             },
         },
         "caddy": {

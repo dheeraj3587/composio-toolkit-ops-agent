@@ -8,6 +8,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ops.browser.setup_values import normalize_provider_setup_fields
 from ops.core.state import AccessRoute, BrowserProvider, CredentialCreationPolicy
 
 VAULT_REFERENCE_PATTERN = re.compile(r"^vault://[a-z0-9-]+/[a-z0-9_-]+/[A-Za-z0-9_-]+$")
@@ -121,10 +122,18 @@ class OperationsRequest(StrictModel):
     # Immutable authorization boundary for developer-app/key creation. Legacy
     # API/CLI callers remain read-only unless they opt in explicitly.
     credential_creation_policy: CredentialCreationPolicy = "reuse_only"
+    # Immutable, explicitly reviewed provider setup values (names, callback URL,
+    # region, expiry, etc.). Secret material is categorically not accepted here.
+    provider_setup: dict[str, str] = Field(default_factory=dict, max_length=20)
     dry_run: bool = True
     # Explicit local intent only. It is never inferred from research, a browser
     # page, or an LLM, and is forwarded only to the browser target selector.
     account_creation_requested: bool = False
+
+    @field_validator("provider_setup")
+    @classmethod
+    def validate_provider_setup(cls, value: dict[str, str]) -> dict[str, str]:
+        return normalize_provider_setup_fields(value)
 
     @model_validator(mode="before")
     @classmethod

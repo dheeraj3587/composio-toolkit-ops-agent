@@ -15,6 +15,8 @@ from types import MappingProxyType
 from typing import Literal, cast
 from urllib.parse import urlsplit
 
+from ops.browser.setup_values import APPROVED_BROWSER_VALUE_REFS
+
 AccessModel = Literal["self_serve", "gated"]
 
 _CATALOG_PATH = Path(__file__).with_name("api_traces.json")
@@ -51,6 +53,7 @@ _STEP_KEYS = frozenset(
         "expected_signals",
         "completion",
         "allowed_value_refs",
+        "credential_creation_controls",
         "requires_hitl",
     }
 )
@@ -63,11 +66,8 @@ _PREDICATE_KEYS = frozenset(
         "forbidden_text",
     }
 )
-# Non-secret value references a checkpoint may authorize the agent to TYPE. Kept
-# in sync with ops.browser.candidates.APPROVED_VALUE_REFS.
-_ALLOWED_VALUE_REFS = frozenset(
-    {"company_name", "company_website", "application_name", "use_case", "expected_volume"}
-)
+# Shared non-secret value-reference vocabulary.
+_ALLOWED_VALUE_REFS = APPROVED_BROWSER_VALUE_REFS
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +118,7 @@ class BrowserApiTraceStep:
     expected_signals: tuple[str, ...]
     completion: CheckpointPredicate = CheckpointPredicate()
     allowed_value_refs: tuple[str, ...] = ()
+    credential_creation_controls: tuple[str, ...] = ()
     requires_hitl: bool = False
 
 
@@ -247,13 +248,22 @@ def _parse_predicate(value: object, label: str) -> CheckpointPredicate:
 
 
 def _parse_value_refs(value: object, label: str) -> tuple[str, ...]:
-    if not isinstance(value, list) or len(value) > 10:
-        raise ValueError(f"{label} must be a list of at most 10 value references")
+    if not isinstance(value, list) or len(value) > 20:
+        raise ValueError(f"{label} must be a list of at most 20 value references")
     refs = tuple(_string(item, f"{label} item", maximum=60) for item in value)
     unknown = set(refs) - _ALLOWED_VALUE_REFS
     if unknown:
         raise ValueError(f"{label} references unapproved values: {sorted(unknown)}")
     return refs
+
+
+def _parse_creation_controls(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or len(value) > 20:
+        raise ValueError(f"{label} must be a list of at most 20 controls")
+    controls = tuple(_string(item, f"{label} item", maximum=160) for item in value)
+    if len(controls) != len(set(controls)):
+        raise ValueError(f"{label} must not contain duplicates")
+    return controls
 
 
 def _parse_step(value: object, app_slug: str) -> BrowserApiTraceStep:
@@ -283,6 +293,10 @@ def _parse_step(value: object, app_slug: str) -> BrowserApiTraceStep:
         completion=completion,
         allowed_value_refs=_parse_value_refs(
             data.get("allowed_value_refs", []), f"{app_slug} checkpoint allowed_value_refs"
+        ),
+        credential_creation_controls=_parse_creation_controls(
+            data.get("credential_creation_controls", []),
+            f"{app_slug} checkpoint credential_creation_controls",
         ),
         requires_hitl=requires_hitl,
     )

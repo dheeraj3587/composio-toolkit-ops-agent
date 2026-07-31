@@ -28,11 +28,13 @@ import pytest
 
 from ops.core.storage import OperationsStorage
 from ops.onboarding.driver import EffectReservationRecord, SQLitePhaseHistoryStore
-from ops.onboarding.phase import OnboardingPhase
+from ops.onboarding.phase import OnboardingPhase, OnboardingReasonCode
 from ops.runs.resume import (
     CANCEL_REASON_CODE,
     CAPTCHA_RESUME_REASON_CODE,
     PAUSE_REASON_CODE,
+    PAUSE_REQUESTED_EVENT,
+    PAUSED_EVENT,
     OnboardingRunControlService,
 )
 
@@ -144,6 +146,37 @@ def controls(
         release_session=release,
     )
     return service, storage, release, phases
+
+
+def test_request_pause_persists_the_supplied_closed_reason_code(controls) -> None:
+    service, storage, release, phases = controls
+    reason_code: OnboardingReasonCode = "session_lifetime_exceeded"
+
+    assert service.resume_from_pause(RUN_ID).committed is True
+    paused = service.request_pause(RUN_ID, reason_code=reason_code)
+
+    assert paused.accepted is True
+    assert paused.committed is True
+    assert paused.reason_code == reason_code
+    assert paused.browser_session_released is False
+    assert release.calls == []
+
+    boundary = phases.history(run_id=RUN_ID)[-1]
+    assert boundary.to_phase == "paused"
+    assert boundary.reason_code == reason_code
+    record = storage.get_run(RUN_ID)
+    assert record is not None
+    assert record["reason_code"] == reason_code
+
+    pause_events = [
+        event
+        for event in storage.list_audit_events(RUN_ID)
+        if event["event_type"] in {PAUSE_REQUESTED_EVENT, PAUSED_EVENT}
+    ]
+    assert [(event["event_type"], event["payload"]["reason_code"]) for event in pause_events] == [
+        (PAUSE_REQUESTED_EVENT, reason_code),
+        (PAUSED_EVENT, reason_code),
+    ]
 
 
 def test_resume_then_pause_then_cancel_walks_one_run_through_the_controls(controls) -> None:

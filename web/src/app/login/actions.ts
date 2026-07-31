@@ -11,7 +11,6 @@ import {
   authConfigurationValid,
   createAuthSession,
 } from "@/lib/auth-session"
-import { matchTotpStep } from "@/lib/totp"
 
 const THROTTLE_WINDOW_MS = 10 * 60 * 1_000
 const INITIAL_LOCKOUT_MS = 30 * 1_000
@@ -31,7 +30,6 @@ interface LoginAttempt {
 // bounded in-process; a multi-replica deployment must replace this with a shared
 // limiter at the ingress or session store.
 const loginAttempts = new Map<string, LoginAttempt>()
-const acceptedTotpSteps = new Map<string, number>()
 
 function safeDestination(value: FormDataEntryValue | null): string {
   if (
@@ -128,7 +126,6 @@ export async function loginAction(formData: FormData): Promise<void> {
   const configuredUsername = process.env.OPS_AUTH_USERNAME
   const configuredPassword = process.env.OPS_AUTH_PASSWORD
   const sessionSecret = process.env.OPS_AUTH_SESSION_SECRET
-  const totpSecret = process.env.OPS_AUTH_TOTP_SECRET
   const destination = safeDestination(formData.get("next"))
 
   if (
@@ -136,7 +133,6 @@ export async function loginAction(formData: FormData): Promise<void> {
       configuredUsername,
       configuredPassword,
       sessionSecret,
-      totpSecret,
     )
   ) {
     redirect(`/login?error=configuration&next=${encodeURIComponent(destination)}`)
@@ -144,7 +140,6 @@ export async function loginAction(formData: FormData): Promise<void> {
 
   const username = formData.get("username")
   const password = formData.get("password")
-  const totp = formData.get("totp")
   const usernameWellFormed = typeof username === "string" && username.length <= 320
   const passwordWellFormed =
     typeof password === "string" && // pragma: allowlist secret
@@ -153,8 +148,6 @@ export async function loginAction(formData: FormData): Promise<void> {
     usernameWellFormed && typeof username === "string" ? username : ""
   const passwordCandidate =
     passwordWellFormed && typeof password === "string" ? password : "" // pragma: allowlist secret
-  const totpWellFormed = typeof totp === "string" && /^\d{6}$/u.test(totp)
-  const totpCandidate = totpWellFormed && typeof totp === "string" ? totp : ""
 
   // Evaluate both comparisons for every well-formed or malformed submission so
   // username validity does not change the amount of credential work performed.
@@ -172,22 +165,11 @@ export async function loginAction(formData: FormData): Promise<void> {
     redirect(rateLimitedDestination(destination, blockedFor))
   }
 
-  const matchedTotpStep = matchTotpStep(
-    totpCandidate,
-    totpSecret!,
-    Math.floor(now / 1_000),
-  )
-  const lastAcceptedStep = acceptedTotpSteps.get(configuredUsername!.trim()) ?? -1
-  const totpValid =
-    totpWellFormed &&
-    matchedTotpStep !== null &&
-    matchedTotpStep > lastAcceptedStep
   const valid =
     usernameWellFormed &&
     passwordWellFormed &&
     usernameValid &&
-    passwordValid &&
-    totpValid
+    passwordValid
 
   if (!valid) {
     const retryAfter = Math.max(
@@ -201,12 +183,11 @@ export async function loginAction(formData: FormData): Promise<void> {
   }
 
   for (const key of attemptKeys) loginAttempts.delete(key)
-  acceptedTotpSteps.set(configuredUsername!.trim(), matchedTotpStep!)
   const session = await createAuthSession(configuredUsername!.trim(), sessionSecret!)
   const cookieStore = await cookies()
   cookieStore.set(AUTH_COOKIE_NAME, session, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
+    secure: true,
     sameSite: "strict",
     path: "/",
     maxAge: AUTH_SESSION_SECONDS,
@@ -218,7 +199,7 @@ export async function signOutAction(): Promise<void> {
   const cookieStore = await cookies()
   cookieStore.set(AUTH_COOKIE_NAME, "", {
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
+    secure: true,
     sameSite: "strict",
     path: "/",
     maxAge: 0,

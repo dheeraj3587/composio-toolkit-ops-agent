@@ -566,7 +566,14 @@ if [ "$DRY_RUN" -eq 1 ]; then
 		cleanup_input_stage
 	}
 	trap cleanup_dry_validation EXIT INT TERM
-	tar xzf "$ARCHIVE" -C "$DRY_VALIDATION_DIR" \
+	# --no-same-owner is load-bearing for the dry run. The archive records the
+	# in-container ops uid, and a root extraction would recreate that ownership;
+	# the validation container then runs as the extracting user with --cap-drop
+	# ALL, so it has no DAC_OVERRIDE and cannot read owner-only files it does not
+	# own. Every production deployment runs as root, so validating a pre-deploy
+	# archive failed with EACCES and looked like a key mismatch. A real restore
+	# still preserves ownership: only this read-only copy follows the caller.
+	tar xzf "$ARCHIVE" --no-same-owner -C "$DRY_VALIDATION_DIR" \
 		ops_data credential_vault browser_profiles
 	validate_state_mounts \
 		"$DRY_VALIDATION_DIR/ops_data" \

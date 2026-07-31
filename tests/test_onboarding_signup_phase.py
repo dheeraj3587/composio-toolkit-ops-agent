@@ -42,7 +42,9 @@ def _profile() -> ProviderProfile:
     profile = ProviderProfile(
         run_id=RUN_ID,
         provider_name="Provider",
-        app_slug="provider",
+        # A slug whose reviewed recipe declares a signup policy: without one the
+        # phase refuses before it stages anything (Requirement 7.2).
+        app_slug="pipedrive",
         registrable_domain="provider.com",
         auxiliary_hosts=(),
         developer_portal_url="https://developers.provider.com/",

@@ -38,8 +38,7 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   const username = process.env.OPS_AUTH_USERNAME
   const password = process.env.OPS_AUTH_PASSWORD
   const sessionSecret = process.env.OPS_AUTH_SESSION_SECRET
-  const totpSecret = process.env.OPS_AUTH_TOTP_SECRET
-  if (!authConfigurationValid(username, password, sessionSecret, totpSecret)) {
+  if (!authConfigurationValid(username, password, sessionSecret)) {
     return unauthorized(request)
   }
 

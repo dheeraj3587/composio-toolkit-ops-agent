@@ -12,6 +12,7 @@ import { useFormStatus } from "react-dom"
 
 import {
   openLiveView,
+  refreshRunDetailAction,
   runOnboardingControlAction,
   runPhaseAction,
   type LiveViewState,
@@ -170,6 +171,20 @@ export function HitlLiveControls({
     runId,
   ])
 
+  // The phase poll is deliberately separate from the live-view effect above,
+  // which returns early in `interactive_remote` mode — the mode a CAPTCHA pause
+  // uses. It revalidates the route only: no grant is requested and the RFB
+  // connection is untouched, so an autonomous takeover appears without a reload.
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        void refreshRunDetailAction(runId).catch(() => undefined)
+      }
+    }, 5_000)
+
+    return () => window.clearInterval(timer)
+  }, [runId])
+
   function disconnectBeforeResume() {
     remoteViewRef.current?.disconnect()
     // The next backend state version represents a new HITL generation on the
@@ -208,6 +223,7 @@ export function HitlLiveControls({
               runId={runId}
               canResume={controls.can_resume}
               canCancel={controls.can_cancel}
+              withheldReason={controls.resume_withheld_reason ?? null}
               onResumeSubmit={isInteractiveHitl ? disconnectBeforeResume : undefined}
             />
           ) : (

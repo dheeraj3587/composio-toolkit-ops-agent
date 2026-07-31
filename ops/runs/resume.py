@@ -511,7 +511,9 @@ class RunResumeService:
 
 # The reason code each control writes onto the boundary it commits. Every one is
 # a member of the closed onboarding vocabulary, so it projects onto an API
-# response without translation.
+# response without translation. ``PAUSE_REASON_CODE`` is the operator's cause and
+# stays the DEFAULT of :meth:`OnboardingRunControlService.request_pause`; a
+# non-operator caller of that one path names its own cause instead.
 PAUSE_REASON_CODE: Final[OnboardingReasonCode] = "run_paused_by_operator"
 CANCEL_REASON_CODE: Final[OnboardingReasonCode] = "operator_cancelled"
 # Re-entry after the one mid-flight prompt that exists says the CAPTCHA was
@@ -535,20 +537,31 @@ CANCELLED_PHASE: Final[OnboardingPhase] = "cancelled"
 # also what makes the settlement idempotent across a repeated pause request.
 IN_FLIGHT_DISPOSITIONS: Final[frozenset[EffectDisposition]] = frozenset({"execute", "reconcile"})
 
-# Audit event types this surface writes. Absent from ``_EVENT_SUMMARIES`` until
-# task 21.2 adds them, which degrades them to the generic run-updated summary
-# rather than leaking a payload — the timeline projection's default is closed.
+# Audit event types this surface writes. An event type the API's static
+# ``_EVENT_SUMMARIES`` allow-list does not carry degrades to the generic
+# run-updated summary rather than leaking a payload — the timeline projection's
+# default is closed. The two continuation events are allow-listed, because a
+# continuation the operator cannot read in the timeline is the whole of the
+# reliability evidence Requirement 10.2 asks for.
 PAUSE_REQUESTED_EVENT: Final = "onboarding_pause_requested"
 PAUSED_EVENT: Final = "onboarding_paused"
 RESUMED_EVENT: Final = "onboarding_resumed"
+# The continuation of a CAPTCHA pause has its own event type: the timeline says
+# "the challenge is cleared", not "the run was resumed", and the allow-list
+# already carried this exception summary from the sibling spec with no writer.
+# Selected beside :data:`CAPTCHA_RESUME_REASON_CODE`, by the same waiting phase,
+# so the event type and the reason code can never disagree.
+CAPTCHA_RESOLVED_EVENT: Final = "onboarding_captcha_resolved"
 CANCELLED_EVENT: Final = "onboarding_cancelled"
 EFFECT_SETTLED_EVENT: Final = "onboarding_effect_settled"
 
-# The three events that open or close an outstanding pause request. Read in
-# commit order, the last of them answers "is a pause outstanding right now?", so
-# the answer is a durable fact a restarted worker can still read.
+# The events that open or close an outstanding pause request. Read in commit
+# order, the last of them answers "is a pause outstanding right now?", so the
+# answer is a durable fact a restarted worker can still read. Both continuation
+# events close a request, because which one a resume writes is a legibility
+# choice about the waiting phase and must not change whether the run stops again.
 _PAUSE_LIFECYCLE_EVENTS: Final[frozenset[str]] = frozenset(
-    {PAUSE_REQUESTED_EVENT, RESUMED_EVENT, CANCELLED_EVENT}
+    {PAUSE_REQUESTED_EVENT, RESUMED_EVENT, CAPTCHA_RESOLVED_EVENT, CANCELLED_EVENT}
 )
 
 
@@ -697,7 +710,13 @@ class OnboardingRunControlService:
 
     # --- pause --------------------------------------------------------------
 
-    def request_pause(self, run_id: str, *, reason: str | None = None) -> PauseOutcome:
+    def request_pause(
+        self,
+        run_id: str,
+        *,
+        reason: str | None = None,
+        reason_code: OnboardingReasonCode = PAUSE_REASON_CODE,
+    ) -> PauseOutcome:
         """Stop the run at the next boundary with no reserved effect in flight.
 
         PRE:  ``run_id`` names a run with at least one committed phase boundary.
@@ -710,11 +729,24 @@ class OnboardingRunControlService:
                   request is durable, so a worker still driving the run reads it
                   at its next boundary through :meth:`pause_requested`.
               Q4. ``pausing_after_phase`` names the phase the run stops after.
+              Q5. the durable reason code, the audit row and the returned outcome
+                  all carry ``reason_code`` — one cause, named once.
 
         ``reason`` is the operator's free-text note. It is deliberately *not*
         written anywhere: the durable record carries the closed reason code, and
         an operator-supplied string on an audit row is the one field that could
         carry anything at all.
+
+        ``reason_code`` is an EXTENSION of this one pause path, not a second path.
+        Everything a pause does — settling reservations, the outstanding request,
+        the boundary, the projection, the audit rows — is unchanged and happens in
+        this method only; the argument names the *cause*, which used to be
+        hard-coded to the operator's. So the autonomous caller that must pause a
+        run for ``session_unreattachable`` or ``session_lifetime_exceeded``
+        (reliability R1.11, R2.5, R2.6) gets the same settlement guarantees rather
+        than a parallel implementation that would have to re-derive them. The
+        operator path passes nothing and is byte-for-byte what it was: the default
+        is :data:`PAUSE_REASON_CODE`.
         """
 
         boundary = self._last_boundary(run_id)
@@ -732,14 +764,14 @@ class OnboardingRunControlService:
 
         phase = boundary.to_phase
         if phase == PAUSED_PHASE:
-            # Already stopped by an operator. Reported as accepted with nothing
-            # committed rather than as a second pause: the identity boundary would
-            # otherwise be admitted by the phase table and write a redundant row.
+            # Already stopped. Reported as accepted with nothing committed rather
+            # than as a second pause: the identity boundary would otherwise be
+            # admitted by the phase table and write a redundant row.
             return PauseOutcome(
                 run_id=run_id,
                 accepted=True,
                 pausing_after_phase=phase,
-                reason_code=PAUSE_REASON_CODE,
+                reason_code=reason_code,
                 committed=False,
             )
 
@@ -752,7 +784,7 @@ class OnboardingRunControlService:
             event_type=PAUSE_REQUESTED_EVENT,
             payload={
                 "pausing_after_phase": phase,
-                "reason_code": PAUSE_REASON_CODE,
+                "reason_code": reason_code,
                 "settled_effects": len(settlements),
                 "external_actions": False,
             },
@@ -763,7 +795,7 @@ class OnboardingRunControlService:
                 run_id=run_id,
                 boundary=boundary,
                 to_phase=PAUSED_PHASE,
-                reason_code=PAUSE_REASON_CODE,
+                reason_code=reason_code,
                 # A second pause of the same phase after a resume is a genuinely
                 # new boundary, so it must not collide with the first one; a
                 # repeated request for the *same* pause must. Counting the
@@ -781,7 +813,7 @@ class OnboardingRunControlService:
             run_id=run_id,
             accepted=True,
             pausing_after_phase=phase,
-            reason_code=PAUSE_REASON_CODE,
+            reason_code=reason_code,
             committed=committed,
             settlements=settlements,
         )
@@ -813,6 +845,12 @@ class OnboardingRunControlService:
                   table admits the re-entry, and nothing is written otherwise.
               Q3. the outstanding pause request is closed, so a driver claiming the
                   run next drives it rather than stopping again.
+              Q4. the committed boundary is recorded under the audit event type the
+                  waiting phase names — ``onboarding_captcha_resolved`` out of
+                  ``captcha_paused``, ``onboarding_resumed`` out of any other
+                  waiting phase — both of which the API's static summary allow-list
+                  carries, so a continuation reads as itself in the timeline rather
+                  than as a generic run update (Requirements 1.13, 10.2).
 
         The refused case is real and worth naming: the phase table declares
         ``paused -> {research, cancelled}``, so a run parked by an operator pause
@@ -835,11 +873,14 @@ class OnboardingRunControlService:
 
         waiting_phase = boundary.to_phase
         phase_at_pause = self._phase_at_pause(run_id)
+        # One reading of the waiting phase decides both what the boundary says and
+        # what the timeline shows, so the audit event type is selected here beside
+        # the reason code rather than fixed at the commit call.
+        resuming_from_captcha = waiting_phase == "captcha_paused"
         reason_code = (
-            CAPTCHA_RESUME_REASON_CODE
-            if waiting_phase == "captcha_paused"
-            else PAUSE_RESUME_REASON_CODE
+            CAPTCHA_RESUME_REASON_CODE if resuming_from_captcha else PAUSE_RESUME_REASON_CODE
         )
+        event_type = CAPTCHA_RESOLVED_EVENT if resuming_from_captcha else RESUMED_EVENT
         if phase_at_pause is None or not is_legal_phase_transition(waiting_phase, phase_at_pause):
             LOGGER.info(
                 "onboarding run %s cannot re-enter %s from %s",
@@ -865,7 +906,7 @@ class OnboardingRunControlService:
             # attempt advances and a second pause/resume cycle cannot replay onto
             # this boundary.
             attempt=boundary.attempt + 1,
-            event_type=RESUMED_EVENT,
+            event_type=event_type,
         )
         return ResumeOutcome(
             run_id=run_id,
@@ -1120,6 +1161,7 @@ __all__ = [
     "CANCELLED_EVENT",
     "CANCELLED_PHASE",
     "CANCEL_REASON_CODE",
+    "CAPTCHA_RESOLVED_EVENT",
     "CAPTCHA_RESUME_REASON_CODE",
     "EFFECT_SETTLED_EVENT",
     "IN_FLIGHT_DISPOSITIONS",

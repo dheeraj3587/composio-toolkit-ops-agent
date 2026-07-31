@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from ops.browser.decider import SnapshotElement
+from ops.browser.setup_values import APPROVED_BROWSER_VALUE_REFS
 
 # Phase 2 vocabulary. "type" is retained as a backward-compatible alias for
 # "fill" (Phase 1 candidates and their tests use it); new code emits "fill".
@@ -143,14 +144,9 @@ _IRREVERSIBLE_INTENTS: tuple[tuple[str, str], ...] = (
     ("accept and continue", "legal_acceptance"),
 )
 
-# Non-secret value references a `type` candidate may use. A model never supplies
-# free text; it selects a candidate whose value comes from this reviewed mapping
-# (resolved by ops.playwright.worker.ApprovedBrowserValueResolver). NEVER contains
-# a vault reference, password, API key, OTP, or magic link. Kept in sync with
-# ops.browser.api_trace_catalog._ALLOWED_VALUE_REFS.
-APPROVED_VALUE_REFS: frozenset[str] = frozenset(
-    {"company_name", "company_website", "application_name", "use_case", "expected_volume"}
-)
+# Non-secret value references a `type` candidate may use. The canonical set is
+# shared with request/RPC validation in ``ops.browser.setup_values``.
+APPROVED_VALUE_REFS: frozenset[str] = APPROVED_BROWSER_VALUE_REFS
 
 _ALLOWED_KEYS: frozenset[str] = frozenset({"Enter", "Escape", "Tab"})
 
@@ -442,7 +438,6 @@ def generate_candidates(
                     hint_index=element.index,
                 )
             )
-            break
 
     # `select_option` candidates come from the element's REVIEWED options only.
     for element in elements:
@@ -474,7 +469,6 @@ def generate_candidates(
                     postcondition=CandidatePostcondition(target=_predicate_of(element)),
                 )
             )
-            break
 
     # `check` / `uncheck`: only for a real checkbox/radio, and the postcondition
     # asserts the resulting checked state so the transition is verifiable.
@@ -624,8 +618,8 @@ def render_candidates(candidates: Sequence[ActionCandidate]) -> str:
         if not candidate.executable:
             continue
         detail = candidate.semantic_target
-        if candidate.action == "type" and candidate.value_ref:
-            detail = f"{detail} (fill approved value: {candidate.value_ref})"
+        if candidate.action in VALUE_ACTIONS and candidate.value_ref:
+            detail = f"{detail} (approved value: {candidate.value_ref})"
         elif candidate.action == "press" and candidate.press_key:
             detail = f"{detail} (press {candidate.press_key})"
         elif candidate.action == "goto":

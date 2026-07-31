@@ -15,6 +15,7 @@ from ops.browser.session_capability import (
     BrowserSessionCapabilityError,
     validate_capability_owner,
 )
+from ops.core.inference import DecisionBudget
 from ops.core.models import validate_vault_reference
 
 
@@ -125,6 +126,10 @@ class Settings(BaseModel):
     you_api_key: SecretStr | None = Field(default=None, repr=False)
     google_genai_api_key: SecretStr | None = Field(default=None, repr=False)
     openrouter_api_key: SecretStr | None = Field(default=None, repr=False)
+    # Inception's Mercury diffusion models. First in the browser-decision chain
+    # because the action loop is latency bound: every page state costs one
+    # decision, and a faster first token shortens the whole run.
+    mercury_api_key: SecretStr | None = Field(default=None, repr=False)
     groq_api_key: SecretStr | None = Field(default=None, repr=False)
     cerebras_api_key: SecretStr | None = Field(default=None, repr=False)
     composio_api_key: SecretStr | None = Field(default=None, repr=False)
@@ -174,6 +179,12 @@ class Settings(BaseModel):
     # with "openai/" while Cerebras does not (verified against both vendors' docs).
     groq_model: str = "openai/gpt-oss-120b"
     cerebras_model: str = "gpt-oss-120b"
+    # Mercury 2 is Inception's chat model and supports strict json_schema.
+    mercury_model: str = "mercury-2"
+    # Inception exposes a reasoning dial. The action loop wants latency over
+    # deliberation on a page it can already see, so default to the low setting;
+    # "instant", "medium", and "high" are the other documented values.
+    mercury_reasoning_effort: str = "low"
 
     # Session count is the real quota (not dollars), so use the most capable
     # Browser Use model for reliable multi-step onboarding navigation. The latest
@@ -396,6 +407,48 @@ class Settings(BaseModel):
     # fenced-out worker instead of a tolerated retry.
     onboarding_lease_ttl_seconds: int = Field(default=60, ge=15, le=600)
     onboarding_lease_renew_interval_seconds: int = Field(default=20, ge=5, le=200)
+    # Autonomous takeover after a human clears a human-only gate (Requirement 1.1).
+    #
+    # This one defaults ON, unlike every live-capability flag in this file, and the
+    # difference is deliberate: the watcher only OBSERVES a page a human is already
+    # looking at. It spends nothing, opens no session, and starts no provider work,
+    # so defaulting it off would ship the reported freeze — "after a human enters the
+    # captcha the agent doesn't take over" — unfixed. It stays gated by
+    # `ops_startup_automation_enabled` and by deployment acceptance, exactly like the
+    # existing sweeps. ALLOW_LIVE_BROWSER and ALLOW_LIVE_VENDOR_EMAIL are untouched
+    # and stay disabled.
+    onboarding_takeover_enabled: bool = True
+    # 5 s is "immediately" at human scale, and one read-only clearance probe per
+    # paused run is cheap.
+    onboarding_takeover_interval_seconds: int = Field(default=5, ge=1, le=30)
+    # A probe must never outlive its own interval: a slow probe is reported as
+    # `probe_failed` and the run keeps waiting, so this stays under the tightest
+    # interval rather than queueing behind it.
+    onboarding_takeover_probe_timeout_seconds: float = Field(default=5.0, ge=1.0, le=15.0)
+    # Progress liveness (Requirements 4.2, 4.9). The staleness window sits above the
+    # slowest single step (act 40 s plus verify 20 s) with room for one retry, and far
+    # below the loop wall clock of 900 s, so a working-but-slow run is not marked
+    # stalled. The window is the bound on the timeline's progress query.
+    onboarding_progress_stale_seconds: int = Field(default=180, ge=30, le=1_800)
+    onboarding_progress_window: int = Field(default=50, ge=1, le=200)
+    # One deadline per step of one browser operation (Requirement 4.7). The set is
+    # checked against `browser_service_client_timeout_seconds` by
+    # `browser_step_deadlines_fit_inside_the_client_budget` below rather than merely
+    # documented, because a set that sums past the outer budget turns a per-step
+    # timeout into a client-side abort that names no step at all. The defaults sum to
+    # 100 s, under the browser service's own 120 s operation ceiling and far under the
+    # 315 s client budget.
+    onboarding_step_observe_timeout_seconds: int = Field(default=20, ge=5, le=60)
+    onboarding_step_decide_timeout_seconds: int = Field(default=20, ge=5, le=60)
+    onboarding_step_act_timeout_seconds: int = Field(default=40, ge=5, le=90)
+    onboarding_step_verify_timeout_seconds: int = Field(default=20, ge=5, le=60)
+    # Pre-flight planning (Requirement 5.3). Paid once per run, before any browser
+    # session exists, so the total is wider than one action decision while each
+    # provider attempt stays short and how much of the chain one plan may consume
+    # stays bounded.
+    onboarding_plan_decision_total_seconds: float = Field(default=20.0, ge=5.0, le=60.0)
+    onboarding_plan_decision_provider_seconds: float = Field(default=8.0, ge=2.0, le=30.0)
+    onboarding_plan_max_providers: int = Field(default=3, ge=1, le=5)
     # The two budgets that terminate the credential ladder. See the module-level
     # comment above `Settings` for why these numbers were chosen and which
     # acceptance criteria each one terminates.
@@ -536,6 +589,42 @@ class Settings(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def browser_step_deadlines_fit_inside_the_client_budget(self) -> Settings:
+        """Keep the four per-step deadlines inside the outer browser-operation budget.
+
+        Requirement 4.7 declares one deadline per step of one browser operation, and
+        Requirement 4.8 makes a set that does not fit a configuration error naming the
+        rejected values. A set summing to the client budget or beyond turns a per-step
+        timeout into a client-side abort, which reports no step at all — exactly the
+        diagnosis this feature exists to make possible. The decide deadline is floored
+        separately at the decision budget, because a decide step shorter than the chain
+        it waits on would cancel a decision the chain was still allowed to make.
+        """
+
+        deadlines = (
+            ("observe", self.onboarding_step_observe_timeout_seconds),
+            ("decide", self.onboarding_step_decide_timeout_seconds),
+            ("act", self.onboarding_step_act_timeout_seconds),
+            ("verify", self.onboarding_step_verify_timeout_seconds),
+        )
+        total = sum(seconds for _, seconds in deadlines)
+        if total >= self.browser_service_client_timeout_seconds:
+            named = ", ".join(f"{name}={seconds}" for name, seconds in deadlines)
+            raise ValueError(
+                f"the per-step deadlines ({named}) sum to {total} which is not below "
+                "BROWSER_SERVICE_CLIENT_TIMEOUT_SECONDS="
+                f"{self.browser_service_client_timeout_seconds}"
+            )
+        decision_budget_seconds = DecisionBudget().total_seconds
+        if self.onboarding_step_decide_timeout_seconds < decision_budget_seconds:
+            raise ValueError(
+                "ONBOARDING_STEP_DECIDE_TIMEOUT_SECONDS="
+                f"{self.onboarding_step_decide_timeout_seconds} must be at least the "
+                f"decision budget of {decision_budget_seconds}s"
+            )
+        return self
+
+    @model_validator(mode="after")
     def control_plane_tokens_are_independent(self) -> Settings:
         configured = [
             (name, value.get_secret_value())
@@ -580,8 +669,19 @@ class Settings(BaseModel):
             "openrouter_api_key": _secret(source.get("OPENROUTER_API_KEY")),
             "groq_api_key": _secret(source.get("GROQ_API_KEY")),
             "cerebras_api_key": _secret(source.get("CEREBRAS_API_KEY")),
+            # MERCURY_API_KEY is canonical. INCEPTION_API_KEY is accepted because
+            # that is the name Inception's own documentation exports.
+            "mercury_api_key": _secret(
+                source.get("MERCURY_API_KEY") or source.get("INCEPTION_API_KEY")
+            ),
             "groq_model": _optional(source.get("GROQ_MODEL")) or "openai/gpt-oss-120b",
             "cerebras_model": _optional(source.get("CEREBRAS_MODEL")) or "gpt-oss-120b",
+            "mercury_model": _optional(source.get("MERCURY_MODEL")) or "mercury-2",
+            "mercury_reasoning_effort": _choice(
+                source.get("MERCURY_REASONING_EFFORT"),
+                ("instant", "low", "medium", "high"),
+                default="low",
+            ),
             "openrouter_model": _optional(source.get("OPENROUTER_MODEL"))
             or "nvidia/nemotron-3-ultra-550b-a55b:free",
             "composio_api_key": _secret(source.get("COMPOSIO_API_KEY")),
@@ -771,6 +871,42 @@ class Settings(BaseModel):
             ),
             "onboarding_lease_renew_interval_seconds": _integer(
                 source.get("ONBOARDING_LEASE_RENEW_INTERVAL_SECONDS"), default=20
+            ),
+            "onboarding_takeover_enabled": _boolean(
+                source.get("ONBOARDING_TAKEOVER_ENABLED"), default=True
+            ),
+            "onboarding_takeover_interval_seconds": _integer(
+                source.get("ONBOARDING_TAKEOVER_INTERVAL_SECONDS"), default=5
+            ),
+            "onboarding_takeover_probe_timeout_seconds": _float(
+                source.get("ONBOARDING_TAKEOVER_PROBE_TIMEOUT_SECONDS"), default=5.0
+            ),
+            "onboarding_progress_stale_seconds": _integer(
+                source.get("ONBOARDING_PROGRESS_STALE_SECONDS"), default=180
+            ),
+            "onboarding_progress_window": _integer(
+                source.get("ONBOARDING_PROGRESS_WINDOW"), default=50
+            ),
+            "onboarding_step_observe_timeout_seconds": _integer(
+                source.get("ONBOARDING_STEP_OBSERVE_TIMEOUT_SECONDS"), default=20
+            ),
+            "onboarding_step_decide_timeout_seconds": _integer(
+                source.get("ONBOARDING_STEP_DECIDE_TIMEOUT_SECONDS"), default=20
+            ),
+            "onboarding_step_act_timeout_seconds": _integer(
+                source.get("ONBOARDING_STEP_ACT_TIMEOUT_SECONDS"), default=40
+            ),
+            "onboarding_step_verify_timeout_seconds": _integer(
+                source.get("ONBOARDING_STEP_VERIFY_TIMEOUT_SECONDS"), default=20
+            ),
+            "onboarding_plan_decision_total_seconds": _float(
+                source.get("ONBOARDING_PLAN_DECISION_TOTAL_SECONDS"), default=20.0
+            ),
+            "onboarding_plan_decision_provider_seconds": _float(
+                source.get("ONBOARDING_PLAN_DECISION_PROVIDER_SECONDS"), default=8.0
+            ),
+            "onboarding_plan_max_providers": _integer(
+                source.get("ONBOARDING_PLAN_MAX_PROVIDERS"), default=3
             ),
             "credential_validation_attempt_budget": _integer(
                 source.get("CREDENTIAL_VALIDATION_ATTEMPT_BUDGET"), default=3

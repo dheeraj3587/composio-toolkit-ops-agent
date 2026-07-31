@@ -110,6 +110,8 @@ if [[ "${gate_scope}" == "all" || "${gate_scope}" == "backend" ]]; then
     GOOGLE_GENAI_API_KEY= \
     GMAIL_SIGNUP_ADDRESS= \
     GROQ_API_KEY= \
+    INCEPTION_API_KEY= \
+    MERCURY_API_KEY= \
     LANGGRAPH_AES_KEY= \
     OPENROUTER_API_KEY= \
     OUTREACH_RECIPIENT_OVERRIDE= \

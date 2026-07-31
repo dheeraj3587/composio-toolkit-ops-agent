@@ -76,6 +76,7 @@ class _Telemetry:
         self.denials: list[str] = []
         self.dlp_refusals = 0
         self.actions = 0
+        self.steps: list[tuple[int, str]] = []
 
     def denial(self, reason_code: str) -> None:
         self.denials.append(reason_code)
@@ -91,6 +92,9 @@ class _Telemetry:
 
     def model_call(self, *, model_calls: int) -> None:
         return None
+
+    def progress(self, *, step_index: int, stage: str, elapsed_ms: int) -> None:
+        self.steps.append((step_index, stage))
 
 
 def test_short_cycle_returns_done_with_the_phase_success_code() -> None:

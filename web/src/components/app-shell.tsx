@@ -2,7 +2,7 @@
 
 import Link from "next/link"
 import { usePathname } from "next/navigation"
-import { Activity, Boxes, LayoutDashboard, LogOut, Plus, ShieldCheck } from "lucide-react"
+import { Activity, Boxes, LayoutDashboard, LogOut, Plus, ShieldCheck, Smartphone } from "lucide-react"
 
 import { signOutAction } from "@/app/login/actions"
 import { NavLink } from "@/components/nav-link"
@@ -12,6 +12,7 @@ const navigation = [
   { href: "/runs/new", label: "New integration", icon: Plus },
   { href: "/#app-catalog", label: "Apps", icon: Boxes },
   { href: "/system", label: "System health", icon: Activity },
+  { href: "/security/authenticator", label: "Authenticator", icon: Smartphone },
 ] as const
 
 export function AppShell({

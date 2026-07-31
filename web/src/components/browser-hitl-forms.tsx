@@ -17,6 +17,7 @@ import {
   type OnboardingControlState,
 } from "@/app/runs/[runId]/actions"
 import { Button } from "@/components/ui/button"
+import { humanize } from "@/lib/format"
 
 const initialSubmit: CredentialSubmitState = { message: null, tone: "neutral", status: null }
 const initialLogin: BrowserLoginState = { message: null, tone: "neutral" }
@@ -123,11 +124,15 @@ export function CaptchaResumeForm({
   runId,
   canResume,
   canCancel,
+  withheldReason = null,
   onResumeSubmit,
 }: {
   runId: string
   canResume: boolean
   canCancel: boolean
+  // The backend's closed reason code for an absent resume control, rendered in
+  // place of the button so a paused page always says why.
+  withheldReason?: string | null
   // Interactive sessions hand remote control back before the resume request, so
   // the caller can drop its noVNC connection first.
   onResumeSubmit?: () => void
@@ -152,7 +157,14 @@ export function CaptchaResumeForm({
             <input type="hidden" name="control" value="resume" />
             <FormSubmitButton label="I solved it, continue" pendingLabel="Resuming…" />
           </form>
-        ) : null}
+        ) : (
+          <p
+            className="text-[10px] leading-4 text-muted-foreground"
+            data-testid="resume-withheld-reason"
+          >
+            Handing this session back is withheld · {humanize(withheldReason)}
+          </p>
+        )}
         {canCancel ? (
           <form action={controlAction}>
             <input type="hidden" name="run_id" value={runId} />
