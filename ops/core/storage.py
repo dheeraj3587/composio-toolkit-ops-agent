@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Final, get_args
 
 from ops.browser.worker import HumanActionType
+from ops.core.inference import DecisionReasonCode
 from ops.core.private_files import finalize_private_database, prepare_private_database
 from ops.core.redaction import redact_data, redact_text
 from ops.core.secret_store import parse_vault_reference
@@ -365,6 +366,242 @@ CREATE TABLE IF NOT EXISTS onboarding_autonomy_outcomes (
 """
 
 
+# The two closed words a plan revision's lifecycle uses, and the two ways a plan
+# is authored. Exported so ``ops/planner/plan.py`` can assert its ``PlanSource``
+# Literal against this tuple the way ``ops.onboarding.driver`` asserts its
+# ``AutonomyVerdict`` against :data:`AUTONOMY_VERDICT_VALUES` — the planner
+# imports this module for the run ledger, so importing it back would be a cycle.
+RUN_PLAN_STATUS_VALUES: Final[tuple[str, ...]] = ("active", "superseded")
+RUN_PLAN_SOURCE_VALUES: Final[tuple[str, ...]] = ("planner", "recipe")
+
+# The stages one action-loop iteration reports from (reliability R4.1). Declared
+# here for the same reason as the verdicts above: ``ops/onboarding/action_loop.py``
+# owns the ``LoopStage`` Literal and asserts equality with this tuple, so a stage
+# added on one side fails to import instead of failing a CHECK against a live run.
+LOOP_STAGE_VALUES: Final[tuple[str, ...]] = (
+    "observe",
+    "candidates",
+    "decide",
+    "act",
+    "verify",
+    "gate",
+    "exhausted",
+)
+
+# What one inference attempt is recorded as: usable, or the typed reason it was
+# not. Derived from :data:`ops.core.inference.DecisionReasonCode` rather than
+# retyped, so the column's vocabulary follows the producer's own Literal and the
+# two cannot drift. ``ops.core.inference`` imports nothing from ``ops``, so the
+# edge is safe.
+DECISION_OUTCOME_VALUES: Final[tuple[str, ...]] = ("usable", *get_args(DecisionReasonCode))
+
+# The two things a decision is made for: one loop action, or one pre-flight plan.
+DECISION_ATTEMPT_PURPOSE_VALUES: Final[tuple[str, ...]] = ("action", "plan")
+
+# A plan carries at most the recipe's own step count, and the recipe bounds that
+# at 12. Enforced here as well as by ``ops.planner.plan.RunPlan`` for the reason
+# the admission and autonomy tables give: the dataclass protects callers that go
+# through it, the writer protects the durable record from anything that does not.
+MAX_PLAN_SURFACES: Final = 12
+
+# A surface is a host and a path, never a URL: the query string and the fragment
+# are dropped before a plan is built, so no bound here has to be wide enough for
+# one. The host bound is the DNS name limit; the path bound is the design's.
+MAX_SURFACE_HOST_LENGTH: Final = 253
+MAX_SURFACE_PATH_LENGTH: Final = 300
+
+# Twelve surfaces of a bounded host and a bounded path fit inside this with room
+# to spare, so the column bound is a blob guard rather than a working limit.
+MAX_PLAN_SURFACES_JSON_LENGTH: Final = 4_000
+
+# ``app_slug``, ``catalog_id`` and ``recipe_version`` are catalog identifiers —
+# ``salesforce``, ``approved-50-routes-2026-07-28``, ``…-2026-07-28@1.0``. The
+# shape admits what the catalog actually carries and refuses ``/``, ``?``, ``#``,
+# ``:`` and whitespace, so a URL cannot be stored under any of the three.
+MAX_PLAN_IDENTIFIER_LENGTH: Final = 200
+_PLAN_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,199}$")
+
+# A provider name is a lower snake_case word (``mercury``, ``openai_compatible``),
+# bounded well below anything a payload would need.
+MAX_DECISION_PROVIDER_LENGTH: Final = 40
+
+# The bounds ``api.models.RunProgressEventView`` projects these two integers
+# under. Enforced at the write so a durable row cannot exist that the API view
+# would refuse to render.
+MAX_PROGRESS_STEP_INDEX: Final = 100_000
+MAX_TELEMETRY_ELAPSED_MS: Final = 3_600_000
+
+
+# One row per plan revision (Requirements 5.7, 6.6). History, not current state:
+# a re-plan supersedes the active row and inserts its replacement in the same
+# transaction, so the superseded plan and the plan that replaced it both stay
+# readable and the route change is reconstructable.
+#
+# The partial unique index is what makes "at most one active plan per run"
+# unrepresentable otherwise rather than merely intended, and it is also the reason
+# two workers racing to re-plan produce one plan instead of two: the loser blocks
+# on the write lock, then supersedes the winner's row rather than adding a second
+# active one. ``UNIQUE (run_id, revision)`` gives the same guarantee for the
+# revision sequence.
+#
+# No column here is free-form. The surfaces are a JSON array whose CHECK refuses a
+# query string and a fragment outright; the credential surface is a bounded host
+# and an absolute bounded path, both refusing the same two characters, so the
+# design's claim that no column can hold a URL with a query string holds for the
+# credential columns too and not only for the array; the reason code comes from
+# the onboarding vocabulary; and the success signal is a digest of the recipe's own
+# predicate rather than re-copied clause text.
+_RUN_PLANS_DDL = f"""
+CREATE TABLE IF NOT EXISTS onboarding_run_plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    status TEXT NOT NULL CHECK (
+        status IN ({_vocabulary_clause(RUN_PLAN_STATUS_VALUES)})
+    ),
+    source TEXT NOT NULL CHECK (
+        source IN ({_vocabulary_clause(RUN_PLAN_SOURCE_VALUES)})
+    ),
+    app_slug TEXT NOT NULL,
+    catalog_id TEXT NOT NULL,
+    recipe_version TEXT NOT NULL,
+    surfaces_json TEXT NOT NULL CHECK (
+        surfaces_json LIKE '[%]' AND length(surfaces_json) <= {MAX_PLAN_SURFACES_JSON_LENGTH}
+        AND surfaces_json NOT LIKE '%?%' AND surfaces_json NOT LIKE '%#%'
+    ),
+    credential_host TEXT NOT NULL CHECK (
+        length(credential_host) <= {MAX_SURFACE_HOST_LENGTH}
+        AND credential_host NOT LIKE '%/%'
+        AND credential_host NOT LIKE '%?%' AND credential_host NOT LIKE '%#%'
+    ),
+    credential_path TEXT NOT NULL CHECK (
+        credential_path LIKE '/%' AND length(credential_path) <= {MAX_SURFACE_PATH_LENGTH}
+        AND credential_path NOT LIKE '%?%' AND credential_path NOT LIKE '%#%'
+    ),
+    success_digest TEXT NOT NULL,
+    reason_code TEXT NOT NULL CHECK (
+        reason_code IN ({_vocabulary_clause(ONBOARDING_REASON_CODES)})
+    ),
+    created_at TEXT NOT NULL,
+    superseded_at TEXT,
+    superseded_by INTEGER,
+    UNIQUE (run_id, revision),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_run_plans_active
+ON onboarding_run_plans(run_id) WHERE status = 'active';
+"""
+
+
+# One row per completed loop iteration (Requirement 4.1). Append-only and never
+# deduplicated, like the denial facts above: "the loop stepped again" is a fact
+# about a moment, and the absence of new rows is exactly what makes a stalled run
+# visible (Requirement 4.9).
+#
+# Every column is closed, fixed-width, or a bounded count — a phase and a stage
+# from the code vocabularies, a content-addressed digest, the correlation id that
+# ties the row to the phase boundary it happened under, and two integers. There is
+# no column a prompt, a page projection, or a URL could be written into
+# (Requirement 4.10).
+_PROGRESS_EVENTS_DDL = f"""
+CREATE TABLE IF NOT EXISTS onboarding_progress_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (
+        phase IN ({_vocabulary_clause(ONBOARDING_PHASES)})
+    ),
+    profile_digest TEXT NOT NULL,
+    correlation_id TEXT NOT NULL,
+    step_index INTEGER NOT NULL CHECK (step_index >= 1),
+    stage TEXT NOT NULL CHECK (
+        stage IN ({_vocabulary_clause(LOOP_STAGE_VALUES)})
+    ),
+    elapsed_ms INTEGER NOT NULL CHECK (elapsed_ms >= 0),
+    recorded_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_progress_events_run
+ON onboarding_progress_events(run_id, id);
+"""
+
+
+# One row per inference attempt (Requirement 4.3): the provider that was called,
+# how the attempt ended, and how long it took. Nothing else — no prompt, no
+# payload, no answer (Requirement 4.10).
+#
+# One row *per attempt* rather than per decision is the point of the table: a
+# provider skipped by its circuit breaker never appears in a decision's reason
+# codes, so "Mercury was attempted first" is only answerable from attempts
+# (Requirement 4.11).
+_DECISION_ATTEMPTS_DDL = f"""
+CREATE TABLE IF NOT EXISTS onboarding_decision_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (
+        phase IN ({_vocabulary_clause(ONBOARDING_PHASES)})
+    ),
+    purpose TEXT NOT NULL CHECK (
+        purpose IN ({_vocabulary_clause(DECISION_ATTEMPT_PURPOSE_VALUES)})
+    ),
+    provider TEXT NOT NULL CHECK (length(provider) <= {MAX_DECISION_PROVIDER_LENGTH}),
+    outcome TEXT NOT NULL CHECK (
+        outcome IN ({_vocabulary_clause(DECISION_OUTCOME_VALUES)})
+    ),
+    latency_ms INTEGER NOT NULL CHECK (latency_ms >= 0),
+    recorded_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_decision_attempts_run
+ON onboarding_decision_attempts(run_id, id);
+"""
+
+
+# The three new tables' columns, in each table's own declared order, so the
+# readers below hand out mappings without listing the columns a second time.
+_RUN_PLAN_COLUMNS: Final[tuple[str, ...]] = (
+    "id",
+    "run_id",
+    "revision",
+    "status",
+    "source",
+    "app_slug",
+    "catalog_id",
+    "recipe_version",
+    "surfaces_json",
+    "credential_host",
+    "credential_path",
+    "success_digest",
+    "reason_code",
+    "created_at",
+    "superseded_at",
+    "superseded_by",
+)
+_PROGRESS_EVENT_COLUMNS: Final[tuple[str, ...]] = (
+    "id",
+    "run_id",
+    "phase",
+    "profile_digest",
+    "correlation_id",
+    "step_index",
+    "stage",
+    "elapsed_ms",
+    "recorded_at",
+)
+_DECISION_ATTEMPT_COLUMNS: Final[tuple[str, ...]] = (
+    "id",
+    "run_id",
+    "phase",
+    "purpose",
+    "provider",
+    "outcome",
+    "latency_ms",
+    "recorded_at",
+)
+
+
 # The columns one committed phase boundary is read back under, in the table's own
 # order. Named here because the metrics reader below hands them out as a mapping.
 _PHASE_BOUNDARY_COLUMNS: Final[tuple[str, ...]] = (
@@ -616,6 +853,127 @@ def _audit_reason_code(value: str) -> str:
     return value
 
 
+def _vocabulary_member(value: object, *, vocabulary: tuple[str, ...], field: str) -> str:
+    """One value from a closed vocabulary, refused here before the column CHECK."""
+
+    if not isinstance(value, str) or value not in vocabulary:
+        raise ValueError(f"an onboarding {field} must be one of: {', '.join(vocabulary)}")
+    return value
+
+
+def _telemetry_count(value: object, *, field: str, minimum: int, maximum: int) -> int:
+    """One bounded telemetry integer, and never a bool.
+
+    Bounded at the top as well as the bottom because
+    :class:`api.models.RunProgressEventView` projects these integers under the same
+    bounds: a durable row the API view would refuse to render must not be writable.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ValueError(
+            f"an onboarding telemetry {field} must be an integer between {minimum} and {maximum}"
+        )
+    return value
+
+
+def _plan_identifier(value: object, *, field: str) -> str:
+    """One catalog identifier a plan row carries.
+
+    The shape refuses ``/``, ``?``, ``#``, ``:`` and whitespace, so none of the
+    three identifier columns can hold a URL even though only the surface columns
+    carry a CHECK that says so.
+    """
+
+    if not isinstance(value, str) or _PLAN_IDENTIFIER.fullmatch(value) is None:
+        raise ValueError(
+            f"a run plan {field} must be a catalog identifier of at most "
+            f"{MAX_PLAN_IDENTIFIER_LENGTH} characters"
+        )
+    return value
+
+
+def _plan_digest(value: object, *, field: str) -> str:
+    """The sha-256 digest a plan row carries in place of re-copied clause text."""
+
+    if not isinstance(value, str) or _PROFILE_DIGEST.fullmatch(value) is None:
+        raise ValueError(f"a run plan {field} must be a sha256 hex digest")
+    return value
+
+
+def _surface_host(value: object, *, field: str) -> str:
+    """One planned surface's host: lower case, no port, no userinfo, no path.
+
+    A host that would need normalizing is refused rather than normalized here.
+    ``ops.planner.plan.canonical_surface`` owns canonicalization; a durable row that
+    differed from what the planner canonicalized would make an adherence comparison
+    lie about where the run was expected to be.
+    """
+
+    if not isinstance(value, str) or not value or len(value) > MAX_SURFACE_HOST_LENGTH:
+        raise ValueError(f"a plan {field} must be a bounded host name")
+    if not value.isascii() or value != value.lower():
+        raise ValueError(f"a plan {field} must be a lower-case ascii host name")
+    if any(character in value for character in "/?#:@ "):
+        raise ValueError(f"a plan {field} carries no port, userinfo, path, query, or fragment")
+    return value
+
+
+def _surface_path(value: object, *, field: str) -> str:
+    """One planned surface's path: absolute, bounded, and never a URL."""
+
+    if not isinstance(value, str) or len(value) > MAX_SURFACE_PATH_LENGTH:
+        raise ValueError(f"a plan {field} must be a bounded absolute path")
+    if not value.isascii() or not value.startswith("/"):
+        raise ValueError(f"a plan {field} must be an absolute ascii path")
+    if any(character in value for character in "?# "):
+        raise ValueError(f"a plan {field} carries no query string and no fragment")
+    return value
+
+
+def _decision_provider(value: object) -> str:
+    """One backend's own name (``mercury``, ``openai_compatible``), bounded.
+
+    Refused rather than truncated: a truncated provider name would still be stored,
+    and a telemetry row that names the wrong provider is worse than none.
+    """
+
+    if not isinstance(value, str) or len(value) > MAX_DECISION_PROVIDER_LENGTH:
+        raise ValueError(
+            f"a decision provider name must be at most {MAX_DECISION_PROVIDER_LENGTH} characters"
+        )
+    return _audit_label(value, field="decision provider")
+
+
+def _surfaces_json(surfaces: Sequence[Mapping[str, str]]) -> str:
+    """Serialize the ordered surfaces a plan names, refusing anything else.
+
+    Each surface is exactly a host, a path, and a purpose. The purpose vocabulary is
+    ``ops.planner.plan.SurfacePurpose``'s to declare, so it is bounded here as a
+    label rather than restated as a second closed list that could disagree with it.
+    """
+
+    if not 1 <= len(surfaces) <= MAX_PLAN_SURFACES:
+        raise ValueError(f"a run plan names 1..{MAX_PLAN_SURFACES} surfaces")
+    encoded: list[dict[str, str]] = []
+    for ordinal, surface in enumerate(surfaces, start=1):
+        if frozenset(surface) != frozenset({"host", "path", "purpose"}):
+            raise ValueError(f"plan surface {ordinal} carries a host, a path, and a purpose")
+        purpose = surface["purpose"]
+        if not isinstance(purpose, str):
+            raise ValueError(f"plan surface {ordinal} purpose must be a label")
+        encoded.append(
+            {
+                "host": _surface_host(surface["host"], field=f"surface {ordinal} host"),
+                "path": _surface_path(surface["path"], field=f"surface {ordinal} path"),
+                "purpose": _audit_label(purpose, field=f"surface {ordinal} purpose"),
+            }
+        )
+    serialized = json.dumps(encoded, separators=(",", ":"), sort_keys=True)
+    if len(serialized) > MAX_PLAN_SURFACES_JSON_LENGTH:
+        raise ValueError("a run plan's surface list is too large")
+    return serialized
+
+
 @dataclass(frozen=True, slots=True)
 class OnboardingAuditContext:
     """The correlation set every onboarding audit row carries (design "Event Model").
@@ -808,6 +1166,52 @@ class OperationsUnitOfWork:
             run_id=run_id,
             event_type=event_type,
             payload=payload,
+        )
+
+    def count_run_plans(self, run_id: str) -> int:
+        """Count every plan revision inside this run transaction."""
+
+        return self._storage.count_run_plans_in_transaction(
+            self._connection,
+            run_id=run_id,
+        )
+
+    def read_active_run_plan(self, run_id: str) -> dict[str, Any] | None:
+        """Read the active plan inside this run transaction."""
+
+        return self._storage.read_active_run_plan_in_transaction(
+            self._connection,
+            run_id=run_id,
+        )
+
+    def record_run_plan(
+        self,
+        *,
+        run_id: str,
+        source: str,
+        app_slug: str,
+        catalog_id: str,
+        recipe_version: str,
+        surfaces: Sequence[Mapping[str, str]],
+        credential_host: str,
+        credential_path: str,
+        success_digest: str,
+        reason_code: str,
+    ) -> dict[str, Any]:
+        """Supersede and insert a plan inside this run transaction."""
+
+        return self._storage.record_run_plan_in_transaction(
+            self._connection,
+            run_id=run_id,
+            source=source,
+            app_slug=app_slug,
+            catalog_id=catalog_id,
+            recipe_version=recipe_version,
+            surfaces=surfaces,
+            credential_host=credential_host,
+            credential_path=credential_path,
+            success_digest=success_digest,
+            reason_code=reason_code,
         )
 
     def record_phase_transition_audit(
@@ -1159,6 +1563,11 @@ class OperationsStorage:
             connection.executescript(_ADMISSION_DECISIONS_DDL)
             connection.executescript(_NAVIGATION_DENIALS_DDL)
             connection.executescript(_AUTONOMY_OUTCOMES_DDL)
+            # Additive: three new tables and their indexes, no data migration.
+            # An existing database gains them on the next open (design "Release 2").
+            connection.executescript(_RUN_PLANS_DDL)
+            connection.executescript(_PROGRESS_EVENTS_DDL)
+            connection.executescript(_DECISION_ATTEMPTS_DDL)
             for column_name, declaration in migration_columns.items():
                 if column_name not in existing_columns:
                     connection.execute(f"ALTER TABLE runs ADD COLUMN {column_name} {declaration}")
@@ -2357,6 +2766,362 @@ class OperationsStorage:
                 (_metric_row_limit(limit),),
             ).fetchall()
         return [dict(zip(_AUTONOMY_OUTCOME_COLUMNS, row, strict=True)) for row in rows]
+
+    def record_run_plan(
+        self,
+        *,
+        run_id: str,
+        source: str,
+        app_slug: str,
+        catalog_id: str,
+        recipe_version: str,
+        surfaces: Sequence[Mapping[str, str]],
+        credential_host: str,
+        credential_path: str,
+        success_digest: str,
+        reason_code: str,
+    ) -> dict[str, Any]:
+        """Record a plan revision, superseding the run's active plan in one transaction.
+
+        PRE:  ``surfaces`` names 1..12 surfaces, each exactly a host, a path and a
+              purpose, with the query string and the fragment already dropped;
+              ``source`` and ``reason_code`` are members of their vocabularies.
+              Everything else is refused here and, for a writer that bypasses this
+              method, by the column CHECKs.
+        POST: exactly one row for the run has ``status = 'active'`` — this one, at
+              ``revision = max + 1``. If the run had an active plan, that row now
+              reads ``superseded`` with ``superseded_at`` set and ``superseded_by``
+              naming this row, so the superseded plan and its replacement are both
+              still readable (Requirement 6.6). Returns the stored row.
+
+        The supersession and the insert are one ``BEGIN IMMEDIATE`` transaction, so
+        two workers racing to re-plan produce one plan rather than two: the second
+        writer waits for the first to commit, then supersedes *its* row and inserts
+        the next revision. The partial unique index is the backstop — a second
+        active row is unrepresentable rather than merely unlikely.
+
+        ``superseded_by`` is set by a second UPDATE after the insert because the
+        replacement's id does not exist until then; the intermediate state never
+        leaves the transaction.
+
+        Raises ``sqlite3.IntegrityError`` if the run does not exist.
+        """
+
+        self.initialize()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return self.record_run_plan_in_transaction(
+                connection,
+                run_id=run_id,
+                source=source,
+                app_slug=app_slug,
+                catalog_id=catalog_id,
+                recipe_version=recipe_version,
+                surfaces=surfaces,
+                credential_host=credential_host,
+                credential_path=credential_path,
+                success_digest=success_digest,
+                reason_code=reason_code,
+            )
+
+    def record_run_plan_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        source: str,
+        app_slug: str,
+        catalog_id: str,
+        recipe_version: str,
+        surfaces: Sequence[Mapping[str, str]],
+        credential_host: str,
+        credential_path: str,
+        success_digest: str,
+        reason_code: str,
+    ) -> dict[str, Any]:
+        """Supersede and insert a plan inside the caller's transaction."""
+
+        stored_run_id = _safe_text(run_id)
+        values = (
+            stored_run_id,
+            _vocabulary_member(source, vocabulary=RUN_PLAN_SOURCE_VALUES, field="run plan source"),
+            _plan_identifier(app_slug, field="app slug"),
+            _plan_identifier(catalog_id, field="catalog id"),
+            _plan_identifier(recipe_version, field="recipe version"),
+            _surfaces_json(surfaces),
+            _surface_host(credential_host, field="credential surface host"),
+            _surface_path(credential_path, field="credential surface path"),
+            _plan_digest(success_digest, field="success digest"),
+            _audit_reason_code(reason_code),
+        )
+        columns = ", ".join(_RUN_PLAN_COLUMNS)
+        active = connection.execute(
+            "SELECT id FROM onboarding_run_plans WHERE run_id = ? AND status = 'active'",
+            (stored_run_id,),
+        ).fetchone()
+        highest = connection.execute(
+            "SELECT COALESCE(MAX(revision), 0) FROM onboarding_run_plans WHERE run_id = ?",
+            (stored_run_id,),
+        ).fetchone()
+        recorded_at = _utc_now()
+        if active is not None:
+            connection.execute(
+                "UPDATE onboarding_run_plans "
+                "SET status = 'superseded', superseded_at = ? WHERE id = ?",
+                (recorded_at, active[0]),
+            )
+        cursor = connection.execute(
+            """
+            INSERT INTO onboarding_run_plans (
+                run_id, revision, status, source, app_slug, catalog_id, recipe_version,
+                surfaces_json, credential_host, credential_path, success_digest,
+                reason_code, created_at
+            ) VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                values[0],
+                int(highest[0]) + 1,
+                *values[1:],
+                recorded_at,
+            ),
+        )
+        plan_id = cursor.lastrowid
+        if plan_id is None:  # pragma: no cover - sqlite invariant
+            raise RuntimeError("run plan id was not generated")
+        if active is not None:
+            connection.execute(
+                "UPDATE onboarding_run_plans SET superseded_by = ? WHERE id = ?",
+                (int(plan_id), active[0]),
+            )
+        row = connection.execute(
+            f"SELECT {columns} FROM onboarding_run_plans WHERE id = ?",
+            (int(plan_id),),
+        ).fetchone()
+        if row is None:  # pragma: no cover - insertion invariant
+            raise RuntimeError("run plan could not be read back")
+        return dict(zip(_RUN_PLAN_COLUMNS, row, strict=True))
+
+    def read_active_run_plan(self, run_id: str) -> dict[str, Any] | None:
+        """The run's one active plan, or ``None`` if it has never been planned.
+
+        The read a re-entering worker performs before planning again (Requirement
+        5.9): a run that already recorded a validated plan reuses it, so re-queuing
+        a run performs no second planning call. The partial unique index is what
+        makes "one active plan" a fact about the table rather than about this query.
+        """
+
+        self.initialize()
+        with self._connect() as connection:
+            return self.read_active_run_plan_in_transaction(connection, run_id=run_id)
+
+    def read_active_run_plan_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        """Read the active plan inside the caller's transaction."""
+
+        columns = ", ".join(_RUN_PLAN_COLUMNS)
+        row = connection.execute(
+            f"SELECT {columns} FROM onboarding_run_plans WHERE run_id = ? AND status = 'active'",
+            (_safe_text(run_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(zip(_RUN_PLAN_COLUMNS, row, strict=True))
+
+    def count_run_plans(self, run_id: str) -> int:
+        """How many plan revisions the run has recorded, superseded ones included.
+
+        This is how "has this run already re-planned?" is answered (Requirement
+        6.2): a run with one revision may still re-plan once, and a run with two has
+        spent that authorization. A count of durable rows rather than an in-memory
+        flag, so it survives the worker that planned.
+        """
+
+        self.initialize()
+        with self._connect() as connection:
+            return self.count_run_plans_in_transaction(connection, run_id=run_id)
+
+    def count_run_plans_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+    ) -> int:
+        """Count every plan revision inside the caller's transaction."""
+
+        row = connection.execute(
+            "SELECT COUNT(*) FROM onboarding_run_plans WHERE run_id = ?",
+            (_safe_text(run_id),),
+        ).fetchone()
+        return int(row[0])
+
+    def record_progress_event(
+        self,
+        *,
+        run_id: str,
+        phase: str,
+        profile_digest: str,
+        correlation_id: str,
+        step_index: int,
+        stage: str,
+        elapsed_ms: int,
+    ) -> int:
+        """Record one completed loop iteration as a durable fact (Requirement 4.1).
+
+        PRE:  ``phase`` is an onboarding phase and ``stage`` a loop stage; the digest
+              is a content address and the correlation id ties the row to the phase
+              boundary it happened under. Nothing free-form is accepted, so no prompt
+              text or page content can reach the row (Requirement 4.10).
+        POST: one row exists per call. Progress events are never deduplicated — an
+              iteration that acted on nothing must still leave a row, because the
+              absence of new rows is exactly what makes a stalled run visible
+              (Requirement 4.9).
+        """
+
+        self.initialize()
+        values = (
+            _safe_text(run_id),
+            _audit_phase(phase),
+            _plan_digest(profile_digest, field="profile digest"),
+            _audit_identifier(correlation_id, field="correlation id", limit=64),
+            _telemetry_count(
+                step_index,
+                field="step index",
+                minimum=1,
+                maximum=MAX_PROGRESS_STEP_INDEX,
+            ),
+            _vocabulary_member(stage, vocabulary=LOOP_STAGE_VALUES, field="loop stage"),
+            _telemetry_count(
+                elapsed_ms,
+                field="elapsed time",
+                minimum=0,
+                maximum=MAX_TELEMETRY_ELAPSED_MS,
+            ),
+            _utc_now(),
+        )
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO onboarding_progress_events (
+                    run_id, phase, profile_digest, correlation_id, step_index,
+                    stage, elapsed_ms, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            event_id = cursor.lastrowid
+            if event_id is None:  # pragma: no cover - sqlite invariant
+                raise RuntimeError("progress event id was not generated")
+        return int(event_id)
+
+    def list_progress_events(
+        self,
+        run_id: str,
+        *,
+        limit: int = MAX_METRIC_ROWS,
+    ) -> list[dict[str, Any]]:
+        """The run's progress events, newest first, bounded by ``limit``.
+
+        Newest first because the question this read answers is "is the run still
+        stepping?" — a bounded window taken from the oldest end would answer it about
+        a moment that has passed. The API projects the same rows in the same order
+        over ``onboarding_progress_window`` (Requirement 4.2).
+        """
+
+        self.initialize()
+        columns = ", ".join(_PROGRESS_EVENT_COLUMNS)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT {columns} FROM onboarding_progress_events "
+                "WHERE run_id = ? ORDER BY id DESC LIMIT ?",
+                (_safe_text(run_id), _metric_row_limit(limit)),
+            ).fetchall()
+        return [dict(zip(_PROGRESS_EVENT_COLUMNS, row, strict=True)) for row in rows]
+
+    def record_decision_attempt(
+        self,
+        *,
+        run_id: str,
+        phase: str,
+        purpose: str,
+        provider: str,
+        outcome: str,
+        latency_ms: int,
+    ) -> int:
+        """Record one inference attempt: provider, outcome, latency (Requirement 4.3).
+
+        PRE:  ``purpose`` says what the decision was for, ``provider`` is the
+              backend's own name, and ``outcome`` is ``usable`` or the typed reason
+              it was not. No prompt, no payload and no answer is accepted, which is
+              the whole of Requirement 4.10 for this table.
+        POST: one row exists per *attempt*, not per decision. A provider skipped by
+              its circuit breaker never appears in a decision's reason codes, so
+              attribution (Requirement 4.11) is only possible from these rows.
+        """
+
+        self.initialize()
+        values = (
+            _safe_text(run_id),
+            _audit_phase(phase),
+            _vocabulary_member(
+                purpose,
+                vocabulary=DECISION_ATTEMPT_PURPOSE_VALUES,
+                field="decision purpose",
+            ),
+            _decision_provider(provider),
+            _vocabulary_member(
+                outcome,
+                vocabulary=DECISION_OUTCOME_VALUES,
+                field="decision outcome",
+            ),
+            _telemetry_count(
+                latency_ms,
+                field="attempt latency",
+                minimum=0,
+                maximum=MAX_TELEMETRY_ELAPSED_MS,
+            ),
+            _utc_now(),
+        )
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO onboarding_decision_attempts (
+                    run_id, phase, purpose, provider, outcome, latency_ms, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            attempt_id = cursor.lastrowid
+            if attempt_id is None:  # pragma: no cover - sqlite invariant
+                raise RuntimeError("decision attempt id was not generated")
+        return int(attempt_id)
+
+    def list_decision_attempts(
+        self,
+        run_id: str,
+        *,
+        limit: int = MAX_METRIC_ROWS,
+    ) -> list[dict[str, Any]]:
+        """The run's inference attempts, newest first, bounded by ``limit``.
+
+        Newest first for the same reason as the progress window: the diagnosis an
+        operator is making is about the decision the run is failing on now, and the
+        provider order inside one decision is still readable because the rows of one
+        decision share a recorded second and descend by id.
+        """
+
+        self.initialize()
+        columns = ", ".join(_DECISION_ATTEMPT_COLUMNS)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT {columns} FROM onboarding_decision_attempts "
+                "WHERE run_id = ? ORDER BY id DESC LIMIT ?",
+                (_safe_text(run_id), _metric_row_limit(limit)),
+            ).fetchall()
+        return [dict(zip(_DECISION_ATTEMPT_COLUMNS, row, strict=True)) for row in rows]
 
     def list_phase_boundaries(
         self,

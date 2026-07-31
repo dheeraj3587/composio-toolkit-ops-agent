@@ -40,7 +40,7 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast, get_args
 
 import httpx
 from pydantic import SecretStr
@@ -336,6 +336,36 @@ DecisionReasonCode = Literal[
     "all_providers_failed",
 ]
 
+# How one attempt ended: usable, or the typed reason it was not. Spelled out
+# rather than unpacked from ``DecisionReasonCode`` because a type checker cannot
+# read a computed Literal; the assert below is what keeps the two in step.
+DecisionOutcome = Literal[
+    "usable",
+    "rate_limited",
+    "authentication_failed",
+    "provider_timeout",
+    "invalid_json",
+    "schema_invalid",
+    "all_providers_failed",
+]
+assert get_args(DecisionOutcome) == ("usable", *get_args(DecisionReasonCode)), (
+    "a decision outcome is 'usable' or one of the decision reason codes"
+)
+
+
+class DecisionAttemptSink(Protocol):
+    """Where one inference attempt is recorded (reliability R4.3).
+
+    Declared beside the producer so ``ops/core/`` never imports the onboarding
+    telemetry that implements it. Provider name, outcome and latency only: no
+    prompt, no payload, no answer.
+    """
+
+    def record_attempt(self, *, provider: str, outcome: DecisionOutcome, latency_ms: int) -> None:
+        """Record one attempt of the chain."""
+        ...
+
+
 # Programming errors must propagate out of the decision path, never be recorded
 # as a provider failure.
 _PROGRAMMING_ERRORS: tuple[type[Exception], ...] = (
@@ -425,12 +455,17 @@ class JsonInference:
     """
 
     def __init__(
-        self, backends: Sequence[JsonBackend], *, budget: DecisionBudget | None = None
+        self,
+        backends: Sequence[JsonBackend],
+        *,
+        budget: DecisionBudget | None = None,
+        attempts: DecisionAttemptSink | None = None,
     ) -> None:
         if not backends:
             raise ValueError("at least one inference backend is required")
         self._backends = tuple(backends)
         self._budget = budget or DecisionBudget()
+        self._attempts = attempts
         self._breakers: dict[str, _Breaker] = {}
         # Sanitized record of the last decision's failures, for reporting.
         self.last_reason_codes: tuple[DecisionReasonCode, ...] = ()
@@ -438,6 +473,17 @@ class JsonInference:
     @property
     def provider_names(self) -> tuple[str, ...]:
         return tuple(backend.name for backend in self._backends)
+
+    def with_attempts(self, attempts: DecisionAttemptSink) -> JsonInference:
+        """This chain, recording each attempt into ``attempts``.
+
+        The breakers are shared rather than copied: a provider this deployment has
+        already found to be failing must stay skipped for every run.
+        """
+
+        view = JsonInference(self._backends, budget=self._budget, attempts=attempts)
+        view._breakers = self._breakers
+        return view
 
     @property
     def budget(self) -> DecisionBudget:
@@ -479,6 +525,7 @@ class JsonInference:
                 reasons.append("provider_timeout")
                 break
             attempted += 1
+            started = time.monotonic()
             try:
                 payload = _call_with_timeout(
                     backend.generate_json, prompt, schema, timeout=per_attempt
@@ -486,16 +533,26 @@ class JsonInference:
                 if validate is not None:
                     validate(payload)
                 breaker.record_success()
+                self._record(backend.name, "usable", started)
                 self.last_reason_codes = tuple(reasons)
                 return InferenceResult(payload=payload, provider=backend.name)
             except _PROGRAMMING_ERRORS:
                 raise  # a broken integration must surface
             except Exception as exc:
-                reasons.append(_classify_backend_error(exc))
+                reason = _classify_backend_error(exc)
+                reasons.append(reason)
+                self._record(backend.name, reason, started)
                 breaker.record_failure(time.monotonic())
 
         self.last_reason_codes = tuple(reasons)
         raise DecisionFailed(reasons[-1] if reasons else "all_providers_failed")
+
+    def _record(self, provider: str, outcome: DecisionOutcome, started: float) -> None:
+        """One row per attempt, so a provider skipped by its breaker is visible."""
+
+        if self._attempts is not None:
+            latency_ms = max(int((time.monotonic() - started) * 1000), 0)
+            self._attempts.record_attempt(provider=provider, outcome=outcome, latency_ms=latency_ms)
 
 
 def build_json_inference(
@@ -503,6 +560,7 @@ def build_json_inference(
     *,
     budget: DecisionBudget | None = None,
     max_completion_tokens: int = _MAX_COMPLETION_TOKENS,
+    attempts: DecisionAttemptSink | None = None,
 ) -> JsonInference | None:
     """Build the ordered chain, skipping unconfigured providers.
 
@@ -567,13 +625,15 @@ def build_json_inference(
         if models:
             backends.append(GeminiJsonBackend(gemini_key, models=models))
 
-    return JsonInference(backends, budget=budget) if backends else None
+    return JsonInference(backends, budget=budget, attempts=attempts) if backends else None
 
 
 __all__ = [
     "CerebrasJsonBackend",
+    "DecisionAttemptSink",
     "DecisionBudget",
     "DecisionFailed",
+    "DecisionOutcome",
     "DecisionReasonCode",
     "GeminiJsonBackend",
     "GroqJsonBackend",

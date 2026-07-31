@@ -47,17 +47,17 @@ from ops.onboarding.phase import (
 from ops.providers.profile import SOURCE_DIGEST_LENGTH
 
 if TYPE_CHECKING:  # pragma: no cover - imported for typing only
-    from ops.onboarding.action_loop import LoopTelemetry
+    from ops.onboarding.action_loop import LoopStage, LoopTelemetry
 
 LOGGER = logging.getLogger("composio_ops.onboarding_loop_telemetry")
 
 
 class DenialFactStore(Protocol):
-    """The one durable write this telemetry performs.
+    """The three durable writes this telemetry performs.
 
-    Narrower than :class:`~ops.core.storage.OperationsStorage` on purpose: the sink for
-    a denial fact is the only capability this module needs, so nothing else in the
-    run ledger is reachable from here.
+    Narrower than :class:`~ops.core.storage.OperationsStorage` on purpose: these
+    appends are the only capabilities this module needs, so nothing else in the run
+    ledger is reachable from here.
     """
 
     def record_navigation_denial(
@@ -69,6 +69,33 @@ class DenialFactStore(Protocol):
         reason_code: str,
     ) -> int:
         """Append one denial fact and return its identifier."""
+        ...
+
+    def record_progress_event(
+        self,
+        *,
+        run_id: str,
+        phase: str,
+        profile_digest: str,
+        correlation_id: str,
+        step_index: int,
+        stage: str,
+        elapsed_ms: int,
+    ) -> int:
+        """Append one loop-iteration fact and return its identifier."""
+        ...
+
+    def record_decision_attempt(
+        self,
+        *,
+        run_id: str,
+        phase: str,
+        purpose: str,
+        provider: str,
+        outcome: str,
+        latency_ms: int,
+    ) -> int:
+        """Append one inference-attempt fact and return its identifier."""
         ...
 
 
@@ -85,6 +112,9 @@ class DurableLoopTelemetry:
     run_id: str
     phase: OnboardingPhase
     profile_digest: str
+    # Ties every progress row to the phase attempt it happened under, so a retried
+    # phase reads as one thread.
+    correlation_id: str
     denials: int = field(default=0, init=False)
     rejects: int = field(default=0, init=False)
     dlp_refusals: int = field(default=0, init=False)
@@ -168,6 +198,31 @@ class DurableLoopTelemetry:
         """Adopt the loop's running model-call total."""
 
         self.model_calls = model_calls
+
+    def progress(self, *, step_index: int, stage: LoopStage, elapsed_ms: int) -> None:
+        """Record one completed loop iteration durably (Requirement 4.1)."""
+
+        self.store.record_progress_event(
+            run_id=self.run_id,
+            phase=self.phase,
+            profile_digest=self.profile_digest,
+            correlation_id=self.correlation_id,
+            step_index=step_index,
+            stage=stage,
+            elapsed_ms=elapsed_ms,
+        )
+
+    def record_attempt(self, *, provider: str, outcome: str, latency_ms: int) -> None:
+        """Record one inference attempt of this phase's loop (Requirement 4.3)."""
+
+        self.store.record_decision_attempt(
+            run_id=self.run_id,
+            phase=self.phase,
+            purpose="action",
+            provider=provider,
+            outcome=outcome,
+            latency_ms=latency_ms,
+        )
 
 
 def _port_conformance(telemetry: DurableLoopTelemetry) -> LoopTelemetry:
