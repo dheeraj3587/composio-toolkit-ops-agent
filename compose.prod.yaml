@@ -298,11 +298,6 @@ services:
       OPS_AUTH_USERNAME: ${OPS_AUTH_USERNAME:?OPS_AUTH_USERNAME is required}
       OPS_AUTH_PASSWORD: ${OPS_AUTH_PASSWORD:?OPS_AUTH_PASSWORD is required}
       OPS_AUTH_SESSION_SECRET: ${OPS_AUTH_SESSION_SECRET:?OPS_AUTH_SESSION_SECRET is required}
-      # Optional, and unused once the console completes its single-factor
-      # migration. It is still passed through so the current web image keeps
-      # finding it and sign-in stays unchanged; a deployment that omits it
-      # renders and deploys just the same.
-      OPS_AUTH_TOTP_SECRET: ${OPS_AUTH_TOTP_SECRET:-}
       # Next.js waits longer than the API client, which in turn waits longer than
       # the worker. This preserves the worker's structured timeout/error result.
       OPS_RUN_ACTION_TIMEOUT_MS: ${OPS_RUN_ACTION_TIMEOUT_MS:-330000}

@@ -39,12 +39,10 @@ export default async function LoginPage({
   const configuredUsername = process.env.OPS_AUTH_USERNAME
   const configuredPassword = process.env.OPS_AUTH_PASSWORD
   const sessionSecret = process.env.OPS_AUTH_SESSION_SECRET
-  const totpSecret = process.env.OPS_AUTH_TOTP_SECRET
   const configured = authConfigurationValid(
     configuredUsername,
     configuredPassword,
     sessionSecret,
-    totpSecret,
   )
 
   if (
@@ -144,7 +142,7 @@ export default async function LoginPage({
                   ? `Sign-in is temporarily paused. Try again in about ${retryAfter} seconds.`
                   : invalid
                     ? "The username or password was not accepted."
-                    : "Set the operator username, a password of at least 20 characters, a 32-character session secret, and a valid TOTP secret."}
+                    : "Set the operator username, a password of at least 8 characters, and a 32-character session secret."}
               </AlertDescription>
             </Alert>
           ) : null}
@@ -163,24 +161,6 @@ export default async function LoginPage({
                 autoFocus
                 className="h-12 rounded-xl bg-white px-4"
                 placeholder="Operator username"
-              />
-            </div>
-            <div className="space-y-2">
-              <label htmlFor="totp" className="text-sm font-medium">
-                Authenticator code
-              </label>
-              <Input
-                id="totp"
-                name="totp"
-                type="text"
-                required
-                minLength={6}
-                maxLength={6}
-                inputMode="numeric"
-                pattern="[0-9]{6}"
-                autoComplete="one-time-code"
-                className="h-12 rounded-xl bg-white px-4 font-mono tracking-[0.2em]"
-                placeholder="000000"
               />
             </div>
             <div className="space-y-2">

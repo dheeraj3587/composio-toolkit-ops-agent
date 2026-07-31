@@ -7,7 +7,6 @@ export function GET(): NextResponse {
     process.env.OPS_AUTH_USERNAME,
     process.env.OPS_AUTH_PASSWORD,
     process.env.OPS_AUTH_SESSION_SECRET,
-    process.env.OPS_AUTH_TOTP_SECRET,
   )
   return NextResponse.json(
     {
