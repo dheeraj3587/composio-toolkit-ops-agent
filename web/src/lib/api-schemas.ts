@@ -394,6 +394,7 @@ export const onboardingControlsSchema = z.strictObject({
   can_retry_step: z.boolean().default(false),
   retryable_step: retryableStepSchema.nullish().default(null),
   reason_code: safeToken.nullish().default(null),
+  resume_withheld_reason: safeToken.nullish().default(null),
 })
 
 // api/models.py::AutonomyOutcomeView, projected once the run is terminal.
@@ -599,6 +600,24 @@ const timelineDetail = z.strictObject({
     .default(null),
 })
 
+const loopStageSchema = z.enum([
+  "observe",
+  "candidates",
+  "decide",
+  "act",
+  "verify",
+  "gate",
+  "exhausted",
+])
+
+const runProgressEventSchema = z.strictObject({
+  step_index: z.number().int().min(1).max(100_000),
+  stage: loopStageSchema,
+  elapsed_ms: z.number().int().min(0).max(3_600_000),
+  onboarding_phase: onboardingPhaseSchema,
+  recorded_at: isoTimestamp,
+})
+
 export const timelineResponseSchema = z.strictObject({
   run_id: runId,
   items: z
@@ -616,6 +635,7 @@ export const timelineResponseSchema = z.strictObject({
       }),
     )
     .max(1_000),
+  progress: z.array(runProgressEventSchema).max(200).default([]),
 })
 
 const integratorBundle = z.strictObject({

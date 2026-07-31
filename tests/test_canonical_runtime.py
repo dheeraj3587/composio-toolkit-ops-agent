@@ -14,6 +14,7 @@ import threading
 from collections import Counter
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -33,9 +34,16 @@ from ops.core.redaction import RedactingFilter
 from ops.core.secret_store import SQLiteSecretStore
 from ops.core.storage import OperationsStorage, OperationsUnitOfWork
 from ops.gmail.models import GmailSendResult
-from ops.onboarding.composition import build_onboarding_ports
+from ops.onboarding.composition import (
+    InferenceCandidateDecider,
+    SettingsRunPlanner,
+    build_onboarding_ports,
+)
 from ops.onboarding.driver import SQLitePhaseHistoryStore
 from ops.onboarding.lease_store import SQLiteLeaseStore, SQLiteRunQueue
+from ops.planner.adherence import RouteAdherenceMonitor
+from ops.planner.store import SQLiteRunPlanStore
+from ops.planner.validator import validate_plan
 from ops.playwright.routing import select_initial_target
 from ops.providers.composio_managed_auth import ManagedConnectionPoll, ManagedConnectionStart
 from ops.providers.profile_store import SQLiteProviderProfileStore
@@ -209,9 +217,10 @@ class _FakePlaywright:
         secret_grants: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
         signup_fields: Mapping[str, str] | None = None,
+        setup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
-        del account_creation_requested, signup_fields, credential_creation_policy
+        del account_creation_requested, signup_fields, setup_fields, credential_creation_policy
         self._assert_outside_transaction()
         self.navigate_context = context
         self.navigate_research = research
@@ -244,6 +253,7 @@ class _FakePlaywright:
         secret_grants: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
         signup_fields: Mapping[str, str] | None = None,
+        setup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
@@ -252,6 +262,7 @@ class _FakePlaywright:
             sensitive_data,
             account_creation_requested,
             signup_fields,
+            setup_fields,
             credential_creation_policy,
         )
         self._assert_outside_transaction()
@@ -1650,6 +1661,13 @@ def test_composition_root_binds_every_onboarding_port(tmp_path: Path) -> None:
         assert isinstance(ports.queue, SQLiteRunQueue)
         assert isinstance(ports.profiles, SQLiteProviderProfileStore)
         assert ports.profiles.owner == settings.browser_service_owner
+        # Planning is one composed graph: the store is shared by admission and
+        # adherence, and the validator is the catalog validator rather than an
+        # inference fallback.
+        assert isinstance(ports.plans, SQLiteRunPlanStore)
+        assert isinstance(ports.planner, SettingsRunPlanner)
+        assert ports.plan_validator is validate_plan
+        assert isinstance(ports.adherence, RouteAdherenceMonitor)
         # The adapters that need configuration, bound because it is present.
         assert ports.verification is not None and ports.verification.kind == "gmail"
         assert ports.validator is not None
@@ -1674,7 +1692,15 @@ def test_composition_root_binds_every_onboarding_port(tmp_path: Path) -> None:
         assert deps.pauses is ports.phases
         assert deps.effects is ports.phases
         assert deps.outcomes is ports.outcomes
-        assert deps.decider is ports.decider
+        assert deps.plans is ports.plans
+        assert deps.planner is ports.planner
+        assert deps.plan_validator is ports.plan_validator
+        # An explicitly unwired plan store disables adherence instead of letting
+        # the monitor infer an expectation from transient state.
+        assert replace(ports, plans=None).adherence is None
+        # The decider is the composed chain, rebound to this run's attempt sink so
+        # each inference attempt is recorded against the run that made it (R4.3).
+        assert isinstance(deps.decider, InferenceCandidateDecider)
         assert deps.verification is ports.verification
         assert deps.vault is ports.vault
         # Requirement 19.4: the same filter the API and CLI startup boundaries

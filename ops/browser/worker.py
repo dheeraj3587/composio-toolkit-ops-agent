@@ -157,9 +157,18 @@ class BrowserObservation:
     # existing Browser Use results need not supply one. NEVER page or exception
     # text — it is validated to a strict character class below.
     reason_code: str | None = None
+    # Browser-service HITL generation. Zero means the provider does not expose a
+    # generation and therefore cannot participate in autonomous takeover.
+    hitl_generation: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "current_url", sanitize_browser_url(self.current_url))
+        if (
+            isinstance(self.hitl_generation, bool)
+            or not isinstance(self.hitl_generation, int)
+            or self.hitl_generation < 0
+        ):
+            raise ValueError("browser HITL generation is invalid")
         if not self.page_title or len(self.page_title) > 500:
             raise ValueError("browser page title is invalid")
         if self.reason_code is not None and (
@@ -300,11 +309,12 @@ class BrowserWorker:
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
         signup_fields: Mapping[str, str] | None = None,
+        setup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
         # Browser Use compatibility does not execute canonical recipes or the
         # deterministic Playwright signup contract.
-        del recipe, signup_fields
+        del recipe, signup_fields, setup_fields
         self._require_configuration()
         if context.session_id:
             self._research[context.session_id] = research
@@ -327,12 +337,13 @@ class BrowserWorker:
         sensitive_data: Mapping[str, str] | None = None,
         account_creation_requested: bool = False,
         signup_fields: Mapping[str, str] | None = None,
+        setup_fields: Mapping[str, str] | None = None,
         credential_creation_policy: str = "reuse_only",
         provider_session_id: str | None = None,
     ) -> BrowserObservation:
         # Browser Use compatibility does not execute canonical recipes or the
         # deterministic Playwright signup contract.
-        del recipe, account_creation_requested, signup_fields
+        del recipe, account_creation_requested, signup_fields, setup_fields
         self._require_configuration()
         resolved = research or self._research.get(context.session_id)
         if resolved is None:
@@ -402,7 +413,6 @@ class BrowserWorker:
         account_creation_requested: bool = False,
         credential_creation_policy: str = "reuse_only",
     ) -> BrowserObservation:
-        del credential_creation_policy
         try:
             allowed = build_browser_allowed_hosts(
                 research.app_slug,
@@ -431,7 +441,13 @@ class BrowserWorker:
         # Browser Use v3 provider injects the values via secure ``sensitive_data``
         # placeholders the agent can type but never read.
         login_fields = tuple(sensitive_data) if sensitive_data else ()
-        task = _render_browser_task(target_url, patterns, resume_signal, login_fields)
+        task = _render_browser_task(
+            target_url,
+            patterns,
+            resume_signal,
+            login_fields,
+            credential_creation_policy=credential_creation_policy,
+        )
         client = self._get_client()
         run_kwargs: dict[str, Any] = {
             "schema": BrowserTaskOutput,
@@ -807,6 +823,7 @@ def _render_browser_task(
     resume_signal: str | None,
     login_fields: tuple[str, ...] = (),
     trace: BrowserApiTrace | None = None,
+    credential_creation_policy: str = "reuse_only",
 ) -> str:  # pragma: no cover - live only
     """Render the bounded onboarding task.
 
@@ -815,8 +832,11 @@ def _render_browser_task(
     enters them by typing the bare ``x_``-prefixed placeholder keys (e.g.
     ``x_login_email``) verbatim; the Cloud replaces each with the real value and
     the model never sees it. Plain password entry is therefore no longer a hard
-    stop, but every other human-only gate (CAPTCHA, OTP/MFA, passkey, device
-    approval, billing, legal consent) still pauses for HITL.
+    stop. Credential creation is controlled by the immutable run policy, and a
+    credential surface hands off successfully to trusted code-owned capture rather
+    than becoming HITL. Genuine provider challenges with no approved continuation
+    (interactive CAPTCHA, unavailable OTP/MFA, passkey, device approval, billing,
+    or legal consent) still pause.
     """
 
     allowlist = ", ".join(allowed_domains)
@@ -827,6 +847,31 @@ def _render_browser_task(
         else ""
     )
     trace_note = f"{render_browser_api_trace(trace)}\n\n" if trace is not None else ""
+    if credential_creation_policy not in {"reuse_only", "create_if_missing"}:
+        raise ValueError("unsupported credential creation policy")
+    create_missing = credential_creation_policy == "create_if_missing"
+    creation_note = (
+        "CREDENTIAL CREATION AUTHORITY: This run explicitly authorizes create_if_missing. "
+        "Search for the exact existing developer application or credential first. If it is "
+        "absent, autonomously use the reviewed Create/New/Generate controls and the Save/Create "
+        "confirmation needed to mint it. Use only an exact prefilled or run-provided idempotent "
+        "name and reviewed non-secret values; never invent account, scope, billing, or legal "
+        "data. Reaching a generated-value surface is success, not a human checkpoint.\n\n"
+        if create_missing
+        else "CREDENTIAL CREATION POLICY: reuse_only. Search for and open an existing developer "
+        "application or credential, but do not create, generate, regenerate, rotate, or save a "
+        "new one.\n\n"
+    )
+    creation_strategy = (
+        "3. If no exact existing app/credential exists, use a reviewed 'Create'/'New'/'Generate' "
+        "control and complete its non-secret setup with only prefilled or run-provided values. "
+        "Commit the reviewed Save/Create step, then continue until the generated credential "
+        "surface is present.\n"
+        if create_missing
+        else "3. If a section lists apps/integrations, search it for the exact existing "
+        "run-owned app or credential. Because this run is reuse-only, do not open or submit a "
+        "Create/New/Generate flow.\n"
+    )
     has_login = "login_email" in login_fields or "login_password" in login_fields
     has_otp = "login_otp" in login_fields
     has_verify_link = "login_verification_url" in login_fields
@@ -882,6 +927,7 @@ def _render_browser_task(
         f"{resume_note}"
         f"{trace_note}"
         f"{login_note}"
+        f"{creation_note}"
         f"START: Open {target_url}. Stay strictly within these hostnames: {allowlist}. Never "
         "navigate to any other domain.\n\n"
         "GOAL: Reach the page where the account's API credentials are shown or generated — an "
@@ -897,10 +943,7 @@ def _render_browser_task(
         "2. Use the app's OWN search box (a search icon, or press '/') and search terms like "
         "'API', 'API key', 'API token', 'personal access token', 'developer', 'client secret', "
         "'access token' to jump straight to the right page.\n"
-        "3. If a section lists apps/integrations, open it and look for a 'Create'/'New'/'Generate' "
-        "control (e.g. 'Create private app', 'New API key', 'Generate token', 'Add integration'). "
-        "Follow it and complete the non-secret setup steps (name, scopes) to reach the screen "
-        "where the key/secret is shown or a 'Show/Reveal/Copy token' control appears.\n"
+        f"{creation_strategy}"
         "4. If a menu is hard to find, try known deep-link paths on the SAME allowlisted host "
         "(for example /settings/api, /settings/integrations, /developers, /settings/tokens).\n"
         "5. Scroll the ENTIRE page and open each tab/sub-tab; the credential or its "
@@ -914,18 +957,27 @@ def _render_browser_task(
         "settings, dismiss cookie banners, and fill clearly non-secret fields (name, company, "
         "website, work email, use case) ONLY when their values are already visibly present on the "
         "page. Never invent values.\n\n"
-        "HARD STOPS — set hitl_required=true and STOP (do not attempt these yourself): "
+        "HARD STOPS — set hitl_required=true and STOP only for a genuine provider-imposed "
+        "challenge with no approved code-owned continuation: "
         f"{password_hard_stop}solving a VISIBLE INTERACTIVE CAPTCHA challenge that actually "
         "appears and blocks you (an 'I'm not a robot' checkbox, an image/grid/tile puzzle, or a "
         "slider) — a passive 'protected by reCAPTCHA' badge or a 'Remember me' checkbox is NOT a "
         f"CAPTCHA and must not stop you, {otp_hard_stop}"
-        "passkey or security-key prompts, device approval, accepting "
-        "legal/terms/consent, confirming account ownership, entering billing/payment details, or "
-        "any 'reveal/copy your API token' step. In hitl_reason, name the single specific action "
-        "the human must take (e.g. 'Enter the email verification code sent to your inbox').\n\n"
-        "NEVER read, type, copy, transcribe, or report any password, secret, API token, cookie, "
-        "or credential value, even if it is visible. The login placeholders are the only "
-        "exception, and only for typing into the app's own login form.\n\n"
+        "passkey or security-key prompts, device approval, accepting legal/terms/consent, "
+        "confirming ambiguous account ownership, entering billing/payment details, or provider "
+        "manual review. In hitl_reason, name the single specific action the human must take "
+        "(e.g. 'Complete the interactive security-key prompt').\n\n"
+        "CREDENTIAL SURFACE HANDOFF: Credential labels, a generated-value surface, or a "
+        "Show/Reveal/Copy control are NOT human checkpoints. Do not click a reveal/copy control "
+        "or extract its value in this model-driven task. Instead set "
+        "reached_official_setup_page=true and stop successfully on that same page; the trusted "
+        "code-owned capture boundary will reveal if needed and write the value directly to the "
+        "vault.\n\n"
+        "NEVER transcribe, summarize, print, echo, or return a password, secret, API token, "
+        "cookie, or credential value. Approved login placeholders may be typed only into the "
+        "app's own allowlisted login form. A trusted capture boundary may read a generated "
+        "credential directly into the vault, but plaintext must never enter this prompt or the "
+        "structured output.\n\n"
         "OUTPUT: When you stop (goal reached or a hard stop), return the structured fields: "
         "current_url (the exact current page URL), reached_official_setup_page (true only if the "
         "API credentials/token page is actually visible), hitl_required, hitl_reason (specific "

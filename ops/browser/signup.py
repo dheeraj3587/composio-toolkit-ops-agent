@@ -23,6 +23,7 @@ from urllib.parse import urljoin, urlsplit
 
 from ops.browser.login import inspect_login, reviewed_login_surfaces, visible_login_challenge
 from ops.core.effect_ledger import EffectStore
+from ops.email.verification import canonical_address
 from ops.onboarding.driver import (
     DEFAULT_CAPTCHA_BUDGET,
     OnboardingDeps,
@@ -41,11 +42,14 @@ from ops.onboarding.effects import (
 )
 from ops.onboarding.lease import Lease
 from ops.onboarding.phase import OnboardingPhase, OnboardingReasonCode
-from ops.playwright.page_inspection import _page_url
+from ops.playwright.page_inspection import PageInspection, _page_url
+from ops.playwright.predicates import predicate_satisfied
 from ops.playwright.routing import navigation_allowed
 from ops.providers.profile import ProviderProfile
+from ops.recipes.app_recipes import get_app_recipe, recipe_predicate
 
 if TYPE_CHECKING:
+    from ops.browser.api_trace_catalog import CheckpointPredicate
     from ops.recipes.app_recipes import SignupPolicy
 
 LOGGER = logging.getLogger("composio_ops.browser_signup")
@@ -240,11 +244,14 @@ async def _unique_visible(root: Any, selector: str) -> tuple[str, Any | None]:
     return "unique", matches[0]
 
 
-def _current_path(page: Any) -> str:
+def _url_path(url: str) -> str:
     """Return a value-free normalized path (never query or fragment data)."""
 
-    path = urlsplit(_page_url(page)).path
-    return path.rstrip("/") or "/"
+    return urlsplit(url).path.rstrip("/") or "/"
+
+
+def _current_path(page: Any) -> str:
+    return _url_path(_page_url(page))
 
 
 def _path_matches(path: str, prefixes: Sequence[str]) -> bool:
@@ -1350,6 +1357,15 @@ class SignupIdentity:
     session_id: str
     signup_address: str
 
+    @property
+    def verification_recipient(self) -> str:
+        """The canonical alias the verification search binds to (Requirement 7.3)."""
+
+        canonical = canonical_address(self.signup_address)
+        if canonical is None:
+            raise ValueError("a signup identity requires one parseable signup address")
+        return canonical.address
+
 
 @dataclass(frozen=True, slots=True)
 class SignupSecretFill:
@@ -1473,8 +1489,23 @@ class SignupRunBinding(Protocol):
         """The account binding, browser session, and signup address for this run."""
 
 
+class SignupMailboxBinder(Protocol):
+    """Where the run's expected verification recipient is recorded.
+
+    One write verb: the address the ``email_verification`` phase binds its search
+    to is the alias this signup submitted under, so the operation key and the
+    recipient cannot name different accounts (Requirements 7.3, 7.4).
+    """
+
+    def bind_verification_recipient(self, *, run_id: str, session_id: str, address: str) -> None:
+        """Record the canonical mailbox alias this run verifies on."""
+
+
 class SignupSubmitter(Protocol):
     """The browser seam: fill the reviewed form from grants, submit it once."""
+
+    async def observe_signup(self) -> PageInspection:
+        """A fresh, bounded inspection of the page the submission landed on."""
 
     async def submit_signup(
         self,
@@ -1603,6 +1634,62 @@ def _paused_session_conformance(session: _PausedSignupSession) -> PausedSession:
     return session
 
 
+def declared_signup_policy(app_slug: str) -> SignupPolicy | None:
+    """The reviewed signup policy one app's recipe declares, or ``None`` (7.1, 7.2)."""
+
+    recipe = get_app_recipe(app_slug)
+    browser = None if recipe is None else recipe.browser
+    return None if browser is None else browser.signup
+
+
+def declared_signup_postcondition(app_slug: str) -> CheckpointPredicate | None:
+    """The recipe's own completion predicate for the signup step (Requirement 7.5).
+
+    The signup step is the declared step whose target lies under the policy's own
+    entry prefixes. ``None`` means the recipe declares no signup step, so there is
+    no declared postcondition to hold the submission against — an invented one
+    would pause runs on a bar no reviewer set.
+    """
+
+    recipe = get_app_recipe(app_slug)
+    browser = None if recipe is None else recipe.browser
+    if browser is None or browser.signup is None:
+        return None
+    step = next(
+        (
+            candidate
+            for candidate in browser.steps
+            if candidate.target_url is not None
+            and _path_matches(_url_path(candidate.target_url), browser.signup.entry_path_prefixes)
+        ),
+        None,
+    )
+    return None if step is None else recipe_predicate(step.completion)
+
+
+async def enter_signup(
+    *,
+    run_id: str,
+    phase: OnboardingPhase,
+    profile: ProviderProfile | None,
+    lease: Lease,
+    deps: OnboardingDeps,
+) -> PhaseStep:
+    """Gate ``route_selected_signup -> signup`` on the same policy read (7.1, 7.2).
+
+    An app whose recipe declares no signup policy never enters the phase, so it
+    never stages a credential either.
+    """
+
+    if phase != "route_selected_signup":
+        raise ValueError("the signup admission gate drives route_selected_signup only")
+    if profile is None:
+        return PhaseStep.pause("capture_spec_unavailable")
+    if declared_signup_policy(profile.app_slug) is None:
+        return PhaseStep.pause("signup_policy_absent")
+    return PhaseStep.advance("signup", "operator_approved_signup")
+
+
 @dataclass(frozen=True, slots=True)
 class SignupPhaseHandler:
     """The ``signup`` phase, as a :class:`~ops.onboarding.driver.PhaseHandler`.
@@ -1619,6 +1706,11 @@ class SignupPhaseHandler:
     effects: EffectStore
     binding: SignupRunBinding
     submitter: SignupSubmitter
+    # Where the verification recipient is recorded. Optional for the reason the
+    # driver's own mailbox ports are: a deployment that never verifies by email
+    # needs nothing wired, and an unwired binder records nothing rather than
+    # inventing a recipient.
+    mailbox: SignupMailboxBinder | None = None
     approved_fields: Mapping[str, str] = field(default_factory=dict)
     ttl_seconds: int = SIGNUP_SECRET_TTL_SECONDS
 
@@ -1647,8 +1739,13 @@ class SignupPhaseHandler:
             # Neither the allow-list nor the operation key can be derived without
             # a profile that names where signup happens.
             return PhaseStep.pause("capture_spec_unavailable")
+        # Requirements 7.1, 7.2: read before staging and before the reservation, so
+        # a refusal leaves no staged credential and no vault entry behind.
+        if declared_signup_policy(profile.app_slug) is None:
+            return PhaseStep.pause("signup_policy_absent")
 
         identity = self.binding.signup_identity(run_id=run_id)
+        recipient = identity.verification_recipient
         # Derivation, not reservation: pure in the run, the profile digest, the
         # canonicalized signup URL, and the account binding (Requirement 6.11).
         operation_key = signup_submit_key(run_id, profile, identity.account_ref)
@@ -1666,6 +1763,12 @@ class SignupPhaseHandler:
 
         # Requirement 6.4: the submission is reserved before it is made.
         plan = plan_effect(self.effects, operation_key=operation_key, action="signup_submit")
+        if self.mailbox is not None:
+            # Requirements 7.3, 7.4: bound as the effect is reserved, from the same
+            # identity the key names, so the search and the key agree on the account.
+            self.mailbox.bind_verification_recipient(
+                run_id=run_id, session_id=identity.session_id, address=recipient
+            )
         if plan.disposition == "skip":
             # A submission already happened under this key. Adopt it rather than
             # creating a second account.
@@ -1711,6 +1814,11 @@ class SignupPhaseHandler:
             receipt = {**staged.receipt(), **dict(submission.receipt)}
             complete_effect(self.effects, plan, receipt=receipt)
             self._promote(run_id=run_id, profile=profile, identity=identity)
+            # Requirements 7.5, 7.6, after the completion write: the submission did
+            # reach the provider, so an unmet postcondition must pause a run whose
+            # retry skips rather than create a second account.
+            if not await self._postcondition_met(profile.app_slug):
+                return PhaseStep.pause("signup_postcondition_unmet")
             return PhaseStep.advance("email_verification", "signup_submitted")
         if submission.status == "duplicate_account":
             # The submission reached the provider and was answered, so the effect
@@ -1747,6 +1855,14 @@ class SignupPhaseHandler:
         mark_effect_outcome_unknown(self.effects, plan)
         return PhaseStep.pause("outcome_unknown")
 
+    async def _postcondition_met(self, app_slug: str) -> bool:
+        """Whether the recipe's signup completion holds on a fresh observation."""
+
+        predicate = declared_signup_postcondition(app_slug)
+        if predicate is None:
+            return True
+        return predicate_satisfied(predicate, await self.submitter.observe_signup())
+
     def _promote(self, *, run_id: str, profile: ProviderProfile, identity: SignupIdentity) -> None:
         """Promote the staged pair into the reusable account scope.
 
@@ -1772,11 +1888,18 @@ def _handler_conformance(handler: SignupPhaseHandler) -> PhaseHandler:
     return handler
 
 
+def _admission_conformance() -> PhaseHandler:
+    """Typecheck-only proof that the admission gate satisfies the same port."""
+
+    return enter_signup
+
+
 __all__ = [
     "SIGNUP_LOGIN_FIELDS",
     "SIGNUP_SECRET_TTL_SECONDS",
     "SignupCredentialVault",
     "SignupIdentity",
+    "SignupMailboxBinder",
     "SignupPhaseHandler",
     "SignupResult",
     "SignupRunBinding",
@@ -1786,7 +1909,10 @@ __all__ = [
     "SignupSubmissionStatus",
     "SignupSubmitter",
     "StagedSignupCredentials",
+    "declared_signup_policy",
+    "declared_signup_postcondition",
     "drive_signup",
+    "enter_signup",
     "generate_signup_credentials",
     "normalize_signup_fields",
     "signup_secret_continuation_ready",

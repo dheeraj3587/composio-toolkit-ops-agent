@@ -13,6 +13,7 @@ import asyncio
 import logging
 import threading
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
@@ -45,6 +46,23 @@ from ops.email.verification import (
     VerificationPurpose,
 )
 from ops.gmail.worker import GmailSignupPreflight, GmailWorker
+from ops.onboarding.composition import SettingsRunPlanner
+from ops.onboarding.driver import (
+    RunPlanner,
+    RunPlanValidator,
+    SQLitePhaseHistoryStore,
+)
+from ops.onboarding.lease_store import SQLiteLeaseStore, SQLiteRunQueue
+from ops.planner.adherence import AdherenceOutcome, RouteAdherenceMonitor
+from ops.planner.decide import PlanOutcome
+from ops.planner.plan import RunPlan
+from ops.planner.store import SQLiteRunPlanStore, plan_from_row
+from ops.planner.validator import (
+    CREDENTIAL_SURFACE_ORDINAL,
+    PLAN_REFUSAL_REASON_CODE,
+    PlanRefusal,
+    validate_plan,
+)
 from ops.providers.composio_capability import ComposioCapabilityPreflight, ComposioCapabilityReport
 from ops.providers.composio_managed_auth import (
     ComposioManagedAuthProvider,
@@ -53,7 +71,12 @@ from ops.providers.composio_managed_auth import (
 from ops.providers.errors import (
     ConfigurationRequiredError,
 )
-from ops.recipes.app_recipes import AppRecipe, get_app_validation_policy, load_app_recipe_catalog
+from ops.recipes.app_recipes import (
+    AppRecipe,
+    get_app_recipe,
+    get_app_validation_policy,
+    load_app_recipe_catalog,
+)
 from ops.research.cache import SqliteResearchCache
 from ops.research.operational_research import (
     GeminiStructuredExtractor,
@@ -101,6 +124,7 @@ from ops.runs.idempotency import (  # noqa: F401
 )
 from ops.runs.idempotency import validate_idempotency_key as validate_idempotency_key
 from ops.runs.live_view import RunLiveViewService
+from ops.runs.liveness import RunLivenessService
 from ops.runs.login_secrets import RunLoginSecretService
 from ops.runs.projections import (  # noqa: F401
     _LOGICAL_EXECUTION_MODE,
@@ -121,12 +145,13 @@ from ops.runs.projections import (  # noqa: F401
 )
 from ops.runs.queries import RunQueryService
 from ops.runs.reconciliation import RunReconciliationService
-from ops.runs.resume import RunResumeService
+from ops.runs.resume import OnboardingRunControlService, ResumeOutcome, RunResumeService
 from ops.runs.state_projection import (  # noqa: F401
     _CREATE_PROJECTION_CHAINS,
     RunProjectionService,
     _validate_created_projection,
 )
+from ops.runs.takeover import ClearanceProbe, RunTakeoverService
 from ops.runs.verification import (  # noqa: F401
     RunVerificationService,
     _verification_backoff,
@@ -171,6 +196,16 @@ class CredentialValidationPort(Protocol):
     async def validate(
         self, *, app_slug: str, credential_refs: dict[str, str]
     ) -> CredentialValidationResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _RunPlanningBinding:
+    """One memoized plan store, planner, validator, and adherence monitor."""
+
+    plans: SQLiteRunPlanStore
+    planner: RunPlanner
+    plan_validator: RunPlanValidator
+    adherence: RouteAdherenceMonitor
 
 
 class RunService:
@@ -238,6 +273,9 @@ class RunService:
         self._autonomous_advances: dict[str, int] = {}
         self._advance_thread: threading.Thread | None = None
         self._advance_stop = threading.Event()
+        # The takeover sweep owns its own thread, so the service holds the instance
+        # rather than a handle to it.
+        self._takeover_service: RunTakeoverService | None = None
         # Asynchronous browser execution: when enabled (production live mode), a
         # self-serve browser run commits at browser_running with the live view
         # available immediately, and the bounded onboarding task runs in a
@@ -249,6 +287,8 @@ class RunService:
         self._browser_threads: list[threading.Thread] = []
         self._secret_store: SQLiteSecretStore | None = None
         self._effect_store: SQLiteEffectStore | None = None
+        self._run_planning_binding: _RunPlanningBinding | None = None
+        self._route_adherence_monitor: RouteAdherenceMonitor | None = None
         # Sanitized startup wiring audit rows; never contains secrets.
         self._wiring: list[dict[str, object]] = []
 
@@ -290,13 +330,37 @@ class RunService:
     def _canonical(self) -> CanonicalRuntime:
         """The single SQLite-backed state machine for every reviewed recipe."""
 
-        return CanonicalRuntime(self)
+        return CanonicalRuntime(self, planning=self._planning)
 
     @property
     def _resume(self) -> RunResumeService:
         """HITL resume on the run's existing session and thread."""
 
         return RunResumeService(self)
+
+    @property
+    def _control(self) -> OnboardingRunControlService:
+        """Run controls over the durable onboarding phase machine.
+
+        The phase history is both ports it needs: the store owns the boundary
+        table and the reservation table in the same file, so a control decides
+        from the standing disposition of each key rather than from anything
+        reconstructed on this side.
+
+        No release port is wired here on purpose. The verbs reached through this
+        boundary — resume from a waiting phase, and the pause the takeover sweep
+        commits — never hand a session back (Requirement 14.2), so a release port
+        would be an unused capability. Cancel and reset, which must release
+        synchronously, keep their own wiring on the surface that owns that
+        guarantee.
+        """
+
+        phases = SQLitePhaseHistoryStore(self.storage.db_path)
+        return OnboardingRunControlService(
+            storage=self.storage,
+            phases=phases,
+            effects=phases,
+        )
 
     @property
     def _credentials(self) -> RunCredentialService:
@@ -339,6 +403,211 @@ class RunService:
         """Autonomous continuation of machine-resolvable human gates."""
 
         return RunAdvanceService(self)
+
+    @property
+    def _liveness(self) -> RunLivenessService:
+        """The sweep that marks a run whose loop has stopped reporting progress."""
+
+        return RunLivenessService(
+            storage=self.storage,
+            phases=SQLitePhaseHistoryStore(self.storage.db_path),
+            control=self._control,
+            leases=SQLiteLeaseStore(self.storage.db_path),
+            settings=self._settings or Settings.from_env(),
+            canonical=self._canonical,
+        )
+
+    @property
+    def _planning(self) -> _RunPlanningBinding:
+        """The memoized pre-flight dependencies shared with canonical execution."""
+
+        existing = cast(
+            "_RunPlanningBinding | None",
+            getattr(self, "_run_planning_binding", None),
+        )
+        if existing is None:
+            settings = cast("Settings | None", getattr(self, "_settings", None))
+            plans = SQLiteRunPlanStore(self.storage.db_path)
+            existing = _RunPlanningBinding(
+                plans=plans,
+                planner=SettingsRunPlanner(settings or Settings.from_env()),
+                plan_validator=validate_plan,
+                adherence=RouteAdherenceMonitor(plans=plans, audit=self.storage),
+            )
+            self._run_planning_binding = existing
+        return existing
+
+    @property
+    def plan_validator(self) -> RunPlanValidator:
+        """Expose the catalog Plan_Validator through the run-service boundary."""
+
+        return self._planning.plan_validator
+
+    @property
+    def route_adherence_monitor(self) -> RouteAdherenceMonitor:
+        """Expose the plan-backed Route_Adherence_Monitor through this boundary."""
+
+        return self._planning.adherence
+
+    @property
+    def _plan_validator(self) -> RunPlanValidator:
+        """Compatibility alias for the public Plan_Validator boundary."""
+
+        return self.plan_validator
+
+    @property
+    def _route_adherence(self) -> RouteAdherenceMonitor:
+        """Compatibility alias for the public adherence-monitor boundary."""
+
+        return self.route_adherence_monitor
+
+    def validate_run_plan(self, *, plan: RunPlan, app_slug: str) -> PlanRefusal | None:
+        """The Plan_Validator, against the catalog recipe for ``app_slug`` (R9.3).
+
+        An app the catalog does not carry is refused rather than admitted: there is
+        no reviewed recipe to validate its surfaces against.
+        """
+
+        recipe = get_app_recipe(app_slug)
+        if recipe is None:
+            return PlanRefusal(
+                reason_code=PLAN_REFUSAL_REASON_CODE,
+                detail="recipe_route_not_browser",
+                ordinal=CREDENTIAL_SURFACE_ORDINAL,
+            )
+        return self.plan_validator(plan, recipe=recipe)
+
+    def observe_run_surface(
+        self, *, run_id: str, step_index: int, observed_url: str
+    ) -> AdherenceOutcome:
+        """What one observed surface authorizes for ``run_id`` (R6.1, R9.3)."""
+
+        return self.route_adherence_monitor.observe(
+            run_id=run_id, step_index=step_index, observed_url=observed_url
+        )
+
+    def replan_run_route(
+        self,
+        *,
+        run_id: str,
+        recipe: AppRecipe,
+        expected_state_revision: int,
+        expected_effect_identity: str | None,
+    ) -> bool | None:
+        """Atomically commit the run's one catalog-confined replacement plan.
+
+        ``None`` means the observed browser operation no longer owns the run,
+        ``False`` means no valid replacement can be committed, and ``True`` means
+        revision 2 is already valid or was committed with the run projection.
+        """
+
+        planning = self._planning
+        planned = planning.planner.plan_for(recipe=recipe, revision=2)
+        outcome = (
+            planned
+            if isinstance(planned, PlanOutcome)
+            and planned.plan.revision == 2
+            and planning.plan_validator(planned.plan, recipe=recipe) is None
+            else None
+        )
+
+        lock = self._run_lock(run_id)
+        with lock, self.storage.unit_of_work() as transaction:
+            current = transaction.get_run(run_id)
+            if current is None:
+                return None
+            if (
+                current.get("state_engine") != "canonical_v1"
+                or current.get("browser_provider") != "playwright"
+                or current.get("status") != "browser_running"
+                or int(current.get("state_revision", 0) or 0) != expected_state_revision
+                or current.get("effect_identity") != expected_effect_identity
+            ):
+                return None
+            if outcome is None:
+                return False
+            replacement = outcome.plan
+
+            plan_count = transaction.count_run_plans(run_id)
+            active_row = transaction.read_active_run_plan(run_id)
+            if plan_count == 2:
+                if active_row is None:
+                    return False
+                try:
+                    active_plan = plan_from_row(active_row)
+                except (KeyError, TypeError, ValueError):
+                    return False
+                return active_plan == replacement
+            if plan_count != 1 or active_row is None:
+                return False
+            try:
+                active_plan = plan_from_row(active_row)
+            except (KeyError, TypeError, ValueError):
+                return False
+            if active_plan.revision != 1:
+                return False
+
+            recorded = transaction.record_run_plan(
+                run_id=run_id,
+                source=replacement.source,
+                app_slug=replacement.app_slug,
+                catalog_id=replacement.catalog_id,
+                recipe_version=replacement.recipe_version,
+                surfaces=replacement.as_surface_rows(),
+                credential_host=replacement.credential_surface.host,
+                credential_path=replacement.credential_surface.path,
+                success_digest=replacement.success_digest,
+                reason_code=outcome.reason_code,
+            )
+            recorded_revision = int(recorded["revision"])
+            if recorded_revision != 2:  # pragma: no cover - transaction invariant
+                raise RuntimeError("replacement plan revision was not 2")
+            projection_revision = int(current.get("state_revision", 0) or 0) + 1
+            transaction.update_run(
+                run_id,
+                attempt=int(current.get("attempt", 0) or 0) + 1,
+                reason_code="route_replanned",
+                route_reason_code="route_replanned",
+                state_revision=projection_revision,
+                last_projected_revision=projection_revision,
+            )
+            transaction.append_audit_event(
+                run_id=run_id,
+                event_type="onboarding_plan_superseded",
+                payload={
+                    "revision": recorded_revision,
+                    "reason_code": "route_replanned",
+                    "external_actions": False,
+                },
+            )
+        return True
+
+    @property
+    def _takeover(self) -> RunTakeoverService | None:
+        """The takeover sweep, or ``None`` when no worker can serve a clearance read.
+
+        Built once and remembered, unlike the stateless collaborators above: it owns
+        a thread that shutdown has to join.
+        """
+
+        existing = cast("RunTakeoverService | None", getattr(self, "_takeover_service", None))
+        if existing is not None:
+            return existing
+        worker = self._browser_worker_for("playwright")
+        probe = getattr(worker, "probe_gate_clearance", None)
+        if probe is None:
+            return None
+        service = RunTakeoverService(
+            storage=self.storage,
+            phases=SQLitePhaseHistoryStore(self.storage.db_path),
+            control=self._control,
+            clearance=cast("ClearanceProbe", worker),
+            queue=SQLiteRunQueue(self.storage.db_path),
+            settings=self._settings or Settings.from_env(),
+            canonical=self._canonical,
+        )
+        self._takeover_service = service
+        return service
 
     @classmethod
     def from_paths(
@@ -502,6 +771,7 @@ class RunService:
             # Independent maintenance handles reconciliation even when Gmail is
             # unavailable; the email worker handles only bounded inbox work.
             self._start_autonomous_advancer()
+            self._start_onboarding_takeover()
             self._start_email_poller()
 
     def _reconcile_stranded_runs(self) -> None:
@@ -569,10 +839,28 @@ class RunService:
 
         self._advance.start()
 
+    def _start_onboarding_takeover(self) -> None:
+        """Start the sweep that continues a run once a human clears its gate."""
+
+        takeover = self._takeover
+        if takeover is not None:
+            takeover.start()
+
     def reconcile_idle_browser_runs(self, *, limit: int = 100) -> int:
         """Recover runs stuck at ``browser_running`` with nothing driving them."""
 
         return self._reconciliation.reconcile_idle_browser_runs(limit=limit)
+
+    def sweep_onboarding_takeover(self, limit: int = 100) -> int:
+        """Continue every paused run whose human gate a person has now cleared."""
+
+        takeover = self._takeover
+        return 0 if takeover is None else takeover.sweep(limit=limit)
+
+    def mark_stale_runs(self, *, limit: int = 100) -> int:
+        """Mark every run whose loop stopped stepping inside the staleness window."""
+
+        return self._liveness.mark_stale_runs(limit=limit)
 
     def advance_autonomous_runs(self, *, limit: int = 100) -> int:
         """Resume every waiting run whose human gate the agent can resolve itself."""
@@ -1126,6 +1414,13 @@ class RunService:
                     owner=settings.browser_service_owner,
                     capability_key=settings.browser_session_capability_key,
                     timeout_seconds=settings.browser_service_client_timeout_seconds,
+                    # The clearance probe is bounded on its own, well inside the
+                    # takeover interval, rather than inheriting the operation
+                    # budget above: a slow read is reported unread and the run
+                    # keeps waiting.
+                    takeover_probe_timeout_seconds=(
+                        settings.onboarding_takeover_probe_timeout_seconds
+                    ),
                 ),
             )
         return BrowserWorker(settings=settings)
@@ -1167,6 +1462,10 @@ class RunService:
         if self._advance_thread is not None:
             self._advance_thread.join(timeout=5)
             self._advance_thread = None
+        takeover = cast("RunTakeoverService | None", getattr(self, "_takeover_service", None))
+        if takeover is not None:
+            takeover.stop()
+            self._takeover_service = None
         workflow = self._workflow
         self._workflow = None
         if workflow is not None:
@@ -1439,6 +1738,9 @@ class RunService:
     def get_timeline(self, run_id: str) -> list[dict[str, Any]]:
         return self._queries.get_timeline(run_id)
 
+    def get_progress_events(self, run_id: str, *, limit: int) -> list[dict[str, Any]]:
+        return self._queries.get_progress_events(run_id, limit=limit)
+
     def get_research(self, run_id: str) -> OperationalResearch | None:
         """Return the persisted sanitized research projection for a run."""
 
@@ -1566,6 +1868,19 @@ class RunService:
                 browser_login=browser_login,
             )
         raise CredentialSubmissionError("legacy_run_is_read_only")
+
+    def resume_onboarding_from_pause(self, run_id: str) -> ResumeOutcome:
+        """Re-enter the phase an onboarding run recorded when it parked.
+
+        The one continuation an onboarding run has: the phase machine commits
+        ``captcha_paused -> phase_at_pause`` with ``captcha_resolved`` at the next
+        attempt, projects the coarse status, and writes the audit row. A replayed
+        signal reports ``committed=False`` and writes nothing, so the owner's
+        resume and an autonomous takeover are the same mechanism rather than two
+        (Requirements 1.5, 1.9, 1.10).
+        """
+
+        return self._control.resume_from_pause(run_id)
 
     def connect_managed_run(self, run_id: str) -> dict[str, Any]:
         """Create or replay one managed Composio connection link."""

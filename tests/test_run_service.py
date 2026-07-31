@@ -7,11 +7,15 @@ from pathlib import Path
 
 import pytest
 
+from ops.core.config import Settings
 from ops.core.models import (
     CompanyProfile,
     OperationsRequest,
 )
 from ops.core.storage import OperationsUnitOfWork
+from ops.planner.adherence import RouteAdherenceMonitor
+from ops.planner.decide import recipe_route_plan
+from ops.recipes.app_recipes import get_app_recipe
 from ops.research.p1_adapter import DEFAULT_P1_ROOT, SnapshotIntegrityError
 from ops.runs.service import (
     IdempotencyConflictError,
@@ -31,6 +35,28 @@ def request_for(app_name: str) -> OperationsRequest:
         ),
         dry_run=True,
     )
+
+
+def test_planning_concerns_are_reachable_through_run_service(tmp_path: Path) -> None:
+    db_path = tmp_path / "ops.db"
+    service = RunService.from_paths(
+        db_path=db_path,
+        settings=Settings(ops_db_path=db_path),
+    )
+    recipe = get_app_recipe("pipedrive")
+    assert recipe is not None
+    plan = recipe_route_plan(recipe)
+    assert plan is not None
+
+    assert service.plan_validator(plan, recipe=recipe) is None
+    assert service.validate_run_plan(plan=plan, app_slug=recipe.app_slug) is None
+    assert isinstance(service.route_adherence_monitor, RouteAdherenceMonitor)
+    # No plan row means no expected route: adherence is inert rather than inferred.
+    assert service.observe_run_surface(
+        run_id="run_without_plan",
+        step_index=0,
+        observed_url="https://outside.example.test/unplanned",
+    ).action == "proceed"
 
 
 def test_run_service_records_canonical_recipe_and_final_route(tmp_path: Path) -> None:

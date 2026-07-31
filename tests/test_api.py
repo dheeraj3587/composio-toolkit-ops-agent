@@ -368,7 +368,7 @@ def test_timeline_endpoint_returns_summaries_not_raw_audit_payloads(
 
     assert response.status_code == 200
     payload = response.json()
-    assert set(payload) == {"run_id", "items"}
+    assert set(payload) == {"run_id", "items", "progress"}
     assert payload["run_id"] == run_id
     assert payload["items"]
     assert all(

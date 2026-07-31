@@ -56,6 +56,7 @@ from api.models import (
     RunDetailResponse,
     RunListResponse,
     RunOutputResponse,
+    RunProgressEventView,
     RunSummary,
     SecurityState,
     SnapshotHealth,
@@ -308,11 +309,59 @@ _ONBOARDING_ADMISSION_SUMMARIES: Final[dict[str, str]] = {
     "onboarding_admission_requested": "Operator authorization requested for account creation.",
 }
 
+# The continuation of a paused run, written by
+# ``OnboardingRunControlService.resume_from_pause``. A CAPTCHA pause continues
+# under ``onboarding_captcha_resolved`` above; every other waiting phase continues
+# under this type, and without a static summary here that continuation degraded to
+# the generic run-updated projection — the one fact the production evidence of
+# Requirement 10.2 has to be able to read (Requirements 1.13, 10.2).
+_ONBOARDING_CONTINUATION_SUMMARIES: Final[dict[str, str]] = {
+    "onboarding_resumed": "Run continued from its pause.",
+}
+
+# The autonomous takeover of a run paused on a human-only gate, written by the
+# Takeover_Watcher's sweep. The durable row carries the run id, the gate type, the
+# phase re-entered and the reason code; none of it reaches the projection, which
+# renders these fixed strings instead (Requirement 1.13).
+_ONBOARDING_TAKEOVER_SUMMARIES: Final[dict[str, str]] = {
+    "onboarding_takeover_continued": "Gate cleared; the agent continued the run by itself.",
+    "onboarding_takeover_withheld": "Takeover withheld; the run stays paused for an operator.",
+}
+
+# The live-view attachment fact that decides whether a paused session keeps its
+# idle budget, written by the browser session boundary. The row carries the run id,
+# the session id and the attachment outcome, and never a signed live-view URL
+# (Requirement 2.7).
+_ONBOARDING_ATTACHMENT_SUMMARIES: Final[dict[str, str]] = {
+    "onboarding_attachment_changed": "Live browser view attachment changed.",
+}
+
+# Loop liveness, written by the Run_Liveness sweep when a non-waiting run has
+# reported no progress inside the Staleness_Window (Requirement 4.9).
+_ONBOARDING_LIVENESS_SUMMARIES: Final[dict[str, str]] = {
+    "onboarding_progress_stale": "No loop progress within the staleness window.",
+}
+
+# The pre-flight route plan and its adherence, written by the plan store and the
+# Route_Adherence_Monitor. A divergence row carries only the four bounded host and
+# path fields, and a plan row only its revision, so the projection stays a fixed
+# string and no observed URL can reach the timeline (Requirements 5.9, 6.1, 6.6).
+_ONBOARDING_PLAN_SUMMARIES: Final[dict[str, str]] = {
+    "onboarding_plan_recorded": "Pre-flight route plan recorded.",
+    "onboarding_plan_superseded": "Route plan superseded by a replacement revision.",
+    "onboarding_route_divergence": "The run left the surface its plan declared.",
+}
+
 _EVENT_SUMMARIES: Final[dict[str, str]] = {
     **_LEGACY_EVENT_SUMMARIES,
     **_ONBOARDING_PROGRESS_SUMMARIES,
     **_ONBOARDING_EXCEPTION_SUMMARIES,
     **_ONBOARDING_ADMISSION_SUMMARIES,
+    **_ONBOARDING_CONTINUATION_SUMMARIES,
+    **_ONBOARDING_TAKEOVER_SUMMARIES,
+    **_ONBOARDING_ATTACHMENT_SUMMARIES,
+    **_ONBOARDING_LIVENESS_SUMMARIES,
+    **_ONBOARDING_PLAN_SUMMARIES,
 }
 
 # What an event type absent from the allow-list projects. The durable row is left
@@ -1394,19 +1443,48 @@ class LocalRunService:
             or "research" in targets
             or ("paused" in targets and is_legal_phase_transition("paused", "research"))
         )
+        can_resume = waiting
+        withheld = (
+            self._withheld_resume_reason(run_id, state) if phase == "captcha_paused" else None
+        )
+        if withheld is not None:
+            can_resume = False
         return OnboardingControlsView(
             can_decide_admission=(
                 phase == "awaiting_admission"
                 and self._service.storage.read_admission_decision(run_id) is None
             ),
             can_pause=not terminal and not waiting,
-            can_resume=waiting,
+            can_resume=can_resume,
             can_cancel=not terminal and "cancelled" in targets,
             can_reset=reset_available,
             can_retry_step=retryable is not None,
             retryable_step=retryable,
             reason_code=state.reason_code,
+            resume_withheld_reason=withheld,
         )
+
+    def _withheld_resume_reason(
+        self,
+        run_id: str,
+        state: OnboardingStateView,
+    ) -> OnboardingReasonCode | None:
+        """Why a CAPTCHA-paused run cannot be resumed, or ``None`` when it can.
+
+        Total by construction: the three provable causes in order, then
+        ``control_withheld`` for a re-entry the phase table refuses.
+        """
+
+        if state.phase_at_pause is None:
+            return "takeover_step_unavailable"
+        record = self._service.storage.get_run(run_id)
+        if record is None or not record.get("browser_session_id"):
+            return "session_unreattachable"
+        if state.captcha_prompts >= self._settings.onboarding_captcha_pause_budget:
+            return "captcha_attempt_budget_exhausted"
+        if not is_legal_phase_transition(state.phase, state.phase_at_pause):
+            return "control_withheld"
+        return None
 
     def _secret_capture_boundary_entered(self, record: Mapping[str, object]) -> bool:
         """Whether a capture surface has been reached for this run (Requirement 18.8).
@@ -1807,7 +1885,18 @@ class LocalRunService:
             self._timeline_event(onboarding_timeline_event(event, durable=record))
             for event in raw_events
         ]
-        return TimelineResponse(run_id=run_id, items=items)
+        window = self._settings.onboarding_progress_window
+        progress = [
+            RunProgressEventView(
+                step_index=event["step_index"],
+                stage=event["stage"],
+                elapsed_ms=event["elapsed_ms"],
+                onboarding_phase=event["phase"],
+                recorded_at=event["recorded_at"],
+            )
+            for event in self._service.get_progress_events(run_id, limit=window)
+        ]
+        return TimelineResponse(run_id=run_id, items=items, progress=progress)
 
     @staticmethod
     def _timeline_event(projected: ProjectedTimelineEvent) -> TimelineEvent:
@@ -1999,6 +2088,7 @@ class LocalRunService:
             requested_scope_policy=request.requested_scope_policy,
             browser_provider=request.browser_provider,
             credential_creation_policy=request.credential_creation_policy,
+            provider_setup=request.provider_setup,
             dry_run=True,
             account_creation_requested=request.account_mode == "create_account",
         )
@@ -2084,6 +2174,65 @@ class LocalRunService:
         self._require_started()
         return await run_in_threadpool(self._timeline_sync, run_id)
 
+    def _resume_onboarding_phase(self, run_id: str) -> ActionReceipt | None:
+        """Continue a paused onboarding run through its phase machine.
+
+        ``None`` means this run is not an onboarding run standing at a waiting
+        phase, and the caller keeps the LangGraph resume it has always used. That
+        is the whole of the routing decision: the phase the console reads
+        ``can_resume`` from (:data:`WAITING_PHASES`) is the phase this path serves,
+        so the control the operator sees and the committer that answers it can
+        never disagree.
+
+        The commit is :meth:`OnboardingRunControlService.resume_from_pause`, reached
+        through the run-service boundary — the same method the autonomous takeover
+        commits through, which is what makes an owner signal and a takeover one
+        mechanism rather than two (Requirements 1.5, 1.9, 9.3, 9.5).
+
+        Two refusals, both decided before anything is written. A phase the table
+        gives no re-entry (``paused`` fans out only to ``research`` and
+        ``cancelled``, and a run with no recorded phase at pause has nowhere to go)
+        is the existing 409 carrying the control service's own reason code. A
+        boundary that is already committed is a replay: nothing is written a second
+        time and the receipt says so (Requirement 1.10).
+        """
+
+        state = self._onboarding_state(run_id)
+        if state is None or state.phase not in WAITING_PHASES:
+            return None
+        outcome = self._service.resume_onboarding_from_pause(run_id)
+        if not outcome.accepted:
+            raise PhaseUnavailableError(
+                run_id=run_id,
+                action="resume",
+                available_in=tuple(sorted(WAITING_PHASES)),
+                error="phase_unavailable",
+                message="This run cannot re-enter the phase it recorded when it paused.",
+                reason_code=outcome.reason_code,
+            )
+        projected = self._onboarding_state(run_id) or state
+        if not outcome.committed:
+            return ActionReceipt(
+                run_id=run_id,
+                action="resume",
+                status="no_change",
+                detail=(
+                    "This run was already continued from its pause "
+                    f"({_PHASE_REPLAY_NOOP}); nothing was committed twice."
+                ),
+                onboarding=projected,
+            )
+        return ActionReceipt(
+            run_id=run_id,
+            action="resume",
+            status="accepted",
+            detail=(
+                f"Re-entered {outcome.resumed_phase} on the same browser session "
+                f"({outcome.reason_code}); the run continues from there."
+            ),
+            onboarding=projected,
+        )
+
     def _resume_sync(
         self,
         run_id: str,
@@ -2091,6 +2240,16 @@ class LocalRunService:
         browser_login: Mapping[str, SecretStr] | None = None,
         signal: str = "completed",
     ) -> ActionReceipt:
+        if signal == "completed" and not browser_login:
+            # The owner's continuation of a paused onboarding run is committed by
+            # the phase machine, not by the LangGraph resume. Both conjuncts are
+            # load-bearing: ``cancelled`` ends a run rather than continuing it, and
+            # a credential-bearing resume is a gate this waiting phase does not
+            # represent — routing either one here would drop what the caller asked
+            # for. Every other run, onboarding or not, keeps the path it had.
+            onboarding_receipt = self._resume_onboarding_phase(run_id)
+            if onboarding_receipt is not None:
+                return onboarding_receipt
         try:
             record = self._service.resume_run(run_id, signal=signal, browser_login=browser_login)
         except KeyError:
