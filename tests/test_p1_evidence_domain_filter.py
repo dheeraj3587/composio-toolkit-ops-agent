@@ -127,9 +127,40 @@ def test_recipe_none_keeps_p1_evidence_unfiltered() -> None:
     assert _reviewed_evidence_urls(None, p1r) == ("https://somewhere.example.com/docs",)
 
 
+def test_literal_extractor_drops_foreign_outbound_route_links() -> None:
+    """A ``github.com/.../login`` link inside a provider's own doc is not a route.
+
+    Before this guard, the literal extractor harvested every outbound ``/login``
+    link from page text, so a foreign code-host link mentioned inside the
+    provider's documentation voted in domain resolution and deadlocked research
+    on ``research_domain_disagreement`` (e.g. Telegram's Bot-API docs reference
+    github.com sample repos). Only route links on the document's OWN registrable
+    domain are admitted.
+    """
+    from ops.onboarding.runtime import _literal_route_claims
+    from ops.research.operational_research import EvidenceDocument
+
+    doc = EvidenceDocument(
+        source_url="https://core.telegram.org/bots/api",
+        title="Bot API",
+        relevant_text=(
+            "Samples at https://github.com/some-vendor/login and the app at "
+            "https://web.telegram.org/login."
+        ),
+    )
+    claims = {c.field: c.value for c in _literal_route_claims((doc,))}
+    # The github.com outbound link is NOT harvested as a Telegram route.
+    assert "login_url" not in claims or "github.com" not in claims.get("login_url", "")
+    assert "registrable_domain" not in claims or claims["registrable_domain"] != "github.com"
+    # A same-domain route link on a subdomain IS harvested (web.telegram.org is
+    # the same telegram.org registrable domain as the core.telegram.org doc).
+    assert claims.get("login_url") == "https://web.telegram.org/login"
+    assert claims.get("registrable_domain") == "telegram.org"
+
+
 def test_filter_does_not_over_drop_reviewed_multi_zone_authority() -> None:
     # neo4j genuinely spans two registrable domains (neo4j.com + neo4j.io), both
-    # authori-ted by the reviewed recipe. The guard must NOT collapse that to
+    # authorised by the reviewed recipe. The guard must NOT collapse that to
     # one domain or it would silently hide a real multi-zone provider.
     recipe = get_app_recipe("neo4j")
     authority = _recipe_authority_domains(recipe)

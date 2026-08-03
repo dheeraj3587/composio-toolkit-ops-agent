@@ -223,10 +223,30 @@ class _RequestedIdentityFetcher:
 def _literal_route_claims(
     documents: Sequence[EvidenceDocument],
 ) -> tuple[ProfileClaim, ...]:
-    """Extract only literal login/signup links; no model and no URL synthesis."""
+    """Extract only literal login/signup links; no model and no URL synthesis.
+
+    A route link is harvested only when it is on the SAME registrable domain as
+    the document it appears in. An outbound link to a *different* registrable
+    domain — a ``github.com/.../login`` reference inside Telegram's own
+    Bot-API docs, for example — is that other site's login page, not this
+    provider's route. Harvesting it as a route claim let a foreign host that is
+    merely *mentioned* in the page vote in the domain resolution and deadlock
+    research on ``research_domain_disagreement``. The fetched documents are the
+    reviewed allow-list, so a route link on a non-allow-listed domain is never
+    this provider's evidence.
+
+    This constrains the LITERAL/text path only; model-extracted claims keep
+    their full disagreement semantics, so a model genuinely asserting a route
+    on a conflicting domain still blocks the run.
+    """
 
     claims: dict[tuple[str, str, str], ProfileClaim] = {}
     for document in documents:
+        doc_domain = registrable_domain(urlsplit(document.source_url).hostname or "")
+        if doc_domain is None:
+            # The document's own host has no resolvable registrable domain, so
+            # no link in it can be attributed to the provider's own zone.
+            continue
         for url in extract_https_urls(document.relevant_text):
             path = urlsplit(url).path.casefold().rstrip("/") or "/"
             field: ProfileField | None = None
@@ -239,6 +259,10 @@ def _literal_route_claims(
             host = urlsplit(url).hostname or ""
             domain = registrable_domain(host)
             if domain is None or domain not in document.relevant_text:
+                continue
+            if domain != doc_domain:
+                # An outbound link to a different registrable domain is not this
+                # provider's route; skip it rather than letting it vote.
                 continue
             for claim_field, value in ((field, url), ("registrable_domain", domain)):
                 key = (claim_field, value, document.source_url)
