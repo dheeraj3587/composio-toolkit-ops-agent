@@ -70,6 +70,7 @@ from ops.onboarding.admission import admit_from_vault, decide_from_operator
 from ops.onboarding.composition import (
     OnboardingPorts,
     ProfileResearchPorts,
+    SettingsRunPlanner,
     build_onboarding_ports,
 )
 from ops.onboarding.credentials import (
@@ -600,7 +601,7 @@ class _WalkHandlers:
             action="create_dev_app",
         )
         assert plan.disposition == "skip" and plan.receipt is not None
-        self.earned = await capture_store_validate_publish(
+        earned = await capture_store_validate_publish(
             run_id=run_id,
             profile=profile,
             developer_app_id=plan.receipt[DEVELOPER_APP_RECEIPT_KEY],
@@ -611,38 +612,16 @@ class _WalkHandlers:
             correlation_id=phase_correlation_id(run_id=run_id, phase=phase, attempt=0),
         )
         # The lifecycle committed ``vault_storage`` and ``credential_validation``
-        # itself (Requirement 10.7), so the driver's own view of the phase now
-        # lags two boundaries behind: it is asked for the first of them, which the
-        # phase store recognises as already durable.
-        return PhaseStep.advance("vault_storage", "credential_stored")
-
-    async def store_credential(
-        self,
-        *,
-        run_id: str,
-        phase: OnboardingPhase,
-        profile: ProviderProfile | None,
-        lease: Lease,
-        deps: OnboardingDeps,
-    ) -> PhaseStep:
-        # The second of the two boundaries the lifecycle already committed. The
-        # driver derives its own correlation id for it, so this one is recorded
-        # rather than swallowed — harmless, and the phase lands where it already
-        # was.
-        return PhaseStep.advance("credential_validation", "credential_stored")
-
-    async def validate_credential(
-        self,
-        *,
-        run_id: str,
-        phase: OnboardingPhase,
-        profile: ProviderProfile | None,
-        lease: Lease,
-        deps: OnboardingDeps,
-    ) -> PhaseStep:
-        earned = self.earned
-        assert earned is not None and earned.next_phase is not None
-        return PhaseStep.advance(earned.next_phase, earned.reason_code)
+        # itself (Requirement 10.7), so the step it returns is anchored at the
+        # phase the run durably stands in — ``credential_validation`` — and the
+        # driver commits the boundary it names from there, exactly as the
+        # production ``CredentialPhaseHandler`` maps it.
+        return PhaseStep(
+            kind=earned.kind,
+            reason_code=earned.reason_code,
+            next_phase=earned.next_phase,
+            not_before=earned.not_before,
+        )
 
 
 # --- the assembled system ----------------------------------------------------
@@ -690,15 +669,25 @@ def walkthrough(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Wa
     )
     mailbox = _Mailbox()
     validator = _Validator()
-    # The four outbound seams, replaced on the composed value rather than around
+    # The five outbound seams, replaced on the composed value rather than around
     # it: research is the pair this deployment binds to ``None`` by design, and
-    # the other three would otherwise reach a provider.
+    # the other four would otherwise reach a provider.
+    #
+    # ``planner`` is the fifth and was long invisible here: before the route
+    # authority widened to committed profiles, ``plan_admission`` resolved this
+    # fake provider's slug against the catalog, found nothing, and refused before
+    # the planner was ever consulted. The profile path now reaches it, so the
+    # chain it holds has to be closed like any other outbound seam. ``None``
+    # means "plan with no model": the deterministic profile route is a
+    # first-class outcome (``plan_provider_unconfigured``), which is exactly what
+    # an offline deployment gets.
     ports = replace(
         composed,
         research=_research_ports(),
         decider=cast(Any, _Decider()),
         verification=cast(Any, mailbox),
         validator=cast(Any, validator),
+        planner=SettingsRunPlanner(settings, inference=None),
     )
     assert ports.vault is not None
     site = _ProviderSite(vault=ports.vault)
@@ -736,8 +725,6 @@ def walkthrough(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Wa
                 effects=effects, binding=_DeveloperAppBinding()
             ),
             "credential_generation": handlers.generate_credential,
-            "vault_storage": handlers.store_credential,
-            "credential_validation": handlers.validate_credential,
         },
         verification_binding=cast(Any, _VerificationBinding(site)),
     )

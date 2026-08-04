@@ -192,7 +192,28 @@ _LEGAL_PHASE_TRANSITIONS: dict[OnboardingPhase, frozenset[OnboardingPhase]] = {
             "cancelled",
         }
     ),
-    "paused": frozenset({"research", "cancelled"}),
+    # A paused run re-enters the phase it parked from — exactly what
+    # ``captcha_paused`` above already does. The two waiting phases differ in WHY
+    # they parked, not in what continuing means, and before this a run parked at any
+    # gate could only be restarted or cancelled, so every gate cost a whole new run.
+    #
+    # Widening this table does NOT widen what a resume may do:
+    # ``OnboardingRunControlService.resume_from_pause`` reads ``phase_at_pause`` from
+    # the last committed boundary and refuses any target this table does not admit,
+    # so a run can only ever re-enter a phase it actually stood in. ``research`` is
+    # retained because reset routes through it.
+    "paused": frozenset(
+        {
+            "research",
+            "route_selected_login",
+            "signup",
+            "email_verification",
+            "authenticated",
+            "developer_app",
+            "credential_generation",
+            "cancelled",
+        }
+    ),
     "completed": frozenset(),
     "blocked": frozenset(),
     "cancelled": frozenset(),
@@ -257,7 +278,28 @@ OnboardingReasonCode = Literal[
     "action_not_in_candidate_set",
     "candidate_identity_not_found",
     "candidate_identity_ambiguous",
+    # Retained: the coarse code every gate used to report, still written by rows
+    # created before the three causes below were separated, and still the fallback
+    # when a PAGE (not a candidate) names the human action.
     "candidate_risk_requires_human",
+    # The three distinguishable ways the action loop hands a step to a person.
+    # They were one code, which made a paused run undiagnosable: "a human is
+    # required" did not say whether the page offered nothing safe, the model
+    # declined, or the model chose something it was never shown. Each names a
+    # different thing to fix, so each is its own durable code.
+    #
+    # Every option on the page is irreversible or privilege-changing. No model call
+    # happened. This is the correct fail-closed outcome for a genuine billing,
+    # legal-acceptance or captcha surface.
+    "candidate_gate_no_executable_option",
+    # The model itself asked for a human (``report_hitl``). Also correct behavior,
+    # but attributable to the decision rather than to the page.
+    "candidate_gate_model_declined",
+    # The model named a candidate that is not executable. Reaching this PROVES the
+    # id was offered in the schema enum while its description was withheld from the
+    # rendered prompt, because a non-executable candidate is by construction absent
+    # from the rendered set.
+    "candidate_gate_selection_not_executable",
     "dlp_prompt_refused",
     "loop_action_budget_exhausted",
     "loop_no_progress_budget_exhausted",
@@ -270,6 +312,9 @@ OnboardingReasonCode = Literal[
     "decision_provider_unconfigured",  # the inference builder returned None in the loop
     "decision_provider_failed",  # every configured provider was called, none was usable
     "decision_unusable",  # schema-invalid, or a decision naming no candidate action
+    # A profile-bound plan was admitted, but this deployment has no generic
+    # observe/act/signup RPC. The run pauses before creating a session or effect.
+    "browser_adapter_unavailable",
     # --- signup / verification ---------------------------------------------
     "signup_submitted",
     "signup_rejected_duplicate_account",

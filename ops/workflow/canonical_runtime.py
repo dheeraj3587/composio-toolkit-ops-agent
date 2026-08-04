@@ -25,6 +25,7 @@ from ops.browser.account_binding import (
     derive_browser_account_ref,
     validate_browser_account_ref,
 )
+from ops.browser.host_policy import onboarding_hint_domain
 from ops.browser.link_log import log_event
 from ops.browser.readiness import browser_configuration_state
 from ops.browser.setup_values import browser_setup_values
@@ -42,6 +43,7 @@ from ops.core.storage import OperationsStorage
 from ops.onboarding.composition import OnboardingPorts, build_onboarding_ports
 from ops.onboarding.driver import RunPlanningPorts, plan_admission
 from ops.planner.adherence import AdherenceOutcome
+from ops.planner.decide import research_evidence
 from ops.planner.plan import RunPlan, canonical_surface
 from ops.providers.composio_managed_auth import (
     ComposioManagedAuthProvider,
@@ -227,6 +229,56 @@ def _initial_reason(recipe: AppRecipe) -> str:
         "reviewed_browser_route_ready"
         if recipe.readiness_tier == "browser_ready"
         else "owner_submission_route_ready"
+    )
+
+
+def _hint_seed_research(request: OperationsRequest, app_slug: str) -> OperationalResearch:
+    """The creation-time research seed for a run with no reviewed recipe.
+
+    An off-catalog onboarding run cannot project a recipe, and P1 has no row to
+    read, so this states plainly what is known at creation: the operator's hint
+    URL and nothing else. Every operational field stays absent rather than being
+    invented — the committed ``ProviderProfile`` is what later fills them in, and
+    it must be the only authority that does.
+
+    The hint is the sole ``evidence_urls`` entry and is NOT copied into
+    ``signup_url``/``login_url``: those are navigation targets
+    (``NAVIGATION_TARGET_FIELDS``), so writing an uncorroborated hint there would
+    make it a browser destination one corroboration step early.
+    """
+
+    hint = request.provider_hint_url
+    if onboarding_hint_domain(hint) is None:  # pragma: no cover - gated before here
+        raise ProviderReadinessError(
+            provider="playwright",
+            reason_code="onboarding_hint_url_required",
+        )
+    assert hint is not None
+    return OperationalResearch(
+        app_name=request.app_name.strip()[:200] or app_slug,
+        app_slug=app_slug,
+        api_available=None,
+        api_type="",
+        api_base_url=None,
+        auth_methods=[],
+        authorization_url=None,
+        token_url=None,
+        credential_fields=[],
+        scopes=[],
+        developer_portal_url=None,
+        signup_url=None,
+        login_url=None,
+        credential_management_url=None,
+        # A browser route is required for the profile path to be reachable at all;
+        # ``BROWSER_ROUTES`` refuses anything else at the host boundary.
+        access_route="self_serve",
+        production_approval_required=None,
+        contact_email=None,
+        contact_url=None,
+        evidence_urls=[hint],
+        # Nothing is corroborated yet. The profile builder raises this only after
+        # two independent excerpts agree.
+        confidence=0.0,
     )
 
 
@@ -674,8 +726,23 @@ class CanonicalRuntime:
         browser_login: Mapping[str, SecretStr] | None,
     ) -> dict[str, Any]:
         recipe = self.recipe_for_request(request)
-        if recipe is None:
+        # An off-catalog onboarding run has no reviewed recipe and is not supposed
+        # to: ``ProviderProfile``, corroborated from the operator's hint URL, is its
+        # route authority. Every ``recipe.`` read below therefore needs either a
+        # profile-derived answer or an explicit absence — a NULL ``route_kind`` and
+        # ``recipe_snapshot`` are what keep the legacy static dispatcher, the
+        # pristine-continuation guard, and the reconciliation sweep from claiming it.
+        if recipe is None and not request.onboarding:
             raise KeyError("reviewed app recipe was not found")
+        if recipe is None and onboarding_hint_domain(request.provider_hint_url) is None:
+            # Refused before a run exists. With no recipe and no usable hint there
+            # is no host to seed research with, and seeding from the app name would
+            # widen the allow-list from a display string.
+            raise ProviderReadinessError(
+                provider="playwright",
+                reason_code="onboarding_hint_url_required",
+            )
+        app_slug = recipe.app_slug if recipe is not None else _slugify(request.app_name)
         validated_key = validate_idempotency_key(idempotency_key)
         fingerprint = (
             _request_fingerprint(request, execution_mode) if validated_key is not None else None
@@ -721,10 +788,63 @@ class CanonicalRuntime:
                 finally:
                     lock.release()
 
-        executable_signup = (
-            execution_mode != "plan_only" and request.account_mode == "create_account"
+        profile_onboarding = (
+            request.onboarding
+            and request.account_mode == "create_account"
+            # With no reviewed recipe there is no managed-auth toolkit and no static
+            # signup URL to prefer, so an off-catalog onboarding run is always a
+            # profile run. Both exclusions below are recipe facts and simply do not
+            # apply to it.
+            and (
+                recipe is None
+                # A managed-auth app has a Composio toolkit, so its credential comes from
+                # an OAuth grant rather than from a form. Driving it through browser
+                # signup would be the wrong route entirely: OAuth AUTHORIZES an account
+                # and the managed connection flow already owns that exchange. Excluded
+                # here so these runs keep the ``connection_required`` path they had
+                # before ``onboarding=true`` existed.
+                or (
+                    recipe.route_kind != "managed_auth"
+                    and (recipe.route_kind != "playwright" or recipe.urls.signup is None)
+                )
+            )
         )
-        if executable_signup:
+        # The login route mounts the same seam on an existing account: the run signs
+        # in through the vault-probed login route instead of creating an account, and
+        # then walks the developer application and credential lifecycle exactly like
+        # a signup run. A recipe with no login URL (or a managed-auth recipe) cannot
+        # take that route, so those keep the path they had before onboarding existed.
+        login_onboarding = (
+            request.onboarding
+            and request.account_mode == "existing_account"
+            and (
+                recipe is None
+                or (
+                    recipe.route_kind == "playwright"
+                    and recipe.urls.login is not None
+                )
+            )
+        )
+        profile_onboarding = profile_onboarding or login_onboarding
+        executable_signup = (
+            execution_mode != "plan_only"
+            and request.account_mode == "create_account"
+            # Same reason: a managed-auth run performs no signup at all, so holding
+            # it to the reviewed-signup-recipe readiness check below would refuse a
+            # run that never needed a signup recipe.
+            and (recipe is None or recipe.route_kind != "managed_auth")
+        )
+        # A complete static Playwright signup recipe retains its established fast
+        # path. Every other reviewed recipe enters profile research/planning first;
+        # live readiness is checked only after a profile-bound plan and operator
+        # admission exist, never before the run can be persisted.
+        if executable_signup and not profile_onboarding:
+            # ``recipe is None`` implies ``profile_onboarding``, so this branch is
+            # recipe-bound by construction: only an onboarding request may omit the
+            # recipe, and ``OperationsRequest`` forces such a request to
+            # ``account_mode='create_account'``, which is what ``profile_onboarding``
+            # additionally requires.
+            assert recipe is not None
             if recipe.route_kind != "playwright" or recipe.urls.signup is None:
                 raise ProviderReadinessError(
                     provider="playwright",
@@ -783,16 +903,17 @@ class CanonicalRuntime:
         browser_account_ref = (
             derive_browser_account_ref(
                 run_id=run_id,
-                app_slug=recipe.app_slug,
+                app_slug=app_slug,
                 work_email_ref=request.company.work_email_ref,
                 browser_login=binding_login,
                 binding_secret=getattr(self._context._settings, "secret_vault_key", None),
             )
-            if recipe.route_kind == "playwright"
+            if (recipe is not None and recipe.route_kind == "playwright") or profile_onboarding
             else None
         )
         if (
             execution_mode != "plan_only"
+            and recipe is not None
             and recipe.route_kind == "playwright"
             and request.account_mode == "existing_account"
             and browser_login is None
@@ -807,7 +928,7 @@ class CanonicalRuntime:
         ):
             try:
                 selected = self._context._secret_store.get_unique_account_login_pair(
-                    app_slug=recipe.app_slug
+                    app_slug=app_slug
                 )
             except AccountLoginStateError as exc:
                 stored_login_selection_error = exc.reason_code
@@ -828,31 +949,59 @@ class CanonicalRuntime:
                                 field: SecretStr(selected_values[field])
                                 for field in ("login_email", "login_password")
                             }
-        research = recipe_to_operational_research(recipe)
-        recipe_version = _recipe_version()
-        recipe_snapshot = build_recipe_snapshot(recipe, recipe_version)
+        # With no recipe there is nothing to project and no P1 row to read, so the
+        # seed states only what the operator supplied. ``recipe_version`` and
+        # ``recipe_snapshot`` stay NULL: both columns are nullable, and their absence
+        # is what makes ``recipe_from_run`` refuse later instead of rebinding this run
+        # to today's catalog. The plan row is unaffected — a profile plan carries
+        # ``PROFILE_CATALOG_ID`` and the profile digest via ``profile_binding``.
+        research = (
+            recipe_to_operational_research(recipe)
+            if recipe is not None
+            else _hint_seed_research(request, app_slug)
+        )
+        recipe_version = _recipe_version() if recipe is not None else None
+        recipe_snapshot = (
+            build_recipe_snapshot(recipe, recipe_version)
+            if recipe is not None and recipe_version is not None
+            else None
+        )
         plan_only = execution_mode == "plan_only"
         status: RunStatus = (
-            "route_selected"
-            if plan_only or recipe.route_kind != "managed_auth"
+            "researching"
+            if profile_onboarding
+            else "route_selected"
+            if plan_only or recipe is None or recipe.route_kind != "managed_auth"
             else "connection_required"
         )
         phase = (
-            "route_selected"
+            "research"
+            if profile_onboarding
+            else "route_selected"
             if plan_only
             else "connection_required"
-            if recipe.route_kind == "managed_auth"
+            if recipe is not None and recipe.route_kind == "managed_auth"
             else "browser_pending"
-            if recipe.route_kind == "playwright"
+            if recipe is not None and recipe.route_kind == "playwright"
             else "outreach_review"
         )
-        reason = _initial_reason(recipe)
+        # ``recipe is None`` implies ``profile_onboarding``; naming it here as well
+        # keeps the reason total without a cast.
+        reason = (
+            "profile_research_required"
+            if profile_onboarding or recipe is None
+            else _initial_reason(recipe)
+        )
         provider_status = {
-            "recipe": recipe.readiness_tier,
-            "composio": "connection_required"
-            if recipe.route_kind == "managed_auth"
+            # No reviewed recipe, so no readiness tier was ever assigned. The
+            # profile path reports its own state through ``browser`` below.
+            "recipe": recipe.readiness_tier if recipe is not None else "not_applicable",
+            "composio": "not_started"
+            if profile_onboarding
+            else "connection_required"
+            if recipe is not None and recipe.route_kind == "managed_auth"
             else "not_started",
-            "browser": "not_started",
+            "browser": "profile_planning" if profile_onboarding else "not_started",
             "email": "not_started",
             "validation": "not_started",
         }
@@ -863,7 +1012,11 @@ class CanonicalRuntime:
                 if existing_replay is not None:
                     return existing_replay
 
-            lookup = self._context.p1_adapter.lookup(recipe.app_name)
+            # P1 is evidence, not a gate: an off-catalog app has no row, and a miss
+            # simply leaves the summary absent (the column is already optional).
+            lookup = self._context.p1_adapter.lookup(
+                recipe.app_name if recipe is not None else request.app_name
+            )
             p1_summary: dict[str, object] | None = None
             if isinstance(lookup, P1LookupFound):
                 p1_summary = {
@@ -878,16 +1031,25 @@ class CanonicalRuntime:
             transaction.create_run(
                 run_id=run_id,
                 thread_id=thread_id,
-                app_name=recipe.app_name,
-                app_slug=recipe.app_slug,
+                app_name=recipe.app_name if recipe is not None else request.app_name,
+                app_slug=app_slug,
                 status=status,
-                access_route=cast(Any, _access_route(recipe)),
+                # A browser route is the only route an off-catalog profile run can
+                # take; ``BROWSER_ROUTES`` refuses anything else downstream.
+                access_route=cast(
+                    Any, _access_route(recipe) if recipe is not None else "self_serve"
+                ),
                 p1_summary=p1_summary,
                 operational_research=research.model_dump(mode="json"),
                 request=request.model_dump(mode="json"),
                 route_reason_code=reason,
                 route_explanation=(
-                    "This run is bound to a reviewed, versioned application recipe."
+                    "This app has no reviewed recipe and is onboarded from a corroborated "
+                    "provider profile built off the operator's hint URL."
+                    if recipe is None
+                    else "This reviewed app is mounted on profile research and planner-controlled onboarding."
+                    if profile_onboarding
+                    else "This run is bound to a reviewed, versioned application recipe."
                 ),
                 missing_fields=[],
                 provider_status=provider_status,
@@ -897,13 +1059,26 @@ class CanonicalRuntime:
                 credential_creation_policy=request.credential_creation_policy,
                 recipe_version=recipe_version,
                 recipe_snapshot=recipe_snapshot,
-                route_kind=recipe.route_kind,
-                readiness_tier=recipe.readiness_tier,
+                # NULL for an off-catalog run, and load-bearing: every legacy static
+                # dispatcher keys on ``route_kind == "playwright"``
+                # (``_continue_pristine_playwright_run``, ``reconciliation`` at :167
+                # and :248), so a NULL here keeps them from claiming a profile run.
+                route_kind=recipe.route_kind if recipe is not None else None,
+                readiness_tier=recipe.readiness_tier if recipe is not None else None,
                 browser_account_ref=browser_account_ref,
                 attempt=0,
                 phase=phase,
                 reason_code=reason,
+                # The login route's durable effect identity: the broker recomposes
+                # ``consume`` operation keys from this column, and the login context
+                # store reads the same value, so an RPC worker and the handler mint
+                # the same keys for the same login attempt. Signup runs keep NULL —
+                # their identity is derived from the staged pair instead.
+                effect_identity=(f"{run_id}:login-route:v1" if login_onboarding else None),
                 state_engine="canonical_v1",
+                # The resolved execution path, not the client's ``onboarding`` hint:
+                # every later consumer must branch on what this run actually became.
+                execution_path="profile_mounted" if profile_onboarding else "legacy_static",
                 external_actions=False,
                 idempotency_key=validated_key,
                 request_fingerprint=fingerprint,
@@ -920,8 +1095,8 @@ class CanonicalRuntime:
                     "status": "created",
                     "state_engine": "canonical_v1",
                     "recipe_version": recipe_version,
-                    "route_kind": recipe.route_kind,
-                    "readiness_tier": recipe.readiness_tier,
+                    "route_kind": recipe.route_kind if recipe is not None else None,
+                    "readiness_tier": recipe.readiness_tier if recipe is not None else None,
                     "browser_provider": request.browser_provider,
                     "browser_account_scope": (
                         "account_scoped"
@@ -939,7 +1114,7 @@ class CanonicalRuntime:
                 event_type="route_selected",
                 payload={
                     "status": "route_selected",
-                    "route_kind": recipe.route_kind,
+                    "route_kind": recipe.route_kind if recipe is not None else None,
                     "phase": phase,
                     "reason_code": reason,
                     "external_actions": False,
@@ -949,8 +1124,55 @@ class CanonicalRuntime:
             if created is None:  # pragma: no cover - SQLite invariant
                 raise RuntimeError("created run could not be read")
 
-        persisted_recipe = self._recipe_for_run(created)
-        if not plan_only and persisted_recipe.route_kind == "playwright":
+        # The login route is vault-first: the admission probe at ``vault_check``
+        # reads REUSABLE references (``one_time = 0``), so an owner-supplied pair
+        # must be durable before the run ever advances there — and run creation is
+        # the only point where the raw values are still in hand, because the
+        # persisted request never carries them. Plan-only runs stay inert: no
+        # secret is written for a run that will not act.
+        if (
+            profile_onboarding
+            and not plan_only
+            and submitted_existing_login is not None
+            and browser_account_ref is not None
+            and bool(
+                getattr(
+                    self._context._settings,
+                    "browser_login_credential_reuse",
+                    True,
+                )
+            )
+            and self._context._secret_store is not None
+        ):
+            try:
+                self._context._secret_store.put_account_login_pair(
+                    app_slug=app_slug,
+                    account_ref=validate_browser_account_ref(browser_account_ref),
+                    email=submitted_existing_login["login_email"].get_secret_value(),
+                    password=submitted_existing_login["login_password"].get_secret_value(),
+                )
+            except Exception:
+                # A vault failure must not block creation: the run still exists and
+                # pauses at the admission gate instead of signing in autonomously.
+                pass
+
+        # Re-read the recipe from the persisted snapshot only when there is one.
+        # ``_recipe_for_run`` raises ``immutable_recipe_snapshot_missing`` for a run
+        # that deliberately stored no snapshot, and it runs BEFORE the
+        # ``not profile_onboarding`` guard below that would have skipped it — so
+        # calling it unconditionally would turn every off-catalog creation into a
+        # failure after the run had already been committed.
+        persisted_recipe = self._recipe_for_run(created) if recipe is not None else None
+        # A profile-onboarding run belongs to MountedOnboardingRuntime: it must reach
+        # research/planning before any session exists. Dispatching it here would stage
+        # signup credentials and reserve ``browser-start`` in ``_start_playwright``
+        # first, so the mounted seam would never see a pristine run.
+        if (
+            not plan_only
+            and not profile_onboarding
+            and persisted_recipe is not None
+            and persisted_recipe.route_kind == "playwright"
+        ):
             if stored_login_selection_error is not None:
                 return self._record_provider_failure(
                     run_id,
@@ -1103,6 +1325,10 @@ class CanonicalRuntime:
                     profile=None,
                     recipe=recipe,
                     deps=planning,
+                    # The run's own research, as prose. The recipe stays the only
+                    # authority over which hosts and paths exist; this can only
+                    # inform the order the planner selects among them.
+                    evidence=research_evidence(research),
                 )
                 if refusal is not None:
                     return self._record_provider_failure(

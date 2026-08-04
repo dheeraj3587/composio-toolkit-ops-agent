@@ -45,76 +45,92 @@
   --color-ink: var(--ink);
   --color-rail: var(--rail);
   --color-brand: var(--brand);
-  --color-brand-50: #15162a;
-  --color-brand-100: #1b1d3d;
-  --color-brand-200: #2a2e68;
-  --color-brand-300: #6f77ff;
-  --color-brand-400: #858cff;
-  --color-brand-500: #5962ff;
-  --color-brand-600: #6972ff;
-  --color-brand-700: #a8adff;
-  --color-brand-800: #c5c8ff;
-  --color-brand-950: #eff0ff;
-  --color-amber-50: #241b0b;
-  --color-amber-100: #30240e;
-  --color-amber-200: #624b1c;
-  --color-amber-300: #fcd34d;
-  --color-amber-600: #fbbf24;
-  --color-amber-700: #fcd34d;
-  --color-amber-800: #fde68a;
-  --color-amber-900: #fef3c7;
-  --color-amber-950: #fffbeb;
-  --color-emerald-50: #0c2117;
-  --color-emerald-100: #102d20;
-  --color-emerald-200: #235d43;
-  --color-emerald-300: #6ee7b7;
-  --color-emerald-600: #34d399;
-  --color-emerald-700: #6ee7b7;
-  --color-emerald-800: #a7f3d0;
-  --color-emerald-900: #d1fae5;
-  --color-emerald-950: #ecfdf5;
-  --color-red-50: #281113;
-  --color-red-100: #351518;
-  --color-red-200: #6f2c32;
-  --color-red-300: #fca5a5;
-  --color-red-600: #f87171;
-  --color-red-700: #fca5a5;
-  --color-red-800: #fecaca;
-  --color-red-900: #fee2e2;
-  --color-red-950: #fef2f2;
-  --color-orange-50: #28170b;
-  --color-orange-100: #351e0c;
-  --color-orange-200: #713c18;
-  --color-orange-300: #fdba74;
-  --color-orange-600: #fb923c;
-  --color-orange-700: #fdba74;
-  --color-orange-800: #fed7aa;
-  --color-sky-50: #0c1f2a;
-  --color-sky-100: #102936;
-  --color-sky-200: #24536b;
-  --color-sky-300: #7dd3fc;
-  --color-sky-600: #38bdf8;
-  --color-sky-700: #7dd3fc;
-  --color-sky-800: #bae6fd;
-  --color-blue-50: #10182b;
-  --color-blue-100: #14203a;
-  --color-blue-200: #294477;
-  --color-blue-300: #93c5fd;
-  --color-blue-600: #60a5fa;
-  --color-blue-700: #93c5fd;
-  --color-blue-800: #bfdbfe;
-  --color-indigo-50: #17162b;
-  --color-indigo-100: #201e3b;
-  --color-indigo-200: #45417a;
-  --color-indigo-300: #a5b4fc;
-  --color-indigo-600: #818cf8;
-  --color-indigo-700: #a5b4fc;
-  --color-indigo-800: #c7d2fe;
-  --color-slate-50: #1a1b1e;
-  --color-slate-100: #222429;
-  --color-slate-200: #373a42;
-  --color-slate-300: #6b7280;
-  --color-slate-600: #a1a1aa;
+  --color-brand-50: #131313;
+  --color-brand-100: #171717;
+  --color-brand-200: #262626;
+  --color-brand-300: #e6e6e6;
+  --color-brand-400: #d4d4d4;
+  --color-brand-500: #c4c4c4;
+  --color-brand-600: #b4b4b4;
+  --color-brand-700: #d4d4d4;
+  --color-brand-800: #e6e6e6;
+  --color-brand-950: #fafafa;
+  --color-amber-50: #131313;
+  --color-amber-100: #171717;
+  --color-amber-200: #262626;
+  --color-amber-300: #e6e6e6;
+  --color-amber-400: #d4d4d4;
+  --color-amber-500: #c4c4c4;
+  --color-amber-600: #b4b4b4;
+  --color-amber-700: #d4d4d4;
+  --color-amber-800: #e6e6e6;
+  --color-amber-900: #f0f0f0;
+  --color-amber-950: #fafafa;
+  --color-emerald-50: #131313;
+  --color-emerald-100: #171717;
+  --color-emerald-200: #262626;
+  --color-emerald-300: #e6e6e6;
+  --color-emerald-400: #d4d4d4;
+  --color-emerald-500: #c4c4c4;
+  --color-emerald-600: #b4b4b4;
+  --color-emerald-700: #d4d4d4;
+  --color-emerald-800: #e6e6e6;
+  --color-emerald-900: #f0f0f0;
+  --color-emerald-950: #fafafa;
+  --color-red-50: #131313;
+  --color-red-100: #171717;
+  --color-red-200: #262626;
+  --color-red-300: #e6e6e6;
+  --color-red-400: #d4d4d4;
+  --color-red-500: #c4c4c4;
+  --color-red-600: #b4b4b4;
+  --color-red-700: #d4d4d4;
+  --color-red-800: #e6e6e6;
+  --color-red-900: #f0f0f0;
+  --color-red-950: #fafafa;
+  --color-orange-50: #131313;
+  --color-orange-100: #171717;
+  --color-orange-200: #262626;
+  --color-orange-300: #e6e6e6;
+  --color-orange-400: #d4d4d4;
+  --color-orange-500: #c4c4c4;
+  --color-orange-600: #b4b4b4;
+  --color-orange-700: #d4d4d4;
+  --color-orange-800: #e6e6e6;
+  --color-sky-50: #131313;
+  --color-sky-100: #171717;
+  --color-sky-200: #262626;
+  --color-sky-300: #e6e6e6;
+  --color-sky-400: #d4d4d4;
+  --color-sky-500: #c4c4c4;
+  --color-sky-600: #b4b4b4;
+  --color-sky-700: #d4d4d4;
+  --color-sky-800: #e6e6e6;
+  --color-blue-50: #131313;
+  --color-blue-100: #171717;
+  --color-blue-200: #262626;
+  --color-blue-300: #e6e6e6;
+  --color-blue-400: #d4d4d4;
+  --color-blue-500: #c4c4c4;
+  --color-blue-600: #b4b4b4;
+  --color-blue-700: #d4d4d4;
+  --color-blue-800: #e6e6e6;
+  --color-indigo-50: #131313;
+  --color-indigo-100: #171717;
+  --color-indigo-200: #262626;
+  --color-indigo-300: #e6e6e6;
+  --color-indigo-400: #d4d4d4;
+  --color-indigo-500: #c4c4c4;
+  --color-indigo-600: #b4b4b4;
+  --color-indigo-700: #d4d4d4;
+  --color-indigo-800: #e6e6e6;
+  --color-slate-50: #131313;
+  --color-slate-100: #171717;
+  --color-slate-200: #262626;
+  --color-slate-300: #e6e6e6;
+  --color-slate-400: #d4d4d4;
+  --color-slate-500: #c4c4c4;
+  --color-slate-600: #b4b4b4;
   --color-brand-hover: var(--brand-hover);
   --color-brand-active: var(--brand-active);
   --color-brand-soft: var(--brand-soft);
@@ -133,34 +149,60 @@
 
 :root {
   color-scheme: dark;
-  --paper: #0f0f0f;
-  --ink: #f4f4f1;
-  --rail: #090909;
-  --brand: #0007cd;
-  --brand-hover: #1119d8;
-  --brand-active: #2029e5;
-  --brand-soft: #171930;
-  --brand-ink: #aeb3ff;
-  --brand-dev: #0007cd;
+
+  /* Monochrome, no accent hue.
+   *
+   * The subject is an autonomous agent walking a browser under bounded
+   * authority — its world is machine telemetry, so the console reads as an
+   * instrument trace. A near-black surface with one bright accent is the
+   * current default look for this kind of product, so the accent is spent to
+   * zero and status is carried by FORM instead (see --marker-* below and
+   * `status-badge.tsx`). That is also the accessible answer: never colour alone.
+   *
+   * The `--brand-*` names are retained and pointed at greys because ~34
+   * components already resolve them; only the values change. That is what makes
+   * a full reskin affordable here. */
+  --void: #050505;
+  --panel: #0c0c0c;
+  --raised: #141414;
+  --line: #222222;
+  --line-live: #3d3d3d;
+  --ink: #fafafa;
+  --ink-dim: #8c8c8c;
+  --ink-faint: #545454;
+
+  --paper: var(--void);
+  --rail: #000000;
+  /* Inverted, not tinted: the strongest emphasis available in monochrome is
+   * white-on-black flipped to black-on-white. */
+  --brand: var(--ink);
+  --brand-hover: #e6e6e6;
+  --brand-active: #d4d4d4;
+  --brand-soft: var(--raised);
+  --brand-ink: var(--ink);
+  --brand-dev: var(--ink-dim);
+
   --background: var(--paper);
   --foreground: var(--ink);
-  --card: #1e1e1e;
+  --card: var(--panel);
   --card-foreground: var(--ink);
-  --popover: #242424;
+  --popover: var(--raised);
   --popover-foreground: var(--ink);
   --primary: var(--brand);
-  --primary-foreground: #ffffff;
-  --secondary: #262626;
-  --secondary-foreground: #ededeb;
-  --muted: #222222;
-  --muted-foreground: #a1a1a1;
-  --accent: var(--brand-soft);
-  --accent-foreground: #d8daff;
-  --destructive: #fb7185;
-  --border: #2c2c2c;
-  --input: #3a3a3a;
-  --field: #171717;
-  --ring: #6972ff;
+  --primary-foreground: var(--void);
+  --secondary: var(--raised);
+  --secondary-foreground: var(--ink);
+  --muted: var(--raised);
+  --muted-foreground: var(--ink-dim);
+  --accent: var(--raised);
+  --accent-foreground: var(--ink);
+  /* Destructive stays achromatic. A red here would reintroduce the accent the
+   * palette deliberately removes; severity is carried by form and weight. */
+  --destructive: var(--ink);
+  --border: var(--line);
+  --input: #2e2e2e;
+  --field: #101010;
+  --ring: var(--ink-dim);
 }
 
 @layer base {
@@ -203,8 +245,8 @@
   }
 
   ::selection {
-    background: #2630dc;
-    color: #ffffff;
+    background: var(--ink);
+    color: var(--void);
   }
 
   a,
@@ -317,16 +359,73 @@
     color: var(--foreground) !important;
   }
 
+  /* Toast severity in monochrome: border WEIGHT, not hue. An error reads as the
+   * brightest, heaviest edge; a warning sits between; success is quiet because a
+   * success needs acknowledging, not alarming. */
   [data-sonner-toast][data-type="error"] {
-    border-color: rgb(248 113 113 / 0.38) !important;
-  }
-
-  [data-sonner-toast][data-type="success"] {
-    border-color: rgb(52 211 153 / 0.34) !important;
+    border-color: var(--ink) !important;
+    border-width: 1px 1px 1px 3px !important;
   }
 
   [data-sonner-toast][data-type="warning"] {
-    border-color: rgb(251 191 36 / 0.34) !important;
+    border-color: var(--ink-dim) !important;
+    border-width: 1px 1px 1px 3px !important;
+  }
+
+  [data-sonner-toast][data-type="success"] {
+    border-color: var(--line-live) !important;
+  }
+
+  /* --- the trace spine ---------------------------------------------------
+   *
+   * The signature element. One hairline down the run, each phase boundary a
+   * node on it. The active node carries a travelling highlight so "where the
+   * agent is now" is legible at a glance without colour.
+   *
+   * Entry animation is applied by the CALLER with an inline
+   * `animation-delay`, keyed on the row's durable identity (sequence /
+   * event_id) rather than on mount order — the run page calls
+   * `router.refresh()` every 4s, and mount-order animation would replay on
+   * every poll and strobe. */
+  .cot-marker-live {
+    animation: cot-pulse 2.4s cubic-bezier(0.22, 0.75, 0.2, 1) infinite;
+  }
+
+  .trace-node {
+    animation: trace-node-in 260ms cubic-bezier(0.22, 0.75, 0.2, 1) both;
+  }
+
+  /* Duration rendered as width: a slow decide step is visibly wide, so the
+   * number earns its space instead of sitting in a label. */
+  .stage-bar {
+    @apply h-[3px] rounded-full bg-border;
+    min-width: 3px;
+    transition: background-color 160ms cubic-bezier(0.22, 0.75, 0.2, 1);
+  }
+
+  .stage-bar[data-live="true"] {
+    @apply bg-foreground;
+  }
+}
+
+@keyframes cot-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgb(250 250 250 / 0.5);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgb(250 250 250 / 0);
+  }
+}
+
+@keyframes trace-node-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 
@@ -349,5 +448,15 @@
     animation-iteration-count: 1 !important;
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
+  }
+
+  /* The blanket rule above collapses duration but leaves the animation attached,
+   * so the pulse still resolves to a name and paints its first frame. Remove it
+   * outright: the live marker's ring already distinguishes the active node by
+   * form, so nothing is lost when the travel is gone. */
+  .cot-marker-live,
+  .trace-node,
+  .page-enter {
+    animation: none !important;
   }
 }

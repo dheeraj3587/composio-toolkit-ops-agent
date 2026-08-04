@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import secrets
 from typing import Any
 
@@ -29,12 +28,12 @@ from ops.browser.session_capability import (
     validate_capability_owner,
 )
 from ops.core.secret_store import BrowserSecretGrantError
+from ops.credentials.capture_boundary import CaptureRefused, capture_validated_credential
 from ops.credentials.capture_specs import CredentialCaptureSpec
 from ops.onboarding.capture_specs import (
     CaptureContractUnavailable,
-    profile_capture_contract,
+    resolve_capture_contract,
 )
-from ops.recipes.app_recipes import get_app_capture_spec
 
 LOGGER = logging.getLogger("composio_ops.browser_secret_broker")
 
@@ -281,17 +280,19 @@ def _resolve_capture_spec(
           :class:`BrowserCaptureNotAuthorized`. Research never supplies a
           pattern.
 
-    A checked-in recipe is the stronger authority, so it stays first. The
-    profile contract is the runtime stand-in for the providers that have no
-    reviewed recipe — every brand-new provider — which is exactly the set that
-    used to be refused here because ``get_app_capture_spec`` returned ``None``.
+    The authority order itself lives in ``ops.onboarding.capture_specs`` so this
+    RPC path and the local in-process path provably ask the same question. What
+    stays here is only this transport's failure translation: the run id is safe to
+    log next to a closed ``detail``, and the response vocabulary must not grow.
     """
 
-    reviewed = get_app_capture_spec(payload.app_slug)
-    if reviewed is not None:
-        return reviewed
     try:
-        return profile_capture_contract(core, run_id=payload.scope_id, kind=payload.kind)
+        return resolve_capture_contract(
+            core,
+            app_slug=payload.app_slug,
+            run_id=payload.scope_id,
+            kind=payload.kind,
+        )
     except CaptureContractUnavailable as exc:
         # The orchestrator pauses the run on ``exc.reason_code``; the broker's
         # response vocabulary does not grow a third code. ``detail`` is closed
@@ -314,17 +315,7 @@ def _capture_sync(
         raise BrowserCaptureNotAuthorized
     core, store = _core_and_store(service)
     spec = _resolve_capture_spec(core, payload)
-    # The requested kind must be one the reviewed contract declares; a contract
-    # that declares no pattern for it authorizes nothing.
-    field = spec.field(payload.kind)
-    if field is None:
-        raise BrowserCaptureNotAuthorized
     value = payload.value.get_secret_value()
-    if re.fullmatch(field.value_pattern, value) is None:
-        # The worker is trusted to transport a reviewed capture, not to redefine
-        # its format. Re-apply the recipe's exact value contract at the API/vault
-        # boundary so a compromised worker cannot persist arbitrary material.
-        raise BrowserCaptureNotAuthorized
     lock_factory = getattr(core, "_run_lock", None)
     if not callable(lock_factory):
         raise BrowserCaptureNotAuthorized
@@ -345,18 +336,28 @@ def _capture_sync(
             kind=payload.kind,
         )
         try:
-            return str(
-                store.capture_with_grant(
-                    payload.grant,
-                    app_slug=payload.app_slug,
-                    kind=payload.kind,
-                    scope_id=payload.scope_id,
-                    session_id=payload.session_id,
-                    value=value,
-                    expected_operation_key=operation_key,
-                )
+            # The pattern check and the vault write live together in
+            # ``ops.credentials.capture_boundary`` so BOTH transports provably apply
+            # the same contract: this RPC path, and the local in-process path where
+            # the onboarding credential surface reads the value itself. The comment
+            # that used to sit here — re-apply the recipe's exact value contract at
+            # the API/vault boundary so a compromised worker cannot persist arbitrary
+            # material — is now a property of that one function rather than of this
+            # one call site.
+            return capture_validated_credential(
+                store=store,
+                spec=spec,
+                grant=payload.grant,
+                app_slug=payload.app_slug,
+                kind=payload.kind,
+                scope_id=payload.scope_id,
+                session_id=payload.session_id,
+                value=value,
+                operation_key=operation_key,
             )
-        except BrowserSecretGrantError:
+        except CaptureRefused:
+            # Translated into the broker's own hierarchy, which is what the HTTP
+            # handler maps to a status code. The response vocabulary is unchanged.
             raise BrowserCaptureNotAuthorized from None
     finally:
         lock.release()

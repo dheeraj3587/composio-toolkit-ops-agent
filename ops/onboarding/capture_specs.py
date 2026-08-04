@@ -59,6 +59,7 @@ from ops.onboarding.credentials import credential_value_pattern, is_credential_k
 from ops.onboarding.phase import OnboardingReasonCode
 from ops.providers.profile import FlowSpec, ProviderProfile, compute_profile_digest
 from ops.providers.profile_store import ProviderProfileStore
+from ops.recipes.app_recipes import get_app_capture_spec
 
 # Why the contract is unbuildable. Stable, closed, and free of provider or page
 # text, so it is safe to log next to the run id while the reason code the run
@@ -171,6 +172,36 @@ def profile_capture_contract(
     )
 
 
+def resolve_capture_contract(
+    core: object,
+    *,
+    app_slug: str,
+    run_id: str,
+    kind: str,
+) -> CredentialCaptureSpec:
+    """The capture contract for one run: reviewed recipe first, else the profile.
+
+    THE AUTHORITY ORDER, in one place, for both transports that can capture — the
+    production RPC path through ``api.browser_secret_broker`` and the local
+    in-process path through ``ops.onboarding.adapters``. Two copies of this order
+    could drift into two different answers about which contract governs a write.
+
+    A checked-in recipe is the stronger authority, so it stays first: it was reviewed
+    against a real page. :func:`profile_capture_contract` is the stand-in for every
+    provider that has no reviewed recipe — which is the whole point of the
+    off-catalog path, and exactly the set ``get_app_capture_spec`` returns ``None``
+    for.
+
+    POST: the returned ``value_pattern`` came from checked-in code on either branch.
+          Research and page text never supply a pattern.
+    """
+
+    reviewed = get_app_capture_spec(app_slug)
+    if reviewed is not None:
+        return reviewed
+    return profile_capture_contract(core, run_id=run_id, kind=kind)
+
+
 def _resolve_profile_store(core: object, *, run_id: str) -> ProviderProfileStore:
     """The run service's profile store, or a fail-closed refusal."""
 
@@ -212,4 +243,5 @@ __all__ = [
     "CaptureContractUnavailable",
     "ProfileCaptureCore",
     "profile_capture_contract",
+    "resolve_capture_contract",
 ]

@@ -290,6 +290,86 @@ class ObservationResponse(_Strict):
     session: SessionSummary | None = None
 
 
+class WireElementIdentity(_Strict):
+    """The stable identity the executor re-resolves a target by.
+
+    Pinned against ``ElementIdentity`` by an import-time assertion in
+    ``ops.browser.candidates`` (``WIRE_IDENTITY_FIELDS``), so a part added there has
+    to be carried here or consciously dropped — the type evolves (Phase 2 added the
+    frame path) and a silently missing part would resolve the wrong element.
+    """
+
+    role: str = Field(max_length=80)
+    name: str = Field(max_length=300)
+    element_type: str = Field(default="", max_length=80)
+    frame_path: tuple[str, ...] = Field(default=(), max_length=8)
+    test_id: str | None = Field(default=None, max_length=120)
+    href_path: str | None = Field(default=None, max_length=300)
+    nearby_heading: str | None = Field(default=None, max_length=300)
+
+
+class ExecutableAction(_Strict):
+    """One policy-approved action, projected to what an executor actually reads.
+
+    Deliberately NOT an ``ActionCandidate`` clone. ``risk`` is absent by design:
+    ``ActionCandidate.executable`` is exactly ``risk != "requires_hitl"``, so that
+    field is what decides whether a CAPTCHA, an MFA prompt or a billing
+    confirmation needs a person. The gate is evaluated in the control plane before
+    dispatch, and the browser container is never handed the field it turns on.
+
+    The verify-side fields (``postcondition``, ``expected_postcondition``,
+    ``semantic_target``, ``trace_version``, ``checkpoint_order``, ``hint_index``,
+    ``option_value``) also stay behind: the caller holds the goal and compares a
+    fresh observation itself. Six stable fields instead of fourteen evolving ones —
+    the surface that cannot drift is the surface that is not sent.
+    """
+
+    candidate_id: str = Field(min_length=1, max_length=120)
+    action: Literal[
+        "click",
+        "fill",
+        "type",
+        "press",
+        "goto",
+        "select_option",
+        "check",
+        "uncheck",
+        "scroll_into_view",
+        "focus",
+    ]
+    identity: WireElementIdentity | None = None
+    # A REFERENCE into the approved-value map, resolved inside the executor. Never a
+    # literal value and never a secret.
+    value_ref: str | None = Field(default=None, max_length=120)
+    press_key: str | None = Field(default=None, max_length=40)
+    url: str | None = Field(default=None, max_length=2_048)
+
+
+class ActRequest(_Strict):
+    """Execute one action against the observation the caller last received."""
+
+    action: ExecutableAction
+    # The generation returned by the observe/act response this action was planned
+    # against. Compared AND consumed under the session's loop lock, so a retry of a
+    # call whose response was lost is refused rather than executed twice.
+    expected_generation: int = Field(ge=1)
+
+
+class LoopObservationResponse(_Strict):
+    """One page observation plus the raw elements the caller projects itself.
+
+    ``raw_elements`` are per-element mappings rather than a finished snapshot,
+    because the loop owns the projection: ``build_snapshot`` is what strips
+    secret-ish values, and a transport must not be able to skip it. The accessible
+    names were already DLP-sanitized at inspection time, before reaching this model.
+    """
+
+    observation: ObservationResponse
+    raw_elements: tuple[dict[str, object], ...] = Field(default=(), max_length=60)
+    # The token the next ``/act`` must echo. Monotonic per session.
+    generation: int = Field(ge=1)
+
+
 class CaptureCredentialsResponse(_Strict):
     """Reference-only result of deterministic broker-backed capture.
 

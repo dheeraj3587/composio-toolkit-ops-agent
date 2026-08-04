@@ -131,6 +131,10 @@ export async function createRunAction(
       accountMode === "existing_account" && appLoginEmail && appLoginPassword
         ? { email: appLoginEmail, password: appLoginPassword }
         : null,
+    // The backend remains authoritative: this only selects the durable
+    // research/planner driver for a reviewed create-account request.
+    onboarding: accountMode === "create_account",
+    provider_hint_url: null,
   }
 
   // This value is returned to client-side action state so it must not be

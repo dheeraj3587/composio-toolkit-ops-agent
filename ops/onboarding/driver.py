@@ -104,10 +104,15 @@ from ops.access.gate_policy import (
     resolve_gate,
 )
 from ops.browser.candidates import APPROVED_VALUE_REFS
-from ops.browser.host_policy import BrowserAllowedHosts, evaluate_navigation
+from ops.browser.host_policy import (
+    BrowserAllowedHosts,
+    BrowserPolicyInactiveError,
+    evaluate_navigation,
+    get_browser_policy,
+)
 from ops.browser.metrics import OnboardingCorrelation
 from ops.browser.worker import BrowserObservation, HumanActionType
-from ops.core.effect_ledger import EffectStore
+from ops.core.effect_ledger import EffectStore, SQLiteEffectStore
 from ops.core.inference import DecisionFailed, DecisionReasonCode
 from ops.core.model_input_dlp import sanitize_url
 from ops.core.models import HitlRequest
@@ -148,6 +153,7 @@ from ops.onboarding.credentials import (
     TRANSIENT_LOGIN_VAULT_KINDS,
 )
 from ops.onboarding.effects import (
+    DEFAULT_CREDENTIAL_KIND,
     EFFECT_PROVIDER,
     ONBOARDING_EFFECT_DISPOSITIONS,
     ONBOARDING_EFFECTS,
@@ -157,6 +163,7 @@ from ops.onboarding.effects import (
     OnboardingEffect,
     complete_effect,
     create_dev_app_key,
+    generate_credential_key,
     mark_effect_outcome_unknown,
     plan_effect,
     plan_for_row_status,
@@ -181,7 +188,7 @@ from ops.onboarding.phase import (
     legal_phase_targets,
     validate_phase_transition,
 )
-from ops.planner.decide import PlanOutcome
+from ops.planner.decide import PlanOutcome, profile_research_evidence
 from ops.planner.plan import RunPlan
 from ops.planner.store import RunPlanStore
 from ops.planner.validator import (
@@ -212,6 +219,32 @@ if TYPE_CHECKING:  # pragma: no cover - imported for typing only
 
 LOGGER = logging.getLogger("composio_ops.onboarding_driver")
 
+
+def route_browser_allowed_hosts(profile: ProviderProfile) -> BrowserAllowedHosts:
+    """The run's browser allow-list: recipe authority when one exists, else profile.
+
+    A reviewed recipe always outranks a committed profile — that is what
+    ``build_browser_allowed_hosts(profile_authority=True)`` refuses with
+    ``reviewed_browser_policy_supersedes_profile`` — so any phase that drives the
+    browser for a catalog app must ask HERE rather than at
+    ``ProviderProfile.allowed_hosts()``, which would raise for exactly that app.
+    Off-catalog runs have no recipe policy, so the committed profile's own
+    single-domain authority applies unchanged, and both paths fail closed: an
+    inactive reviewed policy is still a refusal, never a fallback to research.
+    """
+
+    policy = get_browser_policy(profile.app_slug)
+    if policy is None:
+        return profile.allowed_hosts()
+    if not policy.active:
+        raise BrowserPolicyInactiveError(profile.app_slug, "browser_policy_inactive_for_app")
+    return BrowserAllowedHosts(
+        app_slug=profile.app_slug,
+        exact_hosts=policy.exact_hosts,
+        vendor_wildcard_domains=(),
+    )
+
+
 # The reason code a swallowed replay reports. Named here so the ``False`` return
 # of ``commit_phase`` and the code recorded for it cannot drift apart.
 PHASE_REPLAY_NOOP: Final[OnboardingReasonCode] = "phase_replay_noop"
@@ -219,6 +252,17 @@ PHASE_REPLAY_NOOP: Final[OnboardingReasonCode] = "phase_replay_noop"
 # A profile digest is a SHA-256 hex content address, the same width the profile
 # module enforces on its own digests.
 PROFILE_DIGEST_LENGTH: Final = SOURCE_DIGEST_LENGTH
+
+# The terminal phases a run can reach BEFORE any profile exists, and therefore the
+# only boundaries that may be recorded under the empty digest. ``research`` fails
+# to exactly these two (``phase.py``'s legal table: research -> vault_check |
+# blocked | cancelled), and ``vault_check`` refuses with no profile in hand. Every
+# other phase implies a committed profile, so a missing digest there stays a loud
+# wiring defect rather than an unattributable boundary.
+#
+# ``completed`` is deliberately absent: a run that produced a credential built a
+# profile on the way to it.
+_PRE_PROFILE_TERMINAL_PHASES: frozenset[OnboardingPhase] = frozenset({"blocked", "cancelled"})
 
 # The bound ``api.models`` puts on a correlation identifier, applied here so a
 # value that cannot be projected onto the API is refused at the write boundary
@@ -354,16 +398,17 @@ class EffectReservationRecord:
 
 @dataclass(frozen=True, slots=True)
 class ReservedPhaseCommit:
-    """The result of committing a phase and reserving that phase's effect at once.
+    """The result of committing a phase and mirroring its standing effects at once.
 
-    ``committed`` is ``False`` for a replayed boundary. In that case nothing was
-    written — no history row and no new reservation — and ``plan`` reports the
-    disposition the durable ledger already records for the key, so a replaying
-    worker learns what to do without reserving anything.
+    ``committed`` is ``False`` for a replayed boundary; nothing was written then —
+    no history row and no reservation — and ``plan`` is ``None``. For a new
+    boundary ``plan`` reports the first reservation's standing disposition, or
+    ``None`` when the boundary carried no reservations, so a caller that needs
+    one key's standing learns it without a second read.
     """
 
     committed: bool
-    plan: EffectPlan
+    plan: EffectPlan | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,6 +517,43 @@ class PhaseHistoryStore(Protocol):
     def validation_attempts(self, *, run_id: str) -> int:
         """The run's consumed credential-validation attempts, advancing nothing."""
 
+    def commit_phase_with_reservation(
+        self,
+        *,
+        run_id: str,
+        from_phase: OnboardingPhase | None,
+        to_phase: OnboardingPhase,
+        reason_code: OnboardingReasonCode,
+        profile_digest: str,
+        attempt: int,
+        correlation_id: str,
+        reservations: tuple[tuple[OnboardingEffect, str, EffectPlan], ...] = (),
+    ) -> ReservedPhaseCommit:
+        """Commit a boundary and mirror its standing effects as one unit.
+
+        POST: either the history row and every reservation row named are all
+              present, or none of them is; the returned commit reports the
+              standing disposition for the first key (Requirement 13.13).
+        """
+
+    def effect_reservation(
+        self, *, run_id: str, operation_key: str
+    ) -> EffectReservationRecord | None:
+        """The standing reservation for one operation key, or ``None``."""
+
+    def reservations(self, *, run_id: str) -> tuple[EffectReservationRecord, ...]:
+        """Every standing reservation this run owns, oldest key first."""
+
+    def complete_effect_reservation(
+        self, *, run_id: str, operation_key: str, receipt: Mapping[str, str]
+    ) -> EffectReservationRecord:
+        """Record that the reserved effect happened, with its non-secret receipt."""
+
+    def mark_effect_reservation_outcome_unknown(
+        self, *, run_id: str, operation_key: str
+    ) -> EffectReservationRecord:
+        """Mark a reserved effect whose reconciliation stayed ambiguous."""
+
 
 class SQLitePhaseHistoryStore:
     """Phase history in the run ledger, with replay refused by a constraint."""
@@ -503,7 +585,7 @@ class SQLitePhaseHistoryStore:
 
         run = _identifier(run_id, field="run id")
         code = _reason_code(reason_code)
-        digest = _profile_digest(profile_digest)
+        digest = _committed_profile_digest(profile_digest, to_phase=to_phase)
         correlation = _identifier(
             correlation_id, field="correlation id", limit=MAX_CORRELATION_ID_LENGTH
         )
@@ -608,44 +690,45 @@ class SQLitePhaseHistoryStore:
         profile_digest: str,
         attempt: int,
         correlation_id: str,
-        effect: OnboardingEffect,
-        operation_key: str,
-        generation: int = 0,
+        reservations: tuple[tuple[OnboardingEffect, str, EffectPlan], ...] = (),
     ) -> ReservedPhaseCommit:
-        """Commit one phase boundary and reserve that phase's effect as one unit.
+        """Commit one phase boundary and mirror its standing effects as one unit.
 
-        PRE:  the transition is legal and ``operation_key`` was derived by
+        PRE:  the transition is legal, and every operation key was derived by
               :mod:`ops.onboarding.effects` from durable facts only.
-        POST: either the history row, the run-ledger reservation, and the
-              onboarding reservation row are all present, or none of them is. A
-              replayed boundary writes nothing and reports the standing
-              disposition for the key.
+        POST: either the history row and every reservation row named are all
+              present, or none of them is. A replayed boundary writes nothing and
+              reports no standing (``plan`` is ``None``).
 
         Why one transaction rather than two calls (Requirement 13.13): with a
         separate commit and reservation, a worker that lost its lease between them
         leaves a committed phase whose effect is unreserved, and the worker that
         claims next reserves the key and submits while the first is still in
         flight. Inside one ``BEGIN IMMEDIATE`` there is no such window — the
-        second claimant either sees both or neither, and the ledger's
-        ``UNIQUE (run_id, operation_key)`` then tells it the effect is taken.
+        second claimant either sees both or neither.
 
-        The phase is committed *before* the reservation within that unit of work,
+        The phase is committed *before* the reservations within that unit of work,
         which is the ordering Requirement 12.4 asks for: a crash can leave a phase
-        with no reservation (safe, the next worker reserves it) but never a
+        with no reservation (safe, the next boundary mirrors it) but never a
         reservation with no phase (unsafe, the effect would have no owner).
+
+        The reservations are a mirror, not a claim: the caller reads the
+        authoritative ledger (``external_effects``) first and passes a plan for a
+        key only when the authority already holds a row, so this verb never opens
+        a key it is only looking at. An empty ``reservations`` commits the
+        boundary alone, exactly like :meth:`commit_phase`.
         """
 
         run = _identifier(run_id, field="run id")
         code = _reason_code(reason_code)
-        digest = _profile_digest(profile_digest)
+        # The same pre-profile exemption ``commit_phase`` applies: a boundary into
+        # ``blocked`` or ``cancelled`` may be recorded under the empty digest
+        # because no profile was ever built (``_committed_profile_digest``).
+        digest = _committed_profile_digest(profile_digest, to_phase=to_phase)
         correlation = _identifier(
             correlation_id, field="correlation id", limit=MAX_CORRELATION_ID_LENGTH
         )
         attempt_number = _attempt(attempt)
-        action = _effect(effect)
-        key = _identifier(operation_key, field="operation key")
-        if generation < 0:
-            raise ValueError("effect generation must be zero or greater")
         validate_phase_transition(from_phase, to_phase, code)
 
         with self._write() as connection:
@@ -660,45 +743,26 @@ class SQLitePhaseHistoryStore:
                 correlation_id=correlation,
             )
             if not committed:
-                # ``_commit_phase`` rolled the unit of work back, so the reads
-                # below observe only what was already durable.
-                return ReservedPhaseCommit(
-                    committed=False,
-                    plan=self._standing_plan(connection, run_id=run, key=key, action=action),
-                )
+                # ``_commit_phase`` rolled the unit of work back, so a replay
+                # wrote neither the history row nor any reservation row.
+                return ReservedPhaseCommit(committed=False, plan=None)
 
-            intent, created = self._ledger.reserve_side_effect_in_transaction(
-                connection, run_id=run, operation_key=key, provider=EFFECT_PROVIDER
-            )
-            # A fresh insert means no prior attempt existed, which is the only
-            # state besides a provable failure that authorizes execution.
-            row_status = None if created else _row_status(intent["status"])
-            plan = plan_for_row_status(
-                operation_key=key,
-                action=action,
-                row_status=row_status,
-                receipt=self._stored_receipt(connection, run_id=run, key=key)
-                if row_status == "completed"
-                else None,
-            )
-            if row_status == "failed":
-                # Re-open the row so the retry this plan authorizes is itself
-                # reserved, mirroring how ops.core.effect_ledger reserves over a
-                # failure rather than leaving the key permanently failed.
-                self._ledger.update_side_effect_in_transaction(
-                    connection, run_id=run, operation_key=key, status="pending"
+            standing: EffectPlan | None = None
+            for effect, operation_key, plan in reservations:
+                self._ledger.record_effect_reservation_in_transaction(
+                    connection,
+                    run_id=run,
+                    operation_key=_identifier(operation_key, field="operation key"),
+                    effect=_effect(effect),
+                    generation=0,
+                    phase=to_phase,
+                    disposition=plan.disposition,
+                    reason_code=plan.reason_code,
+                    receipt=plan.receipt,
                 )
-            self._ledger.record_effect_reservation_in_transaction(
-                connection,
-                run_id=run,
-                operation_key=key,
-                effect=action,
-                generation=generation,
-                phase=to_phase,
-                disposition=plan.disposition,
-                reason_code=plan.reason_code,
-            )
-            return ReservedPhaseCommit(committed=True, plan=plan)
+                if standing is None:
+                    standing = plan
+            return ReservedPhaseCommit(committed=True, plan=standing)
 
     def effect_reservation(
         self, *, run_id: str, operation_key: str
@@ -763,9 +827,6 @@ class SQLitePhaseHistoryStore:
         key = _identifier(operation_key, field="operation key")
         with self._write() as connection:
             action = self._reserved_effect(connection, run_id=run, key=key)
-            self._ledger.update_side_effect_in_transaction(
-                connection, run_id=run, operation_key=key, status="completed"
-            )
             plan = plan_for_row_status(
                 operation_key=key, action=action, row_status="completed", receipt=receipt
             )
@@ -788,11 +849,10 @@ class SQLitePhaseHistoryStore:
     ) -> EffectReservationRecord:
         """Mark a reserved effect whose reconciliation stayed ambiguous.
 
-        POST: the submission count for the key is unchanged, and the standing
-              disposition becomes ``pause_outcome_unknown`` — a disposition that
-              authorizes nothing. No path in this module turns it back into
-              ``execute``; only a read-only provider probe that proves the outcome
-              can move the key on, through
+        POST: the standing disposition becomes ``pause_outcome_unknown`` — a
+              disposition that authorizes nothing. No path in this module turns it
+              back into ``execute``; only a read-only provider probe that proves
+              the outcome can move the key on, through
               :meth:`complete_effect_reservation` (Requirements 13.9, 13.10).
         """
 
@@ -800,9 +860,6 @@ class SQLitePhaseHistoryStore:
         key = _identifier(operation_key, field="operation key")
         with self._write() as connection:
             action = self._reserved_effect(connection, run_id=run, key=key)
-            self._ledger.update_side_effect_in_transaction(
-                connection, run_id=run, operation_key=key, status="outcome_unknown"
-            )
             return _reservation_record(
                 self._ledger.record_effect_reservation_in_transaction(
                     connection,
@@ -1390,6 +1447,27 @@ def _profile_digest(value: str) -> str:
     return value
 
 
+def _committed_profile_digest(value: str, *, to_phase: OnboardingPhase) -> str:
+    """The digest one phase boundary may be RECORDED under.
+
+    Empty is admitted only for a boundary into a phase reachable before a profile
+    exists (``_PRE_PROFILE_TERMINAL_PHASES``). That is already the convention on
+    the read side — ``AutonomyOutcome.__post_init__`` admits the empty digest "for
+    a run that never got as far as building a profile", ``RecoveryPlan`` does the
+    same for ``restart_research``, ``drive_run`` itself constructs the outcome with
+    ``profile.profile_digest if profile else ""``, and the history column carries
+    no length constraint. This aligns the write boundary with what the rest of the
+    module already believes instead of widening what a digest may be.
+
+    Anything non-empty, and every other target phase, keeps the strict
+    content-address check.
+    """
+
+    if not value and to_phase in _PRE_PROFILE_TERMINAL_PHASES:
+        return value
+    return _profile_digest(value)
+
+
 def _attempt(value: int) -> int:
     if value < 0:
         raise ValueError("attempt must be zero or greater")
@@ -1892,16 +1970,39 @@ class LoginReferenceBinder(Protocol):
 
 
 class RunPlanner(Protocol):
-    """Produce a pre-flight plan for one reviewed recipe."""
+    """Produce a pre-flight plan from exactly one immutable route authority."""
 
-    def plan_for(self, *, recipe: AppRecipe, revision: int) -> PlanOutcome | PlanRefusal:
-        """Return a plan outcome or a typed refusal."""
+    def plan_for(
+        self,
+        *,
+        revision: int,
+        recipe: AppRecipe | None = None,
+        profile: ProviderProfile | None = None,
+        evidence: str = "",
+        run_id: str | None = None,
+    ) -> PlanOutcome | PlanRefusal:
+        """Return a plan outcome or a typed refusal.
+
+        ``run_id`` is telemetry attribution only — it lets an implementation record
+        which model ordered the route. A planner that ignores it plans identically.
+
+        ``evidence`` is research prose, not authority: it reaches the planning
+        prompt through the DLP boundary and can only influence the *order* of
+        surfaces the recipe or committed profile already declares. A planner that
+        receives none plans exactly as it did before.
+        """
 
 
 class RunPlanValidator(Protocol):
-    """Validate a plan against its reviewed recipe."""
+    """Validate a plan against exactly one immutable route authority."""
 
-    def __call__(self, plan: RunPlan, *, recipe: AppRecipe) -> PlanRefusal | None: ...
+    def __call__(
+        self,
+        plan: RunPlan,
+        *,
+        recipe: AppRecipe | None = None,
+        profile: ProviderProfile | None = None,
+    ) -> PlanRefusal | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -1970,6 +2071,21 @@ class OnboardingDeps:
     # and ambiguous-outcome counters on the autonomy outcome; nothing on this port
     # can reserve or complete an effect.
     effects: RecoveryEffectReader | None = None
+    # The deployment identity the run's developer-application operation key
+    # derives from (``developer_app_name(owner_id, run_id)``). ``None`` leaves the
+    # boundary reservation for that phase unrecorded in the projection, which
+    # fails closed: the handler still dedupes on the authoritative ledger, only
+    # the per-run projection stays empty.
+    developer_app_owner_id: str | None = None
+    # The credential kind the run's credential operation keys derive from, matched
+    # to the reviewed default the credential handler binds at the composition
+    # root, so the boundary reservation and the handler's plan name one key.
+    credential_kind: CredentialKind = DEFAULT_CREDENTIAL_KIND
+    # The authoritative effect ledger, read-only. Without it the per-run
+    # reservation projection is never mirrored, which fails closed exactly like an
+    # unwired recovery reader: boundaries still commit, only the projection stays
+    # stale.
+    effect_authority: EffectAuthorityReader | None = None
     budget: LoopBudget = field(default_factory=LoopBudget)
     # The per-step bound on one browser operation, so a hung step cannot freeze a
     # phase (reliability R4.7).
@@ -2248,6 +2364,7 @@ def plan_admission(
     profile: ProviderProfile | None,
     deps: RunPlanningPorts,
     recipe: AppRecipe | None = None,
+    evidence: str = "",
 ) -> PlanRefusal | None:
     """Produce, reuse, and validate a plan before the run's first session.
 
@@ -2263,27 +2380,47 @@ def plan_admission(
     if plans is None:
         return None
 
+    selected_profile = profile if recipe is None else None
     selected_recipe = recipe
     if selected_recipe is None and profile is not None:
+        # A profile for an app the reviewed catalog names is validated against
+        # the RECIPE, never the profile: ``build_browser_allowed_hosts`` refuses
+        # to derive a profile browser authority for a catalog app
+        # (``reviewed_browser_policy_supersedes_profile``), so the profile path
+        # would refuse every planned surface with ``navigation_denied``. The
+        # catalog lookup is the caller-visible fallback: the recipe is
+        # ``None`` on the mounted path even when the profile's app has one.
         selected_recipe = _catalog_recipe(profile.app_slug)
-    if selected_recipe is None:
+        if selected_recipe is not None:
+            selected_profile = None
+    if selected_profile is None and selected_recipe is None:
         return _catalog_plan_refusal()
+
+    def validate(candidate: RunPlan) -> PlanRefusal | None:
+        if selected_profile is not None:
+            return deps.plan_validator(candidate, profile=selected_profile)
+        assert selected_recipe is not None
+        return deps.plan_validator(candidate, recipe=selected_recipe)
 
     existing = plans.read_active_plan(run_id=run_id)
     if existing is not None:
-        return deps.plan_validator(existing, recipe=selected_recipe)
+        return validate(existing)
 
     planner = deps.planner
     if planner is None:
-        # The storage port is the adherence authority.  If its producing port is
+        # The storage port is the adherence authority. If its producing port is
         # absent, leave the run unplanned rather than inventing a route here.
         return None
 
-    outcome = planner.plan_for(recipe=selected_recipe, revision=1)
+    outcome = (
+        planner.plan_for(profile=selected_profile, revision=1, evidence=evidence, run_id=run_id)
+        if selected_profile is not None
+        else planner.plan_for(recipe=selected_recipe, revision=1, evidence=evidence, run_id=run_id)
+    )
     if isinstance(outcome, PlanRefusal):
         return outcome
 
-    refusal = deps.plan_validator(outcome.plan, recipe=selected_recipe)
+    refusal = validate(outcome.plan)
     if refusal is not None:
         return refusal
     recorded = plans.record_initial_plan(
@@ -2291,9 +2428,9 @@ def plan_admission(
         plan=outcome.plan,
         reason_code=outcome.reason_code,
     )
-    # A concurrent admission may have won the initial-plan race.  Validate the
+    # A concurrent admission may have won the initial-plan race. Validate the
     # durable winner rather than assuming it is the plan this caller proposed.
-    return deps.plan_validator(recorded, recipe=selected_recipe)
+    return validate(recorded)
 
 
 def phase_correlation_id(*, run_id: str, phase: OnboardingPhase, attempt: int) -> str:
@@ -2307,6 +2444,97 @@ def phase_correlation_id(*, run_id: str, phase: OnboardingPhase, attempt: int) -
 
     seed = f"{run_id}|{phase}|{_attempt(attempt)}".encode()
     return sha256(seed).hexdigest()[:32]
+
+
+# The phases whose completed effect the boundary mirrors into the reservation
+# projection, mapped to the effect that names them. The credential lifecycle's
+# later phases (``vault_storage``, ``credential_validation``) are the same mint
+# standing under later names: they are committed by the credential handler
+# through ``STORAGE_BOUNDARIES``, and the boundary the loop commits out of them
+# is where the mint's completed standing becomes mirrorable. ``signup`` and the
+# login-route phases never cross this loop's boundary with a standing effect the
+# projection records, so no boundary here fabricates a row for them.
+_EFFECT_PHASES: Final[Mapping[OnboardingPhase, OnboardingEffect]] = {
+    "developer_app": "create_dev_app",
+    "credential_generation": "generate_credential",
+    "vault_storage": "generate_credential",
+    "credential_validation": "generate_credential",
+}
+
+
+def _boundary_reservations(
+    *,
+    run_id: str,
+    from_phase: OnboardingPhase,
+    to_phase: OnboardingPhase,
+    profile: ProviderProfile | None,
+    deps: OnboardingDeps,
+) -> tuple[tuple[OnboardingEffect, str, EffectPlan], ...]:
+    """The standing reservations the boundary mirrors, or an empty tuple.
+
+    Mirrors the effect of the phase the run is LEAVING, not the phase it is
+    entering: the leaving phase was just driven, so its effect already stands in
+    the authoritative ledger, and the boundary out of it is where that standing
+    becomes mirrorable. An absent authoritative row mirrors nothing: the
+    reservation projection is a view of ``external_effects``, and opening a row
+    this path only looks at would fabricate a reservation no handler ever made.
+    The mirror is a read, so it is safe to call on a boundary that turns out to
+    be a replay — the commit rolls back and the mirror writes nothing with it.
+
+    POST: at most one plan per boundary — the leaving phase's key, carrying the
+          disposition the authority's row classifies to.
+    """
+
+    effect = _EFFECT_PHASES.get(from_phase)
+    if effect is None or deps.effect_authority is None or profile is None:
+        return ()
+    if effect == "create_dev_app":
+        owner_id = deps.developer_app_owner_id
+        if owner_id is None:
+            # The key folds the owner identity in. Without it the phase's handler
+            # still dedupes on the authoritative ledger itself; only the per-run
+            # projection stays empty for this run.
+            return ()
+        operation_key = create_dev_app_key(
+            run_id=run_id,
+            profile=profile,
+            requested_name=developer_app_name(owner_id=owner_id, run_id=run_id),
+        )
+    else:
+        # The credential key folds the developer application id in, which only
+        # exists once the create-app effect completed and was mirrored. Until
+        # then the handler derives its own key when it runs, and there is
+        # nothing to mirror.
+        owner_id = deps.developer_app_owner_id
+        if owner_id is None:
+            return ()
+        create_key = create_dev_app_key(
+            run_id=run_id,
+            profile=profile,
+            requested_name=developer_app_name(owner_id=owner_id, run_id=run_id),
+        )
+        app_record = deps.phases.effect_reservation(run_id=run_id, operation_key=create_key)
+        if app_record is None or app_record.receipt is None:
+            return ()
+        operation_key = generate_credential_key(
+            run_id=run_id,
+            developer_app_id=app_record.receipt["developer_app_id"],
+            kind=deps.credential_kind,
+            generation=0,
+        )
+    standing = deps.effect_authority.read_standing(action=effect, operation_key=operation_key)
+    if standing is None:
+        return ()
+    row_status, receipt = standing
+    return (
+        (
+            effect,
+            operation_key,
+            plan_for_row_status(
+                operation_key=operation_key, action=effect, row_status=row_status, receipt=receipt
+            ),
+        ),
+    )
 
 
 async def drive_run(*, run_id: str, worker_id: str, deps: OnboardingDeps) -> AutonomyOutcome | None:
@@ -2426,7 +2654,12 @@ async def drive_run(*, run_id: str, worker_id: str, deps: OnboardingDeps) -> Aut
             if phase in SESSION_BEARING_PHASES and not planning_settled:
                 # I5: the plan exists before the first session does, because this
                 # runs ahead of ``_drive_phase``, which is what creates one.
-                refusal = plan_admission(run_id=run_id, profile=profile, deps=deps)
+                refusal = plan_admission(
+                    run_id=run_id,
+                    profile=profile,
+                    deps=deps,
+                    evidence=(profile_research_evidence(profile) if profile is not None else ""),
+                )
                 planning_settled = True
 
             step = (
@@ -2446,11 +2679,36 @@ async def drive_run(*, run_id: str, worker_id: str, deps: OnboardingDeps) -> Aut
                 break
 
             target = step.next_phase or "paused"
+            # A handler may have committed boundaries of its own inside the
+            # drive: the credential lifecycle commits ``vault_storage`` then
+            # ``credential_validation`` through ``STORAGE_BOUNDARIES`` before
+            # returning the step this loop is about to commit. The boundary
+            # below therefore leaves the run's CURRENT durable phase, not the
+            # phase it entered the iteration with — otherwise a legal step
+            # would be rejected as an illegal transition from a stale anchor
+            # (and the mirror below would key off the wrong leaving phase).
+            current = deps.phases.current_phase(run_id=run_id)
+            if current is not None:
+                phase = current[0]
             digest = step.profile_digest or (profile.profile_digest if profile else None)
             if digest is None:
-                raise PhaseNotDrivable(phase, "a phase transition requires a profile digest")
-            # Q2: the one place a boundary becomes durable.
-            if deps.phases.commit_phase(
+                # A pre-profile failure carries no digest by construction: research
+                # can fail before ``build_profile`` returns one, and ``vault_check``
+                # refuses with none in hand. Both land on a terminal phase in
+                # ``_PRE_PROFILE_TERMINAL_PHASES``, so admitting the empty digest
+                # for exactly those targets keeps every OTHER missing digest a loud
+                # wiring defect — while letting the run reach a committed ``blocked``
+                # boundary instead of dying here. Without that boundary
+                # ``_onboarding_state`` returns nothing and the console loses its
+                # reset and retry controls, which is what made the run unrecoverable.
+                if target not in _PRE_PROFILE_TERMINAL_PHASES:
+                    raise PhaseNotDrivable(phase, "a phase transition requires a profile digest")
+                digest = ""
+            # Q2: the one place a boundary becomes durable. Effect-bearing
+            # boundaries carry the standing reservations the authoritative
+            # ledger already holds, committed atomically with the boundary so a
+            # claim can never interleave between the two (Requirement 13.13).
+            commit = deps.phases.commit_phase_with_reservation(
                 run_id=run_id,
                 from_phase=phase,
                 to_phase=target,
@@ -2458,7 +2716,11 @@ async def drive_run(*, run_id: str, worker_id: str, deps: OnboardingDeps) -> Aut
                 profile_digest=digest,
                 attempt=attempt,
                 correlation_id=phase_correlation_id(run_id=run_id, phase=phase, attempt=attempt),
-            ):
+                reservations=_boundary_reservations(
+                    run_id=run_id, from_phase=phase, to_phase=target, profile=profile, deps=deps
+                ),
+            )
+            if commit.committed:
                 if target == "captcha_paused":
                     # Requirement 11.3: one prompt per committed captcha pause.
                     tally.captcha_prompts += 1
@@ -2485,9 +2747,15 @@ async def drive_run(*, run_id: str, worker_id: str, deps: OnboardingDeps) -> Aut
                 reroute_pending = True
             phase = target
             phase_is_durable = True
-            if profile is None or profile.profile_digest != digest:
+            if digest and (profile is None or profile.profile_digest != digest):
                 # The research phase is where the digest first exists; from then
                 # on I2 holds because no later step supplies a different one.
+                #
+                # The empty digest is skipped rather than looked up: it means no
+                # profile was ever committed for this run, so there is nothing to
+                # fetch, and the store's own content-address check would refuse the
+                # empty key. ``profile`` stays ``None``, which is what the outcome
+                # below already expects for a run that got no further than research.
                 profile = deps.profiles.get(profile_digest=digest) or profile
 
     ended = deps.clock()
@@ -2888,7 +3156,7 @@ def verification_query(
         purpose=VERIFICATION_PURPOSE,
         not_before_ms=context.challenge_issued_at_ms,
         max_age_seconds=budget.freshness_seconds,
-        allowed_link_hosts=profile.allowed_hosts().patterns(),
+        allowed_link_hosts=route_browser_allowed_hosts(profile).patterns(),
     )
 
 
@@ -3556,7 +3824,7 @@ async def drive_developer_app(
             phase=DEVELOPER_APP_PHASE,
             goal=goal,
             session=session,
-            allowed=profile.allowed_hosts(),
+            allowed=route_browser_allowed_hosts(profile),
             budget=deps.budget,
             decider=deps.decider,
             telemetry=deps.telemetry,
@@ -4717,6 +4985,49 @@ class RecoveryEffectReader(Protocol):
         """Every standing reservation for the run, in reservation order."""
 
 
+class EffectAuthorityReader(Protocol):
+    """Read-only view of the authoritative effect ledger (``external_effects``).
+
+    One read verb, deliberately: the driver mirrors the authoritative standing
+    state into the run's reservation projection at every boundary, and nothing on
+    this port can reserve, complete, or reopen a key (the same read-only
+    discipline :class:`RecoveryEffectReader` holds, applied to the drive path).
+    """
+
+    def read_standing(
+        self, *, action: OnboardingEffect, operation_key: str
+    ) -> tuple[EffectRowStatus, dict[str, str] | None] | None:
+        """The authoritative row status and receipt for one onboarding key.
+
+        POST: ``(status, receipt)`` when the authoritative ledger holds a row for
+              the key (receipt present only for ``completed``), else ``None``.
+              Reads only: an absent key stays absent.
+        """
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerEffectAuthority:
+    """``EffectAuthorityReader`` over the composed ``SQLiteEffectStore``.
+
+    Binds the onboarding provider namespace, so the caller passes an operation key
+    and an effect and never touches the ledger's own ``(provider, action)`` pair.
+    """
+
+    ledger: SQLiteEffectStore
+
+    def read_standing(
+        self, *, action: OnboardingEffect, operation_key: str
+    ) -> tuple[EffectRowStatus, dict[str, str] | None] | None:
+        return cast(
+            "tuple[EffectRowStatus, dict[str, str] | None] | None",
+            self.ledger.read_standing(
+                provider=EFFECT_PROVIDER,
+                action=cast("str", action),
+                idempotency_key=operation_key,
+            ),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class RecoveryPlan:
     """Where a crashed run stands, and what the next worker should do about it.
@@ -4934,7 +5245,7 @@ async def recover_run(
                 effects=planned,
             )
         session_id = await sessions.create_session(
-            run_id=run_id, app_slug=profile.app_slug, allowed=profile.allowed_hosts()
+            run_id=run_id, app_slug=profile.app_slug, allowed=route_browser_allowed_hosts(profile)
         )
         if session_id is None:
             # Nothing to drive the phase on. Reported as the same recoverable state
@@ -5078,7 +5389,7 @@ async def _drive_phase(
             phase=phase,
             goal=goal,
             session=session,
-            allowed=profile.allowed_hosts(),
+            allowed=route_browser_allowed_hosts(profile),
             budget=deps.budget,
             decider=deps.decider,
             telemetry=deps.telemetry,

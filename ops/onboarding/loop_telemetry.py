@@ -47,6 +47,7 @@ from ops.onboarding.phase import (
 from ops.providers.profile import SOURCE_DIGEST_LENGTH
 
 if TYPE_CHECKING:  # pragma: no cover - imported for typing only
+    from ops.core.inference import DecisionAttemptSink
     from ops.onboarding.action_loop import LoopStage, LoopTelemetry
 
 LOGGER = logging.getLogger("composio_ops.onboarding_loop_telemetry")
@@ -225,6 +226,53 @@ class DurableLoopTelemetry:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class PlanAttemptSink:
+    """Where the planner's inference attempts land, as ``purpose="plan"``.
+
+    Separate from :class:`DurableLoopTelemetry` for two reasons, both structural.
+
+    The planner has no profile digest and no correlation id.
+        :meth:`~ops.core.storage.OperationsStorage.record_decision_attempt` takes
+        neither — the decision-attempts table has no such columns — while
+        ``DurableLoopTelemetry`` requires a sha256 digest at construction because
+        the *denial* and *progress* writes it also performs do carry one. Reusing it
+        here would demand a digest this caller has no reason to hold.
+
+    The planner runs before the run has a committed phase.
+        ``purpose="plan"`` exists in the durable vocabulary but had no writer, so
+        every recorded attempt read as ``action`` regardless of which model call
+        produced it. The first plan happens during ``research``, and the
+        ``research -> vault_check`` boundary is committed only *after* that handler
+        returns, so at planning time the phase history is usually empty. The caller
+        therefore resolves the phase itself (last committed ``to_phase``, else
+        ``INITIAL_PHASE``) and passes it here; a sink that read the history would
+        silently drop every plan attempt on the first pass.
+    """
+
+    store: DenialFactStore
+    run_id: str
+    phase: OnboardingPhase
+
+    def __post_init__(self) -> None:
+        if not self.run_id or not self.run_id.strip():
+            raise ValueError("plan attempt sink requires a run id")
+        if self.phase not in ONBOARDING_PHASES:
+            raise ValueError("plan attempt sink requires an onboarding phase")
+
+    def record_attempt(self, *, provider: str, outcome: str, latency_ms: int) -> None:
+        """Record one inference attempt of the planner (Requirement 4.3)."""
+
+        self.store.record_decision_attempt(
+            run_id=self.run_id,
+            phase=self.phase,
+            purpose="plan",
+            provider=provider,
+            outcome=outcome,
+            latency_ms=latency_ms,
+        )
+
+
 def _port_conformance(telemetry: DurableLoopTelemetry) -> LoopTelemetry:
     """Typecheck-only proof that this implementation satisfies the loop's port.
 
@@ -235,4 +283,15 @@ def _port_conformance(telemetry: DurableLoopTelemetry) -> LoopTelemetry:
     return telemetry
 
 
-__all__ = ["DenialFactStore", "DurableLoopTelemetry"]
+def _plan_sink_conformance(sink: PlanAttemptSink) -> DecisionAttemptSink:
+    """Typecheck-only proof that the plan sink satisfies the inference port.
+
+    Same purpose as :func:`_port_conformance`: the chain accepts this by protocol,
+    so a re-signatured ``record_attempt`` would otherwise fail at runtime inside a
+    provider call rather than here.
+    """
+
+    return sink
+
+
+__all__ = ["DenialFactStore", "DurableLoopTelemetry", "PlanAttemptSink"]

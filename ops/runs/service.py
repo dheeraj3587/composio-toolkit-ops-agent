@@ -21,6 +21,7 @@ from typing import Any, Literal, Protocol, cast
 import httpx
 from pydantic import SecretStr
 
+from ops.browser.host_policy import onboarding_hint_domain
 from ops.browser.worker import BrowserWorker
 from ops.core.config import Settings
 from ops.core.effect_ledger import SQLiteEffectStore
@@ -430,7 +431,13 @@ class RunService:
             plans = SQLiteRunPlanStore(self.storage.db_path)
             existing = _RunPlanningBinding(
                 plans=plans,
-                planner=SettingsRunPlanner(settings or Settings.from_env()),
+                planner=SettingsRunPlanner(
+                    settings or Settings.from_env(),
+                    # Telemetry only: records each re-planning attempt as
+                    # ``purpose="plan"``. The route itself is unchanged.
+                    store=self.storage,
+                    phases=SQLitePhaseHistoryStore(self.storage.db_path),
+                ),
                 plan_validator=validate_plan,
                 adherence=RouteAdherenceMonitor(plans=plans, audit=self.storage),
             )
@@ -502,7 +509,7 @@ class RunService:
         """
 
         planning = self._planning
-        planned = planning.planner.plan_for(recipe=recipe, revision=2)
+        planned = planning.planner.plan_for(recipe=recipe, revision=2, run_id=run_id)
         outcome = (
             planned
             if isinstance(planned, PlanOutcome)
@@ -1517,7 +1524,20 @@ class RunService:
         flag is no longer consulted as a runtime control.
         """
 
-        if self._canonical.recipe_for_request(request) is not None:
+        # An off-catalog onboarding request has no reviewed recipe by construction:
+        # ``ProviderProfile`` is its route authority, seeded from the operator's
+        # hint URL. Without this branch it never reaches the canonical runtime at
+        # all — ``execute_when_configured`` would raise ``reviewed_recipe_required``
+        # below and ``plan_only`` would silently downgrade it to a research-only
+        # run, so neither mode can onboard an app outside the 50-slug catalog.
+        #
+        # The hint is gated here, before a run exists, because it becomes the run's
+        # entire host policy. An unusable hint is refused rather than falling back
+        # to the app name, which would widen the allow-list from a display string.
+        onboarding_request = request.onboarding and (
+            onboarding_hint_domain(request.provider_hint_url) is not None
+        )
+        if self._canonical.recipe_for_request(request) is not None or onboarding_request:
             return self._canonical.create_run(
                 request,
                 idempotency_key=idempotency_key,
@@ -1740,6 +1760,21 @@ class RunService:
 
     def get_progress_events(self, run_id: str, *, limit: int) -> list[dict[str, Any]]:
         return self._queries.get_progress_events(run_id, limit=limit)
+
+    def get_phase_boundaries(self, run_id: str, *, limit: int) -> list[dict[str, Any]]:
+        """The run's committed phase boundaries, oldest first."""
+
+        return self._queries.get_phase_boundaries(run_id, limit=limit)
+
+    def get_decision_attempts(self, run_id: str, *, limit: int) -> list[dict[str, Any]]:
+        """The run's inference attempts, newest first."""
+
+        return self._queries.get_decision_attempts(run_id, limit=limit)
+
+    def get_research_facts(self, run_id: str) -> list[dict[str, Any]]:
+        """What research refused to believe, grouped by claim."""
+
+        return self._queries.get_research_facts(run_id)
 
     def get_research(self, run_id: str) -> OperationalResearch | None:
         """Return the persisted sanitized research projection for a run."""

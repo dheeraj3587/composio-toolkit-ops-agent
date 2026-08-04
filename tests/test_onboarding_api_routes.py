@@ -360,18 +360,9 @@ def test_resume_route_continues_a_paused_run_through_the_phase_machine(
     assert [item["event_type"] for item in items] == ["onboarding_captcha_resolved"]
     assert [item["summary"] for item in items] == ["CAPTCHA resolved; run resumed."]
 
-    # The other continuation event type the allow-list carries. The phase table
-    # gives ``paused`` no re-entry, so no transition writes this one today; its
-    # projection is pinned from a synthesized durable row rather than from an
-    # invented boundary.
-    storage.append_audit_event(run_id=RUN_ID, event_type="onboarding_resumed", payload={})
-    projected = client.get(f"/api/runs/{RUN_ID}/timeline").json()["items"][-1]
-    assert projected["event_type"] == "onboarding_resumed"
-    assert projected["summary"] == "Run continued from its pause."
-
-    # A run parked by an operator pause reaches the same committer and is refused
-    # there, before anything is written: ``paused`` fans out to ``research`` and
-    # ``cancelled`` only, so the phase it stopped in is not re-enterable.
+    # The other continuation event type the allow-list carries, now written by a
+    # real transition: a run parked at ``paused`` re-enters the phase it stopped in,
+    # exactly as ``captcha_paused`` does.
     assert phases.commit_phase(
         run_id=RUN_ID,
         from_phase="signup",
@@ -382,13 +373,36 @@ def test_resume_route_continues_a_paused_run_through_the_phase_machine(
         correlation_id="operator-pause",
     )
     storage.update_run(RUN_ID, status="waiting_for_hitl")
+    continued = client.post(f"/api/runs/{RUN_ID}/resume")
+    assert continued.status_code == 200
+    # It re-entered the phase the boundary recorded, not a restart at research.
+    # The attempt advances, so the re-entry is a fresh attempt at that phase
+    # rather than a replay of the one that paused.
+    assert phases.current_phase(run_id=RUN_ID) == ("signup", 2)
+    projected = client.get(f"/api/runs/{RUN_ID}/timeline").json()["items"][-1]
+    assert projected["event_type"] == "onboarding_resumed"
+    assert projected["summary"] == "Run continued from its pause."
+
+    # Re-entry is still decided by the phase table, so a pause whose recorded phase
+    # the table refuses is still refused before anything is written. ``vault_storage``
+    # is not a legal target of ``paused``.
+    assert phases.commit_phase(
+        run_id=RUN_ID,
+        from_phase="vault_storage",
+        to_phase="paused",
+        reason_code="run_paused_by_operator",
+        profile_digest=digest,
+        attempt=3,
+        correlation_id="operator-pause-2",
+    )
+    storage.update_run(RUN_ID, status="waiting_for_hitl")
     refused = client.post(f"/api/runs/{RUN_ID}/resume")
     assert refused.status_code == 409
     assert refused.json()["reason_code"] == "phase_replay_noop"
-    assert phases.current_phase(run_id=RUN_ID) == ("paused", 1)
+    assert phases.current_phase(run_id=RUN_ID) == ("paused", 3)
 
     # Requirement 19.13: neither the continuation nor its timeline carried
     # credential material.
-    for response in (resumed, timeline, refused):
+    for response in (resumed, timeline, continued, refused):
         assert LOGIN_PASSWORD not in response.text
         assert "onboarding@example.invalid" not in response.text

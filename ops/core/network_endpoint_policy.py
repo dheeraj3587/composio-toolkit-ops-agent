@@ -59,8 +59,9 @@ class NetworkEndpointPolicy:
 
 
 # Reviewed exact endpoints. Credential validation is what the backend actively
-# calls today (HubSpot, Pipedrive); token endpoints are reviewed metadata for
-# the documented OAuth flows. Providers the backend does not call have no entry.
+# calls today (HubSpot, Pipedrive, Apify); token endpoints are reviewed metadata
+# for the documented OAuth flows. Providers the backend does not call have no
+# entry.
 _NETWORK_POLICIES: dict[str, NetworkEndpointPolicy] = {
     "hubspot": NetworkEndpointPolicy(
         app_slug="hubspot",
@@ -77,6 +78,10 @@ _NETWORK_POLICIES: dict[str, NetworkEndpointPolicy] = {
             NetworkEndpoint("https://api.pipedrive.com/v1/users/me", "credential_validation"),
             NetworkEndpoint("https://oauth.pipedrive.com/oauth/token", "oauth_token"),
         ),
+    ),
+    "apify": NetworkEndpointPolicy(
+        app_slug="apify",
+        endpoints=(NetworkEndpoint("https://api.apify.com/v2/users/me", "credential_validation"),),
     ),
 }
 

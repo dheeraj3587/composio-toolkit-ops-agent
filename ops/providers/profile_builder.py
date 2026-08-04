@@ -287,6 +287,12 @@ _FLOW_FIELDS: Final[Mapping[str, FlowKind]] = {
     "pat_flow": "pat",
 }
 
+# The adapter name an OPERATOR-declared field carries, as opposed to a discovery
+# adapter's name. It is deliberately visible in ``FieldEvidence.adapters`` so a
+# reader of a committed profile can tell a declaration from a corroborated excerpt
+# without consulting anything else.
+_OPERATOR_ADAPTER: Final = "operator"
+
 # What each flow mints, keyed by flow kind rather than by provider: research may
 # say *where* a credential comes from, never what kind of material a page will
 # hand over.
@@ -527,6 +533,7 @@ async def build_profile(
     provider_name: str,
     app_slug: str,
     hint_url: str | None = None,
+    credential_surface_url: str | None = None,
     adapters: Sequence[DiscoveryAdapter],
     fetcher: ProfileEvidenceFetcher,
     extractor: ProfileExtractor,
@@ -610,6 +617,11 @@ async def build_profile(
             log.add("field_uncorroborated", subject=field, detail="required_field_missing")
         return ResearchInconclusive("research_no_evidence", log.collected())
 
+    # Folded in AFTER the required-field check above, so a declaration can never
+    # substitute for the corroborated domain/signup/login evidence a profile needs.
+    chosen = _with_operator_credential_surface(
+        dict(chosen), credential_surface_url, domain=domain, log=log
+    )
     profile = _assemble(
         run_id=run_id,
         provider_name=provider_name,
@@ -939,6 +951,60 @@ def _best_per_field(evidence: Sequence[FieldEvidence]) -> dict[str, FieldEvidenc
     return best
 
 
+def _with_operator_credential_surface(
+    chosen: dict[str, FieldEvidence],
+    credential_surface_url: str | None,
+    *,
+    domain: str,
+    log: _FactLog,
+) -> dict[str, FieldEvidence]:
+    """Fold an operator-declared credential surface into the admitted evidence.
+
+    Both the ``developer_app_flow`` and ``api_key_flow`` slots are filled from the
+    one declaration, because ``developer_app_flows`` (``driver.py``) selects a PAIR
+    and returns ``None`` unless ``developer_app_flow.supported`` holds as well as
+    the credential flow's. Filling only the credential slot would leave
+    ``developer_app`` pausing ``flow_unsupported`` and change nothing.
+
+    For a provider like Resend that has no separate developer-application concept,
+    those two really are the same page: the credential surface is where the key is
+    created. The single-creation guarantee does not rest on the URLs differing — the
+    effect ledger reserves ``create_dev_app`` once per run — so pointing both at the
+    declared page cannot create two applications.
+
+    ``developer_portal_url`` is filled from the same declaration, and it is what
+    makes the ``authenticated`` phase reachable at all. That field feeds BOTH
+    ``_reviewed_urls("authenticated")`` (the phase's only element-independent
+    candidate source, so without it the phase generates nothing and burns its
+    no-progress budget) and ``expectations_for(...).console_urls`` (which is what
+    lets the post-action page classify as ``developer_console_ready`` and satisfy
+    ``authenticated_session``). Recognition alone is not enough: the loop checks
+    postconditions only AFTER an action, never against the first observation, so the
+    phase needs a candidate as well as a recognisable URL.
+
+    A researched claim for any slot WINS: an already-present key is left untouched,
+    so a declaration can only fill a gap, never override research.
+    """
+
+    if credential_surface_url is None:
+        return chosen
+    for field in ("developer_app_flow", "api_key_flow", "developer_portal_url"):
+        if field in chosen:
+            # Research already corroborated this slot; a declaration does not
+            # outrank it.
+            continue
+        evidence = _operator_declared_evidence(field, credential_surface_url, domain=domain)
+        if evidence is None:
+            log.add(
+                "claim_discarded",
+                subject=field,
+                detail="operator_url_outside_profile_domain",
+            )
+            continue
+        chosen[field] = evidence
+    return chosen
+
+
 def _assemble(
     *,
     run_id: str,
@@ -989,6 +1055,58 @@ def _assemble(
         confidence=_profile_confidence(chosen),
         adapters_engaged=tuple(adapters_engaged),
         built_at=_utc_now(),
+    )
+
+
+def _operator_declared_evidence(
+    field: ProfileField,
+    url: str,
+    *,
+    domain: str,
+) -> FieldEvidence | None:
+    """Evidence for a URL the OPERATOR declared, or ``None`` if it is not usable.
+
+    This is not research and does not pretend to be. A researched claim must occur
+    literally in a fetched excerpt (``_admitted_claims``), and a credential surface
+    cannot satisfy that: the page sits behind login, so an unauthenticated fetch
+    returns the login page and never mentions the credential path. Verified against
+    the live provider — ``https://resend.com/api-keys`` answers 200 with the same
+    383-character excerpt as the login page and no reference to ``/api-keys``.
+
+    So the declaration is recorded truthfully instead: ``adapters=("operator",)``
+    and ``corroborations=1``, which is what a reader of the profile's evidence sees.
+    A researched flow URL needs one citation too (flow fields are absent from
+    ``_REQUIRED_FIELDS``), so this does not lower any corroboration bar.
+
+    ``None`` is returned unless the URL resolves to the SAME registrable domain the
+    corroborated evidence already agreed on. The profile's own
+    ``_require_admitted_url`` would refuse anything else at construction; checking
+    here as well means an unusable declaration is dropped rather than failing a run
+    that research had already completed. An operator may name a page, never a host.
+    """
+
+    try:
+        validated = validate_https_url(url)
+    except ValueError:
+        return None
+    hostname = urlsplit(validated).hostname or ""
+    if resolve_registrable_domain(hostname) != domain:
+        return None
+    return FieldEvidence(
+        field=field,
+        value=validated,
+        # The declaration cites itself: there is no fetched document behind it, and
+        # inventing one would make an operator statement indistinguishable from a
+        # corroborated excerpt.
+        source_url=validated,
+        source_digest=hashlib.sha256(validated.encode("utf-8")).hexdigest(),
+        adapters=(_OPERATOR_ADAPTER,),
+        corroborations=1,
+        # Not a research confidence score. Stated as certain because the operator
+        # asserted it directly, which is a different KIND of claim rather than a
+        # better-evidenced one; ``adapters`` is what distinguishes them.
+        confidence=1.0,
+        extracted_at=_utc_now(),
     )
 
 

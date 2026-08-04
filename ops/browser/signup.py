@@ -21,9 +21,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 from urllib.parse import urljoin, urlsplit
 
+from ops.access.gate_policy import ProfileGateAuthority, resolve_gate
 from ops.browser.login import inspect_login, reviewed_login_surfaces, visible_login_challenge
 from ops.core.effect_ledger import EffectStore
 from ops.email.verification import canonical_address
+from ops.onboarding.admission import AdmissionDecision
 from ops.onboarding.driver import (
     DEFAULT_CAPTCHA_BUDGET,
     OnboardingDeps,
@@ -51,6 +53,11 @@ from ops.recipes.app_recipes import get_app_recipe, recipe_predicate
 if TYPE_CHECKING:
     from ops.browser.api_trace_catalog import CheckpointPredicate
     from ops.recipes.app_recipes import SignupPolicy
+
+# The gate whose autonomous resolution authorizes a signup submission. Named here
+# rather than imported from ops.onboarding.driver to keep this module free of a
+# dependency on the driver (which imports this one).
+_LEGAL_ACCEPTANCE_GATE: Final = "legal_acceptance"
 
 LOGGER = logging.getLogger("composio_ops.browser_signup")
 
@@ -1642,6 +1649,65 @@ def declared_signup_policy(app_slug: str) -> SignupPolicy | None:
     return None if browser is None else browser.signup
 
 
+class AdmissionDecisionReader(Protocol):
+    """The one verb the signup gate needs to read the run's own authorization.
+
+    Deliberately narrow: there is no write verb here, so the handler can consult an
+    admission decision and can never record one. Structurally satisfied by
+    ``ops.core.storage.OperationsStorage``.
+    """
+
+    def read_admission_decision(self, run_id: str) -> AdmissionDecision | None:
+        """The run's recorded admission decision, or ``None`` if it has none."""
+
+
+def signup_authorized_by_admission(
+    profile: ProviderProfile,
+    *,
+    admission: AdmissionDecision | None,
+) -> bool:
+    """Whether this run may sign up on an app the reviewed catalog never described.
+
+    The reviewed catalog ALWAYS wins. Callers consult ``declared_signup_policy``
+    first and reach this only when it is silent — the same precedence
+    ``build_browser_allowed_hosts`` applies to hosts, so a declaration can fill a
+    gap and never override a review.
+
+    The authorization is the operator's own admission decision, and it is checked
+    through ``resolve_gate`` rather than re-derived here so this gate and the
+    mid-form legal gate cannot drift apart. ``ops.access.gate_policy`` states the
+    reasoning: approving account creation IS approving the terms that creation is
+    subject to, which is why ``legal_acceptance`` is profile-declarable rather than
+    human-only. That resolution independently requires the decision to name THIS
+    profile digest, to be an operator-decided ``signup`` route, and the gate URL to
+    sit inside the profile's own registrable domain — so a decision recorded about a
+    different profile, or a signup URL off the vendor's domain, authorizes nothing.
+
+    Note what this does NOT do: it derives no ``SignupPolicy``. The handler's policy
+    read is purely this gate — the object is never passed to the submitter and never
+    consulted again — so synthesizing entry paths or submit labels would invent a
+    value nothing reads. ``_exact_submit`` stays strict on the recipe-driven path.
+    """
+
+    if admission is None or profile.signup_url is None:
+        return False
+    return (
+        resolve_gate(
+            _LEGAL_ACCEPTANCE_GATE,
+            app_slug=profile.app_slug,
+            profile_authority=ProfileGateAuthority(
+                profile_digest=profile.profile_digest,
+                registrable_domain=profile.registrable_domain,
+                gate_url=profile.signup_url,
+                admission_route=admission.route,
+                admission_decided_by=admission.decided_by,
+                admission_profile_digest=admission.profile_digest,
+            ),
+        )
+        == "profile_declared"
+    )
+
+
 def declared_signup_postcondition(app_slug: str) -> CheckpointPredicate | None:
     """The recipe's own completion predicate for the signup step (Requirement 7.5).
 
@@ -1711,6 +1777,11 @@ class SignupPhaseHandler:
     # needs nothing wired, and an unwired binder records nothing rather than
     # inventing a recipient.
     mailbox: SignupMailboxBinder | None = None
+    # Reads the run's durable admission decision, which is what authorizes signup on
+    # an app the reviewed catalog never described. Optional for the same reason the
+    # mailbox binder is: a deployment driving only reviewed recipes needs nothing
+    # wired and keeps today's behavior exactly — an unreviewed app pauses.
+    admissions: AdmissionDecisionReader | None = None
     approved_fields: Mapping[str, str] = field(default_factory=dict)
     ttl_seconds: int = SIGNUP_SECRET_TTL_SECONDS
 
@@ -1741,7 +1812,18 @@ class SignupPhaseHandler:
             return PhaseStep.pause("capture_spec_unavailable")
         # Requirements 7.1, 7.2: read before staging and before the reservation, so
         # a refusal leaves no staged credential and no vault entry behind.
-        if declared_signup_policy(profile.app_slug) is None:
+        # A reviewed policy is preferred and is never overridden — the same
+        # precedence the browser host boundary applies. Only when the catalog is
+        # silent does the operator's own admission decision authorize the
+        # submission, and only for this exact profile digest.
+        if declared_signup_policy(profile.app_slug) is None and not signup_authorized_by_admission(
+            profile,
+            admission=(
+                self.admissions.read_admission_decision(run_id)
+                if self.admissions is not None
+                else None
+            ),
+        ):
             return PhaseStep.pause("signup_policy_absent")
 
         identity = self.binding.signup_identity(run_id=run_id)

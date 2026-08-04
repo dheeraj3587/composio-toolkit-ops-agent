@@ -17,6 +17,7 @@ from pydantic import (
 )
 
 from ops.browser.setup_values import normalize_provider_setup_fields
+from ops.core.inference import DecisionOutcome
 from ops.core.models import AccountMode, OperationalResearch
 from ops.core.state import AccessRoute, BrowserProvider, CredentialCreationPolicy, RunStatus
 from ops.onboarding.action_loop import LoopStage
@@ -31,6 +32,7 @@ from ops.providers.profile import (
     FlowKind,
     ProfileField,
 )
+from ops.providers.profile_builder import ResearchFactKind
 from ops.recipes.app_recipes import ReadinessTier, RouteKind
 
 CredentialFieldName = Annotated[
@@ -113,6 +115,16 @@ HostName = Annotated[
 Sha256Digest = Annotated[
     str,
     StringConstraints(pattern=r"^[0-9a-f]{64}$", min_length=64, max_length=64),
+]
+
+# A profile digest, or the empty string for a run that never built a profile.
+# ``ops.onboarding.driver`` records a pre-profile terminal boundary (``blocked`` or
+# ``cancelled``) under the empty digest by construction — research can fail before
+# a profile exists — so a projection of that boundary has nothing else to carry.
+# Anything non-empty must still be a full content address.
+Sha256DigestOrAbsent = Annotated[
+    str,
+    StringConstraints(pattern=r"^(?:[0-9a-f]{64})?$", max_length=64),
 ]
 
 # An ISO-8601 instant. Bounded and pattern-constrained so a timestamp field is
@@ -289,13 +301,21 @@ class CreateRunRequest(StrictApiModel):
     # Optional operator hint for provider research. A bounded HTTPS URL, never a
     # search phrase, so a hint cannot smuggle prose into the research prompt.
     provider_hint_url: BoundedHttpUrl | None = None
+    # Optional operator-declared credential surface (the in-app page where an API
+    # key is created). Separate from ``provider_hint_url`` because it is not a
+    # research seed: that page is behind login, so an unauthenticated fetch returns
+    # the login page and research can never cite the credential path. Without it
+    # every declared flow stays unsupported and ``developer_app`` pauses
+    # ``flow_unsupported``. It names a page on the provider's own domain and cannot
+    # widen the browser allow-list.
+    credential_surface_url: BoundedHttpUrl | None = None
 
     @field_validator("provider_setup")
     @classmethod
     def provider_setup_is_reviewed(cls, value: dict[str, str]) -> dict[str, str]:
         return normalize_provider_setup_fields(value)
 
-    @field_validator("provider_hint_url")
+    @field_validator("provider_hint_url", "credential_surface_url")
     @classmethod
     def provider_hint_is_https(cls, value: str | None) -> str | None:
         return _validate_http_url(value) if value is not None else None
@@ -316,6 +336,10 @@ class CreateRunRequest(StrictApiModel):
             )
         if self.account_mode == "create_account" and self.browser_login is not None:
             raise ValueError("browser_login is only accepted when account_mode='existing_account'")
+        if self.onboarding and self.account_mode not in {"create_account", "existing_account"}:
+            raise ValueError(
+                "onboarding requires account_mode='create_account' or 'existing_account'"
+            )
         return self
 
 
@@ -513,7 +537,10 @@ class OnboardingStateView(StrictApiModel):
 
     phase: OnboardingPhase
     phase_at_pause: OnboardingPhase | None = None
-    profile_digest: Sha256Digest
+    # Empty for a run blocked before it built a profile: the boundary is real and
+    # must be projectable, or the console loses the reset and retry controls it
+    # reads from this object and the run looks like a silent stall.
+    profile_digest: Sha256DigestOrAbsent
     reason_code: OnboardingReasonCode | None = None
     goal: str = Field(default="", max_length=200)
     step: str = Field(default="", max_length=200)
@@ -775,12 +802,99 @@ class RunProgressEventView(StrictApiModel):
     recorded_at: IsoTimestamp
 
 
+class ResearchFactGroupView(StrictApiModel):
+    """One claim research refused to believe, and how often it refused it.
+
+    The run explaining why its own profile is thin: a field it could not
+    corroborate, an adapter that returned nothing, a candidate list it had to cap.
+    Before this, all of it projected to one fixed sentence repeated dozens of times.
+
+    ``kind`` is the closed ``ResearchFactKind`` vocabulary and is always present.
+    Everything beside it is optional BY CONSTRUCTION rather than by convenience:
+    the durable fact stores its subject as free text, so the projection validates
+    that text against a closed vocabulary chosen by ``kind`` and drops it when it
+    does not fit. For the three kinds whose subject holds an observed URL or host,
+    nothing beyond ``kind`` is ever projected (Requirement 4.10).
+    """
+
+    kind: ResearchFactKind
+    # The profile field the claim was about, when `kind` says the subject is one.
+    field: ProfileField | None = None
+    # The research adapter involved, when `kind` says the subject is one.
+    adapter: AdapterName | None = None
+    # How many candidate URLs were capped, when `kind` says the subject is a count.
+    count: int | None = Field(default=None, ge=0, le=64)
+    # Parsed from the one templated detail form, `corroborations=N/M`.
+    corroborations: int | None = Field(default=None, ge=0, le=64)
+    corroborations_required: int | None = Field(default=None, ge=0, le=64)
+    occurrences: int = Field(ge=1, le=100_000)
+    first_at: IsoTimestamp
+    last_at: IsoTimestamp
+
+
+class RunDecisionAttemptView(StrictApiModel):
+    """One inference attempt: which model was asked, and what it cost (R4.3).
+
+    What a reason code cannot say. ``candidate_gate_model_declined`` records that a
+    gate refused; only these rows record that the refusal came from ``groq`` after
+    884ms, or that a provider ahead of it was skipped by its breaker. That is the
+    difference between "the agent stopped" and "this provider is degraded".
+
+    ``purpose`` separates the action loop from the planner, so one field tells an
+    operator whether they are looking at the agent walking a page or the planner
+    ordering a route.
+
+    Closed by construction: ``provider`` is a bounded lowercase label, ``outcome``
+    the durable ``DecisionOutcome`` union, and everything else an enum, bounded
+    integer, or timestamp. No prompt, no schema, and no model answer has a field to
+    travel in (Requirement 4.10).
+    """
+
+    purpose: Literal["action", "plan"]
+    provider: AdapterName
+    outcome: DecisionOutcome
+    latency_ms: int = Field(ge=0, le=3_600_000)
+    onboarding_phase: OnboardingPhase
+    recorded_at: IsoTimestamp
+
+
+class PhaseBoundaryView(StrictApiModel):
+    """One committed phase transition: what moved, and the reason that moved it.
+
+    The densest reasoning the run records. ``items`` above carries audit events,
+    and those rows have no phase at all, so a console that wants to show *why*
+    the agent went where it went has to read these instead.
+
+    Closed by construction like its siblings: ``to_phase`` is the durable
+    ``OnboardingPhase`` union, ``reason_code`` the durable
+    ``OnboardingReasonCode`` union. There is no free-text field here, so no
+    prompt, page projection, or reasoning trace can travel through it
+    (Requirement 4.10).
+    """
+
+    sequence: int = Field(ge=1, le=100_000)
+    from_phase: OnboardingPhase | None = None
+    to_phase: OnboardingPhase
+    reason_code: OnboardingReasonCode
+    attempt: int = Field(ge=0, le=100_000)
+    profile_digest: Sha256DigestOrAbsent = ""
+    committed_at: IsoTimestamp
+
+
 class TimelineResponse(StrictApiModel):
     run_id: str
     items: list[TimelineEvent]
     # Newest first, capped by ``onboarding_progress_window``. A separate field
     # rather than rows in ``items``, which keeps ``event_id`` uniqueness intact.
     progress: list[RunProgressEventView] = []
+    # Oldest first — the order the run happened in, which is the order a trace
+    # reads in. Same bounded window as ``progress``.
+    boundaries: list[PhaseBoundaryView] = []
+    # Newest first, like ``progress``. These rows carry no correlation id, so a
+    # consumer attributing them to one phase visit does it by time window.
+    attempts: list[RunDecisionAttemptView] = []
+    # What research refused to believe, grouped by claim rather than enumerated.
+    research: list[ResearchFactGroupView] = []
 
 
 class LiveViewResponse(StrictApiModel):

@@ -30,6 +30,7 @@ import {
 } from "@/components/run-detail-panels"
 import { RunProgress } from "@/components/run-progress"
 import { StatusBadge } from "@/components/status-badge"
+import { AgentTrace } from "@/components/agent-trace"
 import { Timeline } from "@/components/timeline"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -59,6 +60,17 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
     onboarding ? getProviderProfile(runId) : Promise.resolve(null),
   ])
   const timeline = timelineResult.status === "fulfilled" ? timelineResult.value.items : []
+  // The per-iteration loop trace. It has always been on the wire and parsed by
+  // `api-schemas.ts`; until now it was dropped here and never rendered.
+  const progress = timelineResult.status === "fulfilled" ? timelineResult.value.progress : []
+  // The committed phase transitions. `items` above carries audit events, and those
+  // rows have no phase attached, so this is the only source of the agent's decisions.
+  const boundaries = timelineResult.status === "fulfilled" ? timelineResult.value.boundaries : []
+  // Which model was asked, and what it cost. No correlation id on these rows, so
+  // the trace attributes them to a phase visit by time window.
+  const attempts = timelineResult.status === "fulfilled" ? timelineResult.value.attempts : []
+  // What research refused to believe, grouped by claim.
+  const research = timelineResult.status === "fulfilled" ? timelineResult.value.research : []
   const timelineUnavailable = timelineResult.status === "rejected"
   const output = outputResult.status === "fulfilled" ? outputResult.value : null
   const profile = profileResult.status === "fulfilled" ? profileResult.value : null
@@ -154,8 +166,9 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         hitlAction={detail.hitl_request?.action_type}
       />
 
+      {/* Informational: a quiet raised surface, no rule. */}
       {isPlanOnly ? (
-        <Alert className="border-brand-400/25 bg-brand-400/[0.07]">
+        <Alert className="border-border bg-secondary">
           <AlertTitle>Planning completed</AlertTitle>
           <AlertDescription>
             Browser, email, HITL, and credential validation were not attempted. Start an execute-mode run to request approved provider actions.
@@ -163,10 +176,11 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         </Alert>
       ) : null}
 
+      {/* Needs attention: a left rule, lighter than the HITL card's 3px. */}
       {missingFields.length ? (
-        <Alert className="border-amber-400/30 bg-amber-400/[0.08] text-amber-950">
+        <Alert className="border-border border-l-2 border-l-muted-foreground bg-secondary text-foreground">
           <AlertTitle>{isPlanOnly ? "Baseline planning completed" : "Configuration or evidence is incomplete"}</AlertTitle>
-          <AlertDescription className="text-amber-800">
+          <AlertDescription className="text-muted-foreground">
             {isPlanOnly
               ? `Operational fields were not enriched in Plan Only mode: ${missingFields.map(humanize).join(", ")}.`
               : `Missing fields: ${missingFields.map(humanize).join(", ")}. Blocked capabilities are not presented as successful.`}
@@ -186,6 +200,16 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
             <Badge variant="outline" className="font-mono text-[9px] uppercase tracking-[0.08em]">Backend projection</Badge>
           </div>
           <OnboardingFocusPanel state={onboarding} />
+          {/* The reasoning behind the snapshot above: every phase boundary the
+            * agent committed, why it moved, and the loop iterations inside each
+            * one. Renders nothing when the run has no boundaries yet. */}
+          <AgentTrace
+            boundaries={boundaries}
+            progress={progress}
+            attempts={attempts}
+            research={research}
+            className="mt-5"
+          />
           {controls?.can_decide_admission ? (
             <div className="mt-4 space-y-3">
               <div>
@@ -362,7 +386,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         initiallyOpen={timelineUnavailable}
       >
         {timelineUnavailable ? (
-          <Alert className="border-amber-400/30 bg-amber-400/[0.08]">
+          <Alert className="border-border border-l-2 border-l-muted-foreground bg-secondary">
             <AlertTitle>Timeline unavailable</AlertTitle>
             <AlertDescription>The backend could not return sanitized events. This is not treated as an empty timeline.</AlertDescription>
           </Alert>

@@ -15,7 +15,7 @@ import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { useAppCapabilities, useAppCatalog } from "@/lib/app-catalog"
-import type { BrowserProvider, ProviderStatus } from "@/lib/types"
+import type { BrowserProvider, ExecutionMode, ProviderStatus } from "@/lib/types"
 
 const safeUrl = z.url({ protocol: /^https$/ })
 
@@ -90,7 +90,6 @@ export function NewRunForm({
     watch,
     resetField,
     setError,
-    setValue,
     formState: { errors },
   } = useForm<RunFormValues>({
     resolver: zodResolver(runFormSchema),
@@ -129,6 +128,7 @@ export function NewRunForm({
     capabilitiesPending: Boolean(selectedApp) && appCapabilities.isPending,
     capabilitiesUnavailable: Boolean(selectedApp) && appCapabilities.isError,
     accountCreationSupported: appCapabilities.data?.account_creation_supported ?? false,
+    executionMode,
     gmail,
   })
 
@@ -138,12 +138,6 @@ export function NewRunForm({
       resetField("app_login_password")
     }
   }, [accountMode, resetField])
-
-  useEffect(() => {
-    if (accountMode === "create_account" && createAccountUnavailable) {
-      setValue("account_mode", "existing_account", { shouldDirty: true, shouldValidate: true })
-    }
-  }, [accountMode, createAccountUnavailable, setValue])
 
   useEffect(() => {
     if (!firstAdvancedError) return
@@ -220,7 +214,7 @@ export function NewRunForm({
                       describedBy="account-creation-readiness"
                       icon={UserPlus}
                       title="Create a new account"
-                      description={createAccountUnavailable ? "Requires a reviewed signup route and ready inbox." : "Sign up and verify the work email in one session."}
+                      description={createAccountUnavailable ? "Requires reviewed planner eligibility." : "Research, plan, approve, then sign up through the autonomous driver."}
                     />
                   </div>
                 )}
@@ -230,7 +224,7 @@ export function NewRunForm({
                 className={`text-xs leading-5 ${createAccountUnavailable ? "text-amber-300" : "text-emerald-300"}`}
                 aria-live="polite"
               >
-                {createAccountUnavailable ?? "Verified signup route and connected work inbox are ready."}
+                {createAccountUnavailable ?? "Reviewed app accepted for profile research and planner-controlled onboarding."}
               </p>
             </fieldset>
           </div>
@@ -473,6 +467,7 @@ function accountCreationUnavailableReason({
   capabilitiesPending,
   capabilitiesUnavailable,
   accountCreationSupported,
+  executionMode,
   gmail,
 }: {
   appName: string
@@ -480,14 +475,17 @@ function accountCreationUnavailableReason({
   capabilitiesPending: boolean
   capabilitiesUnavailable: boolean
   accountCreationSupported: boolean
+  executionMode: ExecutionMode
   gmail: GmailSignupReadiness
 }): string | null {
-  if (!appName.trim()) return "Choose an application to check whether signup is supported."
+  if (!appName.trim()) return "Choose an application to check planner onboarding eligibility."
   if (!selectedAppName) return "Account creation is available only for apps in the verified catalog."
-  if (capabilitiesPending) return `Checking the reviewed signup route for ${selectedAppName}…`
-  if (capabilitiesUnavailable) return `Signup capability for ${selectedAppName} could not be verified.`
-  if (!accountCreationSupported) return `${selectedAppName} does not have a reviewed signup route in this deployment.`
-  if (!gmail.ready) return gmail.detail
+  if (capabilitiesPending) return `Checking planner onboarding eligibility for ${selectedAppName}…`
+  if (capabilitiesUnavailable) return `Planner onboarding eligibility for ${selectedAppName} could not be verified.`
+  if (!accountCreationSupported) return `${selectedAppName} is not eligible for reviewed planner onboarding.`
+  // Research and planning are side-effect free. Inbox readiness is enforced only
+  // when the operator asks the backend to execute the admitted signup plan.
+  if (executionMode !== "plan_only" && !gmail.ready) return gmail.detail
   return null
 }
 

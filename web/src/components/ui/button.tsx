@@ -16,8 +16,10 @@ const buttonVariants = cva(
           "bg-secondary text-secondary-foreground hover:bg-[#303030] aria-expanded:bg-secondary",
         ghost:
           "text-muted-foreground hover:bg-secondary hover:text-foreground aria-expanded:bg-secondary aria-expanded:text-foreground",
+        // A destructive action reads as heavier than a neutral one: bright
+        // border and ink rather than a red fill.
         destructive:
-          "border-red-400/20 bg-red-400/10 text-red-300 hover:bg-red-400/15 focus-visible:border-red-400/50 focus-visible:ring-red-400/20",
+          "border-foreground bg-transparent text-foreground hover:bg-secondary focus-visible:border-foreground focus-visible:ring-foreground/25",
         link: "text-brand-300 underline-offset-4 hover:underline",
       },
       size: {

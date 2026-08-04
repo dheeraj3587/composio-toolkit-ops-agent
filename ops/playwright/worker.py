@@ -26,6 +26,7 @@ import asyncio
 import contextlib
 import importlib
 import re
+import sys
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -211,12 +212,19 @@ def chromium_launch_args(*, headless: bool, sandbox_disabled: bool) -> list[str]
     explicitly asks for it (dev sandboxes and hosts without the required
     seccomp/user-namespace support).
 
-    Headed Chromium additionally disables the GPU process. On a virtual X display
-    with no GPU device, ``Page.captureScreenshot`` fails inside the GPU
+    Headed Chromium on Linux additionally disables the GPU process. On a virtual X
+    display with no GPU device, ``Page.captureScreenshot`` fails inside the GPU
     compositor ("Unable to capture screenshot") while rendering still succeeds —
     so the readiness probe and every masked live-view screenshot broke while the
     page itself looked fine. Software rendering makes capture deterministic on
-    any host. Headless Chromium already captures through its own path.
+    that host. Headless Chromium already captures through its own path.
+
+    This is Linux-only: on a host with a real GPU and compositor (a developer's
+    macOS or Windows machine), ``--disable-gpu`` forces the software rasterizer,
+    which does not composite onto the native window — the page renders correctly
+    (screenshots and DOM access both work) but the visible window paints blank.
+    The flag exists for the headless Xvfb container this always ran in production
+    on, not for a local interactive session.
 
     Do not add ``--disable-dev-shm-usage`` here. Production provisions a private,
     bounded ``/dev/shm`` specifically for Chromium; redirecting shared-memory
@@ -226,7 +234,7 @@ def chromium_launch_args(*, headless: bool, sandbox_disabled: bool) -> list[str]
     args: list[str] = []
     if sandbox_disabled:
         args.append("--no-sandbox")
-    if not headless:
+    if not headless and sys.platform == "linux":
         args.append("--disable-gpu")
     return args
 
@@ -669,10 +677,13 @@ class PlaywrightBrowserWorker:
             normalize_signup_fields(signup_fields) if account_creation_requested else {}
         )
 
-        # Screenshot masking cannot protect the headed X11 desktop. Install the
-        # recipe-owned document-start mask before the first vendor navigation; in
-        # production the browser service also requires this before issuing any
-        # live-view grant.
+        # Screenshot masking cannot protect a display whose pixels are relayed off
+        # the machine (the browser service's noVNC desktop). Install the recipe-owned
+        # document-start mask before the first vendor navigation; in production the
+        # browser service also requires this before issuing any live-view grant. On
+        # the opt-out local in-process path this is a documented no-op (see
+        # ``install_live_pixel_mask``), so the developer's own headed window is not
+        # painted over.
         if not session.live_pixel_mask_installed:
             if not await self.install_live_pixel_mask(
                 context,
@@ -826,6 +837,15 @@ class PlaywrightBrowserWorker:
         ):
             return False
         if session.live_pixel_mask_installed:
+            return True
+        # The pixel mask protects a display whose pixels LEAVE the machine (the
+        # browser service relays its X display over noVNC). When the operator
+        # explicitly disables it AND this is the in-process local path — not
+        # service mode — skip it so the developer's own headed window shows the
+        # real page. Service mode IGNORES the flag: the container's mask must
+        # never be switchable from outside a reviewed deployment.
+        if not self._settings.playwright_live_pixel_mask and not self._service_mode:
+            session.live_pixel_mask_installed = True
             return True
 
         async def _install() -> bool:
@@ -2563,6 +2583,228 @@ class PlaywrightBrowserWorker:
                 capability="Playwright browser", reason_code="session_missing"
             )
         return session
+
+    async def inspect_page_for(self, context: BrowserSessionContext) -> PageInspection:
+        """One bounded, secret-free inspection of the session's current page.
+
+        The supported surface over ``_inspect_page``, in the same spirit as
+        :meth:`_session_for_context`: the onboarding action loop needs to observe a
+        page without reaching into the private session registry or the private
+        inspection method. Every DLP and bounding rule stays where it was — this
+        adds no new capability, only a caller-visible name for one that existed.
+        """
+
+        return await self._inspect_page(self._session_for_context(context))
+
+    async def execute_candidate_for(
+        self,
+        context: BrowserSessionContext,
+        candidate: ActionCandidate,
+        inspection: PageInspection,
+    ) -> ActionExecutionResult:
+        """Execute exactly one policy-generated candidate against the live page.
+
+        The supported surface over ``_execute_candidate``. The candidate arrives
+        whole (never a selector or a bare URL), so the time-of-check-to-time-of-use
+        re-validation inside ``_execute_candidate`` — re-inspect, re-confirm URL and
+        DOM generation, resolve by stable role/name/type identity — remains the only
+        path from a decision to a click.
+        """
+
+        return await self._execute_candidate(
+            self._session_for_context(context), candidate, inspection
+        )
+
+    async def fill_secret_for(
+        self,
+        context: BrowserSessionContext,
+        *,
+        element_index: int,
+        inspection: PageInspection,
+        resolve: Callable[[], str],
+    ) -> None:
+        """Fill one already-resolved element with a value produced by ``resolve``.
+
+        ``resolve`` is called EXACTLY ONCE, and its result is passed straight into
+        Playwright as a single expression — never bound to a name, stored on the
+        session, logged, or returned. That is the same confinement the reviewed
+        candidate path already uses for approved values at ``_execute_candidate``
+        (see the ``locator.fill(_approved_or_raise(), ...)`` call in this module),
+        so this is an established local pattern rather than a new one.
+
+        WHERE THE VALUE MATERIALISES IS A PROPERTY OF THE TRANSPORT, NOT OF THIS
+        METHOD. On the production RPC path the caller's ``resolve`` redeems the grant
+        inside the browser container, so this process only ever holds
+        ``(reference, kind, grant)``. On the local in-process path
+        (``PLAYWRIGHT_IN_PROCESS_SANDBOX=true``) there is no second process by
+        definition and the plaintext necessarily appears here; the single-expression
+        confinement is the whole mitigation in that case. Do NOT copy this reasoning
+        into ``browser_service/`` — there the process boundary is the enforcing
+        mechanism and must stay that way.
+
+        The element is addressed by the index the CALLER already resolved from a
+        bounded inspection, so no selector string crosses this boundary.
+        """
+
+        session = self._session_for_context(context)
+        if not 0 <= element_index < len(inspection.locators):
+            raise ProviderOperationError(
+                capability="Playwright browser", reason_code="target_not_found"
+            )
+        locator = inspection.locators[element_index]
+
+        async def _locked() -> None:
+            async with session.operation_lock:
+                session.last_active_at = datetime.now(UTC)
+                # Confined expression: see this method's docstring.
+                await locator.fill(resolve(), timeout=_ACTION_TIMEOUT_MS)
+
+        await self._loop.run(_locked())
+
+    async def read_pattern_matched_values_for(
+        self,
+        context: BrowserSessionContext,
+        *,
+        element_indexes: Sequence[int],
+        inspection: PageInspection,
+        value_pattern: str,
+    ) -> tuple[str, ...]:
+        """Read the named elements and return only values matching ``value_pattern``.
+
+        The credential read for a provider with NO reviewed recipe.
+        ``ops.onboarding.capture_specs`` states why there are no selectors to use:
+
+            "A brand-new provider has no reviewed page, and inventing selectors from
+            research or from live DOM text would put the untrusted page inside its
+            own admission check ... the absence is the design, not an omission to be
+            filled in later."
+
+        It also names the two mechanisms that replace them, and this method sits
+        between them. The CALLER proves it is on the credential surface first (the
+        action loop's ``credential_visible`` postcondition), and the broker
+        independently re-applies the checked-in pattern to whatever is sent. So the
+        read here is deliberately BROAD — every element the caller nominated — while
+        correctness comes from re-validation, not from having picked the right node.
+
+        ``element_indexes`` are indexes into ``inspection``, so no selector string
+        crosses this boundary and the untrusted page never names its own read target.
+
+        ``value_pattern`` is applied here as a FILTER, not as the authorization: it
+        keeps obviously-wrong text out of the returned tuple so the caller has fewer
+        candidates to reason about. The authorization is still the broker's own
+        re-application of the same checked-in pattern.
+
+        Values are returned rather than stored, so the caller must treat the result as
+        secret. Ordering follows ``element_indexes``, and duplicates are collapsed so
+        one credential rendered twice does not read as an ambiguity.
+        """
+
+        session = self._session_for_context(context)
+        pattern = re.compile(value_pattern)
+        wanted = [index for index in element_indexes if 0 <= index < len(inspection.locators)]
+        if not wanted:
+            return ()
+
+        async def _read() -> tuple[str, ...]:
+            found: list[str] = []
+            async with session.operation_lock:
+                session.last_active_at = datetime.now(UTC)
+                for index in wanted:
+                    locator = inspection.locators[index]
+                    for reader in ("input_value", "text_content"):
+                        try:
+                            raw = await getattr(locator, reader)(timeout=2_000)
+                        except Exception:
+                            continue
+                        candidate = raw.strip() if isinstance(raw, str) else ""
+                        if not candidate:
+                            continue
+                        # An input's value must BE the credential. Free text is split
+                        # into whitespace-delimited tokens and each token must BE the
+                        # credential, which is how a key rendered inside a sentence
+                        # ("Your key: sk_live_...") is still readable.
+                        #
+                        # Tokenising rather than searching is deliberate:
+                        # ``credential_value_pattern`` is anchored ``\A``/``\Z``, so a
+                        # ``search`` for it in a paragraph can never match, and
+                        # stripping the anchors to make it match would apply a
+                        # DIFFERENT, weaker pattern than the one the write re-applies.
+                        # Every value returned here is a whole-string match for the
+                        # exact checked-in pattern.
+                        parts = (
+                            (candidate,) if reader == "input_value" else tuple(candidate.split())
+                        )
+                        for part in parts:
+                            if pattern.fullmatch(part) and part not in found:
+                                found.append(part)
+            return tuple(found)
+
+        return await self._loop.run(_read(), timeout=_OP_TIMEOUT_SECONDS)
+
+    async def click_element_for(
+        self,
+        context: BrowserSessionContext,
+        *,
+        element_index: int,
+        inspection: PageInspection,
+    ) -> None:
+        """Click one element the caller already resolved from a bounded inspection.
+
+        The supported surface for a phase handler that owns its own submission
+        ordering — signup, whose single-submit guarantee comes from the effect
+        ledger rather than from the action loop. The element is addressed by the
+        index the caller resolved, so no selector string crosses this boundary.
+        """
+
+        session = self._session_for_context(context)
+        if not 0 <= element_index < len(inspection.locators):
+            raise ProviderOperationError(
+                capability="Playwright browser", reason_code="target_not_found"
+            )
+        locator = inspection.locators[element_index]
+
+        async def _locked() -> None:
+            async with session.operation_lock:
+                session.last_active_at = datetime.now(UTC)
+                await locator.click(timeout=_ACTION_TIMEOUT_MS)
+
+        await self._loop.run(_locked())
+
+    async def navigate_resolved_for(
+        self,
+        context: BrowserSessionContext,
+        *,
+        resolve: Callable[[], str],
+    ) -> None:
+        """Navigate the session's page to one URL produced by ``resolve``.
+
+        Used for a provider-issued verification link, which is NOT a model-chosen
+        candidate: it never passes through the action loop's per-candidate
+        navigation guard (``NAVIGATION_ACTIONS`` covers candidates only). The
+        CALLER must therefore have checked the URL against the run's allow-list
+        before calling this, and does so explicitly rather than borrowing the
+        candidate path's check.
+
+        Same value discipline as :meth:`fill_secret_for`: ``resolve`` is called once
+        and its result is consumed by a single expression.
+        """
+
+        session = self._session_for_context(context)
+
+        async def _locked() -> None:
+            async with session.operation_lock:
+                session.last_active_at = datetime.now(UTC)
+                page = _active_page(session)
+                # Confined expression: the link is never bound, stored, or logged.
+                response = await page.goto(
+                    resolve(), wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
+                )
+                if response is not None and int(response.status) >= 500:
+                    raise ProviderOperationError(
+                        capability="Playwright browser", reason_code="http_server_error"
+                    )
+
+        await self._loop.run(_locked())
 
     async def refresh_session_screenshot(self, context: BrowserSessionContext) -> bytes | None:
         """Refresh and return the current screenshot for a session (or None).

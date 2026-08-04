@@ -9,9 +9,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final, Literal
 
-from ops.browser.host_policy import BrowserAllowedHosts, evaluate_navigation
+from ops.browser.host_policy import (
+    BrowserAllowedHosts,
+    BrowserPolicyInactiveError,
+    evaluate_navigation,
+)
 from ops.onboarding.phase import OnboardingReasonCode
-from ops.planner.plan import PlannedSurface, RunPlan, canonical_surface
+from ops.planner.plan import (
+    PROFILE_CATALOG_ID,
+    PlannedSurface,
+    RunPlan,
+    canonical_surface,
+    profile_success_digest,
+)
+from ops.providers.profile import ProviderProfile
 from ops.recipes.app_recipes import AppRecipe
 
 PLAN_REFUSAL_REASON_CODE: Final[OnboardingReasonCode] = "plan_surface_not_in_catalog"
@@ -21,10 +32,13 @@ PlanRefusalDetail = Literal[
     "recipe_route_not_browser",
     "app_slug_mismatch",
     "surface_count_exceeds_recipe",
+    "surface_count_exceeds_profile",
     "host_not_in_recipe",
+    "host_not_in_profile",
     "navigation_denied",
     "path_not_declared",
     "credential_surface_unprovable",
+    "profile_binding_mismatch",
 ]
 
 # The credential surface is reported at ordinal 0: it is not one of the ordered
@@ -140,7 +154,7 @@ def _check_surface(
     return None
 
 
-def validate_plan(plan: RunPlan, *, recipe: AppRecipe) -> PlanRefusal | None:
+def _validate_recipe_plan(plan: RunPlan, *, recipe: AppRecipe) -> PlanRefusal | None:
     """``None`` when every surface is catalog-declared; a refusal otherwise."""
 
     browser = recipe.browser
@@ -184,6 +198,68 @@ def validate_plan(plan: RunPlan, *, recipe: AppRecipe) -> PlanRefusal | None:
     return refusal
 
 
+def _profile_surface_keys(profile: ProviderProfile) -> frozenset[tuple[str, str]]:
+    declared: set[tuple[str, str]] = set()
+    for url in profile.operational_urls():
+        try:
+            surface = canonical_surface(url, purpose="entry")
+        except ValueError:
+            continue
+        declared.add((surface.host, surface.path))
+    return frozenset(declared)
+
+
+def validate_profile_plan(plan: RunPlan, *, profile: ProviderProfile) -> PlanRefusal | None:
+    """Validate every surface against one committed profile and its digest."""
+
+    if plan.app_slug != profile.app_slug:
+        return _refuse("app_slug_mismatch", CREDENTIAL_SURFACE_ORDINAL)
+    if (
+        plan.catalog_id != PROFILE_CATALOG_ID
+        or plan.recipe_version != profile.profile_digest
+        or plan.success_digest != profile_success_digest(profile)
+    ):
+        return _refuse("profile_binding_mismatch", CREDENTIAL_SURFACE_ORDINAL)
+    declared = _profile_surface_keys(profile)
+    if not declared:
+        return _refuse("credential_surface_unprovable", CREDENTIAL_SURFACE_ORDINAL)
+    if len(plan.surfaces) > len(declared):
+        return _refuse("surface_count_exceeds_profile", len(declared) + 1)
+    try:
+        allowed = profile.allowed_hosts()
+    except BrowserPolicyInactiveError:
+        return _refuse("navigation_denied", CREDENTIAL_SURFACE_ORDINAL)
+
+    def check(surface: PlannedSurface, ordinal: int) -> PlanRefusal | None:
+        if (surface.host, surface.path) not in declared:
+            return _refuse("host_not_in_profile", ordinal)
+        if not evaluate_navigation(f"https://{surface.host}{surface.path}", allowed).allowed:
+            return _refuse("navigation_denied", ordinal)
+        return None
+
+    for ordinal, surface in enumerate(plan.surfaces, start=1):
+        refusal = check(surface, ordinal)
+        if refusal is not None:
+            return refusal
+    return check(plan.credential_surface, CREDENTIAL_SURFACE_ORDINAL)
+
+
+def validate_plan(
+    plan: RunPlan,
+    *,
+    recipe: AppRecipe | None = None,
+    profile: ProviderProfile | None = None,
+) -> PlanRefusal | None:
+    """Validate against exactly one immutable route authority."""
+
+    if (recipe is None) == (profile is None):
+        raise ValueError("plan validation requires exactly one route authority")
+    if profile is not None:
+        return validate_profile_plan(plan, profile=profile)
+    assert recipe is not None
+    return _validate_recipe_plan(plan, recipe=recipe)
+
+
 __all__ = [
     "CREDENTIAL_SURFACE_ORDINAL",
     "PLAN_REFUSAL_REASON_CODE",
@@ -193,4 +269,5 @@ __all__ = [
     "declared_paths",
     "declared_surface_paths",
     "validate_plan",
+    "validate_profile_plan",
 ]

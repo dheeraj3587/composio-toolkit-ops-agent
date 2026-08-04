@@ -129,11 +129,48 @@ class OperationsRequest(StrictModel):
     # Explicit local intent only. It is never inferred from research, a browser
     # page, or an LLM, and is forwarded only to the browser target selector.
     account_creation_requested: bool = False
+    # Mount this request on the durable autonomous onboarding driver. Additive and
+    # default-false so historical callers retain their static recipe semantics.
+    onboarding: bool = False
+    # Optional reviewed-host research hint. It is durable intent, but never route
+    # authority: the profile fetcher still applies DNS/redirect/host policy and
+    # the builder still requires two independent corroborating excerpts.
+    provider_hint_url: str | None = None
+    # Optional operator-DECLARED credential surface: the in-app page where an API
+    # key is created. Needed because that page sits behind login, so research
+    # cannot corroborate it — an unauthenticated fetch of it returns the login
+    # page, which contains no reference to the credential path and therefore
+    # yields no citable claim.
+    #
+    # It is a declaration, not evidence: the profile records it under the
+    # ``operator`` adapter with a single corroboration rather than presenting it
+    # as research. It also cannot widen the browser boundary — the profile's own
+    # ``_require_admitted_url`` refuses any URL outside the registrable domain the
+    # corroborated evidence already agreed on, so an operator may name a PAGE on
+    # the provider's domain and never a new host.
+    credential_surface_url: str | None = None
 
     @field_validator("provider_setup")
     @classmethod
     def validate_provider_setup(cls, value: dict[str, str]) -> dict[str, str]:
         return normalize_provider_setup_fields(value)
+
+    _validate_provider_hint_url = field_validator("provider_hint_url")(
+        lambda value: validate_operational_url(value) if value is not None else None
+    )
+    _validate_credential_surface_url = field_validator("credential_surface_url")(
+        lambda value: validate_operational_url(value) if value is not None else None
+    )
+
+    @model_validator(mode="after")
+    def validate_onboarding_intent(self) -> OperationsRequest:
+        # Onboarding is the durable phase-machine path for both account modes:
+        # ``create_account`` drives the signup route and ``existing_account`` the
+        # vault-probed login route. Which route a run actually takes is decided by
+        # ``CanonicalRuntime.create_run`` and the admission service, not here.
+        if self.onboarding and self.account_mode not in {"create_account", "existing_account"}:
+            raise ValueError("autonomous onboarding requires a supported account mode")
+        return self
 
     @model_validator(mode="before")
     @classmethod

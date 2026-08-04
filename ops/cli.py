@@ -176,6 +176,63 @@ def get_run_output(run_id: str, *, db_path: str | Path | None = None) -> dict[st
     return _run_service(db_path).get_output(run_id)
 
 
+def get_run_plan(run_id: str, *, db_path: str | Path | None = None) -> dict[str, Any]:
+    """A read-only JSON view of the run's plan revisions, for human inspection.
+
+    A VIEW, not storage: SQLite remains the source of truth for the plan and the
+    only thing route adherence compares against, and nothing here writes, amends,
+    or supersedes a revision. ``active`` is the row in force; ``revisions`` is the
+    whole history, superseded rows included, so an operator can see what the
+    planner decided and what replaced it.
+
+    ``surfaces_json`` is decoded so the output is one JSON document rather than a
+    document with JSON embedded in a string, and every value still passes through
+    the CLI's redaction helper.
+    """
+
+    rows = _storage(db_path).read_run_plan_revisions(run_id)
+    revisions: list[dict[str, Any]] = []
+    for row in rows:
+        surfaces: Any = row.get("surfaces_json")
+        if isinstance(surfaces, str):
+            try:
+                surfaces = json.loads(surfaces)
+            except json.JSONDecodeError:
+                # A row that cannot be decoded is reported as unreadable rather
+                # than dropped: a silent omission would misrepresent the history.
+                surfaces = {"status": "unreadable"}
+        revisions.append(
+            _safe_value(
+                {
+                    "revision": row.get("revision"),
+                    "status": row.get("status"),
+                    "source": row.get("source"),
+                    "app_slug": row.get("app_slug"),
+                    "catalog_id": row.get("catalog_id"),
+                    "recipe_version": row.get("recipe_version"),
+                    "surfaces": surfaces,
+                    "credential_surface": {
+                        "host": row.get("credential_host"),
+                        "path": row.get("credential_path"),
+                        "purpose": "credential",
+                    },
+                    "success_digest": row.get("success_digest"),
+                    "reason_code": row.get("reason_code"),
+                    "created_at": row.get("created_at"),
+                    "superseded_at": row.get("superseded_at"),
+                    "superseded_by": row.get("superseded_by"),
+                }
+            )
+        )
+    active = next((entry for entry in revisions if entry.get("status") == "active"), None)
+    return {
+        "run_id": run_id,
+        "plan_count": len(revisions),
+        "active": active,
+        "revisions": revisions,
+    }
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -497,6 +554,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("resume", "Report resume availability for a run."),
         ("poll-email", "Report email polling availability for a run."),
         ("show-output", "Show a validated IntegratorBundle when one exists."),
+        ("show-plan", "Dump the run's plan revisions as JSON (read-only view of the DB)."),
     ):
         command_parser = subparsers.add_parser(command, help=help_text)
         command_parser.add_argument("run_id")
@@ -584,6 +642,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in {"resume", "poll-email"}:
             _emit(_phase_unavailable(args.command, args.run_id))
             return EXIT_PHASE_UNAVAILABLE
+
+        if args.command == "show-plan":
+            # Read-only: the DB stays the source of truth for the plan and for
+            # route adherence. An unplanned run reports plan_count 0 rather than
+            # an error -- "no plan yet" is a legitimate state, not a failure.
+            _emit({"plan": get_run_plan(args.run_id, db_path=args.db_path)})
+            return EXIT_OK
 
         if args.command == "show-output":
             output = get_run_output(args.run_id, db_path=args.db_path)

@@ -40,6 +40,7 @@ from ops.core.config import Settings
 from ops.core.secret_store import SQLiteSecretStore
 from ops.core.storage import OnboardingAuditContext, OperationsStorage
 from ops.onboarding.driver import SQLitePhaseHistoryStore
+from ops.onboarding.effects import plan_for_row_status
 from ops.onboarding.phase import OnboardingPhase
 from ops.providers.profile import FlowSpec, ProviderProfile, compute_profile_digest
 from ops.providers.profile_store import SQLiteProviderProfileStore
@@ -187,6 +188,7 @@ def _seed_unknown_signup_effect(db_path: Path, *, digest: str) -> SQLitePhaseHis
         attempt=0,
         correlation_id="approved-0",
     )
+    plan = plan_for_row_status(operation_key=OPERATION_KEY, action="signup_submit", row_status=None)
     commit = phases.commit_phase_with_reservation(
         run_id=RUN_ID,
         from_phase="route_selected_signup",
@@ -195,8 +197,7 @@ def _seed_unknown_signup_effect(db_path: Path, *, digest: str) -> SQLitePhaseHis
         profile_digest=digest,
         attempt=0,
         correlation_id="approved-1",
-        effect="signup_submit",
-        operation_key=OPERATION_KEY,
+        reservations=((plan.action, plan.operation_key, plan),),
     )
     assert commit.committed
     record = phases.mark_effect_reservation_outcome_unknown(
@@ -286,7 +287,11 @@ def test_onboarding_refusals_carry_their_reason_code_and_change_nothing(
     unknown = client.post(f"/api/runs/{RUN_ID}/retry", json={"expected_phase": "signup"})
     assert unknown.status_code == 409
     assert unknown.json()["reason_code"] == "outcome_unknown"
-    assert phases.submission_count(run_id=RUN_ID, operation_key=OPERATION_KEY) == 1
+    # The standing is the durable authorization fact: the key is paused, which
+    # authorizes nothing further, and the retry recorded nothing new.
+    standing = phases.effect_reservation(run_id=RUN_ID, operation_key=OPERATION_KEY)
+    assert standing is not None
+    assert standing.disposition == "pause_outcome_unknown"
     assert len(phases.history(run_id=RUN_ID)) == history_before
 
     # A pause is not an error: 200, carrying the phase and the reason code.

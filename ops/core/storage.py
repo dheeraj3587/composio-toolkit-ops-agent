@@ -59,6 +59,7 @@ _RUN_COLUMNS = (
     "reason_code",
     "effect_identity",
     "state_engine",
+    "execution_path",
     "external_actions",
     "state_revision",
     "last_projected_revision",
@@ -372,7 +373,7 @@ CREATE TABLE IF NOT EXISTS onboarding_autonomy_outcomes (
 # ``AutonomyVerdict`` against :data:`AUTONOMY_VERDICT_VALUES` — the planner
 # imports this module for the run ledger, so importing it back would be a cycle.
 RUN_PLAN_STATUS_VALUES: Final[tuple[str, ...]] = ("active", "superseded")
-RUN_PLAN_SOURCE_VALUES: Final[tuple[str, ...]] = ("planner", "recipe")
+RUN_PLAN_SOURCE_VALUES: Final[tuple[str, ...]] = ("planner", "recipe", "profile")
 
 # The stages one action-loop iteration reports from (reliability R4.1). Declared
 # here for the same reason as the verdicts above: ``ops/onboarding/action_loop.py``
@@ -492,6 +493,48 @@ CREATE TABLE IF NOT EXISTS onboarding_run_plans (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_run_plans_active
 ON onboarding_run_plans(run_id) WHERE status = 'active';
 """
+
+
+def _migrate_run_plan_vocabularies(connection: sqlite3.Connection) -> None:
+    """Rebuild ``onboarding_run_plans`` when a CHECK vocabulary has grown.
+
+    ``CREATE TABLE IF NOT EXISTS`` leaves an existing table's CHECK constraints
+    exactly as they were first written, and SQLite cannot ALTER a CHECK. A database
+    created before a vocabulary grew therefore rejects the new value at INSERT time:
+    a ``source='profile'`` plan, or a plan carrying a reason code added later, fails
+    inside ``record_initial_plan`` rather than at startup.
+
+    The stored CREATE statement is the authority on which values the live CHECKs
+    admit, so any missing value means the table predates the current vocabulary and
+    must be rebuilt.
+    """
+
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'onboarding_run_plans'"
+    ).fetchone()
+    if row is None or row[0] is None:  # pragma: no cover - created moments earlier
+        return
+    stored_sql = str(row[0])
+    required = (*RUN_PLAN_STATUS_VALUES, *RUN_PLAN_SOURCE_VALUES, *ONBOARDING_REASON_CODES)
+    if all(f"'{value}'" in stored_sql for value in required):
+        return
+
+    columns = ", ".join(_RUN_PLAN_COLUMNS)
+    # executescript() commits any open transaction, so the rebuild owns its own.
+    connection.executescript(
+        f"""
+        PRAGMA foreign_keys = off;
+        BEGIN;
+        ALTER TABLE onboarding_run_plans RENAME TO onboarding_run_plans_superseded;
+        DROP INDEX IF EXISTS idx_run_plans_active;
+        {_RUN_PLANS_DDL}
+        INSERT INTO onboarding_run_plans ({columns})
+            SELECT {columns} FROM onboarding_run_plans_superseded;
+        DROP TABLE onboarding_run_plans_superseded;
+        COMMIT;
+        PRAGMA foreign_keys = on;
+        """
+    )
 
 
 # One row per completed loop iteration (Requirement 4.1). Append-only and never
@@ -1096,6 +1139,7 @@ class OperationsUnitOfWork:
         reason_code: str | None = None,
         effect_identity: str | None = None,
         state_engine: str = "legacy",
+        execution_path: str = "legacy_static",
         external_actions: bool = False,
         idempotency_key: str | None = None,
         request_fingerprint: str | None = None,
@@ -1138,6 +1182,7 @@ class OperationsUnitOfWork:
             reason_code=reason_code,
             effect_identity=effect_identity,
             state_engine=state_engine,
+            execution_path=execution_path,
             external_actions=external_actions,
             idempotency_key=idempotency_key,
             request_fingerprint=request_fingerprint,
@@ -1392,6 +1437,7 @@ class OperationsStorage:
                     reason_code TEXT,
                     effect_identity TEXT,
                     state_engine TEXT NOT NULL DEFAULT 'legacy',
+                    execution_path TEXT NOT NULL DEFAULT 'legacy_static',
                     external_actions INTEGER NOT NULL DEFAULT 0,
                     state_revision INTEGER NOT NULL DEFAULT 0,
                     last_projected_revision INTEGER NOT NULL DEFAULT 0,
@@ -1553,6 +1599,7 @@ class OperationsStorage:
                 "reason_code": "TEXT",
                 "effect_identity": "TEXT",
                 "state_engine": "TEXT NOT NULL DEFAULT 'legacy'",
+                "execution_path": "TEXT NOT NULL DEFAULT 'legacy_static'",
                 "external_actions": "INTEGER NOT NULL DEFAULT 0",
                 "state_revision": "INTEGER NOT NULL DEFAULT 0",
                 "last_projected_revision": "INTEGER NOT NULL DEFAULT 0",
@@ -1566,6 +1613,7 @@ class OperationsStorage:
             # Additive: three new tables and their indexes, no data migration.
             # An existing database gains them on the next open (design "Release 2").
             connection.executescript(_RUN_PLANS_DDL)
+            _migrate_run_plan_vocabularies(connection)
             connection.executescript(_PROGRESS_EVENTS_DDL)
             connection.executescript(_DECISION_ATTEMPTS_DDL)
             for column_name, declaration in migration_columns.items():
@@ -1630,6 +1678,7 @@ class OperationsStorage:
         reason_code: str | None = None,
         effect_identity: str | None = None,
         state_engine: str = "legacy",
+        execution_path: str = "legacy_static",
         external_actions: bool = False,
         idempotency_key: str | None = None,
         request_fingerprint: str | None = None,
@@ -1719,6 +1768,7 @@ class OperationsStorage:
         reason_code: str | None = None,
         effect_identity: str | None = None,
         state_engine: str = "legacy",
+        execution_path: str = "legacy_static",
         external_actions: bool = False,
         idempotency_key: str | None = None,
         request_fingerprint: str | None = None,
@@ -1765,6 +1815,7 @@ class OperationsStorage:
             _safe_text(reason_code),
             _safe_text(effect_identity),
             _safe_text(state_engine),
+            _safe_text(execution_path),
             int(external_actions),
             _safe_text(idempotency_key),
             _safe_text(request_fingerprint),
@@ -1784,10 +1835,10 @@ class OperationsStorage:
                 recipe_snapshot_json, route_kind, readiness_tier, browser_account_ref,
                 provider_session_id,
                 connection_request_id, attempt, phase, reason_code,
-                effect_identity, state_engine, external_actions,
+                effect_identity, state_engine, execution_path, external_actions,
                 idempotency_key, request_fingerprint,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             values,
         )
@@ -1937,6 +1988,46 @@ class OperationsStorage:
                 (limit, offset),
             ).fetchall()
         return [self._run_from_row(row) for row in rows]
+
+    def stranded_mounted_run_ids(self, *, limit: int = 100) -> tuple[str, ...]:
+        """Mounted runs whose phase can still advance without an operator.
+
+        The queue and the run ledger are separate SQLite files, so an enqueue can
+        never be atomic with the run's own commit. Reconciling from the ledger
+        instead is strictly stronger: it recovers a run stranded by a crash between
+        the commit and any enqueue, which an enqueue-only design cannot do.
+
+        ``awaiting_admission`` is included deliberately. A crash after the decision
+        was recorded leaves the run waiting with its operator trigger already spent,
+        so only a sweep can carry it forward; with no decision recorded the handler
+        simply defers again.
+        """
+
+        if limit < 1 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        self.initialize()
+        # ``paused`` is swept so a run that parked at a gate is reclaimed by a
+        # background worker instead of needing a whole new run. Re-entry is still
+        # decided by ``resume_from_pause`` against the phase table; being listed here
+        # only makes the run visible to a worker again.
+        phases = (
+            "research",
+            "vault_check",
+            "awaiting_admission",
+            "route_selected_signup",
+            "route_selected_login",
+            "paused",
+        )
+        placeholders = ", ".join("?" for _ in phases)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id FROM runs "
+                "WHERE execution_path = 'profile_mounted' "
+                f"AND phase IN ({placeholders}) "
+                "ORDER BY updated_at ASC LIMIT ?",
+                (*phases, limit),
+            ).fetchall()
+        return tuple(str(row[0]) for row in rows)
 
     def count_runs(self) -> int:
         """Return the number of run records without exposing database details."""
@@ -2957,6 +3048,25 @@ class OperationsStorage:
             (_safe_text(run_id),),
         ).fetchone()
         return int(row[0])
+
+    def read_run_plan_revisions(self, run_id: str) -> list[dict[str, Any]]:
+        """Every plan revision for ``run_id``, oldest first, superseded ones included.
+
+        Read-only, for human inspection: the DB remains the source of truth for the
+        plan and for route adherence, and this adds no way to write or amend one.
+        ``read_active_run_plan`` stays the query execution uses -- this exists so an
+        operator can see the whole revision history, not just the row in force.
+        """
+
+        self.initialize()
+        columns = ", ".join(_RUN_PLAN_COLUMNS)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT {columns} FROM onboarding_run_plans "
+                "WHERE run_id = ? ORDER BY revision ASC, id ASC",
+                (_safe_text(run_id),),
+            ).fetchall()
+        return [dict(zip(_RUN_PLAN_COLUMNS, row, strict=True)) for row in rows]
 
     def record_progress_event(
         self,

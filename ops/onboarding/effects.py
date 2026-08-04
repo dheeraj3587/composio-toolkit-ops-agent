@@ -43,6 +43,11 @@ URL canonicalization is part of key identity, not cosmetics.
     longer describe this effect" for every run at once (Requirement 13.14). It
     must never be bumped to move a stuck run past a reservation it does not like.
 
+The reviewed credential flow the operator onboarding binds by default: the
+``credential_generation`` phase asks for an API key unless the provider profile
+declares the flow per kind (``api_key`` sits in the reviewed default the
+composition root binds).
+
 Scope: this module derives keys and classifies ledger rows. The
 ``onboarding_effect_reservations`` table and the transactional
 reserve-inside-the-phase-commit path are task 8.2 and are not sketched here.
@@ -59,6 +64,15 @@ from urllib.parse import urlsplit, urlunsplit
 from ops.core.effect_ledger import EffectReservation, EffectStore
 from ops.onboarding.phase import OnboardingReasonCode
 from ops.providers.profile import CredentialKind, ProviderProfile
+
+# The credential kind the onboarding driver's boundary reservation derives from
+# by default. It must agree with what the credential handler binds at the
+# composition root, because ``drive_run`` mirrors the boundary's operation key
+# into the reservation projection and the handler dedupes against that same key.
+# ``developer_app_flows`` looks the flow up BY KIND, so the key's kind and the
+# handler's bound kind naming one key is a real coupling: split them and the
+# boundary reservation records a key the handler never reserves.
+DEFAULT_CREDENTIAL_KIND: Final = "api_key"
 
 # The version every run's keys carry. A code-level constant shared by all runs, so
 # that changing it is a migration rather than a per-run workaround.

@@ -13,10 +13,13 @@ from ops.core.storage import MAX_PLAN_SURFACES, MAX_SURFACE_HOST_LENGTH, MAX_SUR
 # The key-identity folding is already reviewed in one place; a second implementation
 # here would let a plan surface and an operation key disagree about one URL.
 from ops.onboarding.effects import _canonical
+from ops.providers.profile import ProviderProfile
 from ops.recipes.app_recipes import AppRecipe, SuccessPredicate, load_app_recipe_catalog
 
 SurfacePurpose = Literal["entry", "login", "signup", "verification", "developer_app", "credential"]
-PlanSource = Literal["planner", "recipe"]
+PlanSource = Literal["planner", "recipe", "profile"]
+
+PROFILE_CATALOG_ID: Final = "provider-profile-v1"
 
 SURFACE_PURPOSES: Final[tuple[SurfacePurpose, ...]] = get_args(SurfacePurpose)
 PLAN_SOURCES: Final[tuple[PlanSource, ...]] = get_args(PlanSource)
@@ -126,8 +129,29 @@ def catalog_binding(recipe: AppRecipe) -> tuple[str, str]:
     return catalog.catalog_id, f"{catalog.schema_version}.{recipe.evidence_verified_at}"
 
 
+def profile_binding(profile: ProviderProfile) -> tuple[str, str]:
+    """Bind a plan to exactly one immutable committed provider profile."""
+
+    if not profile.profile_digest:
+        raise ValueError("a profile-authorized plan requires a committed profile digest")
+    return PROFILE_CATALOG_ID, profile.profile_digest
+
+
+def profile_success_digest(profile: ProviderProfile) -> str:
+    """Digest the exact profile-owned URL vocabulary the plan may select from."""
+
+    payload = {
+        "app_slug": profile.app_slug,
+        "profile_digest": profile.profile_digest,
+        "operational_urls": list(profile.operational_urls()),
+    }
+    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 __all__ = [
     "PLAN_SOURCES",
+    "PROFILE_CATALOG_ID",
     "SURFACE_PURPOSES",
     "PlanSource",
     "PlannedSurface",
@@ -135,5 +159,7 @@ __all__ = [
     "SurfacePurpose",
     "canonical_surface",
     "catalog_binding",
+    "profile_binding",
+    "profile_success_digest",
     "success_digest",
 ]

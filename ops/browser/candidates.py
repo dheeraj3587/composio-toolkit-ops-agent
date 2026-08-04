@@ -23,9 +23,9 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Sequence
-from dataclasses import dataclass, field
-from typing import Literal
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, fields
+from typing import Final, Literal, get_args
 
 from ops.browser.decider import SnapshotElement
 from ops.browser.setup_values import APPROVED_BROWSER_VALUE_REFS
@@ -44,6 +44,7 @@ CandidateAction = Literal[
     "scroll_into_view",
     "focus",
 ]
+CANDIDATE_ACTIONS: Final[frozenset[str]] = frozenset(get_args(CandidateAction))
 RiskLevel = Literal["low", "medium", "high", "requires_hitl"]
 
 # Actions that only observe/position and change no application state.
@@ -315,6 +316,74 @@ class ActionCandidate:
     @property
     def is_value_action(self) -> bool:
         return self.action in VALUE_ACTIONS
+
+
+# --- the executor / decision partition ---------------------------------------
+#
+# A remote executor needs SOME of a candidate, and sending it the rest would be a
+# mistake rather than merely wasteful. ``risk`` is the clearest case: ``executable``
+# above is exactly ``risk != "requires_hitl"``, so that one field is what decides
+# whether a CAPTCHA, an MFA prompt or a billing confirmation needs a person. It
+# stays in the control plane, which is the only place allowed to evaluate it.
+#
+# The partition is asserted at import, in the same spirit as the loop-stage
+# assertion in ``ops.onboarding.action_loop``: a field added to ``ActionCandidate``
+# belongs to exactly one side, and the author has to say which. A test could be
+# skipped; an import cannot.
+EXECUTOR_CANDIDATE_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        # Correlation, so a result can be matched to the request.
+        "candidate_id",
+        # The verb, and the element to resolve it against.
+        "action",
+        "identity",
+        # Action-specific payload. ``value_ref`` is a REFERENCE the executor
+        # resolves through the approved-value map — never literal text, and never a
+        # secret.
+        "value_ref",
+        "press_key",
+        "url",
+    }
+)
+DECISION_ONLY_CANDIDATE_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        # The HITL gate. Never sent.
+        "risk",
+        # Verification is the caller's job: it holds the goal and compares a fresh
+        # observation, so none of this needs to cross a process boundary.
+        "expected_postcondition",
+        "postcondition",
+        # Provenance and ordering, used when generating and rendering candidates.
+        "semantic_target",
+        "trace_version",
+        "checkpoint_order",
+        # A generation-time snapshot index. Explicitly "a hint, never trusted", and
+        # the executor re-resolves by stable identity instead.
+        "hint_index",
+        # Read by nothing in the execution path: ``select_option`` resolves its
+        # label through ``value_ref`` like every other value action.
+        "option_value",
+    }
+)
+_CANDIDATE_FIELD_NAMES: Final[frozenset[str]] = frozenset(
+    field_definition.name for field_definition in fields(ActionCandidate)
+)
+assert EXECUTOR_CANDIDATE_FIELDS | DECISION_ONLY_CANDIDATE_FIELDS == _CANDIDATE_FIELD_NAMES, (
+    "every ActionCandidate field must be classified as executor-side or decision-side"
+)
+assert not (EXECUTOR_CANDIDATE_FIELDS & DECISION_ONLY_CANDIDATE_FIELDS), (
+    "an ActionCandidate field cannot be both executor-side and decision-side"
+)
+
+# ``ElementIdentity`` crosses whole: every part of it is what the executor resolves
+# by. Pinned for the same reason — the type's own docstring says Phase 2 added the
+# frame path, so it evolves, and a new part must be carried or consciously dropped.
+WIRE_IDENTITY_FIELDS: Final[frozenset[str]] = frozenset(
+    {"role", "name", "element_type", "frame_path", "test_id", "href_path", "nearby_heading"}
+)
+assert WIRE_IDENTITY_FIELDS == frozenset(
+    field_definition.name for field_definition in fields(ElementIdentity)
+), "every ElementIdentity field must be carried on the wire or consciously dropped"
 
 
 def _candidate_id(*parts: object) -> str:
@@ -597,6 +666,101 @@ def executable_candidates(
     return tuple(candidate for candidate in candidates if candidate.executable)
 
 
+def executable_action_payload(candidate: ActionCandidate) -> dict[str, object]:
+    """Project one candidate onto the executor-side wire shape.
+
+    PRE:  the caller has already applied the HITL gate — ``executable_candidates``
+          and ``select_candidate`` both refuse a ``requires_hitl`` candidate, so a
+          candidate reaching here passed that check in the control plane.
+    POST: only :data:`EXECUTOR_CANDIDATE_FIELDS` cross. ``risk`` is absent by
+          construction, so the browser container is never handed the field that
+          decides whether a person is required.
+
+    ``value_ref`` is a reference into the approved-value map, resolved inside the
+    executor. No literal value and no secret is ever placed here.
+    """
+
+    if not candidate.executable:  # pragma: no cover - callers gate first
+        raise ValueError("a requires_hitl candidate is never dispatched to an executor")
+    identity = candidate.identity
+    return {
+        "candidate_id": candidate.candidate_id,
+        "action": candidate.action,
+        "identity": None
+        if identity is None
+        else {
+            "role": identity.role,
+            "name": identity.name,
+            "element_type": identity.element_type,
+            "frame_path": list(identity.frame_path),
+            "test_id": identity.test_id,
+            "href_path": identity.href_path,
+            "nearby_heading": identity.nearby_heading,
+        },
+        "value_ref": candidate.value_ref,
+        "press_key": candidate.press_key,
+        "url": candidate.url,
+    }
+
+
+def candidate_from_executable_payload(payload: Mapping[str, object]) -> ActionCandidate:
+    """Rebuild the candidate an executor needs from its wire shape.
+
+    The decision-side fields are filled with inert locals rather than transported,
+    because the executor reads none of them — verified against
+    ``ops.playwright.worker._execute_candidate``, which touches only ``action``,
+    ``candidate_id``, ``identity``, ``value_ref``, ``press_key`` and ``url``.
+
+    ``risk`` is set to ``"low"`` and that is a statement of fact, not a default: the
+    control plane refuses to dispatch a ``requires_hitl`` candidate at all
+    (:func:`executable_action_payload`), so anything arriving here already cleared
+    the gate. The value is local to this process and can never travel back.
+    """
+
+    identity_payload = payload.get("identity")
+    identity: ElementIdentity | None = None
+    if isinstance(identity_payload, Mapping):
+        frame_path = identity_payload.get("frame_path")
+        identity = ElementIdentity(
+            role=_wire_text(identity_payload.get("role")),
+            name=_wire_text(identity_payload.get("name")),
+            element_type=_wire_text(identity_payload.get("element_type")),
+            frame_path=(
+                tuple(str(part) for part in frame_path if str(part))
+                if isinstance(frame_path, (list, tuple))
+                else ()
+            ),
+            test_id=_wire_optional(identity_payload.get("test_id")),
+            href_path=_wire_optional(identity_payload.get("href_path")),
+            nearby_heading=_wire_optional(identity_payload.get("nearby_heading")),
+        )
+    action = _wire_text(payload.get("action"))
+    if action not in CANDIDATE_ACTIONS:
+        raise ValueError("an executable action names an unknown verb")
+    return ActionCandidate(
+        candidate_id=_wire_text(payload.get("candidate_id")),
+        action=action,  # type: ignore[arg-type]
+        identity=identity,
+        value_ref=_wire_optional(payload.get("value_ref")),
+        press_key=_wire_optional(payload.get("press_key")),
+        url=_wire_optional(payload.get("url")),
+        # Decision-side, inert in this process. See the docstring.
+        risk="low",
+        semantic_target="",
+        expected_postcondition="",
+        trace_version="",
+        checkpoint_order=0,
+    )
+
+
+def _wire_text(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _wire_optional(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
 def select_candidate(candidates: Sequence[ActionCandidate], candidate_id: str) -> ActionCandidate:
     """Resolve a model-selected id, refusing unknown or non-executable choices."""
 
@@ -636,8 +800,12 @@ def validate_press_key(key: str) -> str:
 
 __all__ = [
     "APPROVED_VALUE_REFS",
+    "CANDIDATE_ACTIONS",
+    "DECISION_ONLY_CANDIDATE_FIELDS",
+    "EXECUTOR_CANDIDATE_FIELDS",
     "READ_ONLY_ACTIONS",
     "VALUE_ACTIONS",
+    "WIRE_IDENTITY_FIELDS",
     "ActionCandidate",
     "CandidateAction",
     "CandidatePostcondition",
@@ -645,7 +813,9 @@ __all__ = [
     "ElementPredicate",
     "IdentityResolution",
     "RiskLevel",
+    "candidate_from_executable_payload",
     "classify_irreversible",
+    "executable_action_payload",
     "executable_candidates",
     "generate_candidates",
     "render_candidates",

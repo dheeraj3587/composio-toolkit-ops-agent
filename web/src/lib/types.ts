@@ -499,10 +499,95 @@ export interface RunProgressEvent {
   recorded_at: string
 }
 
+/** Mirrors ops/providers/profile_builder.py::ResearchFactKind. */
+export type ResearchFactKind =
+  | "adapter_failed"
+  | "adapter_returned_nothing"
+  | "candidate_url_excluded"
+  | "candidate_urls_capped"
+  | "fetch_returned_nothing"
+  | "document_not_requested"
+  | "claim_discarded"
+  | "url_excluded"
+  | "field_uncorroborated"
+  | "domain_disagreement"
+
+/**
+ * One claim research refused to believe, and how often it refused it.
+ *
+ * Every field beside `kind` and the counters is optional BY CONSTRUCTION. The
+ * durable fact stores its subject as free text, so the backend validates that text
+ * against a closed vocabulary chosen by `kind` and drops it when it does not fit —
+ * and for the kinds whose subject holds an observed URL or host, it never projects
+ * one at all. An absent `field` therefore means "not safe to name" or "outside the
+ * vocabulary", not "unknown".
+ */
+export interface ResearchFactGroup {
+  kind: ResearchFactKind
+  field?: ProfileField | null
+  adapter?: string | null
+  count?: number | null
+  corroborations?: number | null
+  corroborations_required?: number | null
+  occurrences: number
+  first_at: string
+  last_at: string
+}
+
+/** Mirrors ops/core/inference.py::DecisionOutcome. */
+export type DecisionOutcome =
+  | "usable"
+  | "rate_limited"
+  | "authentication_failed"
+  | "provider_timeout"
+  | "invalid_json"
+  | "schema_invalid"
+  | "all_providers_failed"
+
+/**
+ * One inference attempt: which model was asked, and what it cost.
+ *
+ * `purpose` separates the action loop (`action`) from the planner (`plan`). These
+ * rows carry no correlation id, so attributing one to a single phase visit is a
+ * time-window judgement, not a join.
+ */
+export interface DecisionAttempt {
+  purpose: "action" | "plan"
+  provider: string
+  outcome: DecisionOutcome
+  latency_ms: number
+  onboarding_phase: OnboardingPhase
+  recorded_at: string
+}
+
+/**
+ * One committed phase transition, and the typed reason that caused it.
+ *
+ * The densest reasoning a run records: `items` above carries audit events, and
+ * those rows have no phase, so this is what a chain-of-thought view reads.
+ * Closed by construction — no free-text field, so no prompt or reasoning trace
+ * can travel through it.
+ */
+export interface PhaseBoundary {
+  sequence: number
+  from_phase?: OnboardingPhase | null
+  to_phase: OnboardingPhase
+  reason_code: string
+  attempt: number
+  profile_digest: string
+  committed_at: string
+}
+
 export interface TimelineResponse {
   run_id: string
   items: TimelineItem[]
   progress: RunProgressEvent[]
+  /** Oldest first — the order the run happened in. */
+  boundaries: PhaseBoundary[]
+  /** Newest first, like `progress`. */
+  attempts: DecisionAttempt[]
+  /** Grouped by claim, oldest group first. */
+  research: ResearchFactGroup[]
 }
 
 export interface SnapshotHealth {
@@ -573,6 +658,10 @@ export interface OperationsRequestInput {
   // Optional app sign-in credentials for autonomous login. Injected into
   // the selected provider's secret boundary at session creation; never persisted.
   browser_login?: { email: string; password: string } | null
+  // Explicitly mount create-account requests on the durable profile/planner path.
+  onboarding?: boolean
+  // Optional HTTPS research hint; never browser or route authority.
+  provider_hint_url?: string | null
 }
 
 export interface IntegratorOutput {
@@ -691,7 +780,7 @@ export interface AppCatalogResponse {
 export interface AppCapabilitiesResponse {
   app_slug: string
   account_creation_supported: boolean
-  reason_code: "reviewed_signup_route" | "signup_route_unavailable"
+  reason_code: "reviewed_signup_route" | "planner_onboarding_available"
 }
 
 export interface AppResearchResponse {

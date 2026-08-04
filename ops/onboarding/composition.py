@@ -43,6 +43,7 @@ from pathlib import Path
 import httpx
 
 from ops.core.config import Settings
+from ops.core.effect_ledger import SQLiteEffectStore
 from ops.core.inference import DecisionOutcome, JsonInference, build_json_inference
 from ops.core.redaction import install_redacting_filter
 from ops.core.secret_store import SQLiteSecretStore
@@ -67,6 +68,7 @@ from ops.onboarding.driver import (
     CaptchaBudget,
     CaptchaPauseStore,
     LedgerAutonomyOutcomes,
+    LedgerEffectAuthority,
     LoginReferenceBinder,
     LoopSessionFactory,
     OnboardingDeps,
@@ -83,14 +85,22 @@ from ops.onboarding.driver import (
 )
 from ops.onboarding.lease import LeaseStore, LeaseTimings, RunQueue
 from ops.onboarding.lease_store import SQLiteLeaseStore, SQLiteRunQueue
-from ops.onboarding.loop_telemetry import DenialFactStore, DurableLoopTelemetry
+from ops.onboarding.loop_telemetry import DenialFactStore, DurableLoopTelemetry, PlanAttemptSink
 from ops.onboarding.phase import (
+    INITIAL_PHASE,
     ONBOARDING_REASON_CODES,
     OnboardingPhase,
     OnboardingReasonCode,
 )
 from ops.planner.adherence import RouteAdherenceMonitor
-from ops.planner.decide import PlanOutcome, decide_run_plan
+from ops.planner.decide import (
+    UNSET_INFERENCE,
+    InferenceUnset,
+    PlanOutcome,
+    decide_profile_plan,
+    decide_run_plan,
+    plan_budget,
+)
 from ops.planner.store import RunPlanStore, SQLiteRunPlanStore
 from ops.planner.validator import PlanRefusal, validate_plan
 from ops.providers.errors import ConfigurationRequiredError, PhaseUnavailableError
@@ -360,19 +370,104 @@ class SettingsRunPlanner:
     driver has no business holding.
     """
 
-    def __init__(self, settings: Settings, *, inference: JsonInference | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        inference: JsonInference | None | InferenceUnset = UNSET_INFERENCE,
+        store: DenialFactStore | None = None,
+        phases: PhaseHistoryStore | None = None,
+    ) -> None:
         self._settings = settings
-        self._inference = inference
+        # Telemetry is optional so a caller that only wants a route (a test, the
+        # CLI) still plans. When both are supplied, every planning inference
+        # attempt is recorded as ``purpose="plan"`` — the durable vocabulary has
+        # always admitted that value, but until now nothing wrote it, so planner
+        # provider and latency were unrecoverable.
+        self._store = store
+        self._phases = phases
+        # Three states, deliberately distinguishable:
+        #   UNSET_INFERENCE -> build the deployment's own chain, ONCE, here rather
+        #             than on every planning call. The budget is the PLAN budget
+        #             from ``ops.planner.decide`` (20s/8s), not the action loop's
+        #             per-page default (15s/6s), so hoisting cannot silently
+        #             narrow planning.
+        #   a chain -> use exactly what the caller supplied.
+        #   None   -> plan with no model at all. The deterministic route fallback
+        #             is a first-class outcome (``plan_provider_unconfigured``),
+        #             so an offline deployment or test plans without a provider
+        #             instead of being unable to express "no model".
+        self._inference: JsonInference | None = (
+            build_json_inference(settings, budget=plan_budget(settings))
+            if isinstance(inference, InferenceUnset)
+            else inference
+        )
 
-    def plan_for(self, *, recipe: AppRecipe, revision: int) -> PlanOutcome | PlanRefusal:
-        """Plan ``recipe``'s route, falling back to the reviewed route as decided."""
+    def plan_for(
+        self,
+        *,
+        revision: int,
+        recipe: AppRecipe | None = None,
+        profile: ProviderProfile | None = None,
+        evidence: str = "",
+        run_id: str | None = None,
+    ) -> PlanOutcome | PlanRefusal:
+        """Plan from exactly one recipe or committed-profile authority.
 
+        ``run_id`` is the attribution for planner telemetry only. Absent it, the
+        plan is identical: the route comes from the recipe or the committed profile
+        either way, so a caller that cannot name the run still plans.
+        """
+
+        if (recipe is None) == (profile is None):
+            raise ValueError("planner requires exactly one route authority")
+        inference = self._recording_chain(run_id)
+        if profile is not None:
+            return decide_profile_plan(
+                profile=profile,
+                settings=self._settings,
+                revision=revision,
+                evidence=evidence,
+                inference=inference,
+            )
+        assert recipe is not None
         return decide_run_plan(
             recipe=recipe,
             settings=self._settings,
             revision=revision,
-            inference=self._inference,
+            evidence=evidence,
+            inference=inference,
         )
+
+    def _recording_chain(self, run_id: str | None) -> JsonInference | None:
+        """This planner's chain, recording each attempt when it can attribute one.
+
+        ``with_attempts`` shares the breakers rather than copying them, which is
+        what we want: a provider this deployment already found to be failing must
+        stay skipped for planning too, not get one free retry per plan.
+        """
+
+        chain = self._inference
+        if chain is None or run_id is None or self._store is None or self._phases is None:
+            return chain
+        return chain.with_attempts(
+            PlanAttemptSink(store=self._store, run_id=run_id, phase=self._planning_phase(run_id))
+        )
+
+    def _planning_phase(self, run_id: str) -> OnboardingPhase:
+        """The phase to attribute a planning attempt to.
+
+        The initial plan is made *during* ``research``, and the driver commits the
+        ``research -> vault_check`` boundary only after that handler returns — so at
+        planning time the phase history is normally EMPTY, and no run ever holds a
+        boundary whose ``to_phase`` is ``research``. Falling back to
+        :data:`INITIAL_PHASE` rather than skipping the write is what makes the first
+        plan of every run recordable; a re-plan later reads the phase it stands in.
+        """
+
+        assert self._phases is not None
+        history = self._phases.history(run_id=run_id)
+        return history[-1].to_phase if history else INITIAL_PHASE
 
 
 @dataclass(frozen=True, slots=True)
@@ -466,6 +561,7 @@ class OnboardingPorts:
         logins: LoginReferenceBinder | None = None,
         verification_binding: VerificationBinding | None = None,
         telemetry: LoopTelemetry | None = None,
+        vault: VerificationSecretVault | None = None,
     ) -> OnboardingDeps:
         """Compose the driver's dependencies for one run.
 
@@ -516,8 +612,21 @@ class OnboardingPorts:
             outcomes=self.outcomes,
             pauses=_captcha_pause_store(self.phases),
             verification_binding=verification_binding,
-            vault=self.vault,
+            # A caller-supplied wrapper wins over the composed store: the mounted
+            # runtime passes a recording vault so the grant the verification phase
+            # reserves is redeemable by its in-process consumer. ``None`` keeps the
+            # composed store, so every other caller is unchanged.
+            vault=vault if vault is not None else self.vault,
             effects=_effect_reader(self.phases),
+            # The drive boundary mirrors the authoritative effect ledger
+            # (``external_effects``) into the run's reservation projection. The
+            # authority handle is one more SQLiteEffectStore over the same file the
+            # phase handlers present their keys to, so the projection and the
+            # handlers see one ledger; reads only, per the port's contract.
+            developer_app_owner_id=self.settings.browser_service_owner,
+            effect_authority=LedgerEffectAuthority(
+                ledger=SQLiteEffectStore(self.settings.provider_effects_db_path)
+            ),
             plans=self.plans,
             planner=self.planner,
             plan_validator=self.plan_validator,
@@ -604,6 +713,9 @@ def build_onboarding_ports(
     # The plan lives in the run ledger's own file, so the plan rows and the phase
     # boundaries are one durable view of the run.
     plans = SQLiteRunPlanStore(path)
+    # Hoisted rather than constructed inline twice: the planner reads it to
+    # attribute its telemetry to the phase the run stands in.
+    phases = SQLitePhaseHistoryStore(path)
 
     return OnboardingPorts(
         settings=settings,
@@ -612,7 +724,7 @@ def build_onboarding_ports(
             path.parent / PROFILE_DATABASE_NAME,
             owner=settings.browser_service_owner,
         ),
-        phases=SQLitePhaseHistoryStore(path),
+        phases=phases,
         leases=SQLiteLeaseStore(path),
         queue=SQLiteRunQueue(path),
         outcomes=LedgerAutonomyOutcomes(ledger),
@@ -621,10 +733,13 @@ def build_onboarding_ports(
         deadlines=StepDeadlines.from_settings(settings),
         inference=inference,
         plans=plans,
-        # The planner builds its own bounded decision chain so planning uses the
-        # plan budget/provider order from ops.planner.decide rather than borrowing
-        # the action loop's per-page chain.
-        planner=SettingsRunPlanner(settings),
+        # The planner builds its own bounded decision chain ONCE, in its
+        # constructor, so planning uses the plan budget/provider order from
+        # ops.planner.decide rather than borrowing the action loop's per-page
+        # chain -- and does not rebuild that chain on every request.
+        # ``store``/``phases`` are telemetry only: they make each planning inference
+        # attempt durable as ``purpose="plan"``, which nothing wrote before.
+        planner=SettingsRunPlanner(settings, store=ledger, phases=phases),
         plan_validator=validate_plan,
         adherence=RouteAdherenceMonitor(plans=plans, audit=ledger),
         captcha_budget=CaptchaBudget(max_pauses=settings.onboarding_captcha_pause_budget),

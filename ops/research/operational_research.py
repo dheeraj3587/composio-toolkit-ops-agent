@@ -251,13 +251,19 @@ class _VisibleTextParser(HTMLParser):
         self.title = ""
         self._inside_title = False
         self.parts: list[str] = []
+        self.links: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        del attrs
         if tag in {"script", "style", "svg", "noscript"}:
             self._ignored_depth += 1
         if tag == "title":
             self._inside_title = True
+        if tag in {"a", "form"}:
+            target_name = "href" if tag == "a" else "action"
+            for name, value in attrs:
+                if name.casefold() == target_name and value:
+                    self.links.append(value)
+                    break
 
     def handle_endtag(self, tag: str) -> None:
         if tag in {"script", "style", "svg", "noscript"} and self._ignored_depth:
@@ -315,7 +321,7 @@ class OfficialEvidenceFetcher:
                         raise ValueError("official evidence exceeded the response size limit")
                     chunks.append(chunk)
                 body = b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
-                title, text = _extract_visible_text(body, content_type)
+                title, text = _extract_visible_text(body, content_type, base_url=current)
                 return EvidenceDocument(
                     source_url=self._policy.sanitize_candidate(str(response.url)),
                     title=title,
@@ -324,14 +330,43 @@ class OfficialEvidenceFetcher:
         raise AssertionError("redirect loop exited unexpectedly")  # pragma: no cover
 
 
-def _extract_visible_text(body: str, content_type: str) -> tuple[str, str]:
+def _extract_visible_text(
+    body: str,
+    content_type: str,
+    *,
+    base_url: str | None = None,
+) -> tuple[str, str]:
     if "html" not in content_type:
         return "Official documentation", " ".join(body.split())[:MAX_EXCERPT_CHARACTERS]
     parser = _VisibleTextParser()
     parser.feed(body)
-    return parser.title or "Official documentation", "\n".join(parser.parts)[
-        :MAX_EXCERPT_CHARACTERS
-    ]
+    links: list[str] = []
+    if base_url is not None:
+        for raw in parser.links:
+            candidate = urljoin(base_url, raw)
+            try:
+                validated = validate_https_url(candidate)
+            except ValueError:
+                continue
+            parsed = urlsplit(validated)
+            safe_query = urlencode(
+                [
+                    (name, value)
+                    for name, value in parse_qsl(parsed.query, keep_blank_values=True)
+                    if name.casefold() not in _SENSITIVE_QUERY_NAMES
+                ],
+                doseq=True,
+            )
+            safe = urlunsplit(("https", parsed.hostname or "", parsed.path or "/", safe_query, ""))
+            if safe not in links:
+                links.append(safe)
+            if len(links) >= 200:
+                break
+    # Actual document links are evidence too. Put the bounded, secret-stripped
+    # link block first so long pages cannot truncate the signup/login targets out
+    # of the excerpt before the claim extractor sees them.
+    text = "\n".join((*links, *parser.parts))
+    return parser.title or "Official documentation", text[:MAX_EXCERPT_CHARACTERS]
 
 
 PERPLEXITY_TIMEOUT_SECONDS = 20.0

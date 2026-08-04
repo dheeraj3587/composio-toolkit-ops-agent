@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import re
 import stat
 import threading
 import time
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -44,15 +47,18 @@ from api.models import (
     OnboardingControlsView,
     OnboardingStateView,
     PauseResponse,
+    PhaseBoundaryView,
     PhaseState,
     PrimaryAction,
     ProviderProfileView,
     ProviderState,
+    ResearchFactGroupView,
     ResetResponse,
     RetryableStep,
     RetryStepRequest,
     RetryStepResponse,
     RouteDecisionView,
+    RunDecisionAttemptView,
     RunDetailResponse,
     RunListResponse,
     RunOutputResponse,
@@ -65,6 +71,7 @@ from api.models import (
     TimelineEvent,
     TimelineResponse,
 )
+from ops.browser.host_policy import onboarding_hint_domain
 from ops.browser.metrics import autonomy_outcome_view
 from ops.browser.readiness import browser_configuration_state
 from ops.browser.service_client import BrowserServiceClient, BrowserServiceHealth
@@ -86,6 +93,7 @@ from ops.onboarding.phase import (
     is_legal_phase_transition,
     legal_phase_targets,
 )
+from ops.onboarding.runtime import MountedOnboardingRuntime
 from ops.providers.composio_managed_auth import managed_auth_configuration_is_valid
 from ops.providers.profile import FieldEvidence, FlowSpec, ProviderProfile
 from ops.providers.profile_store import SQLiteProviderProfileStore
@@ -102,6 +110,18 @@ from ops.runs.projections import (
 from ops.runs.reconciliation import OnboardingRunRecoveryService
 from ops.runs.service import CredentialSubmissionError
 from ops.runs.service import RunService as CoreRunService
+
+LOGGER = logging.getLogger(__name__)
+
+# Resuming into these is a restart or an end, not a continuation of the run.
+#
+# ``paused`` was listed here only because the phase table gave it no forward target,
+# so ``can_resume`` read true while every resume answered 409. The table now admits
+# re-entry into the phase a run parked from, which fixes that 409 at its source
+# rather than by withholding the control permanently: ``can_resume`` is now true
+# exactly when ``resume_from_pause`` will accept, and that method still fails closed
+# on a run whose recorded ``phase_at_pause`` the table refuses.
+_NON_CONTINUATION_PHASES: Final = frozenset({"research", "cancelled"})
 
 
 class RunNotFoundError(LookupError):
@@ -352,8 +372,23 @@ _ONBOARDING_PLAN_SUMMARIES: Final[dict[str, str]] = {
     "onboarding_route_divergence": "The run left the surface its plan declared.",
 }
 
+_ONBOARDING_RESEARCH_SUMMARIES: Final[dict[str, str]] = {
+    # Research reasoning: what the profile builder refused to believe, and why.
+    # These rows dominate the live ledger (51 of 104 at the time of writing) and
+    # were previously absent from this table, so every one of them projected as
+    # the generic ``run_updated`` / "Run state updated." — the console showed a
+    # state change where the durable row actually explains a judgement.
+    #
+    # The summary stays at the event-type level. The specific field or host sits
+    # in the row's own sanitized payload, which is a closed, non-secret shape;
+    # nothing free-text is promoted into the summary here.
+    "onboarding_research_fact": "Research recorded a claim it could not corroborate.",
+    "operational_research_enriched": "Operational research enriched the verified baseline.",
+}
+
 _EVENT_SUMMARIES: Final[dict[str, str]] = {
     **_LEGACY_EVENT_SUMMARIES,
+    **_ONBOARDING_RESEARCH_SUMMARIES,
     **_ONBOARDING_PROGRESS_SUMMARIES,
     **_ONBOARDING_EXCEPTION_SUMMARIES,
     **_ONBOARDING_ADMISSION_SUMMARIES,
@@ -622,14 +657,55 @@ class LocalRunService:
         self._onboarding_lock = threading.Lock()
         self._onboarding_phases: SQLitePhaseHistoryStore | None = None
         self._onboarding_profiles: SQLiteProviderProfileStore | None = None
+        self._mounted_onboarding: MountedOnboardingRuntime | None = None
+        self._mounted_drain: asyncio.Task[None] | None = None
 
     async def startup(self) -> None:
         await run_in_threadpool(self._service.startup)
         self._started = True
+        self._mounted_drain = asyncio.create_task(self._drain_mounted_runs())
 
     async def shutdown(self) -> None:
         self._started = False
+        drain = self._mounted_drain
+        self._mounted_drain = None
+        if drain is not None:
+            drain.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain
+        mounted = self._mounted_onboarding
+        self._mounted_onboarding = None
+        if mounted is not None:
+            await mounted.aclose()
         await run_in_threadpool(self._service.shutdown)
+
+    async def _drain_mounted_runs(self) -> None:
+        """Carry mounted runs forward after a crash, and on every later tick.
+
+        Post-commit onboarding work used to run only inside the request that
+        created or decided it, so a crash stranded the run with no trigger left in
+        the UI. This sweep is the durable half: it reconciles from the run ledger,
+        so it does not depend on an enqueue having survived the crash.
+        """
+
+        interval = max(
+            5.0,
+            float(getattr(self._settings, "autonomous_advance_interval_seconds", 20)),
+        )
+        while self._started:
+            try:
+                run_ids = await run_in_threadpool(
+                    self._service.storage.stranded_mounted_run_ids, limit=100
+                )
+                for run_id in run_ids:
+                    if not self._started:
+                        return
+                    await self._mounted_runtime().advance(run_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - the sweep must never die
+                LOGGER.exception("mounted onboarding drain cycle failed")
+            await asyncio.sleep(interval)
 
     def deployment_mutations_allowed(self) -> bool:
         """Keep production writes inert until this exact release is accepted.
@@ -691,6 +767,20 @@ class LocalRunService:
     def _primary_action(self, record: Mapping[str, object], summary: RunSummary) -> PrimaryAction:
         if summary.status == "completed":
             return PrimaryAction(kind="none", enabled=False, reason_code="run_completed")
+        # The resolved path, not the client's request flag: a complete static
+        # Playwright recipe keeps its normal primary action even when the client
+        # asked for onboarding, because the backend kept it on the legacy path.
+        if record.get("execution_path") == "profile_mounted":
+            onboarding = self._onboarding_state(summary.run_id)
+            return PrimaryAction(
+                kind="none",
+                enabled=False,
+                reason_code=(
+                    (onboarding.reason_code if onboarding is not None else None)
+                    or summary.reason_code
+                    or "profile_research_required"
+                ),
+            )
         if summary.execution_mode == "plan_only":
             return PrimaryAction(kind="none", enabled=False, reason_code="plan_only_run_read_only")
         if summary.status == "credentials_ready":
@@ -1058,6 +1148,10 @@ class LocalRunService:
         route_kind = str(record.get("route_kind") or "")
         run_status = str(record.get("status") or "")
         run_phase = str(record.get("phase") or "")
+        # The backend's resolved path, not the client's request flag; see
+        # ``_primary_action`` for why static Playwright runs must not be reported
+        # as profile-planned.
+        profile_onboarding = record.get("execution_path") == "profile_mounted"
         browser_provider: BrowserProvider = (
             "playwright" if record.get("browser_provider") == "playwright" else "browser_use"
         )
@@ -1077,7 +1171,46 @@ class LocalRunService:
         )
         bundle_ready = record.get("integrator_bundle") is not None
 
-        if route_kind != "playwright":
+        if profile_onboarding:
+            browser_phase = PhaseState(
+                key="browser",
+                name="Browser",
+                phase="browser",
+                status=(
+                    "configuration_required"
+                    if record.get("reason_code") == "browser_adapter_unavailable"
+                    else "waiting"
+                    if run_status in {"researching", "waiting_for_hitl", "route_selected"}
+                    else "blocked"
+                    if run_status == "blocked"
+                    else "failed"
+                    if run_status == "failed"
+                    else "configuration_required"
+                    if run_status == "configuration_required"
+                    else "ready"
+                ),
+                detail=(
+                    "The profile-bound plan is durable. This deployment still needs the "
+                    "generic observe/act/signup browser RPC before provider effects can run."
+                ),
+                available=False,
+            )
+            hitl_phase = PhaseState(
+                key="hitl",
+                name="HITL",
+                phase="hitl",
+                status=(
+                    "waiting"
+                    if run_phase in {"awaiting_admission", "paused", "captcha_paused"}
+                    else "ready"
+                ),
+                detail=(
+                    "Operator admission and CAPTCHA/MFA/billing/legal pauses remain "
+                    "backend-authoritative for profile-planned onboarding."
+                ),
+                available=True,
+            )
+        elif route_kind != "playwright":
             browser_phase = PhaseState(
                 key="browser",
                 name="Browser",
@@ -1144,7 +1277,7 @@ class LocalRunService:
                 or hitl_request.get("action_type") == "email_otp"
             )
         )
-        if route_kind == "playwright":
+        if route_kind == "playwright" or profile_onboarding:
             email_phase = PhaseState(
                 key="email",
                 name="Email verification",
@@ -1282,6 +1415,17 @@ class LocalRunService:
     # them drives a provider, and none of them can resolve a credential value: the
     # only vault-facing dependency is the reference-only probe reset uses to count
     # what it preserved.
+
+    def _mounted_runtime(self) -> MountedOnboardingRuntime:
+        """The process-wide durable onboarding mount for API-created runs."""
+
+        with self._onboarding_lock:
+            if self._mounted_onboarding is None:
+                self._mounted_onboarding = MountedOnboardingRuntime(
+                    self._settings,
+                    ledger_path=str(self._service.storage.db_path),
+                )
+            return self._mounted_onboarding
 
     def _phase_store(self) -> SQLitePhaseHistoryStore:
         """The run ledger's phase history, opened once per service instance."""
@@ -1443,7 +1587,11 @@ class LocalRunService:
             or "research" in targets
             or ("paused" in targets and is_legal_phase_transition("paused", "research"))
         )
-        can_resume = waiting
+        # Resume must mean "continue this run", so it is offered only when the
+        # phase table declares a forward target. ``paused`` declares only
+        # ``research`` and ``cancelled``, so offering resume there returned a 409
+        # for every run the mounted seam paused on an unavailable browser adapter.
+        can_resume = waiting and bool(targets - _NON_CONTINUATION_PHASES)
         withheld = (
             self._withheld_resume_reason(run_id, state) if phase == "captcha_paused" else None
         )
@@ -1760,7 +1908,13 @@ class LocalRunService:
         request: AdmissionDecisionRequest,
     ) -> AdmissionDecisionResponse:
         self._require_started()
-        return await run_in_threadpool(self._decision_sync, run_id, request)
+        response = await run_in_threadpool(self._decision_sync, run_id, request)
+        if response.route == "signup":
+            await self._mounted_runtime().advance(run_id)
+            state = await run_in_threadpool(self._onboarding_state, run_id)
+            if state is not None:
+                response = response.model_copy(update={"onboarding": state})
+        return response
 
     async def pause_onboarding(self, run_id: str, *, reason: str | None = None) -> PauseResponse:
         self._require_started()
@@ -1896,7 +2050,43 @@ class LocalRunService:
             )
             for event in self._service.get_progress_events(run_id, limit=window)
         ]
-        return TimelineResponse(run_id=run_id, items=items, progress=progress)
+        boundaries = [
+            PhaseBoundaryView(
+                sequence=boundary["sequence"],
+                from_phase=boundary["from_phase"],
+                to_phase=boundary["to_phase"],
+                reason_code=boundary["reason_code"],
+                attempt=boundary["attempt"],
+                profile_digest=boundary["profile_digest"] or "",
+                committed_at=boundary["committed_at"],
+            )
+            for boundary in self._service.get_phase_boundaries(run_id, limit=window)
+        ]
+        attempts = [
+            RunDecisionAttemptView(
+                purpose=attempt["purpose"],
+                provider=attempt["provider"],
+                outcome=attempt["outcome"],
+                latency_ms=attempt["latency_ms"],
+                onboarding_phase=attempt["phase"],
+                recorded_at=attempt["recorded_at"],
+            )
+            for attempt in self._service.get_decision_attempts(run_id, limit=window)
+        ]
+        # Already validated and grouped at the projection boundary
+        # (``ops/runs/projections.py::research_fact_groups``), so a group carries
+        # only keys this view declares and unprojectable values are already gone.
+        research = [
+            ResearchFactGroupView(**group) for group in self._service.get_research_facts(run_id)
+        ]
+        return TimelineResponse(
+            run_id=run_id,
+            items=items,
+            progress=progress,
+            boundaries=boundaries,
+            attempts=attempts,
+            research=research,
+        )
 
     @staticmethod
     def _timeline_event(projected: ProjectedTimelineEvent) -> TimelineEvent:
@@ -2067,10 +2257,19 @@ class LocalRunService:
         recipe = get_app_recipe_for_name(request.app_name) or get_app_recipe(
             request.app_name.strip().casefold()
         )
-        if recipe is None:
+        if recipe is None and not (
+            request.onboarding and onboarding_hint_domain(request.provider_hint_url) is not None
+        ):
             # Canonical runs are bound to the reviewed recipe matrix. Reject an
             # unknown display name at the API boundary instead of letting a
             # KeyError escape as a misleading 500 after the operator submits.
+            #
+            # The one exception is an off-catalog ONBOARDING request carrying a
+            # usable hint URL: it has no recipe by design and is routed on a
+            # corroborated ``ProviderProfile`` instead. The hint is required rather
+            # than optional — it becomes the run's entire host policy, so without it
+            # there is no host to seed research with and no way to tell the request
+            # apart from a typo'd app name, which is what this 404 is for.
             raise AppNotFoundError("unknown")
         work_email_ref = request.company.work_email_ref or _work_email_ref_for_app(request.app_name)
         company = CompanyProfile(
@@ -2091,6 +2290,9 @@ class LocalRunService:
             provider_setup=request.provider_setup,
             dry_run=True,
             account_creation_requested=request.account_mode == "create_account",
+            onboarding=request.onboarding,
+            provider_hint_url=request.provider_hint_url,
+            credential_surface_url=request.credential_surface_url,
         )
         # Autonomous sign-in credentials (if provided) are mapped to the Browser
         # Use secure-placeholder key names and injected at session creation. The
@@ -2102,13 +2304,25 @@ class LocalRunService:
                 "login_email": request.browser_login.email,
                 "login_password": request.browser_login.password,
             }
-        return await run_in_threadpool(
+        detail = await run_in_threadpool(
             self._create_sync,
             operation,
             idempotency_key,
             request.execution_mode,
             browser_login,
         )
+        # Ask the persisted run what it became. ``request.onboarding`` is only a
+        # hint: ``CanonicalRuntime.create_run`` keeps complete static Playwright
+        # recipes on the legacy path, and advancing those here would drive a run
+        # this seam does not own.
+        if await run_in_threadpool(self._is_profile_mounted, detail.run.run_id):
+            await self._mounted_runtime().advance(detail.run.run_id)
+            return await run_in_threadpool(self._get_sync, detail.run.run_id)
+        return detail
+
+    def _is_profile_mounted(self, run_id: str) -> bool:
+        record = self._service.storage.get_run(run_id)
+        return record is not None and record.get("execution_path") == "profile_mounted"
 
     def _submit_credentials_sync(
         self,

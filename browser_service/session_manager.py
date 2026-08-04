@@ -146,6 +146,32 @@ class ManagedSession:
     # domain. None means no run allow-list was supplied and the reviewed
     # recipe-derived policy inside the worker remains the only boundary.
     allowed_hosts: BrowserAllowedHosts | None = None
+    # --- the loop seam: one observation's inspection, held for its one action ----
+    #
+    # The action loop runs in the CONTROL PLANE and acts through two RPCs, so the
+    # inspection an action was planned against cannot cross the wire (it holds live
+    # Playwright locators). It is cached here between ``/observe`` and ``/act``.
+    #
+    # ``loop_generation`` is the token the client echoes back. It is COMPARED AND
+    # CONSUMED inside ``loop_lock``, which makes the token do two jobs at once:
+    #
+    #  * TOCTOU-ish staleness: an ``/act`` planned against an older observation is
+    #    refused rather than executed against a page the client has not seen.
+    #  * duplicate dispatch: if ``/act`` succeeds but its response is lost, the
+    #    client's retry carries a consumed token and is refused instead of
+    #    submitting a second time. That matters because an action can be
+    #    provider-visible (a signup submit) while the effect ledger is
+    #    phase-granular, not per-action, so the ledger would not catch it.
+    #
+    # It is NOT a page fingerprint, and the distinction is load-bearing. The real
+    # time-of-check-to-time-of-use guard is the strict ``resolve_identity``
+    # re-resolution inside the worker immediately before the click: a JS redirect or
+    # an async re-render moves the page without any inspection happening, so the
+    # generation stays equal while the locators die. Both guards are required and
+    # neither replaces the other.
+    loop_inspection: Any = None
+    loop_generation: int = 0
+    loop_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Lifecycle + lease accounting.
     lifecycle: SessionLifecycle = "ACTIVE"
     active_operations: int = 0

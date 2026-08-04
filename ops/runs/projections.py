@@ -12,15 +12,17 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, Literal, cast, get_args
 
 from ops.core.redaction import redact_data, redact_text
 from ops.core.secret_store import parse_vault_reference
 from ops.onboarding.phase import ONBOARDING_PHASES, ONBOARDING_REASON_CODES
 from ops.providers.composio_capability import ComposioCapabilityReport
+from ops.providers.profile_builder import ResearchFactKind
+from ops.providers.profile_store import PROFILE_FIELDS
 from ops.research.p1_adapter import P1AppRecord, to_operational_research
 
 # Gated routes that may proceed to a single controlled outreach in
@@ -232,11 +234,19 @@ def decode_stored_payload(value: object) -> dict[str, Any]:
 # Onboarding timeline projection (design LL-7, LL-6.1)
 # ---------------------------------------------------------------------------
 
-# The projector reads DURABLE ROWS ONLY. An audit row's sanitized payload is
-# never a source: the summary comes from the API's static allow-list and every
-# field below is read from a typed durable column (phase history, onboarding run
-# state, or the run row). A mistakenly-rich audit payload therefore cannot reach
-# the timeline (Requirements 17.1, 17.11).
+# The PER-EVENT projector reads DURABLE ROWS ONLY. An audit row's sanitized payload
+# is never a source for a timeline event: the summary comes from the API's static
+# allow-list and every field below is read from a typed durable column (phase
+# history, onboarding run state, or the run row). A mistakenly-rich audit payload
+# therefore cannot reach a timeline event (Requirements 17.1, 17.11).
+#
+# ONE aggregate is scoped out of that, deliberately and in one place:
+# ``research_fact_groups`` at the bottom of this module. It reads the research-fact
+# payload, but it does not project a stored value — it projects a value that
+# survived validation against a closed vocabulary (a ``ProfileField``, an adapter
+# label, a bounded count), and drops everything else including every ``subject``
+# that could hold an observed URL. So the property is narrower than "no payload is
+# ever read" and still exact: no UNVALIDATED payload value is ever projected.
 
 TimelineEventStatus = Literal["recorded", "completed", "blocked", "failed"]
 
@@ -473,11 +483,120 @@ def onboarding_timeline_event(
     )
 
 
+RESEARCH_FACT_EVENT_TYPE: Final = "onboarding_research_fact"
+
+# Which validator a fact's ``kind`` selects for its ``subject``.
+#
+# ``kind`` is a closed Literal, but ``subject`` and ``detail`` are free-form strings
+# truncated to 200 chars, and for three kinds ``subject`` holds a raw URL or a host
+# observed on the network. ``kind`` is what tells us which of those it is, so it
+# selects the projection: a field name, an adapter name, a count, or nothing.
+_FACT_SUBJECT_IS_FIELD: Final[frozenset[str]] = frozenset(
+    {"field_uncorroborated", "claim_discarded"}
+)
+_FACT_SUBJECT_IS_ADAPTER: Final[frozenset[str]] = frozenset(
+    {"adapter_failed", "adapter_returned_nothing", "candidate_url_excluded"}
+)
+_FACT_SUBJECT_IS_COUNT: Final[frozenset[str]] = frozenset({"candidate_urls_capped"})
+# url_excluded, document_not_requested, and domain_disagreement carry an observed
+# URL or host in ``subject``; they project their kind and nothing else.
+
+RESEARCH_FACT_KINDS: Final[frozenset[str]] = frozenset(get_args(ResearchFactKind))
+PROFILE_FIELD_NAMES: Final[frozenset[str]] = PROFILE_FIELDS
+
+# Mirrors ``api.models.AdapterName``.
+_ADAPTER_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_CORROBORATIONS = re.compile(r"^corroborations=(\d{1,3})/(\d{1,3})$")
+_MAX_FACT_COUNT = 64
+
+
+def research_fact_groups(rows: Iterable[Mapping[str, object]]) -> list[dict[str, Any]]:
+    """Group a run's research facts by what they say, newest activity last.
+
+    THE ONE PLACE an audit payload is read. The module note above states the
+    per-event projector never reads one, and that remains exactly true — this is a
+    separate aggregate, and it does not project a stored value, it projects a value
+    that survived validation against a closed vocabulary. Anything else is dropped,
+    the same discipline ``_BOUNDED_IDENTIFIER`` applies to durable columns.
+
+    Grouping rather than enumerating: a live run holds 52 of these rows carrying 4
+    distinct facts, and 45 repetitions of "signup_url has 1 of 2 corroborations" is
+    noise that would bury the trace it belongs to.
+    """
+
+    grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        if str(row.get("event_type") or "") != RESEARCH_FACT_EVENT_TYPE:
+            continue
+        payload = decode_stored_payload(row.get("payload"))
+        kind = payload.get("kind")
+        if not isinstance(kind, str) or kind not in RESEARCH_FACT_KINDS:
+            continue
+        projected = _fact_subject(kind, payload.get("subject"))
+        projected.update(_fact_corroborations(payload.get("detail")))
+        recorded_at = str(row.get("created_at") or "unknown")
+
+        key = (kind, *sorted(projected.items(), key=lambda item: item[0]))
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = {
+                "kind": kind,
+                **projected,
+                "occurrences": 1,
+                "first_at": recorded_at,
+                "last_at": recorded_at,
+            }
+            continue
+        existing["occurrences"] += 1
+        existing["first_at"] = min(existing["first_at"], recorded_at)
+        existing["last_at"] = max(existing["last_at"], recorded_at)
+    return sorted(grouped.values(), key=lambda group: (group["first_at"], group["kind"]))
+
+
+def _fact_subject(kind: str, subject: object) -> dict[str, Any]:
+    """What this kind's ``subject`` is allowed to become, or nothing."""
+
+    if not isinstance(subject, str):
+        return {}
+    if kind in _FACT_SUBJECT_IS_FIELD:
+        # An off-vocabulary value is exactly the `field_outside_vocabulary` case the
+        # builder records; the group still counts, it just names no field.
+        return {"field": subject} if subject in PROFILE_FIELD_NAMES else {}
+    if kind in _FACT_SUBJECT_IS_ADAPTER:
+        return {"adapter": subject} if _ADAPTER_NAME.match(subject) else {}
+    if kind in _FACT_SUBJECT_IS_COUNT:
+        if subject.isdigit() and int(subject) <= _MAX_FACT_COUNT:
+            return {"count": int(subject)}
+        return {}
+    return {}
+
+
+def _fact_corroborations(detail: object) -> dict[str, int]:
+    """Only the templated ``corroborations=N/M`` form; every other detail is dropped.
+
+    The rest of the vocabulary is snake_case labels, but one member interpolates a
+    third-party exception class name (``adapter_failed``), and no closed vocabulary
+    governs that.
+    """
+
+    if not isinstance(detail, str):
+        return {}
+    match = _CORROBORATIONS.match(detail)
+    if match is None:
+        return {}
+    found, required = int(match.group(1)), int(match.group(2))
+    if found > _MAX_FACT_COUNT or required > _MAX_FACT_COUNT:
+        return {}
+    return {"corroborations": found, "corroborations_required": required}
+
+
 __all__ = [
+    "RESEARCH_FACT_EVENT_TYPE",
     "ProjectedTimelineEvent",
     "TimelineEventStatus",
     "decode_stored_payload",
     "onboarding_timeline_correlation",
     "onboarding_timeline_detail",
+    "research_fact_groups",
     "onboarding_timeline_event",
 ]

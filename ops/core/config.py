@@ -234,6 +234,22 @@ class Settings(BaseModel):
     # debugging only, so it must be requested explicitly rather than being a silent
     # fallback whenever the service happens to be unconfigured.
     playwright_in_process_sandbox: bool = False
+    # Show the real Chromium window for the in-process sandbox path, so an operator
+    # can watch a run act. Off by default and deliberately NOT tied to
+    # ``browser_interactive_hitl_enabled``: that flag governs the browser service's
+    # one-session noVNC assignment, while this one only affects the local debug
+    # transport. Headed Chromium needs a display, so this is a local-debugging
+    # switch — a headless server that sets it launches nothing.
+    playwright_headed: bool = False
+    # Install the recipe-owned document-start pixel mask on the browser context.
+    # That CSS mask exists ONLY for a display whose pixels are relayed off the
+    # machine (the browser service's noVNC stream): it hides credential fields from
+    # a remote live viewer. For the in-process sandbox on a developer's own screen
+    # it serves no purpose and bricks the visible page, so local debugging may turn
+    # it off. The browser-service container runs the worker in service mode, which
+    # IGNORES this flag and always installs the mask — a misconfigured production
+    # env can never unmask a relayed session.
+    playwright_live_pixel_mask: bool = True
     # Owner-only local credential submission is opt-in and loopback-only.
     allow_local_credential_submission: bool = False
 
@@ -745,6 +761,10 @@ class Settings(BaseModel):
             ),
             "playwright_in_process_sandbox": _boolean(
                 source.get("PLAYWRIGHT_IN_PROCESS_SANDBOX"), default=False
+            ),
+            "playwright_headed": _boolean(source.get("PLAYWRIGHT_HEADED"), default=False),
+            "playwright_live_pixel_mask": _boolean(
+                source.get("PLAYWRIGHT_LIVE_PIXEL_MASK"), default=True
             ),
             "allow_local_credential_submission": _boolean(
                 source.get("ALLOW_LOCAL_CREDENTIAL_SUBMISSION"), default=False

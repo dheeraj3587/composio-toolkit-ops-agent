@@ -240,7 +240,15 @@ class _RefusingPlanner:
     def __init__(self) -> None:
         self.calls = 0
 
-    def plan_for(self, *, recipe: AppRecipe, revision: int) -> PlanRefusal:
+    def plan_for(
+        self,
+        *,
+        revision: int,
+        recipe: AppRecipe | None = None,
+        profile: ProviderProfile | None = None,
+        evidence: str = "",
+        run_id: str | None = None,
+    ) -> PlanRefusal:
         self.calls += 1
         return PlanRefusal(
             reason_code="plan_surface_not_in_catalog",

@@ -78,11 +78,40 @@ def _safe_value(key: str, raw: object, maximum: int) -> str:
     return value
 
 
+_FIELD_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+# The refusal reason a caller can turn into an operator-facing pause. The field
+# name is appended so a human can see WHICH field a provider asked for that this
+# deployment has not reviewed.
+FIELD_NOT_IN_ALLOWLIST: str = "field_not_in_allowlist"
+
+
+def _unapproved_reason(unapproved: Sequence[str]) -> str:
+    """``field_not_in_allowlist:<name>`` for the offending keys, safely rendered.
+
+    The keys are untrusted input, so only allowlist-shaped names are echoed; any
+    other key is reported as ``<unprintable>`` rather than reflecting arbitrary
+    text into a log line or an API body. Sorted so the message is deterministic.
+    """
+
+    named = ",".join(
+        name if _FIELD_NAME.fullmatch(name) else "<unprintable>" for name in sorted(unapproved)[:5]
+    )
+    return f"{FIELD_NOT_IN_ALLOWLIST}:{named}"
+
+
 def _normalize(values: Mapping[str, object] | None, limits: Mapping[str, int]) -> dict[str, str]:
     if not values:
         return {}
-    if set(values) - set(limits) or len(values) > len(limits):
-        raise ValueError("browser setup field is not approved")
+    # Naming the field is the whole point: the allowlist is a REVIEWED security
+    # control, so a provider asking for something outside it must surface as a
+    # diagnosable pause a human can act on -- never as a silent runtime extension
+    # of the allowlist, and never as an anonymous "not approved".
+    unapproved = set(values) - set(limits)
+    if unapproved:
+        raise ValueError(_unapproved_reason(tuple(unapproved)))
+    if len(values) > len(limits):
+        raise ValueError("browser setup fields exceed the approved count")
     return {key: _safe_value(key, raw, limits[key]) for key, raw in values.items()}
 
 
@@ -127,6 +156,7 @@ def browser_setup_values(
 
 __all__ = [
     "APPROVED_BROWSER_VALUE_REFS",
+    "FIELD_NOT_IN_ALLOWLIST",
     "browser_setup_values",
     "normalize_browser_setup_fields",
     "normalize_provider_setup_fields",

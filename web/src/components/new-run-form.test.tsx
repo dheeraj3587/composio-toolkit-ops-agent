@@ -208,7 +208,7 @@ describe("NewRunForm", () => {
     ).toBeInTheDocument()
   })
 
-  it("disables account creation when the selected app lacks a reviewed signup route", () => {
+  it("disables account creation when the selected app is not planner-eligible", () => {
     appMocks.useAppCapabilities.mockReturnValue({
       data: {
         app_slug: "pipedrive",
@@ -235,7 +235,7 @@ describe("NewRunForm", () => {
 
     expect(screen.getByRole("radio", { name: /create a new account/i })).toBeDisabled()
     expect(
-      screen.getByText("Pipedrive does not have a reviewed signup route in this deployment."),
+      screen.getByText("Pipedrive is not eligible for reviewed planner onboarding."),
     ).toBeInTheDocument()
   })
 

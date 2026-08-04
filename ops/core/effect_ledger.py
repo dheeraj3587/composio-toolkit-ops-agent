@@ -226,6 +226,38 @@ class SQLiteEffectStore:
             receipt_json=None,
         )
 
+    def read_standing(
+        self,
+        *,
+        provider: str,
+        action: str,
+        idempotency_key: str,
+    ) -> tuple[str, dict[str, str] | None] | None:
+        """Read one key's durable row, reserving nothing and creating nothing.
+
+        ``reserve()`` has the standing state as a by-product but also inserts a
+        ``pending`` row for an absent key, which is a write this read must not
+        perform: the driver mirrors the authoritative ledger into the run's
+        reservation projection at each boundary, and a mirror must not open a key
+        it is only looking at.
+
+        POST: ``(status, receipt)`` for an existing row, or ``None``. ``status``
+              is one of the durable row statuses the onboarding planner maps
+              (``pending``, ``completed``, ``outcome_unknown``, ``failed``).
+        """
+
+        effect_key = self._key(provider, action, idempotency_key)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status, receipt_json FROM external_effects WHERE effect_key = ?",
+                (effect_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        status = str(row[0])
+        receipt = self._deserialize_receipt(row[1]) if row[1] is not None else None
+        return (status, receipt)
+
     def _transition(
         self,
         *,

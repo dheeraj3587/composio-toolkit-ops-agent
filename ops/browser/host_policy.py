@@ -31,7 +31,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from ops.core.models import OperationalResearch
+from ops.core.models import OperationalResearch, validate_operational_url
 from ops.recipes.app_recipes import AppRecipe, get_app_recipe
 
 # Access routes for which a browser session may be launched at all.
@@ -77,6 +77,65 @@ MAX_ALLOWED_HOST_PATTERNS = 32
 _ALLOWED_HOST_PATTERN = re.compile(
     r"^(?:\*\.)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$"
 )
+
+# A dotted-quad host. Matched to refuse it: an IP literal names a machine, not a
+# vendor, so it can never carry a registrable-domain ownership claim.
+_IP_LITERAL_HOST = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+# Hosts that parse as a domain but attribute nothing to a vendor. Seeding research
+# from one of these would scope a run's whole host policy to the operator's own
+# machine or to a shared code-hosting zone.
+_NON_VENDOR_HINT_DOMAINS: frozenset[str] = frozenset(
+    {
+        "localhost",
+        "local",
+        "localdomain",
+        "internal",
+        "example.com",
+        "example.org",
+        "example.net",
+        "github.io",
+        "githubusercontent.com",
+    }
+)
+
+
+def onboarding_hint_domain(hint_url: str | None) -> str | None:
+    """The registrable domain an off-catalog onboarding hint may seed research with.
+
+    An off-catalog run has no reviewed recipe, so this operator-supplied hint
+    becomes the ONLY seed for its host policy: ``OfficialURLPolicy`` accepts
+    whatever hostname it is handed, and the profile builder's corroboration runs
+    against documents fetched from that host. A hint that is not a plain vendor
+    domain would therefore widen the allow-list by construction — the exact
+    substitution the reviewed-recipe guard in ``build_browser_allowed_hosts``
+    exists to refuse.
+
+    ``None`` means "not usable as a seed", and every caller must fail closed on
+    it rather than falling back to the app name. Refused: anything
+    ``validate_operational_url`` rejects (non-HTTPS, embedded credentials, a
+    session-artifact query, a fragment), a bare IP literal or ``localhost``, and
+    any host whose registrable domain cannot be determined.
+    """
+
+    if hint_url is None:
+        return None
+    try:
+        validated = validate_operational_url(hint_url)
+    except ValueError:
+        return None
+    if validated is None:  # pragma: no cover - None input returns above
+        return None
+    hostname = urlsplit(validated).hostname or ""
+    # An IP literal has no registrable domain, so it can never be attributed to a
+    # vendor. ``registrable_domain`` would return the last two dotted labels of an
+    # IPv4 address, which is a host, not an ownership claim.
+    if _IP_LITERAL_HOST.match(hostname) or ":" in hostname:
+        return None
+    domain = registrable_domain(hostname)
+    if domain is None or domain in _NON_VENDOR_HINT_DOMAINS:
+        return None
+    return domain
 
 
 def registrable_domain(hostname: str) -> str | None:
@@ -254,12 +313,16 @@ def build_browser_allowed_hosts(
     self_host_runtime_host: str | None = None,
     recipe: AppRecipe | None = None,
     allow_domain_discovery: bool | None = None,
+    profile_authority: bool = False,
 ) -> BrowserAllowedHosts:
     """Build the per-run browser allowlist, failing closed for inactive apps.
 
     * The app's route must be a browser route (``self_serve``/``hybrid``) when
       ``access_route`` is provided.
-    * A reviewed recipe policy is always preferred and is never widened.
+    * A reviewed recipe policy is preferred by default and is never widened.
+    * ``profile_authority`` is an explicit second authority available only to a
+      committed ``ProviderProfile``. It derives one domain from that profile's
+      already-corroborated canonical URLs and never mixes profile and recipe hosts.
     * With domain discovery enabled, an app WITHOUT a reviewed recipe may instead
       be scoped to the one registrable domain its own verified URLs agree on.
       Without it, an unknown app still receives no allowlist at all.
@@ -269,25 +332,47 @@ def build_browser_allowed_hosts(
     if access_route is not None and access_route not in BROWSER_ROUTES:
         raise BrowserPolicyInactiveError(app_slug, "route_is_not_a_browser_route")
 
-    if recipe is not None and recipe.app_slug != app_slug:
-        raise BrowserPolicyInactiveError(app_slug, "immutable_recipe_app_mismatch")
-    policy = (
-        browser_policy_from_recipe(recipe) if recipe is not None else get_browser_policy(app_slug)
-    )
-    if policy is None:
-        if allow_domain_discovery is None:
-            from ops.core.config import Settings
-
-            allow_domain_discovery = bool(
-                getattr(Settings.from_env(), "browser_domain_discovery_enabled", False)
-            )
-        if not allow_domain_discovery:
-            # A research URL is evidence, never browser authority. Unknown apps do
-            # not receive an allowlist until a reviewed recipe is checked in.
-            raise BrowserPolicyInactiveError(app_slug, "reviewed_browser_policy_required")
+    if profile_authority:
+        # The caller must hold a committed ProviderProfile. Its construction has
+        # already proven every URL agrees on one registrable domain; re-derive the
+        # same fact here so the browser boundary remains independently fail closed.
+        #
+        # A reviewed recipe outranks a profile, so its EXISTENCE is checked before
+        # anything is derived. Without this, an app that already has a checked-in
+        # policy would silently receive a research-derived allow-list instead of
+        # its reviewed one, and "this allow-list is attributable to the profile"
+        # would be false for that run. Refusing is the only answer that keeps a
+        # single authority per slug: a caller wanting the reviewed list must ask
+        # for it as a recipe, not arrive here.
+        if recipe is not None and recipe.app_slug != app_slug:
+            raise BrowserPolicyInactiveError(app_slug, "immutable_recipe_app_mismatch")
+        if get_browser_policy(app_slug) is not None:
+            raise BrowserPolicyInactiveError(app_slug, "reviewed_browser_policy_supersedes_profile")
         policy = discovered_policy_from_research(app_slug, research)
         if policy is None:
             raise BrowserPolicyInactiveError(app_slug, "discovery_domain_unproven")
+    else:
+        if recipe is not None and recipe.app_slug != app_slug:
+            raise BrowserPolicyInactiveError(app_slug, "immutable_recipe_app_mismatch")
+        policy = (
+            browser_policy_from_recipe(recipe)
+            if recipe is not None
+            else get_browser_policy(app_slug)
+        )
+        if policy is None:
+            if allow_domain_discovery is None:
+                from ops.core.config import Settings
+
+                allow_domain_discovery = bool(
+                    getattr(Settings.from_env(), "browser_domain_discovery_enabled", False)
+                )
+            if not allow_domain_discovery:
+                # A research URL is evidence, never browser authority. Unknown apps do
+                # not receive an allowlist until a reviewed recipe is checked in.
+                raise BrowserPolicyInactiveError(app_slug, "reviewed_browser_policy_required")
+            policy = discovered_policy_from_research(app_slug, research)
+            if policy is None:
+                raise BrowserPolicyInactiveError(app_slug, "discovery_domain_unproven")
 
     if not policy.active:
         raise BrowserPolicyInactiveError(app_slug, "browser_policy_inactive_for_app")
@@ -428,4 +513,6 @@ __all__ = [
     "get_browser_policy",
     "host_matches_patterns",
     "navigation_target_urls",
+    "onboarding_hint_domain",
+    "registrable_domain",
 ]

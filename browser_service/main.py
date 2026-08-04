@@ -40,6 +40,7 @@ from browser_service.auth import (
 from browser_service.clearance import observe_gate_clearance
 from browser_service.display_pool import DisplayPool, DisplayUnavailable
 from browser_service.models import (
+    ActRequest,
     CaptureCredentialsRequest,
     CaptureCredentialsResponse,
     CreateSessionRequest,
@@ -47,6 +48,7 @@ from browser_service.models import (
     GateClearanceReport,
     HealthResponse,
     LiveViewGrant,
+    LoopObservationResponse,
     NavigateRequest,
     ObservationResponse,
     ProviderHealthState,
@@ -59,6 +61,7 @@ from browser_service.novnc import LiveViewDenied, VncTarget, authorize_live_view
 from browser_service.secret_broker import BrokerCaptureStore, BrowserSecretBrokerClient
 from browser_service.session_manager import ManagedSession, SessionManager, SessionUnavailable
 from browser_service.settings import BrowserServiceSettings
+from ops.browser.candidates import candidate_from_executable_payload
 from ops.browser.host_policy import (
     allowed_hosts_from_patterns,
     first_denied_navigation,
@@ -66,6 +69,7 @@ from ops.browser.host_policy import (
 )
 from ops.browser.process_hardening import harden_browser_service_process
 from ops.core.redaction import install_redacting_filter
+from ops.playwright.loop_session import loop_observation_from
 from ops.providers.errors import ProviderOperationError
 
 LOGGER = logging.getLogger("browser_service")
@@ -168,6 +172,45 @@ _AUTH_STATE_INVALIDATION_REASONS = frozenset(
 # Module-level dependency singleton: FastAPI resolves this per request, and
 # defining it once avoids a function call in an argument default (ruff B008).
 _AUTH: AuthContext = Depends(token_dependency)
+
+
+def _loop_response(
+    inspection: Any,
+    generation: int,
+    *,
+    action_status: str | None = None,
+    action_reason: str | None = None,
+) -> LoopObservationResponse:
+    """Project one inspection into the loop's wire observation.
+
+    Classification is delegated to ``ops.playwright.loop_session`` so this transport
+    and the in-process one cannot drift about whether a page is a CAPTCHA: a
+    structural human gate wins over any status either side could infer.
+
+    ``action_status`` carries a non-executed outcome through as the observation's
+    reason code, so the caller learns that its action was refused (``stale``,
+    ``blocked``, ``failed``) rather than having to infer it from an unchanged page.
+    """
+
+    loop_observation = loop_observation_from(inspection)
+    observation = loop_observation.observation
+    reason_code = observation.reason_code
+    if action_status is not None and action_status != "executed":
+        reason_code = action_reason or action_status
+    return LoopObservationResponse(
+        observation=ObservationResponse(
+            status=observation.status,
+            current_url=observation.current_url,
+            page_title=observation.page_title,
+            developer_app_id=observation.developer_app_id,
+            human_action_type=observation.human_action_type,
+            human_instruction=observation.human_instruction,
+            credential_field_labels=observation.credential_field_labels,
+            reason_code=reason_code,
+        ),
+        raw_elements=tuple(dict(element) for element in loop_observation.raw_elements),
+        generation=generation,
+    )
 
 
 def _sanitized_error(exc: SessionUnavailable) -> HTTPException:
@@ -717,6 +760,122 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         except SessionUnavailable:
             # Reaped between the authorization above and the observation itself.
             raise _clearance_absent(session_id) from None
+
+    def _authorized_session(session_id: str, auth: AuthContext) -> ManagedSession:
+        """The session this caller may operate on, or a sanitized refusal.
+
+        Exactly the authorization the sibling session routes perform, factored out
+        because the two loop verbs below need it identically.
+        """
+
+        caller_capability_digest = require_session_capability(auth)
+        session = manager.get_if_present(session_id)
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
+        assert_session_access(
+            session_owner=session.owner,
+            caller_owner=auth.owner,
+            session_capability_digest=session.session_capability_digest,
+            caller_capability_digest=caller_capability_digest,
+        )
+        return session
+
+    @app.post(
+        "/internal/browser/sessions/{session_id}/observe",
+        response_model=LoopObservationResponse,
+    )
+    async def observe(
+        session_id: str,
+        auth: AuthContext = _AUTH,
+    ) -> LoopObservationResponse:
+        """Read the page once and issue the generation the next action must echo.
+
+        The inspection itself stays here: it holds live Playwright locators, so it
+        cannot cross the wire. What crosses is the bounded observation plus the raw
+        elements the caller projects itself — ``build_snapshot`` runs in the control
+        plane so a transport cannot skip the secret-stripping step.
+        """
+
+        _authorized_session(session_id, auth)
+        try:
+            with manager.lease(session_id) as leased:
+                if leased.worker_context is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT, detail="session_not_started"
+                    )
+                # The lease is a janitor counter, not a mutex, so the loop lock is
+                # what serializes this against a concurrent action on the session.
+                async with leased.loop_lock:
+                    inspection = await _worker().inspect_page_for(leased.worker_context)
+                    leased.loop_inspection = inspection
+                    leased.loop_generation = inspection.generation
+                    return _loop_response(inspection, leased.loop_generation)
+        except SessionUnavailable as exc:
+            raise _sanitized_error(exc) from None
+
+    @app.post(
+        "/internal/browser/sessions/{session_id}/act",
+        response_model=LoopObservationResponse,
+    )
+    async def act(
+        session_id: str,
+        payload: ActRequest,
+        auth: AuthContext = _AUTH,
+    ) -> LoopObservationResponse:
+        """Execute one action against the observation the caller last received.
+
+        The generation is compared AND CONSUMED inside the lock, which makes one
+        token authorize at most one action. If this call succeeds but its response is
+        lost, the caller's retry arrives with a consumed token and is refused rather
+        than submitting a second time — an action can be provider-visible (a signup
+        submit) while the effect ledger is phase-granular, so the ledger would not
+        catch the duplicate.
+
+        The generation is NOT a page fingerprint. A JS redirect or an async
+        re-render moves the page without any inspection happening, so the generation
+        stays equal while the locators die. The real time-of-check-to-time-of-use
+        guard is the strict identity re-resolution the worker performs immediately
+        before the click. Both are required; neither makes the other redundant.
+        """
+
+        _authorized_session(session_id, auth)
+        try:
+            with manager.lease(session_id) as leased:
+                if leased.worker_context is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT, detail="session_not_started"
+                    )
+                async with leased.loop_lock:
+                    inspection = leased.loop_inspection
+                    if inspection is None or leased.loop_generation != payload.expected_generation:
+                        # Stale or already spent. Retryable by design: the caller
+                        # re-observes, which is what bounds this under its own
+                        # no-progress budget rather than here.
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="loop_generation_stale",
+                        )
+                    # Consumed before the action runs, so a crash mid-action cannot
+                    # leave a token that would authorize a second attempt.
+                    leased.loop_inspection = None
+                    leased.loop_generation = 0
+                    candidate = candidate_from_executable_payload(payload.action.model_dump())
+                    result = await _worker().execute_candidate_for(
+                        leased.worker_context, candidate, inspection
+                    )
+                    # Re-read the page so the caller can verify the transition and
+                    # plan its next action from one round trip.
+                    fresh = await _worker().inspect_page_for(leased.worker_context)
+                    leased.loop_inspection = fresh
+                    leased.loop_generation = fresh.generation
+                    return _loop_response(
+                        fresh,
+                        leased.loop_generation,
+                        action_status=result.status,
+                        action_reason=result.reason_code,
+                    )
+        except SessionUnavailable as exc:
+            raise _sanitized_error(exc) from None
 
     @app.post(
         "/internal/browser/sessions/{session_id}/navigate", response_model=ObservationResponse

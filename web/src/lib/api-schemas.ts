@@ -19,6 +19,12 @@ function safeHttpUrl(value: string): boolean {
 }
 
 const boundedText = (maximum: number) => z.string().min(1).max(maximum)
+/**
+ * Bounded text that may be empty — for backend fields declared `str` with no
+ * minimum, where "" is a real value meaning "not determined" rather than a
+ * malformed response. Use `boundedText` when the backend does require content.
+ */
+const emptyableText = (maximum: number) => z.string().max(maximum)
 const optionalText = (maximum: number) => z.string().max(maximum).nullable()
 const nullableText = (maximum: number) => z.string().max(maximum).nullish().default(null)
 const safeToken = z.string().regex(/^[a-z0-9][a-z0-9_.:-]{0,119}$/i)
@@ -119,7 +125,12 @@ export const operationalResearchSchema = z.strictObject({
   app_name: boundedText(200),
   app_slug: appSlug,
   api_available: nullableBoolean,
-  api_type: boundedText(80),
+  // `ops/core/models.py::OperationalResearch` declares `api_type: str` with no
+  // minimum, and research legitimately leaves it "" when it could not determine
+  // one. Requiring >=1 char here rejected the whole run detail response and the
+  // page fell back to "the ledger could not read this run" — a real run made
+  // unreadable by a client rule the backend never promised.
+  api_type: emptyableText(80),
   api_base_url: nullableHttpUrl,
   auth_methods: z.array(boundedText(120)).max(50),
   authorization_url: nullableHttpUrl,
@@ -271,6 +282,13 @@ export const browserUiStateSchema = z.strictObject({
 
 // A hex SHA-256 digest, exactly as the provider-profile digest produces it.
 const sha256Digest = z.string().regex(/^[0-9a-f]{64}$/)
+// A profile digest, or the empty string for a run that never built a profile.
+// The backend records a pre-profile terminal boundary (`blocked`/`cancelled`)
+// under the empty digest by construction — research can fail before a profile
+// exists — and the console must still render that run, or it loses the reset and
+// retry controls it reads off the onboarding state. Mirrors
+// `api/models.py::Sha256DigestOrAbsent`.
+const sha256DigestOrAbsent = z.string().regex(/^(?:[0-9a-f]{64})?$/)
 // A bounded, opaque identifier: run id, correlation id, browser session id, or
 // the id segment of a vault reference. The class admits no whitespace.
 const boundedIdentifier = z.string().regex(/^[A-Za-z0-9._-]{1,200}$/)
@@ -371,7 +389,7 @@ export const profileFieldSchema = z.enum([
 export const onboardingStateSchema = z.strictObject({
   phase: onboardingPhaseSchema,
   phase_at_pause: onboardingPhaseSchema.nullish().default(null),
-  profile_digest: sha256Digest,
+  profile_digest: sha256DigestOrAbsent,
   reason_code: safeToken.nullish().default(null),
   goal: z.string().max(200).default(""),
   step: z.string().max(200).default(""),
@@ -618,6 +636,68 @@ const runProgressEventSchema = z.strictObject({
   recorded_at: isoTimestamp,
 })
 
+// Mirrors `ResearchFactKind` (ops/providers/profile_builder.py). Every optional
+// field below is optional by construction: the backend drops a subject that does
+// not validate against the vocabulary its `kind` selects, so absence is a real
+// answer ("research refused this, and its subject was not safe to name") rather
+// than missing data.
+const researchFactKindSchema = z.enum([
+  "adapter_failed",
+  "adapter_returned_nothing",
+  "candidate_url_excluded",
+  "candidate_urls_capped",
+  "fetch_returned_nothing",
+  "document_not_requested",
+  "claim_discarded",
+  "url_excluded",
+  "field_uncorroborated",
+  "domain_disagreement",
+])
+
+const researchFactGroupSchema = z.strictObject({
+  kind: researchFactKindSchema,
+  field: profileFieldSchema.nullish().default(null),
+  adapter: adapterName.nullish().default(null),
+  count: z.number().int().min(0).max(64).nullish().default(null),
+  corroborations: z.number().int().min(0).max(64).nullish().default(null),
+  corroborations_required: z.number().int().min(0).max(64).nullish().default(null),
+  occurrences: z.number().int().min(1).max(100_000),
+  first_at: isoTimestamp,
+  last_at: isoTimestamp,
+})
+
+// Mirrors `DecisionOutcome` (ops/core/inference.py), which is asserted equal to
+// ("usable", *DecisionReasonCode) so the two cannot drift apart.
+const decisionOutcomeSchema = z.enum([
+  "usable",
+  "rate_limited",
+  "authentication_failed",
+  "provider_timeout",
+  "invalid_json",
+  "schema_invalid",
+  "all_providers_failed",
+])
+
+const runDecisionAttemptSchema = z.strictObject({
+  purpose: z.enum(["action", "plan"]),
+  provider: adapterName,
+  outcome: decisionOutcomeSchema,
+  latency_ms: z.number().int().min(0).max(3_600_000),
+  onboarding_phase: onboardingPhaseSchema,
+  recorded_at: isoTimestamp,
+})
+
+const phaseBoundarySchema = z.strictObject({
+  sequence: z.number().int().min(1).max(100_000),
+  // Absent on the very first boundary of a run, serialized as an explicit null.
+  from_phase: onboardingPhaseSchema.nullish().default(null),
+  to_phase: onboardingPhaseSchema,
+  reason_code: safeToken,
+  attempt: z.number().int().min(0).max(100_000),
+  profile_digest: z.string().max(64).default(""),
+  committed_at: isoTimestamp,
+})
+
 export const timelineResponseSchema = z.strictObject({
   run_id: runId,
   items: z
@@ -636,6 +716,10 @@ export const timelineResponseSchema = z.strictObject({
     )
     .max(1_000),
   progress: z.array(runProgressEventSchema).max(200).default([]),
+  boundaries: z.array(phaseBoundarySchema).max(200).default([]),
+  // `.default([])` so an older backend that predates this field still parses.
+  attempts: z.array(runDecisionAttemptSchema).max(200).default([]),
+  research: z.array(researchFactGroupSchema).max(100).default([]),
 })
 
 const integratorBundle = z.strictObject({
@@ -649,7 +733,10 @@ const integratorBundle = z.strictObject({
     "blocked",
     "failed",
   ]),
-  api_type: boundedText(80),
+  // Passed straight through from research (`ops/workflow/integrator.py:63`), so
+  // it inherits the same "" case. `auth_scheme` below is derived and always has
+  // a value — `_auth_scheme` falls back to "unknown" — so it stays required.
+  api_type: emptyableText(80),
   api_base_url: httpUrl.nullish(),
   auth_scheme: boundedText(120),
   authorization_url: httpUrl.nullish(),

@@ -1,7 +1,19 @@
 SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := help
 
-PYTHON ?= python3.11
+# The interpreter used to CREATE the virtualenv. It must come from PATH, because
+# at that point the venv does not exist yet.
+BOOTSTRAP_PYTHON ?= python3.11
+VENV_PYTHON := .venv/bin/python
+
+# Every other target runs the PROJECT interpreter when the venv is present, and
+# falls back to PATH only before `make venv` has run. Without this, documented
+# commands resolved to a PATH python3.11 that has none of the project's
+# dependencies installed — `make api` failed with "No module named uvicorn" while
+# `./.venv/bin/python -m uvicorn` worked, which reads as a broken app rather than a
+# broken interpreter choice. Lazily expanded (`=`, not `:=`) so a venv created
+# during this same make run is picked up by later targets.
+PYTHON ?= $(if $(wildcard $(VENV_PYTHON)),$(VENV_PYTHON),$(BOOTSTRAP_PYTHON))
 PIP := $(PYTHON) -m pip
 
 .PHONY: help venv install-core install-providers install-dev install-browser \
@@ -11,7 +23,7 @@ help: ## Show supported development commands.
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 venv: ## Create the Python 3.11 virtual environment.
-	$(PYTHON) -m venv .venv
+	$(BOOTSTRAP_PYTHON) -m venv .venv
 
 install-core: ## Install the secure core, API, and local interfaces.
 	$(PIP) install --requirement requirements.txt

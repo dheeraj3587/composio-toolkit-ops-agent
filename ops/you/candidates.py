@@ -1,5 +1,9 @@
 """Classifying, scoring, de-duplicating and capping discovered candidates.
 
+
+
+
+
 Ranking exists because a hundred apps share one evidence budget. Without it, six
 OAuth pages for one vendor would crowd out the login and credential pages another
 vendor actually needs, so candidates are scored, de-duplicated by canonical URL, and

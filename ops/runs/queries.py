@@ -27,7 +27,12 @@ from ops.research.p1_adapter import (
     load_verified_snapshot,
     to_operational_research,
 )
-from ops.runs.projections import _app_projection, _public_run, _sanitized_app_list
+from ops.runs.projections import (
+    _app_projection,
+    _public_run,
+    _sanitized_app_list,
+    research_fact_groups,
+)
 
 
 class RunQueryContext(Protocol):
@@ -70,6 +75,55 @@ class RunQueryService:
         if self.storage.get_run(run_id) is None:
             return []
         return self.storage.list_progress_events(run_id, limit=limit)
+
+    def get_phase_boundaries(self, run_id: str, *, limit: int) -> list[dict[str, Any]]:
+        """The run's committed phase boundaries, oldest first.
+
+        Every row is one durable decision the driver committed: which phase it
+        left, which it entered, and the typed reason code that explains the move.
+        That makes this the densest reasoning trail the run has — denser than the
+        audit timeline, whose rows carry no phase at all — so it is what the
+        operator console draws its chain of thought from.
+
+        Ordered by ``sequence`` ascending by the storage layer, which is the order
+        the run actually happened in.
+        """
+
+        if self.storage.get_run(run_id) is None:
+            return []
+        return self.storage.list_phase_boundaries(run_id=run_id, limit=limit)
+
+    def get_research_facts(self, run_id: str) -> list[dict[str, Any]]:
+        """What research refused to believe, grouped by claim (oldest group first).
+
+        Reads the same audit rows :meth:`get_timeline` already reads — the facts are
+        audit events — and aggregates them. A live run records dozens of these
+        carrying only a handful of distinct claims, so the projection groups rather
+        than enumerates: 47 repetitions of "signup_url has 1 of 2 corroborations" is
+        one fact with a count, not 47 lines of a trace.
+        """
+
+        if self.storage.get_run(run_id) is None:
+            return []
+        return research_fact_groups(self.storage.list_audit_events(run_id))
+
+    def get_decision_attempts(self, run_id: str, *, limit: int) -> list[dict[str, Any]]:
+        """The run's inference attempts, newest first (Requirement 4.3).
+
+        One row per provider attempt: which model was asked, whether its answer was
+        usable, and how long it took. This is what makes a slow or degraded decision
+        attributable — a reason code says the gate declined, but only these rows say
+        which provider answered and at what cost.
+
+        Unlike the progress and boundary tables, this one carries no
+        ``correlation_id`` and no ``profile_digest``, so a row ties to a phase and an
+        instant rather than to a specific phase attempt. A caller grouping rows under
+        a phase visit must therefore do it by time window.
+        """
+
+        if self.storage.get_run(run_id) is None:
+            return []
+        return self.storage.list_decision_attempts(run_id, limit=limit)
 
     def get_research(self, run_id: str) -> OperationalResearch | None:
         """Return the persisted sanitized research projection for a run."""

@@ -110,6 +110,63 @@ def test_unknown_app_is_rejected_before_a_run_is_persisted(harness: ApiHarness) 
     assert harness.core.storage.count_runs() == 0
 
 
+def test_unknown_app_asking_to_onboard_with_a_hint_is_admitted(harness: ApiHarness) -> None:
+    """The one exception to the 404: off-catalog ONBOARDING with a usable hint.
+
+    The app has no reviewed recipe by design and is routed on a corroborated
+    ``ProviderProfile`` instead. Without this the operator cannot onboard any of
+    the 49 researched apps that have no Composio toolkit.
+
+    The assertion is on PERSISTENCE, not on the status code, because the response
+    is currently a 500 for a reason this boundary does not own: after creating the
+    run the endpoint advances it, and ``_ResearchHandler`` asks for a ``blocked``
+    boundary carrying no profile digest, which ``drive_run`` refuses
+    (``PhaseNotDrivable``, driver.py:2487). That defect is PRE-EXISTING and not
+    specific to off-catalog runs — an on-catalog mounted onboarding request
+    (``Telegram``, ``onboarding=true``) returns the same 500 on this same line,
+    while a legacy non-onboarding run still returns 201. What this test pins is
+    that the run is no longer REFUSED at the API boundary: a 404 would leave
+    nothing persisted at all.
+    """
+
+    payload = create_payload("Unreviewed Vendor")
+    payload["account_mode"] = "create_account"
+    payload["onboarding"] = True
+    payload["provider_hint_url"] = "https://unreviewed-vendor.com/signup"
+
+    response = harness.client.post("/api/runs", json=payload)
+
+    assert response.status_code != 404
+    assert harness.core.storage.count_runs() == 1
+    records = harness.core.storage.list_runs(limit=10, offset=0)
+    assert records[0]["app_slug"] == "unreviewed-vendor"
+    assert records[0]["execution_path"] == "profile_mounted"
+
+
+def test_unknown_app_asking_to_onboard_without_a_hint_is_still_a_404(
+    harness: ApiHarness,
+) -> None:
+    """No hint means no host to seed research with, so the clean 404 is kept.
+
+    A typo'd display name is indistinguishable from this case, which is exactly
+    what the 404 is for — and returning it here avoids the 500 that admitting the
+    request without a recipe-optional path downstream would produce.
+    """
+
+    payload = create_payload("Unreviewed Vendor")
+    payload["account_mode"] = "create_account"
+    payload["onboarding"] = True
+
+    response = harness.client.post("/api/runs", json=payload)
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": "not_found",
+        "message": "Resource was not found.",
+    }
+    assert harness.core.storage.count_runs() == 0
+
+
 def test_create_run_rejects_per_run_outreach_recipient_override(
     harness: ApiHarness,
 ) -> None:
@@ -368,7 +425,14 @@ def test_timeline_endpoint_returns_summaries_not_raw_audit_payloads(
 
     assert response.status_code == 200
     payload = response.json()
-    assert set(payload) == {"run_id", "items", "progress"}
+    assert set(payload) == {
+        "run_id",
+        "items",
+        "progress",
+        "boundaries",
+        "attempts",
+        "research",
+    }
     assert payload["run_id"] == run_id
     assert payload["items"]
     assert all(
@@ -384,6 +448,37 @@ def test_timeline_endpoint_returns_summaries_not_raw_audit_payloads(
             "detail",
         }
         for item in payload["items"]
+    )
+    # Committed phase transitions. Closed by construction like `items`: every
+    # field is an enum, a digest, a bounded integer, or a timestamp, so no prompt
+    # or page projection has a column to travel in.
+    assert all(
+        set(boundary)
+        == {
+            "sequence",
+            "from_phase",
+            "to_phase",
+            "reason_code",
+            "attempt",
+            "profile_digest",
+            "committed_at",
+        }
+        for boundary in payload["boundaries"]
+    )
+    # Inference attempts. Closed the same way: a bounded provider label, the
+    # durable outcome union, a bounded latency, a phase, and a timestamp. The
+    # prompt, the schema, and the model's answer have no field to travel in.
+    assert all(
+        set(attempt)
+        == {
+            "purpose",
+            "provider",
+            "outcome",
+            "latency_ms",
+            "onboarding_phase",
+            "recorded_at",
+        }
+        for attempt in payload["attempts"]
     )
     rendered = response.text
     assert "provider_payload" not in rendered

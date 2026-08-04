@@ -107,3 +107,19 @@ repomix-output.*
 MANIFEST.txt
 *_AUDIT.md
 _contract_check.py
+.audit_work/
+**/.audit_work/
+
+# Local verification tooling. `dev-session-cookie.mjs` mints a valid 12-hour
+# operator session from web/.env.local; it must never reach a shared host, so it
+# is ignored here as well as gated on ALLOW_DEV_SESSION_MINT at runtime.
+web/scripts/dev-session-cookie.mjs
+scripts/verify_console_trace.py
+
+# iCloud Drive conflict copies. ~/Desktop is a symlink into iCloud Drive on this
+# machine (Desktop & Documents sync), and its file provider renames conflicting
+# copies to "name 2.ext". These are never source; ignoring them keeps a stray
+# `git add .` from committing one.
+* [0-9].*
+* [0-9]
+*\ [0-9][0-9].*

@@ -9,8 +9,10 @@ const alertVariants = cva(
     variants: {
       variant: {
         default: "border-border bg-card text-card-foreground",
+        // Severity by weight, not hue: the heaviest left rule in the system,
+        // matching the `stopped` status form and the HITL card.
         destructive:
-          "border-red-400/30 bg-red-400/[0.08] text-red-950 *:data-[slot=alert-description]:text-red-800 *:[svg]:text-red-300",
+          "border-border border-l-[3px] border-l-foreground bg-secondary text-foreground *:data-[slot=alert-description]:text-muted-foreground *:[svg]:text-foreground",
       },
     },
     defaultVariants: {

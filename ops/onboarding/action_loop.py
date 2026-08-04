@@ -51,7 +51,8 @@ returns a classified outcome and commits nothing (Requirement 4.20).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
+import random
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from time import monotonic
 from typing import TYPE_CHECKING, Final, Literal, Protocol, get_args
@@ -108,6 +109,15 @@ MAX_NAVIGATION_DENIALS: Final = 10
 # as a parameter default; the happy-path test pins the two equal.
 MAX_CANDIDATES: Final = 8
 
+# The two URLs a session can legitimately show BEFORE it has navigated anywhere.
+# Matched as EXACT STRINGS, never by scheme prefix and never by reason code:
+# ``about:srcdoc``, ``data:text/html,...``, ``file:///...`` and ``chrome://...``
+# all share the single reason code ``browser_url_not_https_or_malformed`` with
+# ``about:blank``, so keying on that code would admit attacker-supplied HTML, local
+# disk, and browser-internal pages as "where we are". An ``about:`` prefix test is
+# wrong for the same reason — ``about:srcdoc`` passes it.
+_PRE_NAVIGATION_URLS: Final[frozenset[str]] = frozenset({"", "about:blank"})
+
 LoopOutcome = Literal["done", "gate", "exhausted", "denied_fatal"]
 LOOP_OUTCOMES: Final[tuple[LoopOutcome, ...]] = get_args(LoopOutcome)
 
@@ -127,6 +137,55 @@ _EXHAUSTION_REASONS: Final[dict[BudgetBound, OnboardingReasonCode]] = {
     "no_progress": "loop_no_progress_budget_exhausted",
     "wallclock": "loop_wallclock_budget_exhausted",
 }
+
+# Bounded backoff between retried iterations. A retried step waits before it
+# touches the provider again, so a stuck phase never clicks faster than a person
+# would. The ladder is bounded by the EXISTING no-progress budget rather than by a
+# second counter: nothing here changes how many times the loop retries, only how
+# long it pauses between attempts, so a failing step still cannot retry forever.
+RETRY_BACKOFF_BASE_SECONDS: Final = 1.0
+RETRY_BACKOFF_CAP_SECONDS: Final = 15.0
+RETRY_JITTER_MIN: Final = 0.8
+RETRY_JITTER_MAX: Final = 1.2
+
+# Errors a retried step may recover from: a dropped browser connection, an RPC
+# hiccup, a transport failure. ``TimeoutError`` is an ``OSError`` subclass, so it
+# is covered here and keeps its own act-stage rule below.
+_TRANSIENT_STEP_ERRORS: Final[tuple[type[Exception], ...]] = (OSError, RuntimeError)
+# Deliberately NOT retried: these mean the integration is broken, and retrying
+# would turn a bug into a slow phase that reports a spent budget instead.
+_PROGRAMMING_STEP_ERRORS: Final[tuple[type[Exception], ...]] = (
+    TypeError,
+    AttributeError,
+    NameError,
+    ImportError,
+    ModuleNotFoundError,
+    AssertionError,
+)
+
+
+def retry_backoff_seconds(*, consecutive_failures: int, jitter: float | None = None) -> float:
+    """``base * 2**(n-1)`` seconds, capped, times jitter in [0.8, 1.2).
+
+    Mirrors ``verification_backoff_seconds`` so the two retry ladders read alike:
+    the cap is applied BEFORE the jitter, so jitter can never push a delay past
+    the ceiling, and the sequence is monotonically non-decreasing.
+
+    ``consecutive_failures <= 0`` means this is not a retry and the delay is zero,
+    which is what keeps a healthy loop exactly as fast as it was.
+    """
+
+    if consecutive_failures <= 0:
+        return 0.0
+    if jitter is None:
+        jitter = RETRY_JITTER_MIN + random.random() * (RETRY_JITTER_MAX - RETRY_JITTER_MIN)
+    if not RETRY_JITTER_MIN <= jitter < RETRY_JITTER_MAX:
+        raise ValueError("the retry jitter factor is in [0.8, 1.2)")
+    delay: float = min(
+        RETRY_BACKOFF_BASE_SECONDS * 2.0 ** (consecutive_failures - 1),
+        RETRY_BACKOFF_CAP_SECONDS,
+    )
+    return delay * jitter
 
 
 @dataclass(frozen=True, slots=True)
@@ -545,6 +604,28 @@ def check_postconditions(
     )
 
 
+def phase_postcondition_satisfied(name: str, observation: BrowserObservation) -> bool:
+    """Whether one named PHASE postcondition holds for ``observation``.
+
+    The same predicates :func:`check_postconditions` uses, for a phase handler that
+    owns its own ordering and so never runs the loop — the credential surface is the
+    case: it must prove ``credential_visible`` before it arms a capture, and that
+    proof has to be the loop's own predicate rather than a second opinion that could
+    drift from it.
+
+    ``phase_`` is in the name because ``ops.playwright.predicates`` already has a
+    ``postcondition_satisfied`` that answers a DIFFERENT question — whether one
+    ACTION's state transition held, comparing a before and after inspection. These
+    are not interchangeable and the names should not suggest they are.
+
+    An unknown name is UNMET, matching the loop's rule that a typo cannot make a
+    postcondition easier to satisfy.
+    """
+
+    predicate = _POSTCONDITION_PREDICATES.get(name)
+    return predicate is not None and predicate(observation)
+
+
 async def run_action_loop(
     *,
     phase: OnboardingPhase,
@@ -556,6 +637,7 @@ async def run_action_loop(
     telemetry: LoopTelemetry,
     deadlines: StepDeadlines = DEFAULT_STEP_DEADLINES,
     clock: Callable[[], float] = monotonic,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> LoopResult:
     """Drive one phase to a classified outcome, or exhaust a bound and stop.
 
@@ -640,9 +722,27 @@ async def run_action_loop(
                     denials=denials,
                 )
 
+            # A retry waits before the next provider interaction. Placed AFTER the
+            # budget check so an exhausted phase returns promptly instead of
+            # sleeping first, and skipped entirely while ``no_progress == 0`` so a
+            # healthy loop runs at exactly its previous speed.
+            if no_progress > 0:
+                await sleep(retry_backoff_seconds(consecutive_failures=no_progress))
+
             # --- I2: where we actually are, not where we asked to be ---------
             here = evaluate_navigation(observation.current_url, allowed)
-            if not here.allowed:
+            # A session that has executed nothing yet sits on a blank tab, which is
+            # the ABSENCE of a location rather than a place the agent navigated to.
+            # ``sanitize_browser_url`` already admits it as a representable
+            # observation URL, and the reviewed ``goto`` candidate that follows is
+            # still checked against the allow-list at the per-candidate boundary
+            # below — that check is the security boundary and stays strict.
+            #
+            # Gated on ``actions == 0`` so the steady state cannot widen: once the
+            # session has acted, a page that goes blank is a session that LOST its
+            # page, and continuing to plan against it is not safe.
+            pre_navigation = actions == 0 and observation.current_url in _PRE_NAVIGATION_URLS
+            if not here.allowed and not pre_navigation:
                 reason = _host_reason(here.reason_code)
                 denials += 1
                 telemetry.denial(reason)
@@ -682,6 +782,7 @@ async def run_action_loop(
                 return _gate(
                     candidates[0],
                     observation,
+                    cause="candidate_gate_no_executable_option",
                     actions=actions,
                     model_calls=model_calls,
                     denials=denials,
@@ -727,7 +828,12 @@ async def run_action_loop(
             if choice.decision == "report_hitl":
                 report("gate")
                 return _gate(
-                    None, observation, actions=actions, model_calls=model_calls, denials=denials
+                    None,
+                    observation,
+                    cause="candidate_gate_model_declined",
+                    actions=actions,
+                    model_calls=model_calls,
+                    denials=denials,
                 )
             if choice.decision == "report_blocked":
                 # The chain answered and named no candidate action: unusable, not a
@@ -751,9 +857,18 @@ async def run_action_loop(
                 seen = await observe(deadlines.observe_seconds)
                 continue
             if not selected.executable:  # Requirement 4.18, left unexecuted
+                # Reaching here proves the schema offered an id whose description
+                # was withheld from the prompt: ``options`` is exactly the
+                # executable subset, so a non-executable selection cannot have been
+                # among the candidates the model was shown.
                 report("gate")
                 return _gate(
-                    selected, observation, actions=actions, model_calls=model_calls, denials=denials
+                    selected,
+                    observation,
+                    cause="candidate_gate_selection_not_executable",
+                    actions=actions,
+                    model_calls=model_calls,
+                    denials=denials,
                 )
             # Re-checks executability at the policy boundary rather than trusting the
             # branch above.
@@ -830,9 +945,18 @@ async def run_action_loop(
             no_progress = 0 if check.any_progress else no_progress + 1  # I3
             satisfied_before = check.satisfied
             report("verify")
-        except TimeoutError:
-            # I6: a step that outran its deadline. Only ``act`` may have landed a
-            # side effect we cannot see, so only it ends the phase.
+        except _PROGRAMMING_STEP_ERRORS:
+            # A broken integration must surface rather than be retried: retrying
+            # would turn a bug into a slow phase reporting a spent budget.
+            raise
+        except _TRANSIENT_STEP_ERRORS:
+            # I6, extended: a step that outran its deadline OR failed transiently
+            # (dropped browser connection, RPC hiccup, provider transport error).
+            # Only ``act`` may have landed a side effect we cannot see, so only it
+            # ends the phase; every other stage is retried under the EXISTING
+            # no-progress budget, with the backoff above applied before the next
+            # attempt. Exhausting it returns ``loop_no_progress_budget_exhausted``,
+            # so retries never end in silence.
             report(stage)
             if stage == "act":
                 return _result(
@@ -869,16 +993,28 @@ def _gate(
     candidate: ActionCandidate | None,
     observation: BrowserObservation,
     *,
+    cause: OnboardingReasonCode,
     actions: int,
     model_calls: int,
     denials: int,
 ) -> LoopResult:
-    """A gate outcome that always names the human action, candidate unexecuted."""
+    """A gate outcome that always names the human action, candidate unexecuted.
+
+    ``cause`` distinguishes the three ways this is reached. It is a required
+    argument rather than a default so a future gate site cannot silently inherit
+    another site's meaning — the single shared code is what made a paused run
+    undiagnosable in the first place.
+
+    A page that already names its own typed human action keeps that reading: the
+    page's gate outranks the candidate's, and ``_page_gate_reason`` reports the
+    page's own code. ``cause`` then describes why the loop stopped here, which is
+    still the more specific fact about the loop's behavior.
+    """
 
     return _result(
         "gate",
         _gate_observation(observation, candidate),
-        "candidate_risk_requires_human",
+        cause,
         actions=actions,
         model_calls=model_calls,
         denials=denials,
@@ -982,5 +1118,6 @@ __all__ = [
     "PostconditionCheck",
     "StepDeadlines",
     "check_postconditions",
+    "retry_backoff_seconds",
     "run_action_loop",
 ]

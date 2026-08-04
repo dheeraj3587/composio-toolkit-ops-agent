@@ -16,14 +16,16 @@ export async function GET(
 
   try {
     const result = await getAppResearch(slug)
-    const accountCreationSupported = Boolean(result.research.signup_url)
+    // A successful lookup proves reviewed-catalog membership. Account creation
+    // enters backend-authoritative profile research/planning; a static signup URL
+    // is an optimization, not the eligibility boundary.
     return Response.json(
       {
         app_slug: result.app.app_slug,
-        account_creation_supported: accountCreationSupported,
-        reason_code: accountCreationSupported
+        account_creation_supported: true,
+        reason_code: result.research.signup_url
           ? "reviewed_signup_route"
-          : "signup_route_unavailable",
+          : "planner_onboarding_available",
       },
       {
         status: 200,

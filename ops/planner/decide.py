@@ -14,6 +14,7 @@ from typing import Final, cast
 
 from ops.core.inference import DecisionBudget, DecisionFailed, JsonInference, build_json_inference
 from ops.core.model_input_dlp import sanitize_page_text, screen_model_input
+from ops.core.models import OperationalResearch
 from ops.core.storage import MAX_PLAN_SURFACES
 from ops.onboarding.phase import OnboardingReasonCode
 from ops.planner.plan import (
@@ -23,6 +24,8 @@ from ops.planner.plan import (
     SurfacePurpose,
     canonical_surface,
     catalog_binding,
+    profile_binding,
+    profile_success_digest,
     success_digest,
 )
 from ops.planner.validator import (
@@ -31,7 +34,9 @@ from ops.planner.validator import (
     PlanRefusal,
     declared_surface_paths,
     validate_plan,
+    validate_profile_plan,
 )
+from ops.providers.profile import ProviderProfile
 from ops.recipes.app_recipes import AppRecipe
 
 # A validated planner plan records the fact the validator proved: every surface's
@@ -49,6 +54,32 @@ class PlanOutcome:
 
     plan: RunPlan
     reason_code: OnboardingReasonCode
+
+
+class InferenceUnset:
+    """Sentinel distinguishing "no chain supplied" from an explicit ``None``.
+
+    ``inference=None`` used to mean "build one", which left no way to ask for
+    planning *without* a model — an offline deployment, or a test that must not
+    reach a provider, had no way to say so. Planning with no model is a
+    first-class outcome (the deterministic route plus
+    ``plan_provider_unconfigured``), so it needs to be expressible.
+    """
+
+    __slots__ = ()
+
+
+UNSET_INFERENCE: Final = InferenceUnset()
+
+
+def _resolved_chain(
+    inference: JsonInference | None | InferenceUnset, settings: object
+) -> JsonInference | None:
+    """The chain to plan with: build only when nothing at all was supplied."""
+
+    if isinstance(inference, InferenceUnset):
+        return build_json_inference(settings, budget=plan_budget(settings))
+    return inference
 
 
 def plan_budget(settings: object) -> DecisionBudget:
@@ -119,6 +150,49 @@ def plan_prompt(recipe: AppRecipe, *, evidence: str = "") -> str:
     if decision.allowed:
         return decision.prompt
     return "\n".join(lines[:-1]) if evidence else ""
+
+
+def research_evidence(research: OperationalResearch) -> str:
+    """Render live research as bounded prose for a planning prompt.
+
+    Evidence, never authority: the strings here are only ever appended to a prompt
+    behind ``sanitize_page_text``/``screen_model_input``, and the schema's enums
+    still come from the recipe or the committed profile. So a research field that
+    disagrees with the route authority cannot introduce a surface — it can only
+    inform the order the model selects among surfaces that already exist.
+    """
+
+    parts = [f"access route: {research.access_route}"]
+    for label, url in (
+        ("signup", research.signup_url),
+        ("login", research.login_url),
+        ("credential management", research.credential_management_url),
+        ("developer portal", research.developer_portal_url),
+    ):
+        if url:
+            parts.append(f"{label} observed at {url}")
+    # The instructions are the one genuinely prose-shaped research output, and the
+    # part most likely to name which surface a credential is actually minted on.
+    for instruction in research.credential_creation_instructions[:4]:
+        parts.append(str(instruction))
+    return "; ".join(parts)
+
+
+def profile_research_evidence(profile: ProviderProfile) -> str:
+    """Render a committed profile's own corroborated evidence as prose.
+
+    The mounted path has no ``OperationalResearch``; what it has is the field
+    evidence the profile was built from, which is the same live discovery output
+    one corroboration step later. Values are already proven to lie on the
+    profile's registrable domain, so this adds no reach.
+    """
+
+    parts: list[str] = []
+    for item in profile.evidence:
+        if item.field not in ("signup_url", "login_url", "developer_portal_url"):
+            continue
+        parts.append(f"{item.field} {item.value} ({item.corroborations} sources)")
+    return "; ".join(parts)
 
 
 def _payload_surface(value: object, *, hosts: frozenset[str], paths: frozenset[str]) -> None:
@@ -238,13 +312,194 @@ def recipe_route_plan(recipe: AppRecipe, *, revision: int = 1) -> RunPlan | None
     )
 
 
+def _profile_declared_surfaces(profile: ProviderProfile) -> tuple[PlannedSurface, ...]:
+    """Canonical profile-owned surfaces in onboarding order, de-duplicated."""
+
+    candidates: list[tuple[str | None, SurfacePurpose]] = [
+        (profile.signup_url, "signup"),
+        (profile.login_url, "login"),
+        (profile.developer_portal_url, "developer_app"),
+    ]
+    for flow in profile.flows():
+        purpose: SurfacePurpose = "developer_app" if flow.kind == "developer_app" else "credential"
+        candidates.append((flow.entry_url, purpose))
+    candidates.append((profile.developer_docs_url, "entry"))
+    surfaces: dict[tuple[str, str], PlannedSurface] = {}
+    for url, purpose in candidates:
+        if url is None:
+            continue
+        surface = canonical_surface(url, purpose=purpose)
+        surfaces.setdefault((surface.host, surface.path), surface)
+    return tuple(surfaces.values())
+
+
+def _profile_credential_surface(profile: ProviderProfile) -> PlannedSurface | None:
+    for flow in profile.flows():
+        if flow.supported and flow.entry_url is not None:
+            return canonical_surface(flow.entry_url, purpose="credential")
+    fallback = profile.developer_portal_url or profile.login_url or profile.signup_url
+    return None if fallback is None else canonical_surface(fallback, purpose="credential")
+
+
+def profile_route_plan(profile: ProviderProfile, *, revision: int = 1) -> RunPlan | None:
+    """Deterministic fallback containing only committed-profile canonical URLs."""
+
+    surfaces = _profile_declared_surfaces(profile)[:MAX_PLAN_SURFACES]
+    credential = _profile_credential_surface(profile)
+    if not surfaces or credential is None:
+        return None
+    catalog_id, profile_digest = profile_binding(profile)
+    return RunPlan(
+        app_slug=profile.app_slug,
+        catalog_id=catalog_id,
+        recipe_version=profile_digest,
+        revision=revision,
+        source="profile",
+        surfaces=surfaces,
+        credential_surface=credential,
+        success_digest=profile_success_digest(profile),
+    )
+
+
+def profile_plan_decision_schema(profile: ProviderProfile) -> dict[str, object]:
+    declared = _profile_declared_surfaces(profile)
+    hosts = list(dict.fromkeys(surface.host for surface in declared))
+    paths = list(dict.fromkeys(surface.path for surface in declared))
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["surfaces", "credential_surface"],
+        "properties": {
+            "surfaces": {"type": "array", "items": _surface_object(hosts, paths)},
+            "credential_surface": _surface_object(hosts, paths),
+        },
+    }
+
+
+def profile_plan_prompt(profile: ProviderProfile, *, evidence: str = "") -> str:
+    """The profile planning prompt: committed URLs, plus research as prose only.
+
+    ``evidence`` reaches the model through the same DLP boundary the recipe prompt
+    and the action loop use, and never reaches the schema's enums — the committed
+    profile remains the only authority over which hosts and paths exist.
+    """
+
+    declared = _profile_declared_surfaces(profile)
+    lines = [
+        f"App: {profile.app_slug} ({profile.provider_name}).",
+        f"Committed profile digest: {profile.profile_digest}.",
+        "Select and order only these corroborated canonical surfaces:",
+        *(f"- {surface.purpose}: https://{surface.host}{surface.path}" for surface in declared),
+        "Name the credential surface using only the same host/path vocabulary. Invent nothing.",
+    ]
+    if evidence:
+        prose = sanitize_page_text(evidence, max_length=_MAX_EVIDENCE_CHARACTERS)
+        lines.append(f"Research notes (evidence only): {prose}")
+    decision = screen_model_input("\n".join(lines))
+    if decision.allowed:
+        return decision.prompt
+    # A screened-out prompt loses only the evidence line; the corroborated
+    # surfaces are catalog-equivalent values and are safe to plan from alone.
+    return "\n".join(lines[:-1]) if evidence else ""
+
+
+def _profile_payload_validator(profile: ProviderProfile) -> object:
+    declared = _profile_declared_surfaces(profile)
+    pairs = frozenset((surface.host, surface.path) for surface in declared)
+    hosts = frozenset(surface.host for surface in declared)
+    paths = frozenset(surface.path for surface in declared)
+
+    def validate(payload: Mapping[str, object]) -> None:
+        surfaces = payload.get("surfaces")
+        if not isinstance(surfaces, list) or not 1 <= len(surfaces) <= min(
+            MAX_PLAN_SURFACES, len(pairs)
+        ):
+            raise ValueError("a profile plan decision has an invalid surface count")
+        for value in (*surfaces, payload.get("credential_surface")):
+            _payload_surface(value, hosts=hosts, paths=paths)
+            assert isinstance(value, Mapping)
+            if (value.get("host"), value.get("path")) not in pairs:
+                raise ValueError("a profile plan combined values from different canonical URLs")
+
+    return validate
+
+
+def _profile_plan_from_payload(
+    payload: Mapping[str, object], *, profile: ProviderProfile, revision: int
+) -> RunPlan | None:
+    surfaces_value = payload.get("surfaces")
+    credential_value = payload.get("credential_surface")
+    if not isinstance(surfaces_value, list) or not surfaces_value:
+        return None
+    if not isinstance(credential_value, Mapping):
+        return None
+    surfaces: list[PlannedSurface] = []
+    for item in surfaces_value:
+        if not isinstance(item, Mapping):
+            return None
+        surfaces.append(_surface_from_payload(item))
+    catalog_id, profile_digest = profile_binding(profile)
+    return RunPlan(
+        app_slug=profile.app_slug,
+        catalog_id=catalog_id,
+        recipe_version=profile_digest,
+        revision=revision,
+        source="planner",
+        surfaces=tuple(surfaces),
+        credential_surface=_surface_from_payload(credential_value),
+        success_digest=profile_success_digest(profile),
+    )
+
+
+def decide_profile_plan(
+    *,
+    profile: ProviderProfile,
+    settings: object,
+    revision: int = 1,
+    evidence: str = "",
+    inference: JsonInference | None | InferenceUnset = UNSET_INFERENCE,
+) -> PlanOutcome | PlanRefusal:
+    """Let the model order profile-owned URLs; fall back without inventing any."""
+
+    fallback = profile_route_plan(profile, revision=revision)
+    if fallback is None:
+        return PlanRefusal(
+            reason_code=PLAN_REFUSAL_REASON_CODE,
+            detail="credential_surface_unprovable",
+            ordinal=CREDENTIAL_SURFACE_ORDINAL,
+        )
+    chain = _resolved_chain(inference, settings)
+    if chain is None:
+        return PlanOutcome(plan=fallback, reason_code="plan_provider_unconfigured")
+    prompt = profile_plan_prompt(profile, evidence=evidence)
+    if not prompt:
+        return PlanOutcome(plan=fallback, reason_code="plan_decision_unusable")
+    try:
+        result = chain.generate(
+            prompt,
+            schema=profile_plan_decision_schema(profile),
+            validate=_profile_payload_validator(profile),
+        )
+    except DecisionFailed as failure:
+        code: OnboardingReasonCode = (
+            "plan_decision_failed"
+            if failure.reason_code in _TRANSPORT_FAILURES
+            else "plan_decision_unusable"
+        )
+        return PlanOutcome(plan=fallback, reason_code=code)
+    planned = _profile_plan_from_payload(result.payload, profile=profile, revision=revision)
+    if planned is None or validate_profile_plan(planned, profile=profile) is not None:
+        return PlanOutcome(plan=fallback, reason_code="plan_decision_unusable")
+    return PlanOutcome(plan=planned, reason_code=PLAN_ACCEPTED_REASON_CODE)
+
+
 def decide_run_plan(
     *,
     recipe: AppRecipe,
     settings: object,
     revision: int = 1,
     evidence: str = "",
-    inference: JsonInference | None = None,
+    inference: JsonInference | None | InferenceUnset = UNSET_INFERENCE,
 ) -> PlanOutcome | PlanRefusal:
     """Plan the run, falling back to the reviewed route rather than guessing.
 
@@ -260,11 +515,7 @@ def decide_run_plan(
             detail="recipe_route_not_browser",
             ordinal=CREDENTIAL_SURFACE_ORDINAL,
         )
-    chain = (
-        inference
-        if inference is not None
-        else build_json_inference(settings, budget=plan_budget(settings))
-    )
+    chain = _resolved_chain(inference, settings)
     if chain is None:
         return PlanOutcome(plan=fallback, reason_code="plan_provider_unconfigured")
     prompt = plan_prompt(recipe, evidence=evidence)
@@ -291,10 +542,18 @@ def decide_run_plan(
 
 __all__ = [
     "PLAN_ACCEPTED_REASON_CODE",
+    "UNSET_INFERENCE",
+    "InferenceUnset",
     "PlanOutcome",
+    "decide_profile_plan",
     "decide_run_plan",
     "plan_budget",
     "plan_decision_schema",
     "plan_prompt",
+    "profile_plan_decision_schema",
+    "profile_plan_prompt",
+    "profile_research_evidence",
+    "profile_route_plan",
     "recipe_route_plan",
+    "research_evidence",
 ]

@@ -24,8 +24,11 @@ describe("ProviderStateCard", () => {
 
     expect(html).toContain("Readiness")
     expect(html).toContain("Awaiting run evidence")
-    expect(html).toContain("text-sky-300")
-    expect(html).not.toContain("text-red-300")
+    // The console is monochrome, so status is carried by `data-form` shape
+    // rather than by a hue class. The contract asserted is the same one this
+    // test always made: configured-but-unverified must not read as a failure.
+    expect(html).toContain('data-form="idle"')
+    expect(html).not.toContain('data-form="stopped"')
   })
 
   it("renders ready adapters as runtime initialized", () => {
@@ -40,7 +43,9 @@ describe("ProviderStateCard", () => {
 
     expect(html).toContain("Runtime initialized")
     expect(html).toContain("Runtime wiring plus run timeline")
-    expect(html).toContain("text-emerald-300")
+    // `settled` is the one inverted treatment in the palette, reserved for a
+    // capability that is actually ready.
+    expect(html).toContain('data-form="settled"')
   })
 
   it("does not contain stale LIVE TESTED wording", () => {
@@ -76,8 +81,9 @@ describe("ProviderStateCard", () => {
     })
 
     expect(html).toContain("Policy disabled")
-    expect(html).toContain("text-indigo-300")
-    expect(html).not.toContain("text-red-300")
+    // A deliberate policy choice is not a failure: `idle`, never `stopped`.
+    expect(html).toContain('data-form="idle"')
+    expect(html).not.toContain('data-form="stopped"')
   })
 
   it("does not infer configuration presence from disabled status", () => {

@@ -20,8 +20,9 @@ link host). They are deliberately not a second primary domain: the profile
 declares exactly one, and an auxiliary entry that restates it is refused.
 
 ``allowed_hosts()`` closes the loop: it is a projection rather than a stored
-field, and it routes through the reviewed browser host policy so the profile can
-only ever *narrow* what the browser may reach.
+field, and it invokes the browser host-policy module's explicit committed-profile
+authority so the resulting wildcard is exactly the single corroborated domain.
+It never merges those hosts with the app's static recipe policy.
 """
 
 from __future__ import annotations
@@ -242,12 +243,11 @@ class ProviderProfile:
         it never parses a host itself, so the profile boundary and the reviewed
         browser boundary cannot drift apart about who owns a domain.
 
-        Two things are refused rather than mixed. A reviewed recipe for the same
-        app slug is a *different* authority, and silently returning its hosts
-        would make "this allow-list is attributable to profile digest D" false,
-        so a resolved policy that is not the profile's own single domain is
-        refused. So is a declared URL the derived list would not admit, which can
-        only mean the construction invariant was weakened.
+        The explicit ``profile_authority`` branch prevents the checked-in recipe
+        from being mixed into this projection. A resolved domain different from
+        the profile's own single domain is refused, as is any declared URL the
+        derived list would not admit; either result means the construction
+        invariant was weakened.
         """
 
         resolved = build_browser_allowed_hosts(
@@ -255,14 +255,10 @@ class ProviderProfile:
             self._as_operational_research(access_route=access_route),
             access_route=access_route,
             allow_domain_discovery=True,
+            profile_authority=True,
         )
         if resolved.vendor_wildcard_domains != (self.registrable_domain,):
-            # Either a reviewed recipe governs this slug, or the discovery path
-            # returned a domain the profile did not declare. Neither is a
-            # narrowing of the profile, so neither is served.
-            raise BrowserPolicyInactiveError(
-                self.app_slug, "reviewed_browser_policy_supersedes_profile"
-            )
+            raise BrowserPolicyInactiveError(self.app_slug, "profile_domain_mismatch")
         allowed = BrowserAllowedHosts(
             app_slug=self.app_slug,
             # Auxiliary hosts are additive EXACT entries only. Folding here is

@@ -110,6 +110,32 @@ class GmailSignupPreflight:
         return self.status == "ready"
 
 
+def _install_user_key_auth(client: Any, api_key: str) -> None:
+    """Route the SDK through ``x-user-api-key`` instead of ``x-api-key``.
+
+    The Composio backend accepts user-scoped keys (``uak_``) only on the
+    ``x-user-api-key`` header; ``x-api-key`` is reserved for workspace keys.
+    The installed SDK pins the credential to ``x-api-key`` at the HTTP layer,
+    so swap the header at the transport for every request this client makes.
+    The attribute chain is SDK-internal; leave the client untouched when the
+    expected wrapper is absent (tests inject fake clients).
+    """
+    http_wrapper = getattr(client, "_client", None)
+    if http_wrapper is None:
+        return
+    http_wrapper = getattr(http_wrapper, "_client", None)
+    if http_wrapper is None or not callable(getattr(http_wrapper, "send", None)):
+        return
+    original_send = http_wrapper.send
+
+    def send_with_user_key(request: Any, *args: Any, **kwargs: Any) -> Any:
+        request.headers.pop("x-api-key", None)
+        request.headers["x-user-api-key"] = api_key
+        return original_send(request, *args, **kwargs)
+
+    http_wrapper.send = send_with_user_key
+
+
 def _gmail_effect_request_fingerprint(
     *,
     settings: Settings,
@@ -1465,6 +1491,10 @@ class GmailWorker:
                 allow_tracking=False,
                 dangerously_allow_auto_upload_download_files=False,
                 file_upload_dirs=False,
+            )
+            _install_user_key_auth(
+                self._sdk_client,
+                self._settings.composio_gmail_api_key.get_secret_value(),
             )
         return self._sdk_client
 

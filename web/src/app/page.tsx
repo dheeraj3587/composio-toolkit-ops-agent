@@ -2,6 +2,7 @@ import Link from "next/link"
 import { connection } from "next/server"
 import { Activity, ArrowRight, CheckCircle2, CircleOff, Database, RadioTower } from "lucide-react"
 
+import { AgentTrace } from "@/components/agent-trace"
 import { AppSearch } from "@/components/app-search"
 import { EmptyState } from "@/components/empty-state"
 import { RunTable } from "@/components/run-table"
@@ -9,9 +10,19 @@ import { StatusBadge } from "@/components/status-badge"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { getHealth, listRuns } from "@/lib/api"
+import { getHealth, getTimeline, listRuns } from "@/lib/api"
 import { humanize } from "@/lib/format"
 import type { HealthResponse, RunListResponse } from "@/lib/types"
+
+/** Statuses that mean the agent is mid-walk rather than finished or parked. */
+const LIVE_STATUSES = new Set([
+  "researching",
+  "route_selected",
+  "browser_running",
+  "waiting_for_hitl",
+  "outreach_sent",
+  "waiting_for_reply",
+])
 
 export default async function DashboardPage() {
   await connection()
@@ -19,6 +30,12 @@ export default async function DashboardPage() {
   const health: HealthResponse | null = healthResult.status === "fulfilled" ? healthResult.value : null
   const runs: RunListResponse | null = runsResult.status === "fulfilled" ? runsResult.value : null
   const unavailable = health === null || runs === null
+
+  // The workspace's subject is an agent mid-walk, so the page leads with the one
+  // it is walking now — its actual reasoning — rather than counts. `listRuns`
+  // returns newest first, so the first live run is the most recent one.
+  const featured = runs?.items.find((run) => LIVE_STATUSES.has(run.status)) ?? null
+  const featuredTimeline = featured ? await getTimeline(featured.run_id).catch(() => null) : null
   const passedChecks = health?.checks.filter((check) => check.status === "pass").length ?? null
   const attentionRuns = runs?.items.filter((run) =>
     ["waiting_for_hitl", "outreach_sent", "waiting_for_reply", "configuration_required", "blocked", "failed"].includes(run.status),
@@ -47,13 +64,46 @@ export default async function DashboardPage() {
       </header>
 
       {unavailable ? (
-        <Alert className="border-amber-400/30 bg-amber-400/[0.08] text-amber-950">
-          <RadioTower className="text-amber-300" aria-hidden="true" />
+        // Emphasis by form, not hue: a left rule marks the one thing on this page
+        // that is not simply reported state.
+        <Alert className="border-l-[3px] border-l-foreground">
+          <RadioTower aria-hidden="true" />
           <AlertTitle>Backend state is partially unavailable</AlertTitle>
-          <AlertDescription className="text-amber-800">
+          <AlertDescription>
             Run and health state remain unreported until the operations API is available.
           </AlertDescription>
         </Alert>
+      ) : null}
+
+      {featured && featuredTimeline && featuredTimeline.boundaries.length > 0 ? (
+        <section aria-labelledby="live-run" className="panel p-5 sm:p-6">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <p className="eyebrow">Working now</p>
+              <h2 id="live-run" className="mt-2 text-2xl tracking-[-0.03em]">
+                {featured.app_name}
+              </h2>
+              <p className="mt-1.5 font-mono text-[10px] tracking-[0.06em] text-muted-foreground">
+                {featured.run_id}
+              </p>
+            </div>
+            <div className="flex flex-col items-end gap-2">
+              <StatusBadge status={featured.status} />
+              <Button asChild variant="outline" size="sm">
+                <Link href={`/runs/${featured.run_id}`}>
+                  Open run <ArrowRight aria-hidden="true" />
+                </Link>
+              </Button>
+            </div>
+          </div>
+          <AgentTrace
+            boundaries={featuredTimeline.boundaries}
+            progress={featuredTimeline.progress}
+            attempts={featuredTimeline.attempts}
+            research={featuredTimeline.research}
+            className="mt-6"
+          />
+        </section>
       ) : null}
 
       <section aria-labelledby="workspace-summary">

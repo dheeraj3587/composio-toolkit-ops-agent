@@ -31,5 +31,24 @@
     ".next/dev/types/**/*.ts",
     "**/*.mts"
   ],
-  "exclude": ["node_modules"]
+  "exclude": [
+    "node_modules",
+    // Conflict copies. This machine's ~/Desktop is a symlink into iCloud Drive
+    // (Desktop & Documents sync), and its file provider resolves a conflict by
+    // renaming to "name 2.ext". Because the includes above deliberately pull in
+    // Next's generated .next/**/types, one such copy of cache-life.d.ts or
+    // routes.d.ts makes tsc report TS6200/TS2300 duplicate-identifier errors that
+    // point at generated build output and have no source cause — it reads like a
+    // real type error and costs real time. Excluding the pattern makes typecheck
+    // immune instead of requiring someone to know to delete them first.
+    //
+    // Only `*`, `?` and `**/` are supported here — a `[0-9]` character class is
+    // NOT, and fails silently by matching nothing, so `?` is what makes this work.
+    "**/* ?.ts",
+    "**/* ?.tsx",
+    "**/* ?.mts",
+    "**/*.d ?.ts",
+    "**/*.d ?.cts",
+    "**/*.d ?.mts"
+  ]
 }

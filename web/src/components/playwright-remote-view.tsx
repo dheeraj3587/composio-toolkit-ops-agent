@@ -250,13 +250,18 @@ export const PlaywrightRemoteView = forwardRef<
     >
       <header className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 bg-zinc-950 px-3 py-2.5 text-zinc-100">
         <div className="flex items-center gap-2">
+          {/* State by FORM, not hue: solid = connected, ring = connecting,
+            * hairline = down. The three states were previously green/amber/grey,
+            * which a monochrome console cannot show and a colour-blind operator
+            * could not read either. The adjacent `role="status"` text carries the
+            * same fact, so this is reinforcement rather than the only signal. */}
           <span
             className={
               state === "connected"
-                ? "size-2 rounded-full bg-emerald-400 shadow-[0_0_0_3px_rgba(52,211,153,0.14)]"
+                ? "size-2 rounded-full bg-foreground shadow-[0_0_0_3px_rgba(250,250,250,0.14)]"
                 : state === "connecting"
-                  ? "size-2 animate-pulse rounded-full bg-amber-300 motion-reduce:animate-none"
-                  : "size-2 rounded-full bg-zinc-500"
+                  ? "size-2 animate-pulse rounded-full bg-transparent ring-[1.5px] ring-foreground motion-reduce:animate-none"
+                  : "size-2 rounded-full bg-transparent ring-1 ring-muted-foreground"
             }
             aria-hidden="true"
           />

@@ -111,6 +111,113 @@ class BrowserServiceHealth:
     janitor_running: bool = False
 
 
+class BrowserLoopUnavailable(RuntimeError):
+    """One loop RPC did not produce a usable page. Retryable by the action loop.
+
+    A ``RuntimeError`` on purpose: ``run_action_loop`` classifies those as transient
+    step failures, so a stale generation, a lost response, or a transport error is
+    retried with backoff under the existing no-progress budget and ends as
+    ``loop_no_progress_budget_exhausted`` rather than as an unhandled exception.
+    """
+
+    def __init__(self, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(f"browser loop step failed: {reason_code}")
+
+
+def _loop_payload(
+    payload: Mapping[str, object],
+) -> tuple[BrowserObservation, tuple[Mapping[str, object], ...], int]:
+    """Decode one loop response into an observation, raw elements, and generation."""
+
+    from ops.playwright.loop_session import observation_from_payload
+
+    observation_payload = payload.get("observation")
+    if not isinstance(observation_payload, Mapping):
+        raise BrowserLoopUnavailable("loop_observation_missing")
+    generation = payload.get("generation")
+    if not isinstance(generation, int) or generation < 1:
+        raise BrowserLoopUnavailable("loop_generation_missing")
+    raw = payload.get("raw_elements")
+    elements: tuple[Mapping[str, object], ...] = (
+        tuple(item for item in raw if isinstance(item, Mapping))
+        if isinstance(raw, (list, tuple))
+        else ()
+    )
+    return observation_from_payload(observation_payload), elements, generation
+
+
+class BrowserServiceLoopSession:
+    """``LoopSession`` over the browser-service RPC.
+
+    The mirror of ``ops.playwright.loop_session.PlaywrightLoopSession``: the loop
+    runs here in the control plane and reaches the page through two calls. The
+    generation returned by each response is held and echoed on the next action, so
+    the service can refuse an action planned against a page this session has not
+    seen — and refuse a retry whose first attempt may already have landed.
+
+    ``act`` uses the observation the service returns POST-action as the next
+    observation, so after the first iteration the loop costs one round trip rather
+    than two and never holds a spent token.
+    """
+
+    def __init__(
+        self,
+        client: BrowserServiceClient,
+        session_id: str,
+        *,
+        capability_scope: str,
+    ) -> None:
+        self._client = client
+        self._session_id = session_id
+        self._capability_scope = capability_scope
+        self._generation = 0
+        self._pending: tuple[BrowserObservation, tuple[Mapping[str, object], ...]] | None = None
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    async def observe(self) -> Any:
+        """The current page, or the one the last action produced."""
+
+        from ops.onboarding.action_loop import LoopObservation
+
+        pending = self._pending
+        if pending is not None:
+            # Already fetched as part of the previous act; consumed once so a
+            # second observe in the same iteration reads the live page.
+            self._pending = None
+            return LoopObservation(observation=pending[0], raw_elements=pending[1])
+        observation, elements, generation = await self._client.observe_page(
+            self._session_id, capability_scope=self._capability_scope
+        )
+        self._generation = generation
+        return LoopObservation(observation=observation, raw_elements=elements)
+
+    async def act(self, candidate: Any) -> None:
+        """Execute one candidate through the service, or raise for a retry."""
+
+        from ops.browser.candidates import executable_action_payload
+
+        if self._generation < 1:
+            # No live token: acting now would mean acting on a page this session has
+            # not observed. Retryable — the loop observes at the top of every pass.
+            raise BrowserLoopUnavailable("no_current_observation")
+        expected = self._generation
+        # Cleared before the call so a lost response cannot be retried with the same
+        # token from this side either; the service consumes it independently.
+        self._generation = 0
+        observation, elements, generation = await self._client.act_on_page(
+            self._session_id,
+            action=executable_action_payload(candidate),
+            expected_generation=expected,
+            capability_scope=self._capability_scope,
+        )
+        self._generation = generation
+        self._pending = (observation, elements)
+
+
 class BrowserServiceClient:
     """Provider-shaped RPC client for the out-of-process browser service."""
 
@@ -637,6 +744,57 @@ class BrowserServiceClient:
         payload = response.json()
         lifecycle = str(payload.get("lifecycle") or "")
         return lifecycle == "ACTIVE", lifecycle.casefold() or "unknown"
+
+    async def observe_page(
+        self, session_id: str, *, capability_scope: str
+    ) -> tuple[BrowserObservation, tuple[Mapping[str, object], ...], int]:
+        """Read the page once. Returns the observation, raw elements, generation.
+
+        The generation is the token the next :meth:`act_on_page` must echo. It is
+        consumed server-side on use, so one observation authorizes one action.
+        """
+
+        response = await self._request(
+            "POST",
+            f"/internal/browser/sessions/{session_id}/observe",
+            timeout=45.0,
+            capability_scope=capability_scope,
+        )
+        if response.status_code >= 400:
+            raise BrowserLoopUnavailable(self._reason(response))
+        return _loop_payload(response.json())
+
+    async def act_on_page(
+        self,
+        session_id: str,
+        *,
+        action: Mapping[str, object],
+        expected_generation: int,
+        capability_scope: str,
+    ) -> tuple[BrowserObservation, tuple[Mapping[str, object], ...], int]:
+        """Execute one action and return the page it produced.
+
+        ``action`` is the executor-side projection from
+        ``ops.browser.candidates.executable_action_payload`` — six fields, and
+        deliberately not the whole candidate: ``risk`` decides whether a human is
+        required and stays in this process.
+
+        A ``409`` means the generation was stale or already spent. That is raised as
+        :class:`BrowserLoopUnavailable`, which the action loop treats as a transient
+        step failure: it re-observes under its own no-progress budget rather than
+        retrying the same token, so a lost response cannot become a second submit.
+        """
+
+        response = await self._request(
+            "POST",
+            f"/internal/browser/sessions/{session_id}/act",
+            json_body={"action": dict(action), "expected_generation": expected_generation},
+            timeout=90.0,
+            capability_scope=capability_scope,
+        )
+        if response.status_code >= 400:
+            raise BrowserLoopUnavailable(self._reason(response))
+        return _loop_payload(response.json())
 
     async def probe_gate_clearance(
         self, session_id: str, *, capability_scope: str
@@ -1177,8 +1335,10 @@ __all__ = [
     "OWNER_HEADER",
     "SUPPORTED_SERVICE_MAJOR",
     "TOKEN_HEADER",
+    "BrowserLoopUnavailable",
     "BrowserServiceClient",
     "BrowserServiceHealth",
+    "BrowserServiceLoopSession",
     "ProviderHealthState",
     "ReconcileOutcome",
 ]

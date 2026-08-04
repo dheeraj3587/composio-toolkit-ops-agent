@@ -15,14 +15,47 @@ const TERMINAL_STATUSES: ReadonlySet<RunStatus> = new Set([
   "configuration_required",
 ])
 
+/**
+ * Which rail stage each durable phase belongs to.
+ *
+ * This replaces a regex over the phase string (`/credential|capture|validation/`
+ * and friends). The backend's `OnboardingPhase` is a closed 17-value union, so
+ * guessing from substrings could disagree with reality — `credential_validation`
+ * and `vault_check` both contain neither an obvious stage word nor a unique one,
+ * and a phase added later would silently fall through to "Prepare".
+ *
+ * An explicit table cannot drift silently: a new phase is absent here, hits the
+ * `?? null` below, and falls back to the status mapping rather than being
+ * mis-placed. Terminal phases are deliberately absent — status carries those.
+ */
+const PHASE_STAGE: Record<string, number> = {
+  research: 0,
+  vault_check: 0,
+  awaiting_admission: 0,
+  route_selected_signup: 1,
+  route_selected_login: 1,
+  signup: 1,
+  email_verification: 2,
+  authenticated: 2,
+  developer_app: 3,
+  credential_generation: 3,
+  vault_storage: 3,
+  credential_validation: 3,
+}
+
 function progressIndex(status: RunStatus, phase: string, hitlAction?: string | null): number {
+  // Status wins where it is unambiguous about the whole run.
   if (status === "completed") return 4
   if (status === "credentials_ready") return 3
   if (hitlAction === "email_otp" || ["outreach_sent", "waiting_for_reply"].includes(status)) return 2
+
+  // Then the durable phase, which is the backend's own answer.
+  const fromPhase = PHASE_STAGE[phase] ?? null
+  if (fromPhase !== null) return fromPhase
+
+  // A paused or blocked run keeps the stage it reached; the rail shows position,
+  // and the badge beside it already says the run stopped.
   if (["route_selected", "connection_required", "browser_running", "waiting_for_hitl"].includes(status)) return 1
-  if (/credential|capture|validation|output/iu.test(phase)) return 3
-  if (/email|verif/iu.test(phase)) return 2
-  if (/browser|account|connect|auth/iu.test(phase)) return 1
   return 0
 }
 
@@ -99,17 +132,19 @@ export function RunProgress({
           <div
             className={`flex w-fit items-center gap-2 rounded-md border px-2.5 py-1.5 text-[11px] font-medium ${
               failed
-                ? "border-amber-400/30 bg-amber-400/10 text-amber-300"
+                ? "border-l-[3px] border-foreground bg-secondary text-foreground"
                 : terminal
                   ? "border-border bg-secondary text-muted-foreground"
-                  : "border-emerald-400/25 bg-emerald-400/[0.08] text-emerald-300"
+                  : "border-[--line-live] bg-secondary text-foreground"
             }`}
             aria-live="polite"
           >
             {terminal ? (
               failed ? <TriangleAlert className="size-3.5" aria-hidden="true" /> : <Check className="size-3.5" aria-hidden="true" />
             ) : (
-              <span className="size-1.5 rounded-full bg-emerald-400" aria-hidden="true" />
+              // Ringed + pulsing rather than a filled dot: "live" reads as
+              // motion, which survives the loss of colour.
+              <span className="size-1.5 rounded-full ring-[1.5px] ring-current cot-marker-live" aria-hidden="true" />
             )}
             {terminal
               ? planOnly
@@ -138,7 +173,10 @@ export function RunProgress({
           aria-valuenow={percent}
           aria-valuetext={`${percent}% · ${stages[current] ?? stages.at(-1)}`}
         >
-          <div className={`h-full rounded-full transition-[width] duration-500 ${failed ? "bg-amber-400" : "bg-brand-500"}`} style={{ width: `${percent}%` }} />
+          <div
+            className={`h-full rounded-full transition-[width] duration-500 ${failed ? "bg-muted-foreground" : "bg-foreground"}`}
+            style={{ width: `${percent}%` }}
+          />
         </div>
 
         <ol className="grid grid-cols-5 gap-2">
@@ -150,11 +188,12 @@ export function RunProgress({
                 <span
                   className={`mb-2 grid size-5 place-items-center rounded-full border ${
                     complete
-                      ? "border-brand-500 bg-brand-500 text-white"
+                      ? // The one inverted treatment: a finished stage.
+                        "border-foreground bg-foreground text-background"
                       : active
                         ? failed
-                          ? "border-amber-400/60 bg-amber-400/10 text-amber-300"
-                          : "border-brand-400/60 bg-brand-400/10 text-brand-300"
+                          ? "border-dashed border-muted-foreground bg-transparent text-foreground"
+                          : "border-foreground bg-transparent text-foreground"
                         : "border-border bg-field text-muted-foreground/45"
                   }`}
                 >
