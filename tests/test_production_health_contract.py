@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,6 +12,7 @@ from pydantic import SecretStr
 
 from api.app import create_app as create_api_app
 from api.service import LocalRunService
+from browser_service.main import _READINESS_TTL_SECONDS
 from browser_service.main import create_app as create_browser_app
 from browser_service.settings import BrowserServiceSettings
 from ops.browser.readiness import BrowserReadiness, probe_playwright
@@ -42,7 +44,11 @@ def test_browser_health_is_cache_only_and_ready_owns_refresh(
     )
     with TestClient(app) as client:
         assert calls["count"] == 1
-        app.state.readiness.checked_at = 0.0
+        # Age the cache past its TTL relative to the clock the cache actually
+        # reads. A literal 0.0 is only stale once the machine's monotonic clock
+        # has passed the TTL, so on a freshly booted CI runner the entry still
+        # read fresh and /internal/ready had nothing to refresh.
+        app.state.readiness.checked_at = time.monotonic() - (_READINESS_TTL_SECONDS + 1.0)
         cached = client.get("/internal/health")
         assert cached.status_code == 200
         assert calls["count"] == 1
