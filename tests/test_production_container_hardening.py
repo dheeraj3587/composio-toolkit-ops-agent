@@ -259,7 +259,10 @@ def test_totp_secret_is_withheld_from_the_api_and_optional_for_web() -> None:
         "",
         "${OPS_AUTH_TOTP_SECRET:-}",
     )
-    assert template_environment["OPS_AUTH_TOTP_SECRET"] == ("replace-with-base32-totp-secret")
+    # cd5604f removed TOTP from production authentication, so the template no
+    # longer ships the key at all. The containment rules above still apply to a
+    # deployment carried over from before that change, which may still set it.
+    assert "OPS_AUTH_TOTP_SECRET" not in template_environment
 
 
 def test_ci_runs_browser_with_production_sandbox_posture_and_always_cleans_up() -> None:
