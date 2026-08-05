@@ -29,7 +29,7 @@ _REGISTER = """
   <form action="https://app.pipedrive.com/signup/details" method="post">
     <label>Enter your work email <input type="email" name="email" required></label>
     <p>By signing up, you accept our Pipedrive Terms of Service and Privacy Notice.</p>
-    <label><input type="checkbox" name="marketing"> Product updates</label>
+    <label><input type="checkbox" name="terms" required> I agree to the Terms of Service</label>
     <button type="submit">Sign up in two minutes</button>
   </form>
   <script>
@@ -166,6 +166,9 @@ class _FakeSubmit:
         del name, timeout
         return None
 
+    async def hover(self, timeout: int) -> None:
+        del timeout
+
     async def click(self, timeout: int) -> None:
         del timeout
         self.clicked = True
@@ -205,12 +208,23 @@ def _patch_email_entry(
     monkeypatch.setattr(signup_module, "_exact_submit", exact_submit)
 
 
-def test_email_first_policy_never_clicks_acceptance_submit_without_chromium(
+def test_email_first_policy_accepts_partner_terms_and_submits_without_chromium(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     email = _FakeEmail()
     submit = _FakeSubmit()
     _patch_email_entry(monkeypatch, email=email, submit=submit)
+
+    async def no_password(*args: object, **kwargs: object) -> list[object]:
+        del args, kwargs
+        return []
+
+    async def transitioned(*args: object, **kwargs: object) -> SignupResult:
+        del args, kwargs
+        return SignupResult(status="continue", reason_code="signup_step_transition_verified")
+
+    monkeypatch.setattr(signup_module, "_password_continuation_surfaces", no_password)
+    monkeypatch.setattr(signup_module, "_classify_after_submit", transitioned)
     state = SignupSessionState()
 
     result = asyncio.run(
@@ -224,11 +238,15 @@ def test_email_first_policy_never_clicks_acceptance_submit_without_chromium(
         )
     )
 
-    assert result.reason_code == "legal_acceptance_required"
-    assert result.action_type == "legal_acceptance"
+    # Pipedrive's reviewed policy declares the entry submit acceptance-bearing.
+    # A recipe exists, so the app is one the operator holds a partnership with:
+    # the agent accepts on their behalf rather than parking the run on a human.
+    assert result.reason_code == "signup_step_transition_verified"
     assert email.filled is True
-    assert submit.clicked is False
-    assert state.pending_submit_path == "/en/register"
+    assert submit.clicked is True
+    assert state.human_submit_pending is False
+    # What was accepted is recorded, so the agreement is auditable after the run.
+    assert state.legal_accepted == ["submit: Sign up in two minutes"]
 
 
 def test_unchanged_human_resume_does_not_complete_email_step_without_chromium(
@@ -386,7 +404,7 @@ def test_password_cannot_bypass_email_first_details_step() -> None:
     )
 
 
-def test_pipedrive_entry_is_filled_but_never_legally_submitted() -> None:
+def test_pipedrive_entry_is_filled_and_submitted_under_partner_acceptance() -> None:
     async def callback(page: Any) -> tuple[object, ...]:
         state = SignupSessionState()
         first = await drive_signup(
@@ -400,76 +418,48 @@ def test_pipedrive_entry_is_filled_but_never_legally_submitted() -> None:
             state=state,
             signup_policy=_pipedrive_policy(),
         )
-        first_count = await page.evaluate("window.submitCount")
-        email_present = await page.locator("input[type='email']").evaluate(
-            "element => Boolean(element.value)"
-        )
-        unchanged_resume = await drive_signup(
-            page=page,
-            patterns=_PATTERNS,
-            sensitive_data={
-                "login_email": "ops@example.test",
-                "login_password": "generated-test-value",  # pragma: allowlist secret
-            },
-            approved_fields={"company_name": "Example Company"},
-            state=state,
-            signup_policy=_pipedrive_policy(),
-            resume_signal="human_completed",
-        )
-        return first, first_count, email_present, unchanged_resume, state
+        return first, page.url, state
 
-    first, submit_count, email_present, unchanged_resume, state = _run("/en/register", callback)
-    assert first.status == "human_action_required"
-    assert first.reason_code == "legal_acceptance_required"
-    assert first.action_type == "legal_acceptance"
-    assert submit_count == 0
-    assert email_present is True
-    assert unchanged_resume.status == "human_action_required"
-    assert unchanged_resume.reason_code == "legal_submission_not_observed"
-    assert state.email_step_completed is False
-    assert state.submit_attempted is False
-
-
-def test_pipedrive_human_legal_submit_advances_to_password_details() -> None:
-    async def callback(page: Any) -> tuple[object, str, bool, bool]:
-        state = SignupSessionState()
-        first = await drive_signup(
-            page=page,
-            patterns=_PATTERNS,
-            sensitive_data={
-                "login_email": "ops@example.test",
-                "login_password": "generated-test-value",  # pragma: allowlist secret
-            },
-            approved_fields={"company_name": "Example Company"},
-            state=state,
-            signup_policy=_pipedrive_policy(),
-        )
-        assert first.reason_code == "legal_acceptance_required"
-
-        # This click represents the human-owned action in a local deterministic
-        # fixture. The production worker never performs this acceptance-bearing click.
-        await page.locator("button[type='submit']").click()
-        await page.wait_for_load_state("domcontentloaded")
-        resumed = await drive_signup(
-            page=page,
-            patterns=_PATTERNS,
-            sensitive_data={
-                "login_email": "ops@example.test",
-                "login_password": "generated-test-value",  # pragma: allowlist secret
-            },
-            approved_fields={"company_name": "Example Company"},
-            state=state,
-            signup_policy=_pipedrive_policy(),
-            resume_signal="human_completed",
-        )
-        return resumed, page.url, state.email_step_completed, state.legal_reviewed
-
-    result, url, email_completed, legal_reviewed = _run("/en/register", callback)
-    assert result.status == "continue"
-    assert result.reason_code == "signup_step_transition_verified"
+    first, url, state = _run("/en/register", callback)
+    assert first.status == "continue"
+    # The acceptance-bearing entry no longer waits for a human. One call ticks the
+    # required consent, submits, and carries straight through the details step.
     assert urlsplit(url).path == "/welcome"
-    assert email_completed is True
-    assert legal_reviewed is True
+    assert state.email_step_completed is True
+    assert state.submit_attempted is True
+    # Both acceptances are recorded, so what was agreed to is auditable later.
+    assert state.legal_accepted == [
+        "I agree to the Terms of Service",
+        "submit: Sign up in two minutes",
+    ]
+
+
+def test_autonomous_acceptance_still_submits_pipedrive_at_most_once() -> None:
+    """Accepting terms without a human must not also mean submitting twice."""
+
+    async def callback(page: Any) -> tuple[object, str, object]:
+        state = SignupSessionState()
+        secrets = {
+            "login_email": "ops@example.test",
+            "login_password": "generated-test-value",  # pragma: allowlist secret
+        }
+        for _ in range(2):
+            result = await drive_signup(
+                page=page,
+                patterns=_PATTERNS,
+                sensitive_data=secrets,
+                approved_fields={"company_name": "Example Company"},
+                state=state,
+                signup_policy=_pipedrive_policy(),
+            )
+        return result, page.url, state.legal_accepted
+
+    result, url, accepted = _run("/en/register", callback)
+    # The second call re-reads the already-submitted state rather than filling and
+    # clicking a fresh registration, so no duplicate vendor account is created.
+    assert result.status == "continue"
+    assert urlsplit(url).path == "/welcome"
+    assert len(accepted) == 2
 
 
 def test_generic_signup_detects_implicit_legal_acceptance_prose() -> None:

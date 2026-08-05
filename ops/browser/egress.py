@@ -167,6 +167,19 @@ def reviewed_egress_extensions(
         browser = resolved.browser
         return ReviewedEgressExtensions(
             identity_provider_hosts=browser.identity_provider_hosts,
+            # The same reviewed hosts back the app's XHR/fetch calls. Without
+            # this, every vendor whose signup is a single-page console hangs on
+            # its own loading overlay forever: Apify's console renders the form
+            # under ``#appLoader`` and only removes it once its API answers, so
+            # blocking that call leaves a page that looks drivable and is not.
+            #
+            # This grants no capability the recipe had not already granted. These
+            # exact hosts are already trusted to serve EXECUTABLE SCRIPT into the
+            # page (``active_script_hosts`` below), which subsumes fetching from
+            # them. Hosts outside the reviewed set remain blocked for every kind,
+            # and the vendor-navigation and identity-provider boundaries are
+            # untouched.
+            active_api_hosts=browser.static_resource_hosts,
             active_script_hosts=browser.static_resource_hosts,
             passive_asset_hosts=browser.static_resource_hosts,
         )

@@ -148,6 +148,24 @@ _PASSKEY_SELECTOR = (
 _LEGAL_WORDS = re.compile(
     r"(?i)\b(terms|privacy|legal|agreement|consent|agree|policy|conditions)\b"
 )
+# Whether the agent may accept a vendor's terms on the operator's behalf is a
+# BUSINESS decision, not a browser-safety one, and the operator has made it: the
+# recipe catalog is a hand-curated set of partner apps whose terms the company
+# has already reviewed and agreed to out of band. Signing up is the act of
+# recording an agreement that already exists, so pausing for a human to re-read
+# it added latency without adding review.
+#
+# The authorization is scoped to that curated set, not granted globally. It is
+# carried as an explicit ``accept_legal`` argument threaded from
+# :func:`drive_signup`, which turns it on only where a reviewed
+# :class:`SignupPolicy` came from the catalog. A signup surface reached without
+# a recipe -- the ``signup_policy is None`` path -- is NOT a partner route and
+# still hands its acceptance to a human.
+#
+# Everything else about the boundary is unchanged: the form must still sit on an
+# evidence-bound host and reviewed entry path, billing actions still stop, and
+# the submit-at-most-once guarantee still holds. Acceptance is recorded on the
+# session state and logged, so what was agreed to is auditable after the fact.
 _IMPLICIT_LEGAL_ACCEPTANCE = re.compile(
     r"(?is)\bby\s+(?:signing\s+up|registering|creating|continuing|submitting)\b"
     r".{0,240}\b(?:accept|agree|consent)\b"
@@ -181,6 +199,11 @@ class SignupSessionState:
     handoff_count: int = 0
     legal_gate_issued: bool = False
     legal_reviewed: bool = False
+    #: Bounded, value-free descriptions of every acceptance this session made on
+    #: the operator's behalf -- checkbox labels and the acceptance-bearing submit
+    #: label. Populated only on the authorized partner path; the record is what
+    #: makes an autonomous acceptance auditable later.
+    legal_accepted: list[str] = field(default_factory=list)
     human_submit_pending: bool = False
     pending_submit_path: str | None = None
     submitted_path: str | None = None
@@ -370,11 +393,42 @@ async def _checkbox_text(checkbox: Any) -> str:
         return ""
 
 
+def _record_acceptance(state: SignupSessionState, description: str) -> None:
+    """Note one thing the agent agreed to, bounded and value-free."""
+
+    entry = " ".join(description.split())[:200]
+    if entry and entry not in state.legal_accepted:
+        state.legal_accepted.append(entry)
+        LOGGER.info(
+            "signup accepted vendor terms autonomously",
+            extra={"acceptance": entry},
+        )
+
+
+async def _tick_acceptance_checkbox(checkbox: Any) -> bool:
+    """Check one consent box, reporting whether it is now actually checked.
+
+    Reports the OBSERVED state rather than the absence of an exception: a click
+    that lands on an overlay leaves the box clear, and treating that as accepted
+    would mean submitting a form whose required consent is unchecked.
+    """
+
+    try:
+        await checkbox.check(timeout=5_000)
+    except Exception:
+        return False
+    try:
+        return bool(await checkbox.is_checked())
+    except Exception:
+        return False
+
+
 async def _human_gate_before_fill(
     page: Any,
     form: Any,
     *,
     include_legal: bool,
+    accept_legal: bool,
     resume_signal: str | None,
     state: SignupSessionState,
 ) -> SignupResult | None:
@@ -420,14 +474,24 @@ async def _human_gate_before_fill(
                 continue
             if state.legal_reviewed and checked:
                 continue
+            if checked:
+                continue
+            if accept_legal:
+                # A partner route: tick the operator's already-made agreement.
+                # Only a box the agent could not actually set falls through to a
+                # human -- that is a mechanism failure, not a policy one, and
+                # submitting past it would send an unchecked required consent.
+                if await _tick_acceptance_checkbox(checkbox):
+                    _record_acceptance(state, text or "unlabelled required consent checkbox")
+                    state.legal_reviewed = True
+                    continue
             state.legal_gate_issued = True
             return SignupResult(
                 status="human_action_required",
                 reason_code="legal_acceptance_required",
                 action_type="legal_acceptance",
                 instruction=(
-                    "Review the vendor terms and choose whether to accept them in the live "
-                    "browser. The agent will not accept legal terms."
+                    "Review the vendor terms and choose whether to accept them in the live browser."
                 ),
             )
     return None
@@ -551,6 +615,77 @@ async def _password_continuation_surfaces(
             continue
         surfaces.append((surface, form, email_field, form_passwords))
     return surfaces
+
+
+async def _page_shape(page: Any) -> str:
+    """A value-free structural summary of the current page, for diagnosis only.
+
+    Input TYPES and button LABELS are static UI vocabulary, not account data; no
+    field value is read. This exists because the pauses below describe what the
+    driver expected rather than what the page actually offered, which is the one
+    thing needed to tell a mis-detected surface from a rejected submission.
+    """
+
+    try:
+        shape = await page.evaluate(
+            """() => ({
+                path: location.pathname,
+                inputs: [...document.querySelectorAll('form input')]
+                  .map(i => i.type).slice(0, 20),
+                buttons: [...document.querySelectorAll('form button')]
+                  .map(b => (b.innerText || '').trim()).filter(Boolean).slice(0, 12),
+            })"""
+        )
+    except Exception:
+        return "<unavailable>"
+    return str(shape)[:600]
+
+
+async def _submit_obstructed_gate() -> SignupResult:
+    return SignupResult(
+        status="human_action_required",
+        reason_code="signup_submit_obstructed",
+        action_type="provider_verification",
+        instruction=(
+            "The signup form is filled but something on the page is covering its "
+            "submit control. Clear it in the live browser and resume; nothing has "
+            "been submitted yet."
+        ),
+    )
+
+
+async def _await_clickable(control: Any, *, budget_seconds: float) -> bool:
+    """Wait until a real click on ``control`` would reach it.
+
+    A single-page console commonly paints its form UNDER a full-page loading
+    overlay: the control is visible, enabled and stable, and the click still
+    lands on the overlay. Apify's ``#appLoader`` does exactly this, and the
+    click's own actionability window expired against it.
+
+    Hovering runs the same actionability checks as clicking -- including "does
+    this element receive pointer events" -- while changing nothing on the page,
+    so it can be retried freely. That matters because the click it guards cannot
+    be: the click is the one-shot, and a click that times out against an overlay
+    is indistinguishable from one the server accepted, which costs the whole run.
+    """
+
+    deadline = monotonic() + budget_seconds
+    while True:
+        try:
+            await control.hover(timeout=2_000)
+            return True
+        except Exception as error:
+            if monotonic() >= deadline:
+                # The pause this produces names the obstruction only in prose.
+                # Record what actually blocked the pointer so the route can be
+                # fixed rather than re-diagnosed by hand on every run.
+                LOGGER.warning(
+                    "signup submit never became clickable: %s: %s",
+                    type(error).__name__,
+                    str(error)[:2000],
+                )
+                return False
+        await asyncio.sleep(_SURFACE_RENDER_POLL_SECONDS)
 
 
 async def _exact_submit(
@@ -725,6 +860,18 @@ async def _classify_after_submit(
     )
 
 
+def _partner_acceptance_authorized(policy: SignupPolicy | None) -> bool:
+    """Whether the agent may accept this route's vendor terms without a human.
+
+    A reviewed :class:`SignupPolicy` exists only for an app the operator put in
+    the curated catalog, which is the same set they hold partner agreements with
+    and whose terms they have already reviewed. No recipe means no partnership
+    on record, so no autonomous acceptance.
+    """
+
+    return policy is not None
+
+
 def _legal_submit_gate(*, reason_code: str = "legal_acceptance_required") -> SignupResult:
     return SignupResult(
         status="human_action_required",
@@ -757,6 +904,7 @@ async def _drive_password_continuation(
     state: SignupSessionState,
     resume_signal: str | None,
     researched: bool = False,
+    accept_legal: bool = False,
 ) -> SignupResult:
     """Fill one reviewed password/details continuation after an email-first step.
 
@@ -764,6 +912,10 @@ async def _drive_password_continuation(
     route came from research rather than review, so the form's own submit control
     may be resolved past sibling OAuth buttons. The continuation needs it because
     a researched email-first route reaches its password step through here.
+
+    ``accept_legal`` likewise carries the partner-catalog authorization down from
+    :func:`drive_signup`; a continuation is where a two-step signup usually puts
+    its terms checkbox.
     """
 
     if state.human_submit_pending:
@@ -812,6 +964,7 @@ async def _drive_password_continuation(
         page,
         form,
         include_legal=False,
+        accept_legal=accept_legal,
         resume_signal=resume_signal,
         state=state,
     )
@@ -875,6 +1028,7 @@ async def _drive_password_continuation(
         page,
         form,
         include_legal=True,
+        accept_legal=accept_legal,
         resume_signal=resume_signal,
         state=state,
     )
@@ -912,15 +1066,33 @@ async def _drive_password_continuation(
             instruction="Review the payment or subscription action in the live browser.",
         )
     if _LEGAL_WORDS.search(submit_text) or await _form_implies_legal_acceptance(form):
-        state.human_submit_pending = True
-        state.pending_submit_path = _current_path(page)
-        return _legal_submit_gate()
+        if not accept_legal:
+            state.human_submit_pending = True
+            state.pending_submit_path = _current_path(page)
+            return _legal_submit_gate()
+        _record_acceptance(state, f"submit: {submit_text}")
+
+    # Nothing has been submitted yet, so an obstruction here is recoverable.
+    # Check it BEFORE the one-shot state below: past that line the run can never
+    # try again, because a timed-out click may still have registered.
+    if not await _await_clickable(submit, budget_seconds=_SURFACE_RENDER_BUDGET_SECONDS):
+        return await _submit_obstructed_gate()
 
     state.submit_attempted = True
     state.submitted_path = _current_path(page)
     try:
         await submit.click(timeout=10_000)
-    except Exception:
+    except Exception as error:
+        # This outcome is terminal by design -- the click may have registered, so
+        # it is never retried -- which makes the swallowed cause the only thing
+        # that could explain it later. Record the class and message; a Playwright
+        # actionability failure names the obstruction, and no typed value reaches
+        # here to be leaked.
+        LOGGER.warning(
+            "signup submit click did not complete: %s: %s",
+            type(error).__name__,
+            str(error)[:2000],
+        )
         return SignupResult(status="failed", reason_code="signup_submit_outcome_unknown")
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=15_000)
@@ -943,8 +1115,9 @@ async def _drive_email_first_signup(
     policy: SignupPolicy,
     resume_signal: str | None,
 ) -> SignupResult:
-    """Drive a reviewed email-first registration without accepting legal terms."""
+    """Drive a reviewed email-first registration for a catalog app."""
 
+    accept_legal = _partner_acceptance_authorized(policy)
     if state.email_step_completed:
         return await _drive_password_continuation(
             page=page,
@@ -954,11 +1127,14 @@ async def _drive_email_first_signup(
             state=state,
             resume_signal=resume_signal,
             researched=policy.flow == "dom_detected",
+            accept_legal=accept_legal,
         )
 
-    # The acceptance-bearing entry submit is always human-owned for Pipedrive.
-    # Resume is evidence only when the page positively transitions or exposes the
-    # uniquely recognized password continuation.
+    # Reached only when an earlier attempt handed the acceptance-bearing entry
+    # submit to a human -- which now happens only for a route with no reviewed
+    # recipe, or one whose consent checkbox could not be set. Resume is evidence
+    # only when the page positively transitions or exposes the uniquely
+    # recognized password continuation.
     if state.human_submit_pending:
         if resume_signal != "human_completed":
             return _legal_submit_gate()
@@ -994,27 +1170,45 @@ async def _drive_email_first_signup(
                 state=state,
                 resume_signal=resume_signal,
                 researched=policy.flow == "dom_detected",
+                accept_legal=accept_legal,
             )
         return result
 
     if state.email_step_submit_attempted:
-        password_surfaces = await _password_continuation_surfaces(page, patterns)
-        if len(password_surfaces) > 1:
-            return SignupResult(status="failed", reason_code="multiple_signup_surfaces")
-        result = await _classify_after_submit(
-            page,
-            patterns,
-            before_path=state.submitted_path,
-        )
-        transitioned = bool(password_surfaces) or (
-            state.submitted_path is not None and _current_path(page) != state.submitted_path
-        )
-        if transitioned or result.action_type in {
-            "email_otp",
-            "phone_otp",
-            "billing",
-            "account_selection",
-        }:
+        # The step's own outcome needs the same render budget the entry needed.
+        # A console answers "Next" by swapping the password step in at the SAME
+        # path a second or two later -- Apify does exactly this -- so reading the
+        # page the instant the click returns sees the pre-submit form and calls a
+        # working signup unverified. Poll until something recognizable appears.
+        deadline = monotonic() + _SURFACE_RENDER_BUDGET_SECONDS
+        while True:
+            password_surfaces = await _password_continuation_surfaces(page, patterns)
+            if len(password_surfaces) > 1:
+                return SignupResult(status="failed", reason_code="multiple_signup_surfaces")
+            result = await _classify_after_submit(
+                page,
+                patterns,
+                before_path=state.submitted_path,
+            )
+            transitioned = bool(password_surfaces) or (
+                state.submitted_path is not None and _current_path(page) != state.submitted_path
+            )
+            recognized = transitioned or result.action_type in {
+                "email_otp",
+                "phone_otp",
+                "billing",
+                "account_selection",
+            }
+            if recognized:
+                break
+            if monotonic() >= deadline:
+                LOGGER.warning(
+                    "signup email step produced no recognized continuation: %s",
+                    await _page_shape(page),
+                )
+                break
+            await asyncio.sleep(_SURFACE_RENDER_POLL_SECONDS)
+        if recognized:
             _complete_email_step(state, legal_reviewed=False)
             if password_surfaces:
                 return await _drive_password_continuation(
@@ -1025,6 +1219,7 @@ async def _drive_email_first_signup(
                     state=state,
                     resume_signal=resume_signal,
                     researched=policy.flow == "dom_detected",
+                    accept_legal=accept_legal,
                 )
         return result
 
@@ -1065,6 +1260,7 @@ async def _drive_email_first_signup(
         page,
         form,
         include_legal=False,
+        accept_legal=accept_legal,
         resume_signal=resume_signal,
         state=state,
     )
@@ -1097,6 +1293,7 @@ async def _drive_email_first_signup(
         page,
         form,
         include_legal=True,
+        accept_legal=accept_legal,
         resume_signal=resume_signal,
         state=state,
     )
@@ -1138,16 +1335,34 @@ async def _drive_email_first_signup(
         or _LEGAL_WORDS.search(submit_text)
         or await _form_implies_legal_acceptance(form)
     ):
-        state.legal_gate_issued = True
-        state.human_submit_pending = True
-        state.pending_submit_path = current_path
-        return _legal_submit_gate()
+        if not accept_legal:
+            state.legal_gate_issued = True
+            state.human_submit_pending = True
+            state.pending_submit_path = current_path
+            return _legal_submit_gate()
+        _record_acceptance(state, f"submit: {submit_text}")
+
+    # Nothing has been submitted yet, so an obstruction here is recoverable.
+    # Check it BEFORE the one-shot state below: past that line the run can never
+    # try again, because a timed-out click may still have registered.
+    if not await _await_clickable(submit, budget_seconds=_SURFACE_RENDER_BUDGET_SECONDS):
+        return await _submit_obstructed_gate()
 
     state.email_step_submit_attempted = True
     state.submitted_path = current_path
     try:
         await submit.click(timeout=10_000)
-    except Exception:
+    except Exception as error:
+        # This outcome is terminal by design -- the click may have registered, so
+        # it is never retried -- which makes the swallowed cause the only thing
+        # that could explain it later. Record the class and message; a Playwright
+        # actionability failure names the obstruction, and no typed value reaches
+        # here to be leaked.
+        LOGGER.warning(
+            "signup submit click did not complete: %s: %s",
+            type(error).__name__,
+            str(error)[:2000],
+        )
         return SignupResult(status="failed", reason_code="signup_submit_outcome_unknown")
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=15_000)
@@ -1241,6 +1456,7 @@ async def _drive_dom_detected_signup(
         state=state,
         resume_signal=resume_signal,
         researched=True,
+        accept_legal=_partner_acceptance_authorized(policy),
     )
 
 
@@ -1305,6 +1521,7 @@ async def _drive_email_password_signup(
     state: SignupSessionState,
     resume_signal: str | None,
     researched: bool = False,
+    accept_legal: bool = False,
 ) -> SignupResult:
     """Fill and submit one single-step email-and-password registration form.
 
@@ -1312,6 +1529,10 @@ async def _drive_email_password_signup(
     changes nothing about which page or form is acceptable; it only allows the
     form's own submit control to be resolved past sibling OAuth buttons, for the
     reason :func:`_own_submit` documents.
+
+    ``accept_legal`` is the partner-catalog authorization; it defaults off so the
+    recipe-less path reached directly from :func:`drive_signup` keeps handing
+    acceptance to a human.
     """
 
     if state.human_submit_pending:
@@ -1373,6 +1594,7 @@ async def _drive_email_password_signup(
         page,
         form,
         include_legal=False,
+        accept_legal=accept_legal,
         resume_signal=resume_signal,
         state=state,
     )
@@ -1426,6 +1648,7 @@ async def _drive_email_password_signup(
         page,
         form,
         include_legal=True,
+        accept_legal=accept_legal,
         resume_signal=resume_signal,
         state=state,
     )
@@ -1464,9 +1687,17 @@ async def _drive_email_password_signup(
             instruction="Review the payment or subscription action in the live browser.",
         )
     if _LEGAL_WORDS.search(submit_text) or await _form_implies_legal_acceptance(form):
-        state.human_submit_pending = True
-        state.pending_submit_path = _current_path(page)
-        return _legal_submit_gate()
+        if not accept_legal:
+            state.human_submit_pending = True
+            state.pending_submit_path = _current_path(page)
+            return _legal_submit_gate()
+        _record_acceptance(state, f"submit: {submit_text}")
+
+    # Nothing has been submitted yet, so an obstruction here is recoverable.
+    # Check it BEFORE the one-shot state below: past that line the run can never
+    # try again, because a timed-out click may still have registered.
+    if not await _await_clickable(submit, budget_seconds=_SURFACE_RENDER_BUDGET_SECONDS):
+        return await _submit_obstructed_gate()
 
     # Set before the click: a timeout may mean the server accepted registration.
     # Retrying would risk a duplicate account.
@@ -1474,7 +1705,17 @@ async def _drive_email_password_signup(
     state.submitted_path = _current_path(page)
     try:
         await submit.click(timeout=10_000)
-    except Exception:
+    except Exception as error:
+        # This outcome is terminal by design -- the click may have registered, so
+        # it is never retried -- which makes the swallowed cause the only thing
+        # that could explain it later. Record the class and message; a Playwright
+        # actionability failure names the obstruction, and no typed value reaches
+        # here to be leaked.
+        LOGGER.warning(
+            "signup submit click did not complete: %s: %s",
+            type(error).__name__,
+            str(error)[:2000],
+        )
         return SignupResult(status="failed", reason_code="signup_submit_outcome_unknown")
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=15_000)
