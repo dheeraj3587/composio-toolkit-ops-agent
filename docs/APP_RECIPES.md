@@ -7,7 +7,7 @@ Current catalog:
 - schema: `1.0`
 - catalog ID: `approved-50-routes-2026-07-28`
 - routes: 25 managed authentication, 14 Playwright, 11 gated
-- readiness: 25 `managed_auth_ready`, 1 `browser_ready`, 13 `owner_submit_ready`, 4 `outreach_ready`, 7 `outreach_review_required`
+- readiness: 25 `managed_auth_ready`, 7 `browser_ready`, 7 `owner_submit_ready`, 4 `outreach_ready`, 7 `outreach_review_required`
 
 Recipe readiness describes reviewed automation scope. It is not evidence that a provider is configured, a user has authorized an account, or a live run has succeeded.
 
@@ -50,8 +50,14 @@ A managed recipe has a reviewed Composio toolkit slug and OAuth evidence. It doe
 | App | App slug | Browser scope | Credential | Capture and validation |
 | --- | --- | --- | --- | --- |
 | Pipedrive | `pipedrive` | reviewed credential surface | `api_token` | automatic capture plus read-only API validation |
+| Apify | `apify` | reviewed credential surface | `api_token` | automatic capture plus read-only API validation |
+| Firecrawl | `firecrawl` | reviewed credential surface | `api_key` | automatic capture plus read-only API validation |
+| Vercel | `vercel` | reviewed credential surface | `personal_access_token` | automatic capture plus read-only API validation |
+| Cloudflare | `cloudflare` | reviewed credential surface | `api_token` | automatic capture plus read-only API validation |
+| Datadog | `datadog` | reviewed credential surface | `api_key` | automatic capture plus read-only API validation |
+| Coda | `coda` | reviewed credential surface | `api_token` | automatic capture plus read-only API validation |
 
-Pipedrive is the only recipe allowed to claim full browser readiness. Its contract requires:
+A `browser_ready` recipe claims full browser readiness. Its contract requires:
 
 - a reviewed login URL and credential-management URL;
 - exact navigation hosts and identity-provider hosts;
@@ -70,14 +76,8 @@ These recipes navigate only to the reviewed public entry URL. The success predic
 | Klaviyo | `klaviyo` | `private_api_key` |
 | Shopify | `shopify` | `admin_api_access_token` |
 | DataForSEO | `dataforseo` | `login`, `password` |
-| Apify | `apify` | `api_token` |
-| Firecrawl | `firecrawl` | `api_key` |
 | Bright Data | `bright-data` | `api_token` |
-| Vercel | `vercel` | `personal_access_token` |
-| Cloudflare | `cloudflare` | `api_token` |
 | Neo4j | `neo4j` | `username`, `password` |
-| Datadog | `datadog` | `api_key`, `application_key` |
-| Coda | `coda` | `api_token` |
 | Xero | `xero` | `client_id`, `client_secret` |
 
 An owner-submit recipe must not contain a credential-management URL, automatic capture specification, or validation policy. Its bundle remains explicitly unvalidated.

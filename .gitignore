@@ -107,3 +107,18 @@ repomix-output.*
 MANIFEST.txt
 *_AUDIT.md
 _contract_check.py
+
+# Ad-hoc audit/scratch work (kept local, never tracked)
+.audit_work/
+**/.audit_work/
+
+# iCloud Drive conflict copies. ~/Desktop is a symlink into iCloud Drive and its
+# file provider renames conflicting duplicates to "name 2.ext" (also inside
+# web/.next and __pycache__). These are never source; ignoring them keeps a stray
+# `git add .` from committing one and prevents them from breaking builds/tooling.
+* [0-9].*
+*\ [0-9][0-9].*
+
+
+# Local editor/agent tool configuration
+.qwen/

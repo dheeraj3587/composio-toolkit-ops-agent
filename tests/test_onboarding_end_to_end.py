@@ -65,6 +65,7 @@ from ops.core.storage import OperationsStorage
 from ops.credentials.validator import CredentialValidationResult
 from ops.email.verification import VerificationCandidate
 from ops.email.verification_provider import VerificationQuery
+from ops.onboarding import driver as onboarding_driver
 from ops.onboarding.action_loop import LoopObservation
 from ops.onboarding.admission import admit_from_vault, decide_from_operator
 from ops.onboarding.composition import (
@@ -91,10 +92,16 @@ from ops.onboarding.driver import (
 from ops.onboarding.effects import create_dev_app_key, plan_effect
 from ops.onboarding.lease import Lease, deadline_after
 from ops.onboarding.phase import OnboardingPhase
+from ops.planner.decide import PlanOutcome, recipe_route_plan
+from ops.planner.validator import (
+    CREDENTIAL_SURFACE_ORDINAL,
+    PLAN_REFUSAL_REASON_CODE,
+    PlanRefusal,
+)
 from ops.providers.profile import ProfileField, ProviderProfile
 from ops.providers.profile_builder import ProfileClaim, build_profile, discovery_adapter
 from ops.providers.profile_store import ProviderProfileStore
-from ops.recipes.app_recipes import SignupPolicy
+from ops.recipes.app_recipes import AppRecipe, SignupPolicy
 from ops.research.operational_research import EvidenceDocument
 
 # The run and its bindings. Both identifiers are the opaque forms the vault's own
@@ -647,6 +654,120 @@ class _WalkHandlers:
 
 # --- the assembled system ----------------------------------------------------
 
+# The fake provider's catalog entry. Plan_Validator refuses any run whose planned
+# surfaces are not declared by a reviewed recipe, so a walk over an invented
+# provider needs one; every surface below is a URL this file's fake site serves.
+PROVIDER_RECIPE = AppRecipe.model_validate(
+    {
+        "app_slug": APP_SLUG,
+        "app_name": PROVIDER_NAME,
+        "route_kind": "playwright",
+        "toolkit_slug": APP_SLUG,
+        "readiness_tier": "browser_ready",
+        "evidence_verified_at": "2026-07-25",
+        "evidence_urls": [DOCS_URL, GUIDE_URL],
+        "auth_styles": ["api_key"],
+        "urls": {
+            "login": LOGIN_URL,
+            "signup": SIGNUP_URL,
+            "developer_portal": PORTAL_URL,
+            "credential_management": API_KEY_URL,
+            "contact": DOCS_URL,
+        },
+        "browser": {
+            "scope": "credential_surface",
+            "exact_hosts": ["provider.com", "app.provider.com", "developers.provider.com"],
+            "identity_provider_hosts": [],
+            "static_resource_hosts": [],
+            "verification_sender_domains": ["provider.com"],
+            "verification_link_hosts": ["app.provider.com"],
+            "sensitive_selectors": ["input[type='password']", "input[name='api_key']"],
+            "signup": {
+                "flow": "email_first",
+                "entry_path_prefixes": ["/signup"],
+                "entry_submit_labels": ["Create account"],
+                "entry_submit_implies_legal_acceptance": False,
+            },
+            "steps": [
+                {
+                    "order": 1,
+                    "action": "navigate",
+                    "target_url": LOGIN_URL,
+                    "instruction": "Open the reviewed Provider login entry.",
+                    "completion": {"url_path_contains": ["/login"]},
+                    "hitl_gates": [],
+                },
+                {
+                    "order": 2,
+                    "action": "authenticate_then_navigate",
+                    "target_url": API_KEY_URL,
+                    "instruction": (
+                        "Submit the stored login credentials at most once, then open the "
+                        "reviewed API settings page."
+                    ),
+                    "completion": {
+                        "url_path_contains": ["/settings/api"],
+                        "visible_text_contains": ["API key"],
+                    },
+                    "hitl_gates": ["captcha", "email_verification"],
+                },
+                {
+                    "order": 3,
+                    "action": "capture_boundary",
+                    "target_url": API_KEY_URL,
+                    "instruction": (
+                        "Enter the code-owned secret-capture boundary once the API key field "
+                        "is visible. Never expose plaintext."
+                    ),
+                    "completion": {
+                        "url_path_contains": ["/settings/api"],
+                        "visible_text_contains": ["API key"],
+                    },
+                    "hitl_gates": [],
+                },
+            ],
+            "success": {
+                "url_path_contains": ["/settings/api"],
+                "visible_text_contains": ["API key"],
+            },
+        },
+        "credential_fields": [
+            {"name": "api_key", "label": "API key", "kind": "api_key", "secret": True}
+        ],
+        "capture": {
+            "mode": "automatic",
+            "field_name": "api_key",
+            "selectors": ["input[name='api_key']"],
+            "value_pattern": "pk_live_[a-z0-9]{24}",
+            "expected_path_prefix": "/settings/api",
+            "expected_heading": "API",
+            "reveal_selector": None,
+        },
+        "validation": {
+            "endpoint": VALIDATION_ENDPOINT,
+            "method": "GET",
+            "auth_scheme": "bearer",
+            "credential_field": "api_key",
+            "header_name": "Authorization",
+            "account_identifier_paths": ["data.id"],
+        },
+    }
+)
+
+
+class _RecipeRoutePlanner:
+    """Plan the reviewed route itself, with no inference provider in the loop."""
+
+    def plan_for(self, *, recipe: AppRecipe, revision: int) -> PlanOutcome | PlanRefusal:
+        plan = recipe_route_plan(recipe, revision=revision)
+        if plan is None:
+            return PlanRefusal(
+                reason_code=PLAN_REFUSAL_REASON_CODE,
+                detail="recipe_route_not_browser",
+                ordinal=CREDENTIAL_SURFACE_ORDINAL,
+            )
+        return PlanOutcome(plan=plan, reason_code="plan_provider_unconfigured")
+
 
 @dataclass
 class _Walkthrough:
@@ -671,6 +792,13 @@ def walkthrough(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Wa
             entry_submit_labels=("Create account",),
             entry_submit_implies_legal_acceptance=False,
         ),
+    )
+    # …and its catalog entry, for the same reason: the driver resolves the
+    # reviewed recipe by slug before it will create a session.
+    monkeypatch.setattr(
+        onboarding_driver,
+        "get_app_recipe",
+        lambda app_slug: PROVIDER_RECIPE if app_slug == APP_SLUG else None,
     )
     db_path = tmp_path / "private" / "ops.db"
     settings = Settings(
@@ -741,6 +869,10 @@ def walkthrough(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Wa
         },
         verification_binding=cast(Any, _VerificationBinding(site)),
     )
+    # The planner is the fifth outbound seam: its default reaches an inference
+    # provider. Bind the recipe-declared route directly, which is the same plan
+    # the deployed planner falls back to when no provider answers.
+    deps = replace(deps, planner=cast(Any, _RecipeRoutePlanner()))
     try:
         yield _Walkthrough(
             ports=ports,

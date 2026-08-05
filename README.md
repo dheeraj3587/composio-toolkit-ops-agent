@@ -93,8 +93,8 @@ Catalog membership is not a claim that every app is fully autonomous or live-ver
 | Capability | Apps | Current behavior |
 | --- | ---: | --- |
 | Managed authentication | 25 | Start a Composio authorization link, poll the connected account, and produce a reference-only bundle after Composio reports it active. |
-| Complete Playwright browser flow | 1 | Pipedrive has a reviewed login-to-credential trace, automatic secret capture, read-only validation, and encrypted vault handoff. |
-| Playwright entry plus owner submission | 13 | Open the reviewed public sign-in entry, then let the owner submit the independently obtained credential into the encrypted vault. These recipes do not claim credential-page navigation, automatic capture, or live validation. |
+| Complete Playwright browser flow | 7 | A reviewed login-to-credential trace, automatic secret capture, read-only validation, and encrypted vault handoff. |
+| Playwright entry plus owner submission | 7 | Open the reviewed public sign-in entry, then let the owner submit the independently obtained credential into the encrypted vault. These recipes do not claim credential-page navigation, automatic capture, or live validation. |
 | Gated/outreach | 11 | No browser automation. Four reviewed email routes support explicit controlled-sink outreach; seven remain truthfully review-required. |
 
 See [docs/APP_RECIPES.md](docs/APP_RECIPES.md) for the exact app matrix and promotion requirements.

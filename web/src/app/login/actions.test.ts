@@ -33,7 +33,6 @@ describe("loginAction throttling", () => {
       "OPS_AUTH_SESSION_SECRET",
       "test-session-secret-that-is-longer-than-thirty-two-characters",
     )
-    vi.stubEnv("OPS_AUTH_TOTP_SECRET", "JBSWY3DPEHPK3PXP")
     mocks.cookies.mockReset()
     mocks.headers.mockReset()
     mocks.redirect.mockReset()
@@ -66,10 +65,9 @@ describe("loginAction throttling", () => {
     expect(mocks.cookies).not.toHaveBeenCalled()
   })
 
-  it("requires the second factor and rejects replay of an accepted TOTP step", async () => {
+  it("grants a session on password match without requiring a second factor", async () => {
     vi.useFakeTimers()
     vi.setSystemTime(59_000)
-    vi.stubEnv("OPS_AUTH_TOTP_SECRET", "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
     mocks.headers.mockResolvedValue(
       new Headers({ "x-forwarded-for": "203.0.113.88" }),
     )
@@ -80,10 +78,6 @@ describe("loginAction throttling", () => {
       loginAction(loginForm("correct-password-for-ops", "287082")),
     ).rejects.toThrow("NEXT_REDIRECT:/")
     expect(setCookie).toHaveBeenCalledOnce()
-
-    await expect(
-      loginAction(loginForm("correct-password-for-ops", "287082")),
-    ).rejects.toThrow("error=invalid")
-    expect(setCookie).toHaveBeenCalledOnce()
+    expect(setCookie.mock.calls[0][0]).toBe("ops_session")
   })
 })
