@@ -284,6 +284,9 @@ print(json.dumps({
                 "PLAYWRIGHT_MAX_SESSIONS": "2",
                 "BROWSER_OPERATION_TIMEOUT_SECONDS": "300",
                 "BROWSER_SERVICE_OWNER": "production-owner",
+                # compose.prod.yaml gives this a default, so a real render always
+                # carries it and the contract validator requires it.
+                "MERCURY_MODEL": "mercury-2",
             },
         },
         # The web service carries no TOTP secret, which the release validator
