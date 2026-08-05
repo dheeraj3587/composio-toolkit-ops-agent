@@ -285,6 +285,10 @@ class CreateRunRequest(StrictApiModel):
     browser_login: BrowserLoginInput | None = None
     # Opt into the autonomous onboarding driver (design LL-6.3). Additive and
     # default-false, so an existing client's request keeps its current meaning.
+    # NOT SERVABLE YET: the driver has no browser binding in this deployment, so
+    # ``true`` is refused at the route with ``onboarding_driver_not_wired``. The
+    # field stays in the contract because the refusal is the honest answer and a
+    # removed field would 422 as an unknown key, which says nothing useful.
     onboarding: bool = False
     # Optional operator hint for provider research. A bounded HTTPS URL, never a
     # search phrase, so a hint cannot smuggle prose into the research prompt.

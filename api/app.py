@@ -65,6 +65,7 @@ from api.service import (
     RunService,
 )
 from ops.core.redaction import install_redacting_filter
+from ops.providers.errors import ConfigurationRequiredError
 from ops.runs.errors import ProviderReadinessError
 from ops.runs.service import (
     CredentialSubmissionError,
@@ -531,6 +532,20 @@ def create_app(
         # only in the encrypted account vault, never in run state or logs.
         if payload.browser_login is not None:
             _require_owner_action(request)
+        if payload.onboarding:
+            # The autonomous onboarding driver (design LL-6.3) is built and
+            # tested but has never been bound to a browser: no LoopSessionFactory
+            # implementation exists outside the test fakes, so nothing reads this
+            # field. Accepting it silently produced a run driven by the canonical
+            # runtime while the caller believed it had opted into the phase
+            # machine -- the two differ in where a run pauses and what a retry
+            # replays, so the discrepancy surfaces as a mystery much later.
+            # Refuse with a code that names the actual state instead.
+            raise ConfigurationRequiredError(
+                phase=6,
+                capability="autonomous onboarding driver",
+                reason_code="onboarding_driver_not_wired",
+            )
         return await run_service.create_run(payload, idempotency_key=idempotency_key)
 
     def _request_carries_internal_token(request: Request) -> bool:

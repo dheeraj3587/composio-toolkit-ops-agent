@@ -13,11 +13,13 @@ gate.  The model is never involved in this path.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from time import monotonic
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 from urllib.parse import urljoin, urlsplit
 
@@ -69,6 +71,16 @@ SignupStatus = Literal["continue", "human_action_required", "failed"]
 # The two step orderings this module can drive. A reviewed recipe names one of
 # them directly; a researched route resolves to one by looking at the live form.
 ResolvedSignupFlow = Literal["email_first", "email_password"]
+
+# How long a researched route is given to DRAW its registration form before the
+# absence of one is believed. Client-rendered consoles are the normal case, not
+# the exception: Apify's sign-up form first appears between four and nine seconds
+# after ``domcontentloaded``. Fifteen seconds clears the observed range with
+# margin and still sits inside the ~30s per-step ceiling this harness works to.
+# The cost of waiting is a slower pause; the cost of not waiting is a drivable
+# signup handed to a human, which is the failure this whole path exists to avoid.
+_SURFACE_RENDER_BUDGET_SECONDS: Final[float] = 15.0
+_SURFACE_RENDER_POLL_SECONDS: Final[float] = 0.5
 
 _APPROVED_FIELDS: dict[str, int] = {
     "company_name": 200,
@@ -144,6 +156,17 @@ _BILLING_WORDS = re.compile(
     r"(?i)\b(pay|payment|purchase|subscribe|subscription|checkout|billing|card|upgrade)\b"
 )
 _CONFIRM_PASSWORD = re.compile(r"(?i)(confirm|repeat|verify|again|confirmation)")
+# Controls that hand registration to a THIRD-PARTY identity provider rather than
+# submitting the form we validated. They routinely sit inside that same form
+# element -- Apify's sign-up form carries "Continue with Google", "Continue with
+# GitHub" and "Next" as siblings -- so a count of submit controls says "ambiguous"
+# for a page whose own submit action is perfectly unambiguous. These are excluded
+# from consideration, never clicked: an OAuth handoff would authenticate as some
+# other account entirely, and the vault would end up holding a credential for it.
+_THIRD_PARTY_IDENTITY = re.compile(
+    r"(?i)\b(google|github|gitlab|apple|microsoft|facebook|twitter|slack|okta|auth0|linkedin"
+    r"|sso|saml|single\s+sign[\s-]?on)\b"
+)
 
 
 @dataclass(slots=True)
@@ -547,6 +570,37 @@ async def _exact_submit(
     return "unique", matches[0]
 
 
+async def _own_submit(form: Any) -> tuple[str, Any | None]:
+    """The one control that submits THIS form, read off the live page.
+
+    For a researched route the reviewed labels are the wrong authority. Research
+    reads a route from the vendor's own site; it never executes the page, so for
+    a client-rendered console it records the marketing link's wording ("Sign up")
+    while the hydrated form's button says something else entirely ("Next"). A
+    strict label match then reports "the reviewed submit action is no longer
+    present" about a form that is sitting there, complete and fillable.
+
+    So the control is resolved structurally instead of by wording: among the
+    visible, enabled submit controls of the form ALREADY validated -- on a URL
+    that is still evidence-bound, in a surface that is still the single
+    unambiguous one -- the third-party identity handoffs are set aside and
+    exactly one must remain. Two remaining is still ``ambiguous`` and still
+    stops. This resolves a control inside a form that was already accepted; it
+    grants no new page, no new host, and no new form.
+    """
+
+    controls = await _visible_enabled(form.locator("button, input[type='submit']"), limit=12)
+    matches: list[Any] = []
+    for control in controls:
+        if not _THIRD_PARTY_IDENTITY.search(await _submit_text(control)):
+            matches.append(control)
+    if not matches:
+        return "missing", None
+    if len(matches) != 1:
+        return "ambiguous", None
+    return "unique", matches[0]
+
+
 async def _fill_company_fields(
     form: Any,
     fields: Mapping[str, str],
@@ -702,8 +756,15 @@ async def _drive_password_continuation(
     fields: Mapping[str, str],
     state: SignupSessionState,
     resume_signal: str | None,
+    researched: bool = False,
 ) -> SignupResult:
-    """Fill one reviewed password/details continuation after an email-first step."""
+    """Fill one reviewed password/details continuation after an email-first step.
+
+    ``researched`` carries the same meaning it has in the single-step driver: the
+    route came from research rather than review, so the form's own submit control
+    may be resolved past sibling OAuth buttons. The continuation needs it because
+    a researched email-first route reaches its password step through here.
+    """
 
     if state.human_submit_pending:
         if resume_signal != "human_completed":
@@ -828,6 +889,11 @@ async def _drive_password_continuation(
         )
 
     submit_status, submit = await _unique_visible(form, _SUBMIT_SELECTOR)
+    if submit_status != "unique" and researched:
+        # Sibling OAuth buttons inside the same form make the plain count read
+        # "ambiguous" for a form with one real submit action. Reviewed recipes
+        # keep the plain count; only a researched route looks past them.
+        submit_status, submit = await _own_submit(form)
     if submit_status == "missing" or submit is None:
         return SignupResult(
             status="human_action_required",
@@ -887,6 +953,7 @@ async def _drive_email_first_signup(
             fields=fields,
             state=state,
             resume_signal=resume_signal,
+            researched=policy.flow == "dom_detected",
         )
 
     # The acceptance-bearing entry submit is always human-owned for Pipedrive.
@@ -926,6 +993,7 @@ async def _drive_email_first_signup(
                 fields=fields,
                 state=state,
                 resume_signal=resume_signal,
+                researched=policy.flow == "dom_detected",
             )
         return result
 
@@ -956,6 +1024,7 @@ async def _drive_email_first_signup(
                     fields=fields,
                     state=state,
                     resume_signal=resume_signal,
+                    researched=policy.flow == "dom_detected",
                 )
         return result
 
@@ -1041,6 +1110,11 @@ async def _drive_email_first_signup(
             instruction="Complete the remaining required signup field in the live browser.",
         )
     submit_status, submit = await _exact_submit(form, policy.entry_submit_labels)
+    if submit_status == "missing" and policy.flow == "dom_detected":
+        # A RESEARCHED route's labels are a guess about wording, not evidence
+        # about this form. Fall back to the form's own submit control; a reviewed
+        # recipe keeps its strict label match and never reaches this line.
+        submit_status, submit = await _own_submit(form)
     if submit_status == "missing" or submit is None:
         return SignupResult(
             status="human_action_required",
@@ -1111,26 +1185,44 @@ async def _drive_dom_detected_signup(
 
     Neither shape being present is a pause, not a guess: the alternative is to
     pick a driver on no evidence and have it fill a form nobody recognized.
+
+    That judgement is only worth making against a page that has finished drawing.
+    A researched route is routinely a client-rendered application whose form does
+    not exist at ``domcontentloaded`` -- Apify's takes between four and nine
+    seconds -- so a single immediate read reports "no surface" for a page that
+    was merely still empty, and parks a perfectly drivable signup on a human.
+    The scan therefore repeats until a surface appears or the budget is spent.
+    Waiting cannot manufacture a surface that is not there: an unrecognized page
+    still pauses, just later and on better evidence.
     """
 
     if state.resolved_flow is None:
         if not _path_matches(_current_path(page), policy.entry_path_prefixes):
             return SignupResult(status="failed", reason_code="signup_entry_path_unreviewed")
-        if await _email_only_surfaces(page, patterns):
-            state.resolved_flow = "email_first"
-        elif await _email_password_surfaces(page, patterns):
-            state.resolved_flow = "email_password"
-        else:
-            return SignupResult(
-                status="human_action_required",
-                reason_code="signup_surface_not_supported",
-                action_type="provider_verification",
-                instruction=(
-                    "The researched registration page exposes neither an email-only step "
-                    "nor a single email-and-password form. Complete this vendor-specific "
-                    "step in the live browser."
-                ),
-            )
+        deadline = monotonic() + _SURFACE_RENDER_BUDGET_SECONDS
+        while True:
+            if await _email_only_surfaces(page, patterns):
+                state.resolved_flow = "email_first"
+                break
+            if await _email_password_surfaces(page, patterns):
+                state.resolved_flow = "email_password"
+                break
+            if monotonic() >= deadline:
+                return SignupResult(
+                    status="human_action_required",
+                    reason_code="signup_surface_not_supported",
+                    action_type="provider_verification",
+                    instruction=(
+                        "The researched registration page exposes neither an email-only "
+                        "step nor a single email-and-password form. Complete this "
+                        "vendor-specific step in the live browser."
+                    ),
+                )
+            # Re-check the path each round: a client-side redirect away from the
+            # reviewed entry point must not be waited out and then driven.
+            if not _path_matches(_current_path(page), policy.entry_path_prefixes):
+                return SignupResult(status="failed", reason_code="signup_entry_path_unreviewed")
+            await asyncio.sleep(_SURFACE_RENDER_POLL_SECONDS)
     if state.resolved_flow == "email_first":
         return await _drive_email_first_signup(
             page=page,
@@ -1148,6 +1240,7 @@ async def _drive_dom_detected_signup(
         fields=fields,
         state=state,
         resume_signal=resume_signal,
+        researched=True,
     )
 
 
@@ -1211,8 +1304,15 @@ async def _drive_email_password_signup(
     fields: Mapping[str, str],
     state: SignupSessionState,
     resume_signal: str | None,
+    researched: bool = False,
 ) -> SignupResult:
-    """Fill and submit one single-step email-and-password registration form."""
+    """Fill and submit one single-step email-and-password registration form.
+
+    ``researched`` marks a route that came from research rather than review. It
+    changes nothing about which page or form is acceptable; it only allows the
+    form's own submit control to be resolved past sibling OAuth buttons, for the
+    reason :func:`_own_submit` documents.
+    """
 
     if state.human_submit_pending:
         if resume_signal != "human_completed":
@@ -1341,6 +1441,11 @@ async def _drive_email_password_signup(
         )
 
     submit_status, submit = await _unique_visible(form, _SUBMIT_SELECTOR)
+    if submit_status != "unique" and researched:
+        # Sibling OAuth buttons inside the same form make the plain count read
+        # "ambiguous" for a form with one real submit action. Reviewed recipes
+        # keep the plain count; only a researched route looks past them.
+        submit_status, submit = await _own_submit(form)
     if submit_status == "missing" or submit is None:
         return SignupResult(
             status="human_action_required",
