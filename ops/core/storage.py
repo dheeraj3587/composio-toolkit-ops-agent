@@ -469,14 +469,20 @@ CREATE TABLE IF NOT EXISTS onboarding_run_plans (
         surfaces_json LIKE '[%]' AND length(surfaces_json) <= {MAX_PLAN_SURFACES_JSON_LENGTH}
         AND surfaces_json NOT LIKE '%?%' AND surfaces_json NOT LIKE '%#%'
     ),
-    credential_host TEXT NOT NULL CHECK (
-        length(credential_host) <= {MAX_SURFACE_HOST_LENGTH}
-        AND credential_host NOT LIKE '%/%'
-        AND credential_host NOT LIKE '%?%' AND credential_host NOT LIKE '%#%'
+    -- NULL for an entry_only recipe, which declares no credential-management URL.
+    -- The two columns are null together: a half-named surface is not a surface.
+    credential_host TEXT CHECK (
+        credential_host IS NULL OR (
+            length(credential_host) <= {MAX_SURFACE_HOST_LENGTH}
+            AND credential_host NOT LIKE '%/%'
+            AND credential_host NOT LIKE '%?%' AND credential_host NOT LIKE '%#%'
+        )
     ),
-    credential_path TEXT NOT NULL CHECK (
-        credential_path LIKE '/%' AND length(credential_path) <= {MAX_SURFACE_PATH_LENGTH}
-        AND credential_path NOT LIKE '%?%' AND credential_path NOT LIKE '%#%'
+    credential_path TEXT CHECK (
+        credential_path IS NULL OR (
+            credential_path LIKE '/%' AND length(credential_path) <= {MAX_SURFACE_PATH_LENGTH}
+            AND credential_path NOT LIKE '%?%' AND credential_path NOT LIKE '%#%'
+        )
     ),
     success_digest TEXT NOT NULL,
     reason_code TEXT NOT NULL CHECK (
@@ -485,6 +491,7 @@ CREATE TABLE IF NOT EXISTS onboarding_run_plans (
     created_at TEXT NOT NULL,
     superseded_at TEXT,
     superseded_by INTEGER,
+    CHECK ((credential_host IS NULL) = (credential_path IS NULL)),
     UNIQUE (run_id, revision),
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
@@ -492,6 +499,37 @@ CREATE TABLE IF NOT EXISTS onboarding_run_plans (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_run_plans_active
 ON onboarding_run_plans(run_id) WHERE status = 'active';
 """
+
+
+def _relax_run_plan_credential_columns(connection: sqlite3.Connection) -> None:
+    """Drop NOT NULL from the credential columns of a pre-existing plan table.
+
+    An entry_only recipe declares no credential-management URL, so its plan stores
+    NULL there. SQLite cannot relax NOT NULL in place, so a database created before
+    that change is rebuilt through the documented rename-copy-drop procedure. Rows
+    are preserved exactly: every existing plan has both values and keeps them.
+    """
+
+    columns = connection.execute("PRAGMA table_info(onboarding_run_plans)").fetchall()
+    if not columns:  # A fresh database; _RUN_PLANS_DDL creates it correctly.
+        return
+    not_null = {str(row[1]) for row in columns if int(row[3]) == 1}
+    if not not_null & {"credential_host", "credential_path"}:
+        return
+
+    # The declared column order, so an added column fails loudly at the INSERT
+    # rather than being silently dropped on the next open.
+    names = ", ".join(_RUN_PLAN_COLUMNS)
+    # The index travels with the table across a rename, so it is dropped first and
+    # recreated by _RUN_PLANS_DDL against the rebuilt table.
+    connection.execute("DROP INDEX IF EXISTS idx_run_plans_active")
+    connection.execute("ALTER TABLE onboarding_run_plans RENAME TO onboarding_run_plans_legacy")
+    connection.executescript(_RUN_PLANS_DDL)
+    connection.execute(
+        f"INSERT INTO onboarding_run_plans ({names}) "  # noqa: S608 - fixed column list
+        f"SELECT {names} FROM onboarding_run_plans_legacy"
+    )
+    connection.execute("DROP TABLE onboarding_run_plans_legacy")
 
 
 # One row per completed loop iteration (Requirement 4.1). Append-only and never
@@ -930,6 +968,28 @@ def _surface_path(value: object, *, field: str) -> str:
     return value
 
 
+def _both_or_neither(host: object, path: object) -> bool:
+    """Whether the credential pair is absent, refusing a half-named surface."""
+
+    if host is None and path is None:
+        return True
+    if host is None or path is None:
+        raise ValueError("a plan credential surface names both a host and a path, or neither")
+    return False
+
+
+def _optional_surface_host(host: object, path: object) -> str | None:
+    if _both_or_neither(host, path):
+        return None
+    return _surface_host(host, field="credential surface host")
+
+
+def _optional_surface_path(host: object, path: object) -> str | None:
+    if _both_or_neither(host, path):
+        return None
+    return _surface_path(path, field="credential surface path")
+
+
 def _decision_provider(value: object) -> str:
     """One backend's own name (``mercury``, ``openai_compatible``), bounded.
 
@@ -1193,8 +1253,8 @@ class OperationsUnitOfWork:
         catalog_id: str,
         recipe_version: str,
         surfaces: Sequence[Mapping[str, str]],
-        credential_host: str,
-        credential_path: str,
+        credential_host: str | None,
+        credential_path: str | None,
         success_digest: str,
         reason_code: str,
     ) -> dict[str, Any]:
@@ -1565,6 +1625,7 @@ class OperationsStorage:
             connection.executescript(_AUTONOMY_OUTCOMES_DDL)
             # Additive: three new tables and their indexes, no data migration.
             # An existing database gains them on the next open (design "Release 2").
+            _relax_run_plan_credential_columns(connection)
             connection.executescript(_RUN_PLANS_DDL)
             connection.executescript(_PROGRESS_EVENTS_DDL)
             connection.executescript(_DECISION_ATTEMPTS_DDL)
@@ -2776,8 +2837,8 @@ class OperationsStorage:
         catalog_id: str,
         recipe_version: str,
         surfaces: Sequence[Mapping[str, str]],
-        credential_host: str,
-        credential_path: str,
+        credential_host: str | None,
+        credential_path: str | None,
         success_digest: str,
         reason_code: str,
     ) -> dict[str, Any]:
@@ -2834,8 +2895,8 @@ class OperationsStorage:
         catalog_id: str,
         recipe_version: str,
         surfaces: Sequence[Mapping[str, str]],
-        credential_host: str,
-        credential_path: str,
+        credential_host: str | None,
+        credential_path: str | None,
         success_digest: str,
         reason_code: str,
     ) -> dict[str, Any]:
@@ -2849,8 +2910,10 @@ class OperationsStorage:
             _plan_identifier(catalog_id, field="catalog id"),
             _plan_identifier(recipe_version, field="recipe version"),
             _surfaces_json(surfaces),
-            _surface_host(credential_host, field="credential surface host"),
-            _surface_path(credential_path, field="credential surface path"),
+            # Null together or not at all: an entry_only recipe names no credential
+            # surface, and a half-named one is not a surface.
+            _optional_surface_host(credential_host, credential_path),
+            _optional_surface_path(credential_host, credential_path),
             _plan_digest(success_digest, field="success digest"),
             _audit_reason_code(reason_code),
         )

@@ -84,14 +84,20 @@ def plan_decision_schema(recipe: AppRecipe) -> dict[str, object]:
 
     hosts = list(recipe.browser.exact_hosts) if recipe.browser is not None else []
     paths = list(declared_surface_paths(recipe))
+    properties: dict[str, object] = {
+        "surfaces": {"type": "array", "items": _surface_object(hosts, paths)}
+    }
+    required = ["surfaces"]
+    # An entry_only recipe has no reviewed credential surface, so the schema must not
+    # offer the key at all: with additionalProperties false the model cannot invent one.
+    if recipe.browser is not None and recipe.browser.scope != "entry_only":
+        properties["credential_surface"] = _surface_object(hosts, paths)
+        required.append("credential_surface")
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["surfaces", "credential_surface"],
-        "properties": {
-            "surfaces": {"type": "array", "items": _surface_object(hosts, paths)},
-            "credential_surface": _surface_object(hosts, paths),
-        },
+        "required": required,
+        "properties": properties,
     }
 
 
@@ -104,13 +110,21 @@ def plan_prompt(recipe: AppRecipe, *, evidence: str = "") -> str:
 
     hosts = ", ".join(recipe.browser.exact_hosts) if recipe.browser is not None else ""
     paths = "\n".join(f"- {path}" for path in declared_surface_paths(recipe))
+    # An entry_only recipe's schema offers no credential_surface key, so asking for
+    # one would invite a payload the validator then has to reject.
+    entry_only = recipe.browser is not None and recipe.browser.scope == "entry_only"
+    task = (
+        "Select and order the surfaces an onboarding run should visit."
+        if entry_only
+        else "Select and order the surfaces an onboarding run should visit, and name the"
+        " credential surface."
+    )
     lines = [
         f"App: {recipe.app_slug} ({recipe.app_name}).",
         f"Reviewed hosts: {hosts}.",
         "Reviewed paths, in catalog order:",
         paths,
-        "Select and order the surfaces an onboarding run should visit, and name the",
-        "credential surface. Choose only from the values above; invent nothing.",
+        f"{task} Choose only from the values above; invent nothing.",
     ]
     if evidence:
         prose = sanitize_page_text(evidence, max_length=_MAX_EVIDENCE_CHARACTERS)
@@ -136,6 +150,7 @@ def _payload_validator(recipe: AppRecipe) -> object:
     hosts = frozenset(recipe.browser.exact_hosts) if recipe.browser is not None else frozenset()
     paths = frozenset(declared_surface_paths(recipe))
     maximum = min(MAX_PLAN_SURFACES, len(recipe.browser.steps) if recipe.browser else 0)
+    entry_only = recipe.browser is not None and recipe.browser.scope == "entry_only"
 
     def validate(payload: Mapping[str, object]) -> None:
         surfaces = payload.get("surfaces")
@@ -143,6 +158,10 @@ def _payload_validator(recipe: AppRecipe) -> object:
             raise ValueError(f"a plan decision names 1..{maximum} surfaces")
         for surface in surfaces:
             _payload_surface(surface, hosts=hosts, paths=paths)
+        if entry_only:
+            if payload.get("credential_surface") is not None:
+                raise ValueError("an entry_only recipe declares no credential surface")
+            return
         _payload_surface(payload.get("credential_surface"), hosts=hosts, paths=paths)
 
     return validate
@@ -161,9 +180,13 @@ def _plan_from_payload(
 ) -> RunPlan | None:
     surfaces_value = payload.get("surfaces")
     credential_value = payload.get("credential_surface")
-    if not isinstance(surfaces_value, list) or not surfaces_value:
+    if not isinstance(surfaces_value, list) or not surfaces_value or recipe.browser is None:
         return None
-    if not isinstance(credential_value, Mapping) or recipe.browser is None:
+    entry_only = recipe.browser.scope == "entry_only"
+    if entry_only:
+        if credential_value is not None:
+            return None
+    elif not isinstance(credential_value, Mapping):
         return None
     catalog_id, recipe_version = catalog_binding(recipe)
     surfaces: list[PlannedSurface] = []
@@ -178,7 +201,11 @@ def _plan_from_payload(
         revision=revision,
         source="planner",
         surfaces=tuple(surfaces),
-        credential_surface=_surface_from_payload(credential_value),
+        credential_surface=(
+            None
+            if entry_only
+            else _surface_from_payload(cast("Mapping[str, object]", credential_value))
+        ),
         success_digest=success_digest(
             recipe.browser.success, catalog_id=catalog_id, recipe_version=recipe_version
         ),
@@ -207,7 +234,10 @@ def recipe_route_plan(recipe: AppRecipe, *, revision: int = 1) -> RunPlan | None
     if recipe.route_kind != "playwright" or browser is None or not browser.exact_hosts:
         return None
     credential = _recipe_credential_surface(recipe)
-    if credential is None:
+    # An entry_only recipe declares no credential-management URL by contract, so a
+    # missing credential surface is its normal shape rather than an incomplete route.
+    # Only a credential_surface recipe is incomplete without one.
+    if credential is None and browser.scope != "entry_only":
         return None
     entry = recipe.urls.login or recipe.urls.signup
     candidates: list[PlannedSurface] = []

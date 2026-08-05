@@ -1499,12 +1499,13 @@ class CanonicalRuntime:
         if observation.status == "human_action_required":
             return None
         if observation.status in {"credential_page_ready", "developer_console_ready"}:
-            for index, surface in enumerate(plan.surfaces):
-                if (surface.host, surface.path) == (
-                    plan.credential_surface.host,
-                    plan.credential_surface.path,
-                ):
-                    return plan, index
+            # An entry_only plan names no credential surface, so its terminal
+            # observation is the last surface it planned rather than an unmatched one.
+            credential = plan.credential_surface
+            if credential is not None:
+                for index, surface in enumerate(plan.surfaces):
+                    if (surface.host, surface.path) == (credential.host, credential.path):
+                        return plan, index
             return plan, len(plan.surfaces) - 1
         if observation.status == "navigating":
             return plan, 0

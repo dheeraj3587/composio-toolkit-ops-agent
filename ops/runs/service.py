@@ -554,8 +554,8 @@ class RunService:
                 catalog_id=replacement.catalog_id,
                 recipe_version=replacement.recipe_version,
                 surfaces=replacement.as_surface_rows(),
-                credential_host=replacement.credential_surface.host,
-                credential_path=replacement.credential_surface.path,
+                credential_host=replacement.credential_host,
+                credential_path=replacement.credential_path,
                 success_digest=replacement.success_digest,
                 reason_code=outcome.reason_code,
             )

@@ -59,7 +59,13 @@ class PlannedSurface:
 
 @dataclass(frozen=True, slots=True)
 class RunPlan:
-    """The ordered route a run may drive, bound to one reviewed recipe revision."""
+    """The ordered route a run may drive, bound to one reviewed recipe revision.
+
+    ``credential_surface`` is ``None`` exactly when the recipe's browser scope is
+    ``entry_only``. Such a recipe declares no credential-management URL by contract
+    (docs/APP_RECIPES.md), so a plan that named one would be claiming a reviewed
+    surface the catalog never reviewed. The Plan_Validator enforces both directions.
+    """
 
     app_slug: str
     catalog_id: str
@@ -67,7 +73,7 @@ class RunPlan:
     revision: int
     source: PlanSource
     surfaces: tuple[PlannedSurface, ...]
-    credential_surface: PlannedSurface
+    credential_surface: PlannedSurface | None
     success_digest: str
 
     def __post_init__(self) -> None:
@@ -87,6 +93,18 @@ class RunPlan:
 
     def as_surface_rows(self) -> list[dict[str, str]]:
         return [surface.as_row() for surface in self.surfaces]
+
+    @property
+    def credential_host(self) -> str | None:
+        """The credential surface's host as a storable column, ``None`` if it names none."""
+
+        return None if self.credential_surface is None else self.credential_surface.host
+
+    @property
+    def credential_path(self) -> str | None:
+        """The credential surface's path as a storable column, ``None`` if it names none."""
+
+        return None if self.credential_surface is None else self.credential_surface.path
 
 
 def canonical_surface(url: str, *, purpose: SurfacePurpose) -> PlannedSurface:

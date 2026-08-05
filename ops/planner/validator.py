@@ -25,6 +25,7 @@ PlanRefusalDetail = Literal[
     "navigation_denied",
     "path_not_declared",
     "credential_surface_unprovable",
+    "credential_surface_not_declared",
 ]
 
 # The credential surface is reported at ordinal 0: it is not one of the ordered
@@ -163,25 +164,29 @@ def validate_plan(plan: RunPlan, *, recipe: AppRecipe) -> PlanRefusal | None:
             return refusal
 
     credential = plan.credential_surface
-    if browser.scope == "credential_surface":
-        if not browser.success.proves_credential_surface():
-            return _refuse("credential_surface_unprovable", CREDENTIAL_SURFACE_ORDINAL)
-        credential_paths = DeclaredPaths(
-            exact=frozenset(), prefixes=(), contains=browser.success.url_path_contains
-        )
-    else:
-        declared = _path_of(recipe.urls.credential_management)
-        if declared is None:
-            return _refuse("credential_surface_unprovable", CREDENTIAL_SURFACE_ORDINAL)
-        credential_paths = DeclaredPaths(exact=frozenset({declared}), prefixes=(), contains=())
-    refusal = _check_surface(
+    if browser.scope == "entry_only":
+        # An owner-submit recipe declares no credential-management URL, and the
+        # owner obtains the credential outside the automation. A plan that named a
+        # credential surface anyway would assert a reviewed surface the catalog
+        # never reviewed, so its *presence* is the refusable condition here.
+        if credential is not None:
+            return _refuse("credential_surface_not_declared", CREDENTIAL_SURFACE_ORDINAL)
+        return None
+
+    if credential is None:
+        return _refuse("credential_surface_unprovable", CREDENTIAL_SURFACE_ORDINAL)
+    if not browser.success.proves_credential_surface():
+        return _refuse("credential_surface_unprovable", CREDENTIAL_SURFACE_ORDINAL)
+    credential_paths = DeclaredPaths(
+        exact=frozenset(), prefixes=(), contains=browser.success.url_path_contains
+    )
+    return _check_surface(
         credential,
         CREDENTIAL_SURFACE_ORDINAL,
         recipe=recipe,
         allowed=allowed,
         paths=credential_paths,
     )
-    return refusal
 
 
 __all__ = [

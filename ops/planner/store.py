@@ -56,6 +56,22 @@ def _surface(row: Mapping[str, object]) -> PlannedSurface:
     )
 
 
+def _credential_surface(row: Mapping[str, Any]) -> PlannedSurface | None:
+    """The stored credential surface, or ``None`` for an entry_only recipe's plan.
+
+    The two columns are null together by table CHECK, so a row carrying only one of
+    them is corrupt rather than entry_only and is refused instead of half-read.
+    """
+
+    host = row["credential_host"]
+    path = row["credential_path"]
+    if host is None and path is None:
+        return None
+    if host is None or path is None:
+        raise ValueError("a stored plan names both a credential host and path, or neither")
+    return PlannedSurface(host=str(host), path=str(path), purpose="credential")
+
+
 def plan_from_row(row: Mapping[str, Any]) -> RunPlan:
     """Rebuild a plan from one ``onboarding_run_plans`` row."""
 
@@ -69,11 +85,7 @@ def plan_from_row(row: Mapping[str, Any]) -> RunPlan:
         revision=int(row["revision"]),
         source=cast("PlanSource", str(row["source"])),
         surfaces=tuple(_surface(item) for item in decoded),
-        credential_surface=PlannedSurface(
-            host=str(row["credential_host"]),
-            path=str(row["credential_path"]),
-            purpose="credential",
-        ),
+        credential_surface=_credential_surface(row),
         success_digest=str(row["success_digest"]),
     )
 
@@ -106,8 +118,8 @@ class SQLiteRunPlanStore:
                 catalog_id=plan.catalog_id,
                 recipe_version=plan.recipe_version,
                 surfaces=plan.as_surface_rows(),
-                credential_host=plan.credential_surface.host,
-                credential_path=plan.credential_surface.path,
+                credential_host=plan.credential_host,
+                credential_path=plan.credential_path,
                 success_digest=plan.success_digest,
                 reason_code=reason_code,
             )
@@ -123,8 +135,8 @@ class SQLiteRunPlanStore:
             catalog_id=plan.catalog_id,
             recipe_version=plan.recipe_version,
             surfaces=plan.as_surface_rows(),
-            credential_host=plan.credential_surface.host,
-            credential_path=plan.credential_surface.path,
+            credential_host=plan.credential_host,
+            credential_path=plan.credential_path,
             success_digest=plan.success_digest,
             reason_code=reason_code,
         )
