@@ -114,7 +114,7 @@ def test_container_runtime_has_one_writable_application_path() -> None:
         "langgraph==1.2.9",
         "langgraph-checkpoint-sqlite==3.1.0",
         "pycryptodome==3.23.0",
-        "cryptography==48.0.1",
+        "cryptography==50.0.0",
         "pydantic==2.13.4",
         "python-dotenv==1.2.2",
         "uvicorn[standard]==0.51.0",
