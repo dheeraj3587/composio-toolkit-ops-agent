@@ -141,6 +141,15 @@ export function NewRunForm({
       appCapabilities.data?.account_creation_supported ?? false,
     gmail,
   })
+  // Shown only when the toggle is actually usable. A route the agent will
+  // research at run time is not a reviewed route, so it says so plainly rather
+  // than borrowing the reviewed wording — but that is not a reason to disable
+  // the control.
+  const signupSource = appCapabilities.data?.signup_source
+  const signupResearchCaveat =
+    createAccountUnavailable || signupSource !== "runtime_research"
+      ? null
+      : researchedSignupCaveat(selectedApp?.app_name ?? appName)
 
   useEffect(() => {
     if (state.error) toast.error("Run not created", { description: state.error })
@@ -241,7 +250,11 @@ export function NewRunForm({
                     onSelect={() => field.onChange("create_account")}
                     onBlur={field.onBlur}
                     disabled={Boolean(createAccountUnavailable)}
-                    describedBy="account-creation-readiness"
+                    describedBy={
+                      signupResearchCaveat
+                        ? "account-creation-readiness account-creation-research-caveat"
+                        : "account-creation-readiness"
+                    }
                     icon={UserPlus}
                     title="Create a new account"
                     description={
@@ -262,6 +275,25 @@ export function NewRunForm({
             >
               {createAccountUnavailable ?? "Verified signup route and connected work inbox are ready."}
             </p>
+            {signupResearchCaveat ? (
+              <p
+                id="account-creation-research-caveat"
+                className="text-xs leading-5 text-amber-800"
+                aria-live="polite"
+              >
+                {signupResearchCaveat.detail}{" "}
+                {signupResearchCaveat.evidenceUrl ? (
+                  <a
+                    className="underline underline-offset-2"
+                    href={signupResearchCaveat.evidenceUrl}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                  >
+                    Open the source page
+                  </a>
+                ) : null}
+              </p>
+            ) : null}
           </fieldset>
         </div>
 
@@ -616,6 +648,22 @@ function accountCreationUnavailableReason({
   }
   if (!gmail.ready) return gmail.detail
   return null
+}
+
+/**
+ * The caveat shown when no reviewed signup route exists and the agent will
+ * research one from the app's own site at run time. There is nothing to link
+ * yet — the route does not exist until the run researches it — so the copy
+ * promises the research and points at where it becomes visible.
+ */
+function researchedSignupCaveat(appName: string): {
+  detail: string
+  evidenceUrl: string | null
+} {
+  return {
+    detail: `The signup route for ${appName} has not been reviewed by a human. The agent will find it on ${appName}'s own site when the run starts, and each page it reads appears on the run timeline.`,
+    evidenceUrl: null,
+  }
 }
 
 function fieldError(message: string | undefined, serverInvalid: boolean): string | undefined {

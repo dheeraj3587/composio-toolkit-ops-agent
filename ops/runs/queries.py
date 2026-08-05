@@ -126,7 +126,13 @@ class RunQueryService:
         )
 
     def get_app_research(self, app_slug: str) -> tuple[dict[str, Any], OperationalResearch] | None:
-        """Return a verified app summary and its conservative operational baseline."""
+        """Return a verified app summary and its reviewed operational baseline.
+
+        This stays a pure read of persisted state. Resolving a signup route is
+        the signup research agent's job and happens when a run starts, not while
+        the console is rendering a capability check — a live probe here would put
+        a network call in the request path of an otherwise offline query.
+        """
 
         lookup = self._context.p1_adapter.lookup(app_slug)
         if not isinstance(lookup, P1LookupFound):

@@ -688,14 +688,28 @@ export interface AppCatalogResponse {
   total: number
 }
 
+/** Where a signup route came from. A reviewed route is human-approved; a
+ * runtime_research one is resolved from the app's own site by the signup
+ * research agent when the run starts. The console presents the two
+ * differently. */
+export type SignupSource = "reviewed" | "runtime_research" | "unavailable"
+
 export interface AppCapabilitiesResponse {
   app_slug: string
   account_creation_supported: boolean
-  reason_code: "reviewed_signup_route" | "signup_route_unavailable"
+  signup_source: SignupSource
+  /** The page a reviewed URL was cited from, when one is recorded. */
+  signup_evidence_url: string | null
+  reason_code:
+    | "reviewed_signup_route"
+    | "runtime_research_signup_route"
+    | "signup_route_unavailable"
 }
 
 export interface AppResearchResponse {
   app: AppSearchItem
   research: OperationalResearch
   provenance?: SnapshotHealth | null
+  signup_source: SignupSource
+  signup_evidence_url?: string | null
 }

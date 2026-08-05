@@ -906,4 +906,11 @@ export const appResearchResponseSchema = z.strictObject({
   app: appSearchItemSchema,
   research: operationalResearchSchema,
   provenance: snapshotHealthSchema.nullish(),
+  // Where research.signup_url came from. Defaulted rather than required so a
+  // console deployed against an older api still parses its responses.
+  signup_source: z
+    .enum(["reviewed", "runtime_research", "unavailable"])
+    .nullish()
+    .transform((value) => value ?? "unavailable"),
+  signup_evidence_url: nullableHttpUrl,
 })

@@ -16,14 +16,27 @@ export async function GET(
 
   try {
     const result = await getAppResearch(slug)
-    const accountCreationSupported = Boolean(result.research.signup_url)
+    const signupSource = result.signup_source ?? "unavailable"
+    // "runtime_research" means the app can be signed up for but the route is
+    // resolved from its own site when the run starts. That is a supported
+    // capability, not a missing one — refusing it here was the blocker that
+    // limited account creation to the single app with a hand-authored route.
+    const accountCreationSupported =
+      Boolean(result.research.signup_url) || signupSource === "runtime_research"
     return Response.json(
       {
         app_slug: result.app.app_slug,
         account_creation_supported: accountCreationSupported,
-        reason_code: accountCreationSupported
-          ? "reviewed_signup_route"
-          : "signup_route_unavailable",
+        // A researched route enables the toggle but is reported under its own
+        // reason code, so the form can caveat it instead of presenting a model's
+        // extraction as a reviewed one.
+        signup_source: signupSource,
+        signup_evidence_url: result.signup_evidence_url ?? null,
+        reason_code: !accountCreationSupported
+          ? "signup_route_unavailable"
+          : signupSource === "runtime_research"
+            ? "runtime_research_signup_route"
+            : "reviewed_signup_route",
       },
       {
         status: 200,

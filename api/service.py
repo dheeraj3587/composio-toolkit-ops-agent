@@ -8,12 +8,13 @@ import re
 import stat
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final, Literal, Protocol, TypeVar, cast
 
+import httpx
 from fastapi.exceptions import RequestValidationError
 from pydantic import SecretStr, ValidationError
 from starlette.concurrency import run_in_threadpool
@@ -91,10 +92,20 @@ from ops.providers.composio_managed_auth import managed_auth_configuration_is_va
 from ops.providers.profile import FieldEvidence, FlowSpec, ProviderProfile
 from ops.providers.profile_store import SQLiteProviderProfileStore
 from ops.recipes.app_recipes import (
+    AppRecipe,
     get_app_recipe,
     get_app_recipe_for_name,
     load_app_recipe_catalog,
     recipe_to_operational_research,
+)
+from ops.recipes.signup_overlay import SignupOverlayRefused, install_signup_finding
+from ops.research.operational_research import OfficialEvidenceFetcher
+from ops.research.signup_agent import (
+    PROGRESS_SUMMARIES as SIGNUP_RESEARCH_SUMMARIES,
+)
+from ops.research.signup_agent import (
+    ProgressReporter,
+    research_signup_route,
 )
 from ops.runs.projections import (
     ProjectedTimelineEvent,
@@ -353,8 +364,16 @@ _ONBOARDING_PLAN_SUMMARIES: Final[dict[str, str]] = {
     "onboarding_route_divergence": "The run left the surface its plan declared.",
 }
 
+# The signup research agent's own steps, so an operator watching a run sees what
+# it is reading rather than a gap before signup starts. Static, like every other
+# summary here: the researched page never authors the text an operator reads.
+_ONBOARDING_SIGNUP_RESEARCH_SUMMARIES: Final[dict[str, str]] = {
+    f"onboarding_{step}": summary for step, summary in SIGNUP_RESEARCH_SUMMARIES.items()
+}
+
 _EVENT_SUMMARIES: Final[dict[str, str]] = {
     **_LEGACY_EVENT_SUMMARIES,
+    **_ONBOARDING_SIGNUP_RESEARCH_SUMMARIES,
     **_ONBOARDING_PROGRESS_SUMMARIES,
     **_ONBOARDING_EXCEPTION_SUMMARIES,
     **_ONBOARDING_ADMISSION_SUMMARIES,
@@ -2070,13 +2089,26 @@ class LocalRunService:
             raise AppNotFoundError(app_slug)
         summary, _snapshot_research = result
         # Runtime capabilities must come from the reviewed recipe, not from a
-        # broader evidence snapshot. In particular, only a recipe-owned signup
-        # URL may enable account creation in the operator UI.
+        # broader evidence snapshot.
         research = recipe_to_operational_research(recipe)
+        # This stays an offline read. A recipe-owned signup URL is "reviewed";
+        # otherwise the route is resolved by the signup research agent when the
+        # run starts, so nothing here makes a network call.
+        signup_source: Literal["reviewed", "runtime_research", "unavailable"] = "unavailable"
+        if research.signup_url is not None:
+            signup_source = "reviewed"
+        elif recipe.browser is not None:
+            # No route is known YET, and that is not a reason to refuse. The run
+            # researches the route from the app's own site when it starts, so the
+            # honest answer here is "this app can be signed up for, and where is
+            # decided at run time" rather than a disabled control.
+            signup_source = "runtime_research"
         provenance = self._service.snapshot_provenance()
         return AppResearchResponse(
             app=AppSummary.model_validate(summary),
             research=research,
+            signup_source=signup_source,
+            signup_evidence_url=None,
             provenance=SnapshotHealth(
                 verified=True,
                 source_repository=provenance.source_repository,
@@ -2132,13 +2164,74 @@ class LocalRunService:
                 "login_email": request.browser_login.email,
                 "login_password": request.browser_login.password,
             }
-        return await run_in_threadpool(
+        # Research the signup route BEFORE the run is created, because the
+        # recipe the run binds to is read during creation: an overlay installed
+        # afterwards would arrive too late for this run's plan. The steps it
+        # reports are buffered and written onto the run's timeline as soon as
+        # the run has an id, so the operator can see what was read and where the
+        # route came from.
+        research_steps: list[tuple[str, str | None]] = []
+        if operation.account_creation_requested:
+            await self._research_signup_route(recipe, research_steps.append)
+        detail = await run_in_threadpool(
             self._create_sync,
             operation,
             idempotency_key,
             request.execution_mode,
             browser_login,
         )
+        for step, step_detail in research_steps:
+            self._service.storage.append_audit_event(
+                run_id=detail.run.run_id,
+                event_type=f"onboarding_{step}",
+                # Only a URL or the app's own slug. The agent never passes page
+                # text through here, so the payload stays projectable.
+                payload={"detail": step_detail} if step_detail else {},
+            )
+        return detail
+
+    @staticmethod
+    def _buffer_step(
+        on_step: Callable[[tuple[str, str | None]], object],
+    ) -> ProgressReporter:
+        """Adapt the agent's keyword-only reporter onto a plain list append."""
+
+        def report(step: str, *, detail: str | None = None) -> None:
+            on_step((step, detail))
+
+        return report
+
+    async def _research_signup_route(
+        self,
+        recipe: AppRecipe,
+        on_step: Callable[[tuple[str, str | None]], object],
+    ) -> None:
+        """Fill in a missing signup route from the app's own site, best-effort.
+
+        A reviewed signup policy always wins and skips this entirely. Failure is
+        silent by design: the run proceeds exactly as it did before research
+        existed, which is to pause at ``signup_policy_absent`` rather than to
+        surface a research error the operator cannot act on.
+        """
+
+        browser = recipe.browser
+        if browser is None or browser.signup is not None:
+            return
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=5.0), follow_redirects=False
+            ) as client:
+                finding = await research_signup_route(
+                    recipe=recipe,
+                    fetcher_factory=lambda policy: OfficialEvidenceFetcher(client, policy),
+                    on_progress=self._buffer_step(on_step),
+                )
+            if finding is not None:
+                install_signup_finding(recipe, finding)
+        except (SignupOverlayRefused, httpx.HTTPError, ValueError, OSError) as error:
+            LOGGER.info(
+                "signup research for %s produced no usable route: %r", recipe.app_slug, error
+            )
 
     def _submit_credentials_sync(
         self,

@@ -1757,7 +1757,7 @@ class RunService:
         return self._queries.list_apps()
 
     def get_app_research(self, app_slug: str) -> tuple[dict[str, Any], OperationalResearch] | None:
-        """Return a verified app summary and its conservative operational baseline."""
+        """Return a verified app summary and its reviewed operational baseline."""
 
         return self._queries.get_app_research(app_slug)
 

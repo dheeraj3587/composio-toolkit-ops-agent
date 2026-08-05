@@ -1155,6 +1155,15 @@ class AppResearchResponse(StrictApiModel):
     app: AppSummary
     research: OperationalResearch
     provenance: SnapshotHealth
+    # Where ``research.signup_url`` came from. "reviewed" is a human-approved
+    # catalog entry; "runtime_research" means no route is known yet and the
+    # signup research agent resolves one from the app's own site when the run
+    # starts. The console must not present the two identically, so the
+    # distinction is part of the contract rather than something the caller
+    # infers.
+    signup_source: Literal["reviewed", "runtime_research", "unavailable"] = "unavailable"
+    # The page a reviewed URL was found on, when one is recorded.
+    signup_evidence_url: str | None = None
 
 
 class InvalidRequestResponse(StrictApiModel):

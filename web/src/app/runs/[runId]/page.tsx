@@ -25,9 +25,9 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ApiError, getProviderProfile, getRun, getRunOutput, getTimeline } from "@/lib/api"
-import { formatTimestamp, humanize } from "@/lib/format"
+import { formatTimestamp, humanize, relativeTimestamp } from "@/lib/format"
 import { phaseMap } from "@/lib/phases"
-import type { PhaseCollection, PhaseState, RetryCapability } from "@/lib/types"
+import type { PhaseCollection, PhaseState, RetryCapability, RunProgressEvent } from "@/lib/types"
 
 export const metadata: Metadata = { title: "Run detail" }
 
@@ -52,6 +52,11 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
     onboarding ? getProviderProfile(runId) : Promise.resolve(null),
   ])
   const timeline = timelineResult.status === "fulfilled" ? timelineResult.value.items : []
+  // Loop-progress events (Requirement 4.2) ride on the same timeline response.
+  // They are the granular, live steps the agent is taking and were previously
+  // fetched but never surfaced in the UI.
+  const liveProgress =
+    timelineResult.status === "fulfilled" ? timelineResult.value.progress ?? [] : []
   const timelineUnavailable = timelineResult.status === "rejected"
   const output = outputResult.status === "fulfilled" ? outputResult.value : null
   const profile = profileResult.status === "fulfilled" ? profileResult.value : null
@@ -305,7 +310,47 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
           <Alert className="rounded-md border-amber-300 bg-amber-50"><AlertTitle>Timeline unavailable</AlertTitle><AlertDescription>The backend could not return sanitized events. This is not treated as an empty timeline.</AlertDescription></Alert>
         ) : <Timeline items={timeline} />}
       </section>
+
+      {liveProgress.length ? (
+        <RunProgressFeed events={liveProgress} />
+      ) : null}
     </div>
+  )
+}
+
+function RunProgressFeed({ events }: { events: RunProgressEvent[] }) {
+  return (
+    <section aria-labelledby="live-progress">
+      <div className="mb-3">
+        <p className="eyebrow">Live agent progress</p>
+        <h2 id="live-progress" className="mt-1 text-xl font-semibold">Agent steps</h2>
+      </div>
+      <ol className="panel rounded-md" aria-label="Live agent step progress">
+        {events.map((event) => (
+          <li
+            key={event.step_index}
+            className="grid items-center gap-2 border-b border-border px-5 py-4 last:border-0 sm:grid-cols-[80px_1fr_auto]"
+          >
+            <span className="font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
+              {event.stage.replaceAll("_", " ")}
+            </span>
+            <div>
+              <p className="text-sm font-medium">Step {event.step_index}</p>
+              <p className="mt-1 font-mono text-[9px] uppercase tracking-[0.1em] text-muted-foreground">
+                Onboarding phase · {humanize(event.onboarding_phase)} · {Math.round(event.elapsed_ms / 1000)}s
+              </p>
+            </div>
+            <time
+              className="text-xs text-muted-foreground"
+              dateTime={event.recorded_at}
+              title={formatTimestamp(event.recorded_at)}
+            >
+              {relativeTimestamp(event.recorded_at)}
+            </time>
+          </li>
+        ))}
+      </ol>
+    </section>
   )
 }
 

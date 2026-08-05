@@ -121,6 +121,66 @@ describe("RunDetailPage", () => {
     expect(screen.getByText("Access route selected.")).toBeInTheDocument()
   })
 
+  it("surfaces the agent's live loop-step progress from the timeline response", async () => {
+    const runId = "run_progress_1234567890abcdef"
+    mocks.getRun.mockResolvedValue({
+      run: {
+        run_id: runId,
+        thread_id: "thread_progress_123",
+        app_name: "Pipedrive",
+        app_slug: "pipedrive",
+        status: "browser_running",
+        access_route: "self_serve",
+        execution_mode: "execute_when_configured",
+        browser_provider: "playwright",
+        credential_creation_policy: "create_if_missing",
+        phase: "route_selected_signup",
+        account_mode: "create_account",
+        external_actions: true,
+        created_at: "2026-07-23T10:00:00Z",
+        updated_at: "2026-07-23T10:05:00Z",
+      },
+      research: null,
+      phases: null,
+      security: null,
+      route_decision: null,
+      hitl_request: null,
+      missing_fields: [],
+      provider_states: [],
+    })
+    mocks.getTimeline.mockResolvedValue({
+      run_id: runId,
+      items: [],
+      progress: [
+        {
+          step_index: 1,
+          stage: "observe",
+          elapsed_ms: 4200,
+          onboarding_phase: "research",
+          recorded_at: "2026-07-23T10:02:00Z",
+        },
+        {
+          step_index: 2,
+          stage: "decide",
+          elapsed_ms: 8300,
+          onboarding_phase: "route_selected_signup",
+          recorded_at: "2026-07-23T10:03:00Z",
+        },
+      ],
+    })
+    mocks.getRunOutput.mockRejectedValue(new Error("No output"))
+
+    render(await RunDetailPage({ params: Promise.resolve({ runId }) }))
+
+    expect(screen.getByRole("heading", { name: "Agent steps" })).toBeInTheDocument()
+    expect(screen.getByRole("list", { name: "Live agent step progress" })).toBeInTheDocument()
+    expect(screen.getByText("Step 1")).toBeInTheDocument()
+    expect(screen.getByText("Step 2")).toBeInTheDocument()
+    expect(screen.getAllByText(/observe|decide/).length).toBeGreaterThan(0)
+    expect(screen.getByText(/onboarding phase · research/i)).toBeInTheDocument()
+    expect(screen.getByText(/onboarding phase · route selected signup/i)).toBeInTheDocument()
+  })
+
   it("shows frozen canonical metadata and only the backend-authorized primary action", async () => {
     const runId = "run_11111111111111111111111111111111"
     mocks.getRun.mockResolvedValue({
