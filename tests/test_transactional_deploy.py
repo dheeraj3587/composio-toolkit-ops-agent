@@ -440,6 +440,24 @@ def _make_fake_repo(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
         fi
         """,
     )
+    # Simulating root has to be consistent on both sides of the ownership check:
+    # the release compares `stat -c %u` on .env.production against `id -u`, and a
+    # file the test wrote is owned by the real runner, not by the faked root. Only
+    # that one query is answered; every other stat -- including the mode check on
+    # the same file and the release lock's device:inode identity -- delegates to
+    # the real tool, so the private-file guard is still genuinely exercised.
+    _write_executable(
+        fake_bin / "stat",
+        """
+        #!/usr/bin/env bash
+        set -euo pipefail
+        if [ "${1:-}" = "-c" ] && [ "${2:-}" = "%u" ]; then
+            printf '0\\n'
+        else
+            exec /usr/bin/stat "$@"
+        fi
+        """,
+    )
     _write_executable(
         fake_bin / "install",
         """
