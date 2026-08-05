@@ -1042,8 +1042,10 @@ class PlaywrightBrowserWorker:
                 # With no login form, inspect iframe metadata directly so a
                 # normal visible reCAPTCHA checkbox anchor is still a real gate.
                 # Snapshot names alone cannot distinguish it from an invisible
-                # provider badge.
-                if await visible_login_challenge(_active_page(session)):
+                # provider badge. It goes through ``_visible_login_challenge``,
+                # not the module function: the page belongs to the browser loop,
+                # and awaiting its coroutine on the caller's loop deadlocks both.
+                if await self._visible_login_challenge(session):
                     return self._human_required(
                         session,
                         "An interactive CAPTCHA must be completed by a human.",
