@@ -55,6 +55,11 @@ class ResearchEnrichmentOutcome(StrictModel):
     # Sanitized per-enrichment provider metrics (counts/latency/provider name).
     # Never contains query text, snippets, page content, headers, or the API key.
     provider_metrics: dict[str, int | float | str | None] = Field(default_factory=dict)
+    # The documents the extraction was actually grounded in, so a caller can
+    # repeat the field-level URL-claim check for itself. ``exclude=True``: these
+    # carry page text, and the outcome's other fields are projected into durable
+    # run state — an excerpt must never ride along into the ledger or a log.
+    evidence_documents: tuple[EvidenceDocument, ...] = Field(default=(), exclude=True)
 
 
 class ResearchEnricher(Protocol):
@@ -284,6 +289,25 @@ class OfficialEvidenceFetcher:
         self._policy = policy
 
     async def fetch(self, url: str) -> EvidenceDocument:
+        source_url, content_type, body = await self.fetch_source(url)
+        title, text = _extract_visible_text(body, content_type)
+        return EvidenceDocument(source_url=source_url, title=title, relevant_text=text)
+
+    async def fetch_source(self, url: str, *, max_bytes: int | None = None) -> tuple[str, str, str]:
+        """The same bounded, redirect-validated fetch, but returning raw markup.
+
+        ``fetch`` reduces a page to visible text, which discards anchor targets.
+        The console's signup probe needs those to resolve a relative ``href``,
+        so it reads the body here rather than reimplementing the allowlist,
+        redirect, size and content-type controls that make the fetch safe.
+
+        ``max_bytes`` raises the ceiling for that caller alone. The default
+        256 KiB is sized for a documentation page held as durable evidence; a
+        marketing homepage routinely exceeds it, and rejecting one is not a
+        safety property, just a budget. Evidence fetches keep the default.
+        """
+
+        limit = MAX_RESPONSE_BYTES if max_bytes is None else max_bytes
         current = await self._policy.validate_for_request(url)
         for redirect_count in range(MAX_REDIRECTS + 1):
             async with self._client.stream(
@@ -305,21 +329,20 @@ class OfficialEvidenceFetcher:
                 if not content_type.startswith(_TEXT_CONTENT_TYPES):
                     raise ValueError("official evidence returned an unsupported content type")
                 declared = response.headers.get("content-length")
-                if declared and declared.isdigit() and int(declared) > MAX_RESPONSE_BYTES:
+                if declared and declared.isdigit() and int(declared) > limit:
                     raise ValueError("official evidence exceeded the response size limit")
                 chunks: list[bytes] = []
                 total = 0
                 async for chunk in response.aiter_bytes():
                     total += len(chunk)
-                    if total > MAX_RESPONSE_BYTES:
+                    if total > limit:
                         raise ValueError("official evidence exceeded the response size limit")
                     chunks.append(chunk)
                 body = b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
-                title, text = _extract_visible_text(body, content_type)
-                return EvidenceDocument(
-                    source_url=self._policy.sanitize_candidate(str(response.url)),
-                    title=title,
-                    relevant_text=text,
+                return (
+                    self._policy.sanitize_candidate(str(response.url)),
+                    content_type,
+                    body,
                 )
         raise AssertionError("redirect loop exited unexpectedly")  # pragma: no cover
 
@@ -719,6 +742,7 @@ class OperationalResearchEnricher:
             ),
             missing_fields=_missing_fields(research),
             documents_fetched=len(documents),
+            evidence_documents=tuple(documents),
         )
 
     async def _enrich_rich(
@@ -922,6 +946,7 @@ class OperationalResearchEnricher:
                 missing_fields=_missing_fields(research),
                 documents_fetched=len(documents),
                 provider_metrics=metrics_payload,
+                evidence_documents=tuple(documents),
             )
 
     async def _fetch_documents(

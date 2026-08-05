@@ -706,9 +706,25 @@ def _recipes_by_name() -> MappingProxyType[str, AppRecipe]:
 
 
 def get_app_recipe(app_slug: str) -> AppRecipe | None:
-    """Resolve one canonical app slug."""
+    """Resolve one canonical app slug, reviewed catalog first.
 
-    return _recipes_by_slug().get(app_slug.strip().casefold())
+    A researched signup overlay is consulted only when one has been installed
+    for this app, and an overlay is only ever the reviewed recipe with a signup
+    route filled in — see :mod:`ops.recipes.signup_overlay` for what it may and
+    may not change. Resolving it HERE rather than at each call site is
+    deliberate: the planner validator, the host policy, the signup policy and
+    the driver all read the recipe through this function, so they cannot
+    disagree about which one is in force.
+
+    Imported inside the call because the overlay module imports this one.
+    """
+
+    reviewed = _recipes_by_slug().get(app_slug.strip().casefold())
+    if reviewed is None:
+        return None
+    from ops.recipes.signup_overlay import shared_signup_overlays
+
+    return shared_signup_overlays().overlay_for(reviewed) or reviewed
 
 
 def get_app_recipe_for_name(app_name: str) -> AppRecipe | None:
