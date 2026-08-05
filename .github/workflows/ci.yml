@@ -455,9 +455,6 @@ jobs:
               "OPS_AUTH_USERNAME": "ci-operator",
               "OPS_AUTH_PASSWORD": secrets.token_urlsafe(32),
               "OPS_AUTH_SESSION_SECRET": secrets.token_urlsafe(48),
-              "OPS_AUTH_TOTP_SECRET": base64.b32encode(
-                  secrets.token_bytes(20)
-              ).decode().rstrip("="),
               "OPS_INTERNAL_API_TOKEN": secrets.token_urlsafe(48),
               "BROWSER_SERVICE_TOKEN": secrets.token_urlsafe(48),
               "BROWSER_SESSION_CAPABILITY_KEY": secrets.token_urlsafe(48),
