@@ -1436,6 +1436,70 @@ class SQLiteSecretStore:
         except SignupCredentialStateError:
             return {}
 
+    def staged_signup_login_owner(
+        self,
+        *,
+        app_slug: str,
+        account_ref: str,
+    ) -> tuple[str, str] | None:
+        """The run holding one app/account signup identity, and its stage status.
+
+        Returns ``(run_id, status)`` or ``None``. Both are non-secret ledger
+        metadata; no ciphertext is read. This exists so a caller that CAN answer
+        "is that run still alive?" -- which this store deliberately cannot -- has
+        something to ask the question about.
+        """
+
+        if _APP_SLUG.fullmatch(app_slug) is None or _ACCOUNT_REF.fullmatch(account_ref) is None:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT run_id, status
+                FROM staged_signup_logins
+                WHERE app_slug = ? AND account_ref = ?
+                """,
+                (app_slug, account_ref),
+            ).fetchone()
+        return None if row is None else (str(row[0]), str(row[1]))
+
+    def release_staged_signup_login_pair(
+        self,
+        *,
+        app_slug: str,
+        account_ref: str,
+        run_id: str,
+    ) -> bool:
+        """Drop a PENDING staged pair so a later run may take the identity.
+
+        The ``status = 'pending'`` predicate is the whole safety argument, and it
+        is enforced in SQL rather than by a prior read: a promoted pair is a
+        reusable login that a real vendor account depends on, and deleting one
+        would strand that account with a password nobody holds. Only the
+        never-promoted staging slot of a named run can be released.
+
+        The caller is responsible for establishing that ``run_id`` is finished.
+        This store has no view of the run ledger, so it cannot check liveness --
+        which is exactly why the run id must be named rather than inferred.
+        """
+
+        if (
+            _APP_SLUG.fullmatch(app_slug) is None
+            or _ACCOUNT_REF.fullmatch(account_ref) is None
+            or _ACCOUNT_REF.fullmatch(run_id) is None
+        ):
+            return False
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                DELETE FROM staged_signup_logins
+                WHERE run_id = ? AND app_slug = ? AND account_ref = ? AND status = 'pending'
+                """,
+                (run_id, app_slug, account_ref),
+            )
+            return bool(cursor.rowcount)
+
     def promote_staged_signup_login_pair(
         self,
         *,

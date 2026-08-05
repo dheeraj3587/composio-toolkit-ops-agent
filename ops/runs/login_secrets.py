@@ -18,6 +18,7 @@ rather than proceeding with half the credentials or falling back to a raw value.
 from __future__ import annotations
 
 import contextlib
+import logging
 from collections.abc import Mapping
 from typing import Any, Protocol
 
@@ -25,9 +26,24 @@ from pydantic import SecretStr
 
 from ops.browser.worker import BrowserWorker
 from ops.core.config import Settings
-from ops.core.secret_store import REUSABLE_LOGIN_FIELDS, SQLiteSecretStore
+from ops.core.secret_store import (
+    REUSABLE_LOGIN_FIELDS,
+    SignupCredentialStateError,
+    SQLiteSecretStore,
+)
 from ops.core.state import BrowserProvider
 from ops.providers.errors import ConfigurationRequiredError, ProviderOperationError
+
+LOGGER = logging.getLogger("composio_ops.login_secrets")
+
+
+# A staged signup identity is held against these run statuses only while the run
+# can still submit a registration. Once the run reaches one of them it will never
+# submit again, so continuing to hold the identity blocks the app forever rather
+# than preventing a duplicate vendor account. ``completed`` is included for
+# completeness: a completed signup leaves the row ``promoted``, and a promoted row
+# is refused by the store regardless of what this set says.
+_FINISHED_RUN_STATUSES: frozenset[str] = frozenset({"failed", "cancelled", "blocked", "completed"})
 
 
 class RunLoginSecretContext(Protocol):
@@ -35,6 +51,7 @@ class RunLoginSecretContext(Protocol):
 
     _settings: Settings | None
     _secret_store: SQLiteSecretStore | None
+    storage: Any
 
     def _browser_worker_for(self, record: Any) -> BrowserWorker | None: ...
 
@@ -182,14 +199,77 @@ class RunLoginSecretService:
                 capability="signup login staging",
                 reason_code="signup_login_pair_incomplete",
             )
-        pair = store.stage_signup_login_pair(
-            app_slug=app_slug,
-            account_ref=account_ref,
-            run_id=run_id,
-            email=email.get_secret_value(),
-            password=password.get_secret_value(),
-        )
+
+        def stage() -> dict[str, str]:
+            return store.stage_signup_login_pair(
+                app_slug=app_slug,
+                account_ref=account_ref,
+                run_id=run_id,
+                email=email.get_secret_value(),
+                password=password.get_secret_value(),
+            )
+
+        try:
+            pair = stage()
+        except SignupCredentialStateError as error:
+            if error.reason_code != "signup_identity_in_progress":
+                raise
+            # The account ref is a hash of the work-email reference, so it is the
+            # SAME for every run of one app. A run that died mid-signup therefore
+            # held that app's only signup identity forever, and every later run
+            # failed at ``signup_identity_in_progress`` with no operator remedy --
+            # the store has no release path and nothing calls one. Rather than
+            # hook every terminal transition (there are eight, and a missed one
+            # reintroduces the bug silently), the staging attempt itself repairs
+            # the stale claim: the ledger, not the vault, is asked whether the
+            # holder is still running, and only a PENDING row of a FINISHED run is
+            # released. A live run keeps its identity and the refusal stands.
+            if not self._release_finished_signup_identity(
+                app_slug=app_slug, account_ref=account_ref
+            ):
+                raise
+            pair = stage()
         return {name: SecretStr(value) for name, value in pair.items()}
+
+    def _release_finished_signup_identity(self, *, app_slug: str, account_ref: str) -> bool:
+        """Release a stale signup identity whose owning run has finished.
+
+        Returns whether anything was released. Every uncertainty answers "no": an
+        unreadable ledger, an unknown run, a status this build does not recognize
+        and a store without the release method all leave the claim in place, so
+        the failure mode stays "one app cannot sign up" rather than "two runs
+        register the same identity at the same provider".
+        """
+
+        store = self._context._secret_store
+        owner = getattr(store, "staged_signup_login_owner", None)
+        release = getattr(store, "release_staged_signup_login_pair", None)
+        if store is None or not callable(owner) or not callable(release):
+            return False
+        held = owner(app_slug=app_slug, account_ref=account_ref)
+        if held is None:
+            return False
+        holder_run_id, stage_status = held
+        if stage_status != "pending":
+            return False
+        storage = getattr(self._context, "storage", None)
+        reader = getattr(storage, "get_run", None)
+        if not callable(reader):
+            return False
+        try:
+            record = reader(holder_run_id)
+        except Exception:
+            return False
+        if not record or str(record.get("status") or "") not in _FINISHED_RUN_STATUSES:
+            return False
+        released = bool(release(app_slug=app_slug, account_ref=account_ref, run_id=holder_run_id))
+        if released:
+            LOGGER.info(
+                "released the signup identity for %s held by finished run %s",
+                app_slug,
+                holder_run_id,
+            )
+        return released
 
     def staged_signup_login_values(
         self,

@@ -66,6 +66,9 @@ SignupActionType = Literal[
     "account_selection",
 ]
 SignupStatus = Literal["continue", "human_action_required", "failed"]
+# The two step orderings this module can drive. A reviewed recipe names one of
+# them directly; a researched route resolves to one by looking at the live form.
+ResolvedSignupFlow = Literal["email_first", "email_password"]
 
 _APPROVED_FIELDS: dict[str, int] = {
     "company_name": 200,
@@ -158,6 +161,11 @@ class SignupSessionState:
     human_submit_pending: bool = False
     pending_submit_path: str | None = None
     submitted_path: str | None = None
+    #: Which step ordering a ``dom_detected`` route turned out to use. Latched on
+    #: the first call that actually recognizes a form shape, so a later page --
+    #: a password continuation, or a form that failed to re-render -- cannot move
+    #: an in-flight signup onto the other driver's state machine.
+    resolved_flow: ResolvedSignupFlow | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,6 +463,41 @@ async def _email_only_surfaces(
         if await _visible_enabled(form.locator(_PASSWORD_SELECTOR), limit=4):
             continue
         surfaces.append((surface, form, email_field))
+    return surfaces
+
+
+async def _email_password_surfaces(
+    page: Any,
+    patterns: Sequence[str],
+) -> list[tuple[Any, Any, Any, list[Any]]]:
+    """Return reviewed forms with one email field and one or two passwords.
+
+    Every password must belong to the same form as the email field. Multiple
+    detached forms on one page are refused by the caller rather than resolved by
+    picking the first, so a login form sitting beside a registration form can
+    never be mistaken for the registration form.
+    """
+
+    surfaces: list[tuple[Any, Any, Any, list[Any]]] = []
+    for surface in reviewed_login_surfaces(page, patterns):
+        if surface.frame_url and not navigation_allowed(surface.frame_url, tuple(patterns)):
+            continue
+        email_status, email_field = await _unique_visible(surface.frame, _EMAIL_SELECTOR)
+        if email_status != "unique" or email_field is None:
+            continue
+        passwords = await _visible_enabled(surface.frame.locator(_PASSWORD_SELECTOR), limit=4)
+        if len(passwords) not in {1, 2}:
+            continue
+        try:
+            form = email_field.locator("xpath=ancestor::form[1]")
+            if int(await form.count()) != 1:
+                continue
+        except Exception:
+            continue
+        form_passwords = await _visible_enabled(form.locator(_PASSWORD_SELECTOR), limit=4)
+        if len(form_passwords) != len(passwords):
+            continue
+        surfaces.append((surface, form, email_field, form_passwords))
     return surfaces
 
 
@@ -1047,6 +1090,67 @@ async def _drive_email_first_signup(
     )
 
 
+async def _drive_dom_detected_signup(
+    *,
+    page: Any,
+    patterns: Sequence[str],
+    sensitive_data: Mapping[str, str],
+    fields: Mapping[str, str],
+    state: SignupSessionState,
+    policy: SignupPolicy,
+    resume_signal: str | None,
+) -> SignupResult:
+    """Drive a researched route whose step ordering is read off the live form.
+
+    Research establishes *where* registration lives and what its submit control
+    says; it cannot establish whether the provider asks for an email alone first.
+    So the shape is resolved here, once, against the page the run is actually
+    standing on, and both branches are the drivers a reviewed recipe already
+    uses -- with the same single-unambiguous-surface rule, the same form-action
+    check, the same pre-fill human gates and the same submit-at-most-once state.
+
+    Neither shape being present is a pause, not a guess: the alternative is to
+    pick a driver on no evidence and have it fill a form nobody recognized.
+    """
+
+    if state.resolved_flow is None:
+        if not _path_matches(_current_path(page), policy.entry_path_prefixes):
+            return SignupResult(status="failed", reason_code="signup_entry_path_unreviewed")
+        if await _email_only_surfaces(page, patterns):
+            state.resolved_flow = "email_first"
+        elif await _email_password_surfaces(page, patterns):
+            state.resolved_flow = "email_password"
+        else:
+            return SignupResult(
+                status="human_action_required",
+                reason_code="signup_surface_not_supported",
+                action_type="provider_verification",
+                instruction=(
+                    "The researched registration page exposes neither an email-only step "
+                    "nor a single email-and-password form. Complete this vendor-specific "
+                    "step in the live browser."
+                ),
+            )
+    if state.resolved_flow == "email_first":
+        return await _drive_email_first_signup(
+            page=page,
+            patterns=patterns,
+            sensitive_data=sensitive_data,
+            fields=fields,
+            state=state,
+            policy=policy,
+            resume_signal=resume_signal,
+        )
+    return await _drive_email_password_signup(
+        page=page,
+        patterns=patterns,
+        sensitive_data=sensitive_data,
+        fields=fields,
+        state=state,
+        resume_signal=resume_signal,
+    )
+
+
 async def drive_signup(
     *,
     page: Any,
@@ -1067,9 +1171,16 @@ async def drive_signup(
     if not navigation_allowed(_page_url(page), tuple(patterns)):
         return SignupResult(status="failed", reason_code="signup_origin_unsafe")
     fields = normalize_signup_fields(approved_fields)
-    if signup_policy is not None:
-        if signup_policy.flow != "email_first":
-            return SignupResult(status="failed", reason_code="signup_policy_unsupported")
+    if signup_policy is None:
+        return await _drive_email_password_signup(
+            page=page,
+            patterns=patterns,
+            sensitive_data=sensitive_data,
+            fields=fields,
+            state=state,
+            resume_signal=resume_signal,
+        )
+    if signup_policy.flow == "email_first":
         return await _drive_email_first_signup(
             page=page,
             patterns=patterns,
@@ -1079,6 +1190,30 @@ async def drive_signup(
             policy=signup_policy,
             resume_signal=resume_signal,
         )
+    if signup_policy.flow != "dom_detected":
+        return SignupResult(status="failed", reason_code="signup_policy_unsupported")
+    return await _drive_dom_detected_signup(
+        page=page,
+        patterns=patterns,
+        sensitive_data=sensitive_data,
+        fields=fields,
+        state=state,
+        policy=signup_policy,
+        resume_signal=resume_signal,
+    )
+
+
+async def _drive_email_password_signup(
+    *,
+    page: Any,
+    patterns: Sequence[str],
+    sensitive_data: Mapping[str, str],
+    fields: Mapping[str, str],
+    state: SignupSessionState,
+    resume_signal: str | None,
+) -> SignupResult:
+    """Fill and submit one single-step email-and-password registration form."""
+
     if state.human_submit_pending:
         if resume_signal != "human_completed":
             return _legal_submit_gate()
@@ -1112,29 +1247,7 @@ async def drive_signup(
             instruction="Signup requires the configured email identity and generated password.",
         )
 
-    surfaces: list[tuple[Any, Any, Any, list[Any]]] = []
-    for surface in reviewed_login_surfaces(page, patterns):
-        if surface.frame_url and not navigation_allowed(surface.frame_url, tuple(patterns)):
-            continue
-        email_status, email_field = await _unique_visible(surface.frame, _EMAIL_SELECTOR)
-        if email_status != "unique" or email_field is None:
-            continue
-        passwords = await _visible_enabled(surface.frame.locator(_PASSWORD_SELECTOR), limit=4)
-        if len(passwords) not in {1, 2}:
-            continue
-        try:
-            form = email_field.locator("xpath=ancestor::form[1]")
-            if int(await form.count()) != 1:
-                continue
-        except Exception:
-            continue
-        # Every password must belong to that same form. Multiple detached/login
-        # forms on one page are refused rather than choosing the first.
-        form_passwords = await _visible_enabled(form.locator(_PASSWORD_SELECTOR), limit=4)
-        if len(form_passwords) != len(passwords):
-            continue
-        surfaces.append((surface, form, email_field, form_passwords))
-
+    surfaces = await _email_password_surfaces(page, patterns)
     if not surfaces:
         return SignupResult(
             status="human_action_required",

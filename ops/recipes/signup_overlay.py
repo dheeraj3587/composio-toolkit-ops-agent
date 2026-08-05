@@ -128,7 +128,13 @@ def apply_signup_finding(recipe: AppRecipe, finding: SignupRouteFinding) -> AppR
         raise SignupOverlayRefused("researched signup route has no submit control")
 
     policy = SignupPolicy(
-        flow="email_first",
+        # Research reads a route, not a step ordering. Claiming ``email_first``
+        # would assert that the page asks for an email alone first, which no
+        # evidence here establishes -- and asserting it wrongly strands every
+        # single-step registration form at ``signup_email_step_not_supported``.
+        # ``dom_detected`` lets the driver read the form shape off the live page
+        # under the same reviewed surface, host and human-gate rules.
+        flow="dom_detected",
         entry_path_prefixes=(finding.entry_path_prefix,),
         entry_submit_labels=finding.submit_labels,
         # A researched route cannot assert that submitting accepts terms on the

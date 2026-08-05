@@ -52,7 +52,13 @@ CaptureMode = Literal["managed_connection", "automatic", "owner_submit", "none"]
 CaptureSource = Literal["input_value", "text"]
 BrowserRecipeScope = Literal["entry_only", "credential_surface"]
 BrowserAction = Literal["navigate", "authenticate_then_navigate", "capture_boundary"]
-SignupFlow = Literal["email_first"]
+# ``email_first`` is a reviewer's claim: a human confirmed the route asks for an
+# email alone and only then for a password. ``dom_detected`` is what a researched
+# route may claim instead -- the entry paths and submit labels are evidence-backed,
+# but nobody reviewed the step ordering, so the driver reads the form shape off the
+# live page. It authorizes no new surface: either shape must still be the single
+# unambiguous reviewed form, under the same host allowlist and human gates.
+SignupFlow = Literal["email_first", "dom_detected"]
 HitlGate = Literal[
     "captcha",
     "mfa",
@@ -732,9 +738,19 @@ def get_app_recipe_for_name(app_name: str) -> AppRecipe | None:
 
     This matters for names such as ``Monday.com`` whose punctuation is not part
     of the approved canonical slug (``monday``).
+
+    The name lookup only finds which reviewed recipe is meant; the recipe itself
+    is returned by :func:`get_app_recipe` so a researched signup overlay applies
+    here too. Callers reach the catalog by whichever identifier they hold —
+    ``CanonicalRuntime.recipe_for_request`` tries the display name first — and a
+    recipe that carried a signup route under one identifier but not the other
+    would make the run's signup readiness depend on how the app was named.
     """
 
-    return _recipes_by_name().get(app_name.strip().casefold())
+    reviewed = _recipes_by_name().get(app_name.strip().casefold())
+    if reviewed is None:
+        return None
+    return get_app_recipe(reviewed.app_slug)
 
 
 def recipes_for_route(route_kind: RouteKind) -> tuple[AppRecipe, ...]:
