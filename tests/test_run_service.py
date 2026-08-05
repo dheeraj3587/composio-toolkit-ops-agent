@@ -52,11 +52,14 @@ def test_planning_concerns_are_reachable_through_run_service(tmp_path: Path) -> 
     assert service.validate_run_plan(plan=plan, app_slug=recipe.app_slug) is None
     assert isinstance(service.route_adherence_monitor, RouteAdherenceMonitor)
     # No plan row means no expected route: adherence is inert rather than inferred.
-    assert service.observe_run_surface(
-        run_id="run_without_plan",
-        step_index=0,
-        observed_url="https://outside.example.test/unplanned",
-    ).action == "proceed"
+    assert (
+        service.observe_run_surface(
+            run_id="run_without_plan",
+            step_index=0,
+            observed_url="https://outside.example.test/unplanned",
+        ).action
+        == "proceed"
+    )
 
 
 def test_run_service_records_canonical_recipe_and_final_route(tmp_path: Path) -> None:
