@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import stat
@@ -70,7 +71,7 @@ from ops.browser.readiness import browser_configuration_state
 from ops.browser.service_client import BrowserServiceClient, BrowserServiceHealth
 from ops.core.config import Settings, load_settings
 from ops.core.models import AccountMode, CompanyProfile, OperationalResearch, OperationsRequest
-from ops.core.state import BrowserProvider
+from ops.core.state import RUN_STATUSES, BrowserProvider, RunStatus
 from ops.deploy.acceptance import deployment_is_accepted
 from ops.gmail.worker import GmailSignupPreflight
 from ops.onboarding.admission import AdmissionDecision, decide_from_operator
@@ -424,6 +425,14 @@ _PHASE_NARRATIVE: Final[dict[OnboardingPhase, tuple[str, str]]] = {
     "cancelled": ("Onboarding cancelled", "The run was cancelled"),
 }
 
+LOGGER: Final = logging.getLogger("composio_ops.api_service")
+
+# What an unreadable ``runs.status`` is reported as. ``blocked`` is terminal and
+# authorizes no action, so a row the vocabulary cannot name degrades into one the
+# console will not act on rather than one it might drive.
+_UNKNOWN_STATUS_FALLBACK: Final[RunStatus] = "blocked"
+_KNOWN_RUN_STATUSES: Final[frozenset[str]] = frozenset(RUN_STATUSES)
+
 # Phase -> the step an operator may retry in place. A phase absent here has no
 # retryable step, so the controls view cannot offer a retry the backend refuses.
 _RETRYABLE_STEP_FOR_PHASE: Final[dict[OnboardingPhase, RetryableStep]] = {
@@ -651,6 +660,27 @@ class LocalRunService:
             raise RuntimeError("API service lifespan has not started")
 
     @staticmethod
+    def _run_status(record: Mapping[str, object]) -> RunStatus:
+        """The row's status, or a terminal placeholder if the vocabulary lost it.
+
+        A ledger predates its vocabulary: a status written by a since-removed code
+        path still sits in deployed rows, and a strict model would reject it. One
+        such row must not take the whole list with it, so the value is coerced and
+        the loss is logged with the run it happened to rather than swallowed.
+        """
+
+        status = record.get("status")
+        if isinstance(status, str) and status in _KNOWN_RUN_STATUSES:
+            return cast(RunStatus, status)
+        LOGGER.warning(
+            "run %s carries unknown status %r; reporting it as %r",
+            record.get("run_id"),
+            status,
+            _UNKNOWN_STATUS_FALLBACK,
+        )
+        return _UNKNOWN_STATUS_FALLBACK
+
+    @staticmethod
     def _summary(record: dict[str, object]) -> RunSummary:
         raw_attempt = record.get("attempt", 0)
         attempt = int(raw_attempt) if isinstance(raw_attempt, int | str) else 0
@@ -669,7 +699,7 @@ class LocalRunService:
             app_name=str(record["app_name"]),
             app_slug=str(record["app_slug"]),
             account_mode=account_mode,
-            status=record["status"],  # type: ignore[arg-type]
+            status=LocalRunService._run_status(record),
             access_route=record.get("access_route"),  # type: ignore[arg-type]
             created_at=str(record["created_at"]),
             updated_at=str(record["updated_at"]),

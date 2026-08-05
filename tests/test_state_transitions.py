@@ -82,6 +82,12 @@ _EXPECTED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     "blocked": frozenset(),
     "failed": frozenset({"researching", "browser_running", "outreach_sent"}),
     "completed": frozenset(),
+    # Terminal and unreachable, on purpose. ``cancelled`` entered the vocabulary so
+    # rows written by a since-removed path stay readable, not so the machine could
+    # reach it: a cancellation is the ``cancelled`` *phase*, which projects onto
+    # ``blocked``. An empty edge set on both sides is what keeps that true, so a
+    # later edge into it has to be argued for here first.
+    "cancelled": frozenset(),
 }
 
 
@@ -113,6 +119,20 @@ def test_terminal_states_have_no_outgoing_transition() -> None:
         validate_status_transition("completed", "researching", "retry")
     with pytest.raises(IllegalStatusTransition):
         validate_status_transition("blocked", "route_selected", "retry")
+    with pytest.raises(IllegalStatusTransition):
+        validate_status_transition("cancelled", "browser_running", "retry")
+
+
+def test_no_status_transitions_into_cancelled() -> None:
+    """A cancellation is a phase; the status it projects onto is ``blocked``.
+
+    ``cancelled`` is in the vocabulary only so a row already carrying it reads back.
+    Making it a legal target would give the machine a second way to say "terminal"
+    that no projection produces and no console renders differently.
+    """
+
+    for source, targets in _LEGAL_STATUS_TRANSITIONS.items():
+        assert "cancelled" not in targets, f"{source} gained an edge into cancelled"
 
 
 def test_illegal_transition_is_rejected() -> None:

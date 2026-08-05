@@ -6,7 +6,7 @@ values cross the workflow boundary only as ``vault://`` references.
 
 from __future__ import annotations
 
-from typing import Literal, TypedDict
+from typing import Final, Literal, TypedDict, get_args
 
 AccessRoute = Literal[
     "self_serve",
@@ -33,7 +33,17 @@ RunStatus = Literal[
     "blocked",
     "failed",
     "completed",
+    # Terminal, and legacy: ``project_status`` maps the ``cancelled`` phase onto
+    # ``blocked``, so no current code path writes this. It stays in the vocabulary
+    # because rows carrying it exist in deployed ledgers, and a status the type
+    # cannot name is a status the API cannot read back. See the note on the
+    # transition table for why it has no incoming edge.
+    "cancelled",
 ]
+
+# The vocabulary as data, so the ledger's ``runs.status`` CHECK and the API's
+# read-back coercion are both generated from the Literal rather than restating it.
+RUN_STATUSES: Final[tuple[RunStatus, ...]] = get_args(RunStatus)
 
 
 class IllegalStatusTransition(ValueError):
@@ -120,6 +130,11 @@ _LEGAL_STATUS_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     "blocked": frozenset(),
     "failed": frozenset({"researching", "browser_running", "outreach_sent"}),
     "completed": frozenset(),
+    # No status transitions *into* ``cancelled``: the phase machine expresses a
+    # cancellation as the ``cancelled`` phase projected onto ``blocked`` status.
+    # A row already carrying it is terminal, so it needs an entry here for the
+    # lookup to resolve, and an empty one is the truthful answer.
+    "cancelled": frozenset(),
 }
 
 

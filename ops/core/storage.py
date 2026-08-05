@@ -17,7 +17,7 @@ from ops.core.inference import DecisionReasonCode
 from ops.core.private_files import finalize_private_database, prepare_private_database
 from ops.core.redaction import redact_data, redact_text
 from ops.core.secret_store import parse_vault_reference
-from ops.core.state import AccessRoute, RunStatus
+from ops.core.state import RUN_STATUSES, AccessRoute, RunStatus
 from ops.onboarding.admission import AdmissionDecider, AdmissionDecision, AdmissionRoute
 from ops.onboarding.effects import ONBOARDING_EFFECT_DISPOSITIONS, ONBOARDING_EFFECTS
 from ops.onboarding.phase import ONBOARDING_PHASES, ONBOARDING_REASON_CODES
@@ -530,6 +530,98 @@ def _relax_run_plan_credential_columns(connection: sqlite3.Connection) -> None:
         f"SELECT {names} FROM onboarding_run_plans_legacy"
     )
     connection.execute("DROP TABLE onboarding_run_plans_legacy")
+
+
+# The CHECK ``runs.status`` gains, generated from the Literal so the column and the
+# type cannot drift. It is applied by rebuild rather than written into the CREATE
+# TABLE above because that statement is a plain script shared with a long list of
+# ALTER-migrated columns; one rebuild path serves a fresh and a deployed database
+# alike, and a rebuilt table carries whichever columns the database actually has.
+_RUN_STATUS_CHECK: Final = f"CHECK (status IN ({_vocabulary_clause(RUN_STATUSES)}))"
+_RUNS_TABLE_REBUILD = "runs_status_check_rebuild"
+# ``status TEXT NOT NULL`` exactly once, and only where a CHECK does not already
+# follow it. Anchored on the column name so the transform cannot land on a
+# same-named column of another table's SQL.
+_RUN_STATUS_COLUMN = re.compile(r"\bstatus\s+TEXT\s+NOT\s+NULL\b(?!\s*CHECK)", re.IGNORECASE)
+# sqlite_master stores the statement without ``IF NOT EXISTS`` and may quote the
+# name, so the rebuild renames the target by pattern rather than by literal text.
+_RUNS_CREATE_PREFIX = re.compile(
+    r"^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"'`\[]?runs[\"'`\]]?", re.IGNORECASE
+)
+
+
+def _add_run_status_check(connection: sqlite3.Connection) -> None:
+    """Constrain ``runs.status`` to the closed vocabulary, preserving every row.
+
+    SQLite cannot add a CHECK in place, so the table is rebuilt by the documented
+    create-copy-drop-rename procedure. The replacement is derived from the *stored*
+    schema rather than from a literal here: thirteen tables carry a foreign key into
+    ``runs`` and a deployed database has columns this module only adds by ALTER, so
+    re-deriving is what keeps the rebuilt table identical but for the constraint.
+
+    A row whose status is outside the vocabulary fails the copy. That is the
+    intended outcome — it is the same value the API cannot name — and it surfaces as
+    a refusal to open the ledger rather than a corrupted one, because the rebuild is
+    a single transaction that takes the old table with it when it rolls back.
+    """
+
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
+    ).fetchone()
+    if row is None or not row[0]:  # pragma: no cover - initialize() just created it
+        return
+    original = str(row[0])
+    if "CHECK (status IN (" in original:
+        return
+    replacement, substitutions = _RUN_STATUS_COLUMN.subn(
+        lambda match: f"{match.group(0)} {_RUN_STATUS_CHECK}", original, count=1
+    )
+    if substitutions != 1:  # pragma: no cover - the column is in the DDL above
+        raise RuntimeError("runs.status column could not be located for its CHECK migration")
+    names = ", ".join(
+        str(column[1]) for column in connection.execute("PRAGMA table_info(runs)").fetchall()
+    )
+
+    # Foreign keys MUST be off for the whole rebuild. `DROP TABLE runs` with them on
+    # runs an implicit DELETE first, and thirteen child tables cascade on delete: the
+    # drop would take the entire ledger with it. The pragma is also a no-op inside a
+    # transaction, so the pending one is committed before it is set.
+    connection.commit()
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        # Renaming `runs` would rewrite the referencing tables' FOREIGN KEY clauses to
+        # follow it. Building the replacement under a temporary name and renaming *it*
+        # into place leaves those clauses naming `runs` throughout, which is why the
+        # order is create-copy-drop-rename rather than rename-copy-drop.
+        rebuild_ddl, renamed = _RUNS_CREATE_PREFIX.subn(
+            f"CREATE TABLE {_RUNS_TABLE_REBUILD}", replacement, count=1
+        )
+        if renamed != 1:  # pragma: no cover - the statement came from sqlite_master
+            raise RuntimeError("runs table statement could not be renamed for its CHECK migration")
+        connection.execute(rebuild_ddl)
+        connection.execute(
+            f"INSERT INTO {_RUNS_TABLE_REBUILD} ({names}) "  # noqa: S608 - names come from PRAGMA
+            f"SELECT {names} FROM runs"
+        )
+        connection.execute("DROP TABLE runs")
+        # Legacy rename semantics for this one statement: the modern form re-parses
+        # every referencing table, and they name a `runs` that does not exist between
+        # the drop and this rename.
+        connection.execute("PRAGMA legacy_alter_table = ON")
+        try:
+            connection.execute(f"ALTER TABLE {_RUNS_TABLE_REBUILD} RENAME TO runs")
+        finally:
+            connection.execute("PRAGMA legacy_alter_table = OFF")
+        orphans = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if orphans:
+            raise RuntimeError("runs.status CHECK migration would orphan referencing rows")
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
 
 
 # One row per completed loop iteration (Requirement 4.1). Append-only and never
@@ -1632,6 +1724,10 @@ class OperationsStorage:
             for column_name, declaration in migration_columns.items():
                 if column_name not in existing_columns:
                     connection.execute(f"ALTER TABLE runs ADD COLUMN {column_name} {declaration}")
+            # After the ALTER migrations, so the rebuilt table carries the columns the
+            # database ended up with, and before the index below, which the rebuild
+            # drops along with the table it belongs to.
+            _add_run_status_check(connection)
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_idempotency_key
