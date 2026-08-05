@@ -588,6 +588,8 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 # Headful Chromium renders to THIS session's display only. None in a
                 # headless deployment, where the worker inherits the process env.
                 display=session.display_slot.display if session.display_slot else None,
+                decision_model=payload.decision_model,
+                decision_effort=payload.decision_effort,
             )
             # EXPLICIT ownership: the manager can now close the real session, and
             # nothing reaches into the worker's private session dictionary.

@@ -32,6 +32,7 @@ from ops.browser.api_trace_catalog import get_browser_api_trace
 from ops.browser.link_log import log_event
 from ops.browser.worker import BrowserWorker
 from ops.core.config import Settings
+from ops.core.model_catalog import ModelSelection
 from ops.core.models import CapabilityAvailability, OperationsRequest
 from ops.core.state import AccessRoute, BrowserProvider, OperationsState
 from ops.core.storage import OperationsStorage
@@ -132,6 +133,7 @@ class RunCreationService:
         idempotency_key: str | None = None,
         execution_mode: Literal["plan_only", "execute_when_configured"] = "plan_only",
         browser_login: Mapping[str, SecretStr] | None = None,
+        selection: ModelSelection | None = None,
     ) -> dict[str, Any]:
         """Create and route one run without invoking an external provider.
 
@@ -218,6 +220,10 @@ class RunCreationService:
                     return _public_run(record)
 
             transaction.create_run(
+                decision_model=None
+                if selection is None
+                else f"{selection.provider}:{selection.model}",
+                decision_effort=None if selection is None else (selection.effort or None),
                 run_id=run_id,
                 thread_id=thread_id,
                 app_name=request.app_name,
@@ -521,6 +527,17 @@ class RunCreationService:
                                     app_slug=research.app_slug,
                                     account_ref=account_ref,
                                     secret_scope=run_id,
+                                    # The model this run asked for, carried to
+                                    # whichever process decides. Ignored by a
+                                    # provider that runs its own agent model.
+                                    decision_model=(
+                                        None
+                                        if selection is None
+                                        else f"{selection.provider}:{selection.model}"
+                                    ),
+                                    decision_effort=(
+                                        None if selection is None else (selection.effort or None)
+                                    ),
                                     use_storage_state=is_playwright,
                                     live_view_mode=(
                                         "interactive_remote"

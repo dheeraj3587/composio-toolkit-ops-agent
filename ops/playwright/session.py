@@ -65,6 +65,11 @@ class _PwSession:
     # event loop keeps only a WEAK reference and a task can be garbage-collected
     # before it finishes installing the popup's guards.
     popup_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    # This session's OWN decision chain, when the run pinned a model. None means
+    # the worker's deployment chain decides, which is the ordinary case. It lives
+    # on the session rather than on the worker because the worker is one process
+    # serving several runs, and a model is a property of the run that asked for it.
+    inference: Any = None
     # True only when the WORKER acquired its own capacity slot for this session.
     # False in service mode, where the manager owns capacity — so the worker must
     # not release a slot it never took.

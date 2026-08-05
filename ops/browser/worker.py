@@ -253,11 +253,16 @@ class BrowserWorker:
         secret_scope: str | None = None,
         use_storage_state: bool = False,
         live_view_mode: str = "screenshot",
+        decision_model: str | None = None,
+        decision_effort: str | None = None,
     ) -> BrowserSessionContext:
         # Accept and IGNORE the Playwright-specific metadata so a single call site
         # in the graph works for both providers. Browser Use's own session-creation
-        # request is unchanged — these arguments never alter its behaviour.
+        # request is unchanged — these arguments never alter its behaviour. The
+        # pinned decision model is among them: Browser Use runs its own agent
+        # model, which this deployment's catalog does not describe or control.
         del recipe, app_slug, account_ref, secret_scope, use_storage_state, live_view_mode
+        del decision_model, decision_effort
         self._require_configuration()
         client = self._get_client()
         create_kwargs: dict[str, Any] = {

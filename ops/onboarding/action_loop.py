@@ -80,7 +80,7 @@ from ops.core.model_input_dlp import (
     sanitize_url,
     screen_model_input,
 )
-from ops.core.storage import LOOP_STAGE_VALUES
+from ops.core.storage import LOOP_STAGE_VALUES, STEP_DECISION_VALUES
 from ops.onboarding.phase import (
     ONBOARDING_REASON_CODES,
     SESSION_BEARING_PHASES,
@@ -116,6 +116,16 @@ LOOP_OUTCOMES: Final[tuple[LoopOutcome, ...]] = get_args(LoopOutcome)
 LoopStage = Literal["observe", "candidates", "decide", "act", "verify", "gate", "exhausted"]
 LOOP_STAGES: Final[tuple[LoopStage, ...]] = get_args(LoopStage)
 assert LOOP_STAGES == LOOP_STAGE_VALUES, "loop stages must match the progress table's vocabulary"
+
+# How one iteration's decision ended. The first three are what ``validate_choice``
+# admits from the model; ``rejected`` is the loop's own verdict on a reply it threw
+# away — the model can never author it. Asserted equal to the durable column's
+# vocabulary for the same reason the stages above are.
+StepDecision = Literal["select_candidate", "report_hitl", "report_blocked", "rejected"]
+STEP_DECISIONS: Final[tuple[StepDecision, ...]] = get_args(StepDecision)
+assert STEP_DECISIONS == STEP_DECISION_VALUES, (
+    "step decisions must match the decision table's vocabulary"
+)
 
 # The bound a counter reached, in the loop's own words. Used as the key of the
 # bound → reason-code mapping so the two cannot drift apart.
@@ -434,6 +444,26 @@ class LoopTelemetry(Protocol):
     def progress(self, *, step_index: int, stage: LoopStage, elapsed_ms: int) -> None:
         """Record that one iteration completed, and where it ended (R4.1)."""
 
+    def decision(
+        self,
+        *,
+        step_index: int,
+        decision: StepDecision,
+        reason_code: OnboardingReasonCode | None = None,
+        candidate_label: str | None = None,
+        action: str | None = None,
+        target_host: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Record what this iteration decided, and the model's stated reason.
+
+        The one method on this port that carries free text. ``reason`` is whatever
+        the backend wrote into the ``reason`` field the choice schema requires, so
+        it is page-derived and untrusted; the sink quarantines it before storing it
+        and the console renders it inert. Every other argument is a closed
+        vocabulary or a value the policy generator authored, never the model.
+        """
+
 
 # --- the loop ---------------------------------------------------------------
 # Candidate actions that move the page. Only these are checked against the
@@ -610,6 +640,36 @@ async def run_action_loop(
                 elapsed_ms=max(int((clock() - step_started) * 1000), 0),
             )
 
+    def report_decision(
+        outcome: StepDecision,
+        *,
+        reason_code: OnboardingReasonCode | None = None,
+        candidate: ActionCandidate | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Record this iteration's decision beside its progress row.
+
+        Looked up with ``getattr`` for the same reason :func:`report` looks up
+        ``progress``: a telemetry sink that predates this port stays usable, and a
+        decision that cannot be recorded must never stop the loop from acting.
+
+        Only the candidate's own action and label travel — never its selector, and
+        never a URL beyond the host, which the sink reduces.
+        """
+
+        record = getattr(telemetry, "decision", None)
+        if not callable(record):
+            return
+        record(
+            step_index=iteration,
+            decision=outcome,
+            reason_code=reason_code,
+            candidate_label=None if candidate is None else candidate.semantic_target,
+            action=None if candidate is None else candidate.action,
+            target_host=None if candidate is None else candidate.url,
+            reason=reason,
+        )
+
     async def observe(seconds: float) -> LoopObservation:
         return await asyncio.wait_for(session.observe(), seconds)
 
@@ -719,12 +779,14 @@ async def run_action_loop(
                 choice = validate_choice(payload, candidate_ids=candidate_ids)
             except ValueError:  # Requirement 4.5
                 telemetry.reject("action_not_in_candidate_set")
+                report_decision("rejected", reason_code="action_not_in_candidate_set")
                 no_progress += 1
                 report("decide")
                 seen = await observe(deadlines.observe_seconds)
                 continue
 
             if choice.decision == "report_hitl":
+                report_decision("report_hitl", reason=choice.reason)
                 report("gate")
                 return _gate(
                     None, observation, actions=actions, model_calls=model_calls, denials=denials
@@ -732,6 +794,7 @@ async def run_action_loop(
             if choice.decision == "report_blocked":
                 # The chain answered and named no candidate action: unusable, not a
                 # spent bound (reliability R4.6).
+                report_decision("report_blocked", reason=choice.reason)
                 report("decide")
                 return _result(
                     "exhausted",
@@ -746,10 +809,12 @@ async def run_action_loop(
             selected = _by_id(candidates, choice.candidate_id)
             if selected is None:  # unreachable while validate_choice holds
                 telemetry.reject("action_not_in_candidate_set")
+                report_decision("rejected", reason_code="action_not_in_candidate_set")
                 no_progress += 1
                 report("decide")
                 seen = await observe(deadlines.observe_seconds)
                 continue
+            report_decision("select_candidate", candidate=selected, reason=choice.reason)
             if not selected.executable:  # Requirement 4.18, left unexecuted
                 report("gate")
                 return _gate(
@@ -763,11 +828,13 @@ async def run_action_loop(
             if candidate.identity is not None:  # Requirement 4.6
                 resolution, _ = resolve_identity(candidate.identity, elements)
                 if resolution != "resolved":  # Requirements 4.7, 4.8
-                    telemetry.reject(
+                    unresolved: OnboardingReasonCode = (
                         "candidate_identity_not_found"
                         if resolution == "not_found"
                         else "candidate_identity_ambiguous"
                     )
+                    telemetry.reject(unresolved)
+                    report_decision("rejected", reason_code=unresolved, candidate=candidate)
                     no_progress += 1
                     report("decide")
                     seen = await observe(deadlines.observe_seconds)

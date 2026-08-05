@@ -261,6 +261,8 @@ class BrowserServiceClient:
         live_view_mode: str = "screenshot",
         allowed_hosts: BrowserAllowedHosts | None = None,
         run_id: str | None = None,
+        decision_model: str | None = None,
+        decision_effort: str | None = None,
     ) -> BrowserSessionContext:
         resolved_slug = app_slug or "unknown"
         # The run's allow-list travels as the flat pattern list plus the app slug,
@@ -288,6 +290,12 @@ class BrowserServiceClient:
             "use_storage_state": use_storage_state,
             "allowed_host_patterns": list(patterns),
         }
+        # Only sent when the run pinned one. Omitted otherwise so a service that
+        # predates this field sees exactly the body it always saw.
+        if decision_model:
+            body["decision_model"] = decision_model
+            if decision_effort:
+                body["decision_effort"] = decision_effort
         if recipe is not None:
             body["recipe_snapshot"] = (
                 recipe.model_dump(mode="json") if hasattr(recipe, "model_dump") else recipe

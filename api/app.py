@@ -37,6 +37,7 @@ from api.models import (
     InvalidRequestResponse,
     LiveViewResponse,
     ManagedConnectionResponse,
+    ModelCatalogResponse,
     PauseRequest,
     PauseResponse,
     PhaseUnavailableResponse,
@@ -59,6 +60,7 @@ from api.models import (
 )
 from api.service import (
     AppNotFoundError,
+    InvalidRequestError,
     LocalRunService,
     PhaseUnavailableError,
     RunNotFoundError,
@@ -108,6 +110,12 @@ _KNOWN_VALIDATION_FIELDS = frozenset(
         "body.company.callback_urls",
         "body.requested_scope_policy",
         "body.dry_run",
+        # The run's pinned decision model. Named for the same reason the
+        # onboarding control fields are: a rejected model id must say which
+        # field was wrong, and both are closed vocabularies — one from the
+        # deployment's own catalog, one from the effort ladder.
+        "body.decision_model",
+        "body.decision_effort",
         "body.capability",
         # The onboarding control bodies (design LL-6.3). Named so a refused
         # control reports which field was wrong instead of degrading to
@@ -394,6 +402,21 @@ def create_app(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
+    @application.exception_handler(InvalidRequestError)
+    async def invalid_request_handler(
+        request: Request,
+        exc: InvalidRequestError,
+    ) -> JSONResponse:
+        # The same 422 body a shape failure produces. A field the request model
+        # could not judge alone — one that is only valid against this
+        # deployment's configuration — is still a rejected field, not a server
+        # fault, so it must not surface as a 500.
+        del request
+        return _model_response(
+            InvalidRequestResponse(fields=list(exc.fields)),
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
     @application.exception_handler(RunNotFoundError)
     async def run_not_found_handler(request: Request, exc: RunNotFoundError) -> JSONResponse:
         del request
@@ -629,6 +652,14 @@ def create_app(
         # loopback-only.
         _require_owner_action(request)
         return await run_service.submit_credentials(run_id, payload)
+
+    @application.get(
+        "/api/models",
+        response_model=ModelCatalogResponse,
+        responses={500: {"model": InternalErrorResponse}},
+    )
+    async def get_model_catalog(run_service: ServiceDependency) -> ModelCatalogResponse:
+        return await run_service.get_model_catalog()
 
     @application.get(
         "/api/runs",

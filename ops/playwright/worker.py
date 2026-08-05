@@ -102,7 +102,8 @@ from ops.browser.worker import (
     validate_allowed_domains,
 )
 from ops.core.config import Settings
-from ops.core.inference import build_json_inference
+from ops.core.inference import JsonInference, build_json_inference
+from ops.core.model_catalog import selection_from_record
 from ops.core.model_input_dlp import (
     contains_secret_material,
     sanitize_page_text,
@@ -512,6 +513,8 @@ class PlaywrightBrowserWorker:
         use_storage_state: bool = False,
         live_view_mode: str = "screenshot",
         display: str | None = None,
+        decision_model: str | None = None,
+        decision_effort: str | None = None,
     ) -> BrowserSessionContext:
         # ``display`` is the PRIVATE X display leased to this session by the browser
         # service (e.g. ":100"). Headful Chromium renders to exactly that display,
@@ -620,6 +623,17 @@ class PlaywrightBrowserWorker:
         # This assignment happens only after `browser.new_context` succeeded, so
         # it describes a successful local restore without retaining raw state.
         session.restored_storage_state = storage_state is not None
+        # The run's pinned decision model, resolved against THIS process's own
+        # keys. ``selection_from_record`` returns None for a model this deployment
+        # cannot serve — the control plane and the browser service are separate
+        # processes with separate environments, so a model accepted at run
+        # creation may be unavailable here. That leaves the deployment chain in
+        # place rather than failing a run over a preference.
+        selection = selection_from_record(
+            self._settings, model_id=decision_model, effort=decision_effort
+        )
+        if selection is not None:
+            session.inference = build_json_inference(self._settings, selection=selection)
         with self._registry_lock:
             self._sessions[handle] = session
         return BrowserSessionContext(
@@ -1149,7 +1163,7 @@ class PlaywrightBrowserWorker:
                     chosen = matches[0]
             if chosen is None:
                 selection_source = "llm"
-                if self._inference is None:
+                if self._chain_for(session) is None:
                     return self._human_required(
                         session, "The deterministic navigation path is ambiguous."
                     )
@@ -1508,6 +1522,19 @@ class PlaywrightBrowserWorker:
             # must keep the run waiting rather than continue it on no evidence.
             return _GateProbe(gate=None, reason="probe_failed")
 
+    def _chain_for(self, session: _PwSession) -> JsonInference | None:
+        """The chain that decides for THIS session.
+
+        A run that pinned a model gets its own chain; every other session shares
+        the deployment's. Read through one accessor so a decision, its guard, and
+        the provider recorded against it can never disagree about which chain ran.
+        """
+
+        pinned = session.inference
+        if isinstance(pinned, JsonInference):
+            return pinned
+        return self._inference
+
     async def _choose_candidate(
         self,
         *,
@@ -1526,7 +1553,8 @@ class PlaywrightBrowserWorker:
         persisted.
         """
 
-        if self._inference is None:  # pragma: no cover - guarded by the caller
+        chain = self._chain_for(session)
+        if chain is None:  # pragma: no cover - guarded by the caller
             raise RuntimeError("no inference backend is configured")
         options = executable_candidates(candidates)
         if not options:
@@ -1549,7 +1577,7 @@ class PlaywrightBrowserWorker:
                 session, "The page could not be summarized safely for a decision."
             )
         result = await asyncio.to_thread(
-            self._inference.generate,
+            chain.generate,
             prompt,
             schema=candidate_choice_schema(ids),
             validate=lambda payload: validate_choice(payload, candidate_ids=ids),
@@ -1587,8 +1615,9 @@ class PlaywrightBrowserWorker:
         if sink is None:
             return
         provider = None
-        if selection_source == "llm" and self._inference is not None:
-            provider = getattr(self._inference, "last_provider", None)
+        chain = self._chain_for(session)
+        if selection_source == "llm" and chain is not None:
+            provider = getattr(chain, "last_provider", None)
         event = build_decision_event(
             session_id=session.handle,
             checkpoint_order=checkpoint_order,

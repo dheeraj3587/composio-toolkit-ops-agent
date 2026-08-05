@@ -47,7 +47,7 @@ from ops.onboarding.phase import (
 from ops.providers.profile import SOURCE_DIGEST_LENGTH
 
 if TYPE_CHECKING:  # pragma: no cover - imported for typing only
-    from ops.onboarding.action_loop import LoopStage, LoopTelemetry
+    from ops.onboarding.action_loop import LoopStage, LoopTelemetry, StepDecision
 
 LOGGER = logging.getLogger("composio_ops.onboarding_loop_telemetry")
 
@@ -96,6 +96,28 @@ class DenialFactStore(Protocol):
         latency_ms: int,
     ) -> int:
         """Append one inference-attempt fact and return its identifier."""
+        ...
+
+    def record_step_decision(
+        self,
+        *,
+        run_id: str,
+        phase: str,
+        correlation_id: str,
+        step_index: int,
+        decision: str,
+        reason_code: str | None = None,
+        candidate_label: str | None = None,
+        action: str | None = None,
+        target_host: str | None = None,
+        reason: str | None = None,
+    ) -> int:
+        """Append one decision fact and return its identifier.
+
+        The implementation quarantines ``reason`` — the only untrusted argument —
+        before it is stored; see
+        :meth:`ops.core.storage.OperationsStorage.record_step_decision`.
+        """
         ...
 
 
@@ -211,6 +233,56 @@ class DurableLoopTelemetry:
             stage=stage,
             elapsed_ms=elapsed_ms,
         )
+
+    def decision(
+        self,
+        *,
+        step_index: int,
+        decision: StepDecision,
+        reason_code: OnboardingReasonCode | None = None,
+        candidate_label: str | None = None,
+        action: str | None = None,
+        target_host: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Record what one iteration decided, durably, beside its progress row.
+
+        Unlike :meth:`denial`, this write is *not* allowed to fail the phase. A
+        denial is the containment event the ledger exists to preserve, so losing it
+        must stop the run; a decision row is an explanation of a step that has
+        already happened, and stopping a run because its narration could not be
+        stored would trade a working onboarding for a nicer timeline. The failure is
+        logged with the step it belonged to and the loop continues.
+
+        ``reason`` is the model's own prose, read off a live third-party page. It is
+        passed straight to the store, which caps, redacts, and screens it, and marks
+        the row withheld rather than storing anything it will not vouch for.
+        """
+
+        try:
+            self.store.record_step_decision(
+                run_id=self.run_id,
+                phase=self.phase,
+                correlation_id=self.correlation_id,
+                step_index=step_index,
+                decision=decision,
+                reason_code=reason_code,
+                candidate_label=candidate_label,
+                action=action,
+                target_host=target_host,
+                reason=reason,
+            )
+        except Exception:  # pragma: no cover - narration must not stop the run
+            LOGGER.warning(
+                "step decision not recorded",
+                exc_info=True,
+                extra={
+                    "run_id": self.run_id,
+                    "phase": self.phase,
+                    "step_index": step_index,
+                    "decision": decision,
+                },
+            )
 
     def record_attempt(self, *, provider: str, outcome: str, latency_ms: int) -> None:
         """Record one inference attempt of this phase's loop (Requirement 4.3)."""

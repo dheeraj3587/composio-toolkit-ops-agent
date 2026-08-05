@@ -71,6 +71,18 @@ class RunQueryService:
             return []
         return self.storage.list_progress_events(run_id, limit=limit)
 
+    def get_step_decisions(self, run_id: str, *, limit: int) -> list[dict[str, Any]]:
+        """The run's recorded loop decisions, newest first.
+
+        Guarded by the same run existence check ``get_progress_events`` makes,
+        for the same reason: an unknown run has no decisions, and saying so with
+        an empty list is more useful than a lookup error on a read-only view.
+        """
+
+        if self.storage.get_run(run_id) is None:
+            return []
+        return self.storage.list_step_decisions(run_id, limit=limit)
+
     def get_research(self, run_id: str) -> OperationalResearch | None:
         """Return the persisted sanitized research projection for a run."""
 

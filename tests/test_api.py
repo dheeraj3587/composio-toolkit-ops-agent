@@ -213,6 +213,9 @@ def test_exact_requested_routes_are_registered(harness: ApiHarness) -> None:
         ("/api/apps", "GET"),
         ("/api/apps/search", "GET"),
         ("/api/apps/{app_slug}/research", "GET"),
+        # The decision models this deployment can be asked for, so the operator
+        # picks one instead of inheriting whichever provider key happens to be set.
+        ("/api/models", "GET"),
         ("/api/system/signup-readiness", "GET"),
         ("/api/system/health", "GET"),
     }
@@ -368,7 +371,18 @@ def test_timeline_endpoint_returns_summaries_not_raw_audit_payloads(
 
     assert response.status_code == 200
     payload = response.json()
-    assert set(payload) == {"run_id", "items", "progress"}
+    # The agent trace travels on the same response the console already fetches:
+    # the loop's own decisions, the sources the run earned, and which model
+    # decided. All additive and empty on a run that never entered the loop.
+    assert set(payload) == {
+        "run_id",
+        "items",
+        "progress",
+        "decisions",
+        "citations",
+        "decision_model",
+        "decision_effort",
+    }
     assert payload["run_id"] == run_id
     assert payload["items"]
     assert all(

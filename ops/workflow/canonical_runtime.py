@@ -35,6 +35,7 @@ from ops.browser.worker import (
     BrowserWorker,
     HumanActionType,
 )
+from ops.core.model_catalog import ModelSelection
 from ops.core.models import OperationalResearch, OperationsRequest
 from ops.core.secret_store import AccountLoginStateError, SQLiteSecretStore, parse_vault_reference
 from ops.core.state import BrowserProvider, RunStatus
@@ -672,6 +673,7 @@ class CanonicalRuntime:
         idempotency_key: str | None,
         execution_mode: ExecutionMode,
         browser_login: Mapping[str, SecretStr] | None,
+        selection: ModelSelection | None = None,
     ) -> dict[str, Any]:
         recipe = self.recipe_for_request(request)
         if recipe is None:
@@ -892,6 +894,10 @@ class CanonicalRuntime:
                 missing_fields=[],
                 provider_status=provider_status,
                 scope_policy=request.requested_scope_policy,
+                decision_model=None
+                if selection is None
+                else f"{selection.provider}:{selection.model}",
+                decision_effort=None if selection is None else (selection.effort or None),
                 execution_mode=_PERSISTED_EXECUTION_MODE[execution_mode],
                 browser_provider=request.browser_provider,
                 credential_creation_policy=request.credential_creation_policy,
@@ -1062,6 +1068,13 @@ class CanonicalRuntime:
                 phase="browser_unavailable",
                 reason_code="reviewed_browser_entry_required",
             )
+        # The model this run was pinned to at creation, carried to whichever
+        # process actually decides. Read here rather than threaded through three
+        # callers so a resumed run decides with the same model its first attempt
+        # did. A run that pinned nothing sends nothing.
+        record = self._context.storage.get_run(run_id) or {}
+        pinned_model = record.get("decision_model") or None
+        pinned_effort = record.get("decision_effort") or None
         worker = self._context._browser_worker_for("playwright")
         if worker is None:
             return self._record_provider_failure(
@@ -1187,6 +1200,8 @@ class CanonicalRuntime:
                     secret_scope=run_id,
                     use_storage_state=use_storage_state,
                     live_view_mode="interactive_remote",
+                    decision_model=pinned_model,
+                    decision_effort=pinned_effort,
                 )
             )
             if context is None:

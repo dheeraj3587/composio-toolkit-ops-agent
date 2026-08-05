@@ -40,10 +40,18 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, cast, get_args
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, get_args
 
 import httpx
 from pydantic import SecretStr
+
+if TYPE_CHECKING:  # pragma: no cover - imported for typing only
+    # Typing-only so this module keeps its property of importing nothing from
+    # ``ops`` at runtime: ``ops.core.storage`` derives a column vocabulary from
+    # ``DecisionReasonCode`` here, and that edge is only safe while the reverse
+    # direction does not exist. ``build_json_inference`` needs attribute access on
+    # a selection, not the class.
+    from ops.core.model_catalog import ModelSelection
 
 _TIMEOUT_SECONDS = 45.0
 _MAX_COMPLETION_TOKENS = 1_024
@@ -238,6 +246,14 @@ class MercuryJsonBackend(_OpenAICompatibleBackend):
 
 
 class GroqJsonBackend(_OpenAICompatibleBackend):
+    """gpt-oss on Groq.
+
+    ``reasoning_effort`` is a real field on the gpt-oss models this backend
+    targets, so it is forwarded when a run asks for one. It stays out of the
+    payload entirely by default rather than being sent as a hardcoded level: the
+    vendor's own default is the right answer when nobody chose.
+    """
+
     name = "groq"
 
     def __init__(
@@ -245,6 +261,7 @@ class GroqJsonBackend(_OpenAICompatibleBackend):
         api_key: SecretStr,
         *,
         model: str,
+        reasoning_effort: str = "",
         max_completion_tokens: int = _MAX_COMPLETION_TOKENS,
     ) -> None:
         super().__init__(
@@ -254,10 +271,13 @@ class GroqJsonBackend(_OpenAICompatibleBackend):
             strict_models=_GROQ_STRICT_MODELS,
             use_max_completion_tokens=True,
             max_completion_tokens=max_completion_tokens,
+            extra_payload={"reasoning_effort": reasoning_effort} if reasoning_effort else None,
         )
 
 
 class CerebrasJsonBackend(_OpenAICompatibleBackend):
+    """gpt-oss on Cerebras. Takes ``reasoning_effort`` on the same terms as Groq."""
+
     name = "cerebras"
 
     def __init__(
@@ -265,6 +285,7 @@ class CerebrasJsonBackend(_OpenAICompatibleBackend):
         api_key: SecretStr,
         *,
         model: str,
+        reasoning_effort: str = "",
         max_completion_tokens: int = _MAX_COMPLETION_TOKENS,
     ) -> None:
         super().__init__(
@@ -274,6 +295,7 @@ class CerebrasJsonBackend(_OpenAICompatibleBackend):
             strict_models=_CEREBRAS_STRICT_MODELS,
             use_max_completion_tokens=True,
             max_completion_tokens=max_completion_tokens,
+            extra_payload={"reasoning_effort": reasoning_effort} if reasoning_effort else None,
         )
 
 
@@ -561,6 +583,7 @@ def build_json_inference(
     budget: DecisionBudget | None = None,
     max_completion_tokens: int = _MAX_COMPLETION_TOKENS,
     attempts: DecisionAttemptSink | None = None,
+    selection: ModelSelection | None = None,
 ) -> JsonInference | None:
     """Build the ordered chain, skipping unconfigured providers.
 
@@ -570,62 +593,86 @@ def build_json_inference(
     latency, not raw capability, is what bounds a run. Returns None when no key is
     set, and every later provider still runs unchanged when Mercury is absent,
     rate limited, or fails its schema.
+
+    ``selection`` is one run's pinned model (``ops.core.model_catalog``). It moves
+    that provider to the **front** of the chain and overrides its model id and
+    reasoning effort — it does not become the chain. Every other configured
+    provider stays behind it in the usual order, so a pinned model that starts
+    refusing schemas at 3am degrades to the next provider instead of ending the
+    run. A selection naming a provider this deployment has no key for is ignored;
+    the operator was already refused at the API boundary, and a run that has
+    already been accepted should not die here.
     """
 
-    backends: list[JsonBackend] = []
+    selected = selection.provider if selection is not None else ""
+
+    def effort_for(provider: str, fallback: str) -> str:
+        if selection is not None and selection.provider == provider:
+            return selection.effort or fallback
+        return fallback
+
+    def model_for(provider: str, fallback: str) -> str:
+        if selection is not None and selection.provider == provider and selection.model:
+            return selection.model
+        return fallback
+
+    backends: dict[str, JsonBackend] = {}
 
     mercury_key = getattr(settings, "mercury_api_key", None)
     if isinstance(mercury_key, SecretStr):
         model = getattr(settings, "mercury_model", "") or "mercury-2"
-        backends.append(
-            MercuryJsonBackend(
-                mercury_key,
-                model=model,
-                reasoning_effort=getattr(settings, "mercury_reasoning_effort", "") or "low",
-                max_completion_tokens=max_completion_tokens,
-            )
+        backends["mercury"] = MercuryJsonBackend(
+            mercury_key,
+            model=model_for("mercury", model),
+            reasoning_effort=effort_for(
+                "mercury", getattr(settings, "mercury_reasoning_effort", "") or "low"
+            ),
+            max_completion_tokens=max_completion_tokens,
         )
 
     groq_key = getattr(settings, "groq_api_key", None)
     if isinstance(groq_key, SecretStr):
         model = getattr(settings, "groq_model", "") or "openai/gpt-oss-120b"
-        backends.append(
-            GroqJsonBackend(
-                groq_key,
-                model=model,
-                max_completion_tokens=max_completion_tokens,
-            )
+        backends["groq"] = GroqJsonBackend(
+            groq_key,
+            model=model_for("groq", model),
+            reasoning_effort=effort_for("groq", ""),
+            max_completion_tokens=max_completion_tokens,
         )
 
     cerebras_key = getattr(settings, "cerebras_api_key", None)
     if isinstance(cerebras_key, SecretStr):
         model = getattr(settings, "cerebras_model", "") or "gpt-oss-120b"
-        backends.append(
-            CerebrasJsonBackend(
-                cerebras_key,
-                model=model,
-                max_completion_tokens=max_completion_tokens,
-            )
+        backends["cerebras"] = CerebrasJsonBackend(
+            cerebras_key,
+            model=model_for("cerebras", model),
+            reasoning_effort=effort_for("cerebras", ""),
+            max_completion_tokens=max_completion_tokens,
         )
 
     openrouter_key = getattr(settings, "openrouter_api_key", None)
     if isinstance(openrouter_key, SecretStr):
         model = getattr(settings, "openrouter_model", "") or "openai/gpt-oss-120b"
-        backends.append(
-            OpenRouterJsonBackend(
-                openrouter_key,
-                model=model,
-                max_completion_tokens=max_completion_tokens,
-            )
+        backends["openrouter"] = OpenRouterJsonBackend(
+            openrouter_key,
+            model=model_for("openrouter", model),
+            max_completion_tokens=max_completion_tokens,
         )
 
     gemini_key = getattr(settings, "google_genai_api_key", None)
     if isinstance(gemini_key, SecretStr):
         models = tuple(getattr(settings, "gemini_model_chain", ()) or ())
+        if selected == "gemini" and selection is not None and selection.model:
+            # Gemini's backend owns its own fallback chain, so a pinned model goes
+            # to the head of that chain rather than replacing it.
+            models = tuple(dict.fromkeys((selection.model, *models)))
         if models:
-            backends.append(GeminiJsonBackend(gemini_key, models=models))
+            backends["gemini"] = GeminiJsonBackend(gemini_key, models=models)
 
-    return JsonInference(backends, budget=budget, attempts=attempts) if backends else None
+    ordered = list(backends.values())
+    if selected in backends:
+        ordered = [backends[selected], *(b for name, b in backends.items() if name != selected)]
+    return JsonInference(ordered, budget=budget, attempts=attempts) if ordered else None
 
 
 __all__ = [

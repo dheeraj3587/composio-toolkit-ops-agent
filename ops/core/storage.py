@@ -11,9 +11,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, get_args
+from urllib.parse import urlsplit
 
+from ops.browser.candidates import CandidateAction
 from ops.browser.worker import HumanActionType
 from ops.core.inference import DecisionReasonCode
+from ops.core.model_input_dlp import (
+    contains_secret_material,
+    sanitize_element_name,
+    sanitize_reason,
+)
 from ops.core.private_files import finalize_private_database, prepare_private_database
 from ops.core.redaction import redact_data, redact_text
 from ops.core.secret_store import parse_vault_reference
@@ -62,6 +69,8 @@ _RUN_COLUMNS = (
     "external_actions",
     "state_revision",
     "last_projected_revision",
+    "decision_model",
+    "decision_effort",
     "created_at",
     "updated_at",
 )
@@ -431,6 +440,31 @@ MAX_DECISION_PROVIDER_LENGTH: Final = 40
 MAX_PROGRESS_STEP_INDEX: Final = 100_000
 MAX_TELEMETRY_ELAPSED_MS: Final = 3_600_000
 
+# How one loop iteration's decision ended. The first three are the decisions
+# ``ops.browser.decider.validate_choice`` admits; ``rejected`` is the loop's own
+# verdict on a reply it threw away, which the model never authors.
+STEP_DECISION_VALUES: Final[tuple[str, ...]] = (
+    "select_candidate",
+    "report_hitl",
+    "report_blocked",
+    "rejected",
+)
+
+# The action kinds a candidate can carry, derived from the policy generator's own
+# Literal rather than retyped, for the reason :data:`DECISION_OUTCOME_VALUES`
+# gives: the column's vocabulary follows the producer and the two cannot drift.
+CANDIDATE_ACTION_VALUES: Final[tuple[str, ...]] = get_args(CandidateAction)
+
+# A candidate label is one accessible name, already truncated to 120 characters by
+# ``generate_candidates`` before it is stored. The bound is stated here as well so
+# the column refuses anything longer regardless of who writes it.
+MAX_CANDIDATE_LABEL_LENGTH: Final = 120
+
+# The only column in this schema that holds model-authored prose. Bounded far
+# below anything a payload would need, and screened before it is written: see
+# :meth:`OperationsStorage.record_step_decision` for the quarantine rules.
+MAX_DECISION_REASON_LENGTH: Final = 400
+
 
 # One row per plan revision (Requirements 5.7, 6.6). History, not current state:
 # a re-plan supersedes the active row and inserts its replacement in the same
@@ -689,6 +723,56 @@ ON onboarding_decision_attempts(run_id, id);
 """
 
 
+# One row per decision the loop reached, so the operator console can say *what*
+# the agent chose and *why* rather than only that an iteration happened. Joins to
+# ``onboarding_progress_events`` on ``(run_id, correlation_id, step_index)``; the
+# loop writes exactly one progress row per iteration (invariant I5), so the join
+# is one-to-one.
+#
+# ``reason_text`` is the one column in this schema that holds model-authored
+# prose, and it is the reason the rest of the row is shaped the way it is. Every
+# other column is a closed vocabulary, a bounded accessible name, or a bare host —
+# nothing that could carry a URL with a query string, a selector, or page markup.
+# The prose itself is capped, screened, and stored inert: see
+# :meth:`OperationsStorage.record_step_decision`. When the screen refuses it the
+# row still exists with ``reason_withheld = 1``, because "the model explained
+# itself and we would not repeat it" and "the model said nothing" are different
+# facts and the console renders them differently.
+_STEP_DECISIONS_DDL = f"""
+CREATE TABLE IF NOT EXISTS onboarding_step_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (
+        phase IN ({_vocabulary_clause(ONBOARDING_PHASES)})
+    ),
+    correlation_id TEXT NOT NULL,
+    step_index INTEGER NOT NULL CHECK (step_index >= 1),
+    decision TEXT NOT NULL CHECK (
+        decision IN ({_vocabulary_clause(STEP_DECISION_VALUES)})
+    ),
+    reason_code TEXT,
+    candidate_label TEXT CHECK (
+        candidate_label IS NULL OR length(candidate_label) <= {MAX_CANDIDATE_LABEL_LENGTH}
+    ),
+    action TEXT CHECK (
+        action IS NULL OR action IN ({_vocabulary_clause(CANDIDATE_ACTION_VALUES)})
+    ),
+    target_host TEXT CHECK (
+        target_host IS NULL OR length(target_host) <= {MAX_SURFACE_HOST_LENGTH}
+    ),
+    reason_text TEXT CHECK (
+        reason_text IS NULL OR length(reason_text) <= {MAX_DECISION_REASON_LENGTH}
+    ),
+    reason_withheld INTEGER NOT NULL DEFAULT 0 CHECK (reason_withheld IN (0, 1)),
+    recorded_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_step_decisions_run
+ON onboarding_step_decisions(run_id, id);
+"""
+
+
 # The three new tables' columns, in each table's own declared order, so the
 # readers below hand out mappings without listing the columns a second time.
 _RUN_PLAN_COLUMNS: Final[tuple[str, ...]] = (
@@ -728,6 +812,21 @@ _DECISION_ATTEMPT_COLUMNS: Final[tuple[str, ...]] = (
     "provider",
     "outcome",
     "latency_ms",
+    "recorded_at",
+)
+_STEP_DECISION_COLUMNS: Final[tuple[str, ...]] = (
+    "id",
+    "run_id",
+    "phase",
+    "correlation_id",
+    "step_index",
+    "decision",
+    "reason_code",
+    "candidate_label",
+    "action",
+    "target_host",
+    "reason_text",
+    "reason_withheld",
     "recorded_at",
 )
 
@@ -1048,6 +1147,110 @@ def _surface_host(value: object, *, field: str) -> str:
     return value
 
 
+def _decision_label(value: object) -> str | None:
+    """One candidate's accessible name, bounded and stripped of secret material.
+
+    The name is page-derived, so it goes through the same sanitizer the model's own
+    projection uses (:func:`ops.core.model_input_dlp.sanitize_element_name`) before
+    it is bounded here. A name that sanitizes away to nothing is stored as ``NULL``
+    rather than as an empty string: the console distinguishes "no label" from a
+    label it would not repeat.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("a step decision candidate label must be text")
+    cleaned = _collapse_whitespace(sanitize_element_name(value))
+    if not cleaned:
+        return None
+    return cleaned[:MAX_CANDIDATE_LABEL_LENGTH]
+
+
+def _decision_reason(value: object) -> str | None:
+    """The model's own explanation, quarantined before it becomes a durable row.
+
+    This is the only model-authored prose the ledger holds, and it was written by a
+    backend that had just read a live third-party page — so it is treated as
+    hostile input on the way in, not as an explanation to be trusted.
+
+    Three things happen here, and a failure at any of them yields ``None`` (the
+    caller records ``reason_withheld``) rather than an exception: a decision must
+    stay recordable even when its stated reason is not repeatable.
+
+    1. Control characters go, whitespace collapses, and the text is capped at
+       :data:`MAX_DECISION_REASON_LENGTH`.
+    2. :func:`ops.core.model_input_dlp.sanitize_reason` redacts secret-shaped
+       tokens the way it does for every other page-derived string.
+    3. :func:`ops.core.model_input_dlp.contains_secret_material` gets the last
+       word: text that still looks credential-bearing after redaction is dropped
+       whole rather than stored partly redacted. So is text that redaction hollowed
+       out — a reason that is nothing but ``[REDACTED]`` is withheld rather than
+       stored, because rendering it would attribute the placeholder to the model.
+
+    What is *not* done here is any attempt to make the text safe to interpret. It
+    is stored inert and rendered inert — never parsed as markup, never linkified,
+    never allowed to drive a control. See ``web/src/components/agent-trace.tsx``.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    collapsed = _collapse_whitespace(value)[:MAX_DECISION_REASON_LENGTH]
+    if not collapsed:
+        return None
+    sanitized = _collapse_whitespace(
+        sanitize_reason(collapsed, max_length=MAX_DECISION_REASON_LENGTH)
+    )
+    if not sanitized or contains_secret_material(sanitized):
+        return None
+    if not _REASON_SUBSTANCE.sub("", sanitized).strip():
+        return None
+    return sanitized[:MAX_DECISION_REASON_LENGTH]
+
+
+# Everything redaction leaves behind that is not the model's own words: the
+# placeholder itself, and the punctuation a hollowed-out sentence keeps.
+_REASON_SUBSTANCE = re.compile(r"\[[A-Z_]+\]|[\W_]+")
+
+
+def _decision_host(value: object) -> str | None:
+    """The bare host a decision's action pointed at, or ``NULL``.
+
+    Deliberately lenient where :func:`_surface_host` is strict. A plan surface is
+    compared against later, so a host that would need normalizing is a bug worth
+    raising on; a decision row is a description of something that already happened,
+    and losing the whole row because a host had a port in it would be the wrong
+    trade. Anything unusable becomes ``NULL``.
+
+    Only the host is kept — never the path, query, or fragment — so a URL that
+    carried a token in its query cannot reach the row through this column.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip()
+    host = urlsplit(candidate).hostname if "//" in candidate else candidate.split("/")[0]
+    if not host:
+        return None
+    host = host.split("@")[-1].split(":")[0].strip().lower()
+    if not host or not host.isascii() or len(host) > MAX_SURFACE_HOST_LENGTH:
+        return None
+    if any(character in host for character in "/?#@ "):
+        return None
+    return host
+
+
+def _collapse_whitespace(value: str) -> str:
+    """Drop control characters and squeeze runs of whitespace to single spaces."""
+
+    printable = "".join(character if character.isprintable() else " " for character in value)
+    return " ".join(printable.split())
+
+
 def _surface_path(value: object, *, field: str) -> str:
     """One planned surface's path: absolute, bounded, and never a URL."""
 
@@ -1249,6 +1452,10 @@ class OperationsUnitOfWork:
         effect_identity: str | None = None,
         state_engine: str = "legacy",
         external_actions: bool = False,
+        # The decision model this run is pinned to, already resolved against
+        # ``ops.core.model_catalog``. ``None`` means the deployment's own chain.
+        decision_model: str | None = None,
+        decision_effort: str | None = None,
         idempotency_key: str | None = None,
         request_fingerprint: str | None = None,
     ) -> dict[str, Any]:
@@ -1291,6 +1498,8 @@ class OperationsUnitOfWork:
             effect_identity=effect_identity,
             state_engine=state_engine,
             external_actions=external_actions,
+            decision_model=decision_model,
+            decision_effort=decision_effort,
             idempotency_key=idempotency_key,
             request_fingerprint=request_fingerprint,
         )
@@ -1708,6 +1917,11 @@ class OperationsStorage:
                 "external_actions": "INTEGER NOT NULL DEFAULT 0",
                 "state_revision": "INTEGER NOT NULL DEFAULT 0",
                 "last_projected_revision": "INTEGER NOT NULL DEFAULT 0",
+                # The decision model this run was pinned to, if the operator chose
+                # one. Both nullable: a run that chose nothing uses the
+                # deployment's chain, and that is the overwhelming majority.
+                "decision_model": "TEXT",
+                "decision_effort": "TEXT",
             }
             # Kept as their own scripts because their CHECK lists are generated
             # from the onboarding vocabularies rather than typed out.
@@ -1721,6 +1935,7 @@ class OperationsStorage:
             connection.executescript(_RUN_PLANS_DDL)
             connection.executescript(_PROGRESS_EVENTS_DDL)
             connection.executescript(_DECISION_ATTEMPTS_DDL)
+            connection.executescript(_STEP_DECISIONS_DDL)
             for column_name, declaration in migration_columns.items():
                 if column_name not in existing_columns:
                     connection.execute(f"ALTER TABLE runs ADD COLUMN {column_name} {declaration}")
@@ -1788,6 +2003,10 @@ class OperationsStorage:
         effect_identity: str | None = None,
         state_engine: str = "legacy",
         external_actions: bool = False,
+        # The decision model this run is pinned to, already resolved against
+        # ``ops.core.model_catalog``. ``None`` means the deployment's own chain.
+        decision_model: str | None = None,
+        decision_effort: str | None = None,
         idempotency_key: str | None = None,
         request_fingerprint: str | None = None,
     ) -> dict[str, Any]:
@@ -1832,6 +2051,8 @@ class OperationsStorage:
                 effect_identity=effect_identity,
                 state_engine=state_engine,
                 external_actions=external_actions,
+                decision_model=decision_model,
+                decision_effort=decision_effort,
                 idempotency_key=idempotency_key,
                 request_fingerprint=request_fingerprint,
             )
@@ -1877,6 +2098,10 @@ class OperationsStorage:
         effect_identity: str | None = None,
         state_engine: str = "legacy",
         external_actions: bool = False,
+        # The decision model this run is pinned to, already resolved against
+        # ``ops.core.model_catalog``. ``None`` means the deployment's own chain.
+        decision_model: str | None = None,
+        decision_effort: str | None = None,
         idempotency_key: str | None = None,
         request_fingerprint: str | None = None,
     ) -> dict[str, Any]:
@@ -1923,6 +2148,8 @@ class OperationsStorage:
             _safe_text(effect_identity),
             _safe_text(state_engine),
             int(external_actions),
+            _safe_text(decision_model),
+            _safe_text(decision_effort),
             _safe_text(idempotency_key),
             _safe_text(request_fingerprint),
             now,
@@ -1942,9 +2169,10 @@ class OperationsStorage:
                 provider_session_id,
                 connection_request_id, attempt, phase, reason_code,
                 effect_identity, state_engine, external_actions,
+                decision_model, decision_effort,
                 idempotency_key, request_fingerprint,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             values,
         )
@@ -3199,6 +3427,106 @@ class OperationsStorage:
                 (_safe_text(run_id), _metric_row_limit(limit)),
             ).fetchall()
         return [dict(zip(_PROGRESS_EVENT_COLUMNS, row, strict=True)) for row in rows]
+
+    def record_step_decision(
+        self,
+        *,
+        run_id: str,
+        phase: str,
+        correlation_id: str,
+        step_index: int,
+        decision: str,
+        reason_code: str | None = None,
+        candidate_label: str | None = None,
+        action: str | None = None,
+        target_host: str | None = None,
+        reason: str | None = None,
+    ) -> int:
+        """Record what the loop decided on one iteration, and the model's stated why.
+
+        PRE:  ``decision`` is one of :data:`STEP_DECISION_VALUES` and ``action``, when
+              given, is a candidate action the policy generator can produce. The
+              ``(run_id, correlation_id, step_index)`` triple is the same one
+              :meth:`record_progress_event` writes, so the two rows join.
+        POST: exactly one row exists per call, and it holds no URL, no selector, and
+              no page markup. ``reason`` is quarantined by :func:`_decision_reason`
+              before it is stored; when that returns ``None`` for a non-empty input
+              the row is written with ``reason_text = NULL`` and
+              ``reason_withheld = 1``, which the console renders as *withheld*
+              rather than as *nothing was said*.
+
+        The write never fails on account of the reason text. A decision that cannot
+        be explained is still a decision that must be recorded — dropping the row
+        would hide the step itself in order to hide the prose, which is backwards.
+        """
+
+        self.initialize()
+        offered = isinstance(reason, str) and bool(reason.strip())
+        stored_reason = _decision_reason(reason)
+        values = (
+            _safe_text(run_id),
+            _audit_phase(phase),
+            _audit_identifier(correlation_id, field="correlation id", limit=64),
+            _telemetry_count(
+                step_index,
+                field="step index",
+                minimum=1,
+                maximum=MAX_PROGRESS_STEP_INDEX,
+            ),
+            _vocabulary_member(decision, vocabulary=STEP_DECISION_VALUES, field="step decision"),
+            None if reason_code is None else _audit_reason_code(reason_code),
+            _decision_label(candidate_label),
+            (
+                None
+                if action is None
+                else _vocabulary_member(
+                    action,
+                    vocabulary=CANDIDATE_ACTION_VALUES,
+                    field="candidate action",
+                )
+            ),
+            _decision_host(target_host),
+            stored_reason,
+            1 if offered and stored_reason is None else 0,
+            _utc_now(),
+        )
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO onboarding_step_decisions (
+                    run_id, phase, correlation_id, step_index, decision, reason_code,
+                    candidate_label, action, target_host, reason_text, reason_withheld,
+                    recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            decision_id = cursor.lastrowid
+            if decision_id is None:  # pragma: no cover - sqlite invariant
+                raise RuntimeError("step decision id was not generated")
+        return int(decision_id)
+
+    def list_step_decisions(
+        self,
+        run_id: str,
+        *,
+        limit: int = MAX_METRIC_ROWS,
+    ) -> list[dict[str, Any]]:
+        """The run's decisions, newest first, bounded by ``limit``.
+
+        Same order as :meth:`list_progress_events` so the two windows line up when
+        the API zips them on ``(correlation_id, step_index)``.
+        """
+
+        self.initialize()
+        columns = ", ".join(_STEP_DECISION_COLUMNS)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT {columns} FROM onboarding_step_decisions "
+                "WHERE run_id = ? ORDER BY id DESC LIMIT ?",
+                (_safe_text(run_id), _metric_row_limit(limit)),
+            ).fetchall()
+        return [dict(zip(_STEP_DECISION_COLUMNS, row, strict=True)) for row in rows]
 
     def record_decision_attempt(
         self,

@@ -8,11 +8,11 @@ import re
 import stat
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Final, Literal, Protocol, TypeVar, cast
+from typing import Any, Final, Literal, Protocol, TypeVar, cast
 
 import httpx
 from fastapi.exceptions import RequestValidationError
@@ -43,6 +43,8 @@ from api.models import (
     HitlRequestView,
     LiveViewResponse,
     ManagedConnectionResponse,
+    ModelCatalogResponse,
+    ModelOptionView,
     OnboardingControlsView,
     OnboardingStateView,
     PauseResponse,
@@ -55,6 +57,8 @@ from api.models import (
     RetryStepRequest,
     RetryStepResponse,
     RouteDecisionView,
+    RunCitationView,
+    RunDecisionView,
     RunDetailResponse,
     RunListResponse,
     RunOutputResponse,
@@ -71,6 +75,12 @@ from ops.browser.metrics import autonomy_outcome_view
 from ops.browser.readiness import browser_configuration_state
 from ops.browser.service_client import BrowserServiceClient, BrowserServiceHealth
 from ops.core.config import Settings, load_settings
+from ops.core.model_catalog import (
+    ModelSelection,
+    available_models,
+    default_effort_for,
+    resolve_selection,
+)
 from ops.core.models import AccountMode, CompanyProfile, OperationalResearch, OperationsRequest
 from ops.core.state import RUN_STATUSES, BrowserProvider, RunStatus
 from ops.deploy.acceptance import deployment_is_accepted
@@ -128,6 +138,22 @@ class AppNotFoundError(LookupError):
         super().__init__("app was not found")
 
 
+class InvalidRequestError(ValueError):
+    """A request field that only the deployment's own configuration can judge.
+
+    Pydantic checks a field's shape; some fields are only valid against settings
+    the model has no access to — a decision model id is real only if THIS
+    deployment holds that provider's key. Raising this carries such a rejection
+    back to the same 422 shape a shape failure produces, so a client sees one
+    contract for "that field is not acceptable" rather than a 500 for the half
+    of the check that happens later.
+    """
+
+    def __init__(self, *fields: str) -> None:
+        self.fields = tuple(fields)
+        super().__init__("request validation failed")
+
+
 @dataclass(frozen=True, slots=True)
 class _CachedGmailSignupPreflight:
     result: GmailSignupPreflight
@@ -182,6 +208,8 @@ class RunService(Protocol):
     ) -> RunDetailResponse: ...
 
     async def list_runs(self, *, limit: int, offset: int) -> RunListResponse: ...
+
+    async def get_model_catalog(self) -> ModelCatalogResponse: ...
 
     async def get_run(self, run_id: str) -> RunDetailResponse: ...
 
@@ -1905,12 +1933,14 @@ class LocalRunService:
         idempotency_key: str | None,
         execution_mode: Literal["plan_only", "execute_when_configured"],
         browser_login: Mapping[str, SecretStr] | None = None,
+        selection: ModelSelection | None = None,
     ) -> RunDetailResponse:
         record = self._service.create_run(
             operation,
             idempotency_key=idempotency_key,
             execution_mode=execution_mode,
             browser_login=browser_login,
+            selection=selection,
         )
         return self._detail(self._summary(record))
 
@@ -1945,7 +1975,89 @@ class LocalRunService:
             )
             for event in self._service.get_progress_events(run_id, limit=window)
         ]
-        return TimelineResponse(run_id=run_id, items=items, progress=progress)
+        decisions = [
+            RunDecisionView(
+                step_index=decision["step_index"],
+                onboarding_phase=decision["phase"],
+                decision=decision["decision"],
+                reason_code=decision["reason_code"],
+                candidate_label=decision["candidate_label"],
+                action=decision["action"],
+                target_host=decision["target_host"],
+                reason=decision["reason_text"],
+                reason_withheld=bool(decision["reason_withheld"]),
+                recorded_at=decision["recorded_at"],
+            )
+            for decision in self._service.get_step_decisions(run_id, limit=window)
+        ]
+        return TimelineResponse(
+            run_id=run_id,
+            items=items,
+            progress=progress,
+            decisions=decisions,
+            citations=self._citations(run_id, record, raw_events),
+            decision_model=record.get("decision_model") or None,
+            decision_effort=record.get("decision_effort") or None,
+        )
+
+    def _citations(
+        self,
+        run_id: str,
+        record: Mapping[str, Any],
+        raw_events: Sequence[Mapping[str, Any]],
+    ) -> list[RunCitationView]:
+        """Every source this run already earned, deduplicated, in a stable order.
+
+        Three origins, all of them already fetched and host-policy validated:
+        the research's operational URL claims (each of which names the page it
+        was read on), the evidence pages the research read, and the signup
+        agent's own audit events whose payload detail is a URL.
+
+        Nothing is fetched here and no URL is constructed. A value that does not
+        survive :class:`RunCitationView`'s own HTTPS validator is dropped rather
+        than repaired: a citation that needed fixing is not a citation.
+        """
+
+        del run_id
+        seen: set[tuple[str, str]] = set()
+        citations: list[RunCitationView] = []
+
+        def add(kind: str, url: object, source_url: object = None) -> None:
+            if not isinstance(url, str) or not url:
+                return
+            key = (kind, url)
+            if key in seen:
+                return
+            try:
+                citation = RunCitationView(
+                    kind=kind,
+                    url=url,
+                    source_url=source_url if isinstance(source_url, str) and source_url else None,
+                )
+            except ValidationError:
+                return
+            seen.add(key)
+            citations.append(citation)
+
+        research = record.get("operational_research")
+        if isinstance(research, Mapping):
+            for claim in research.get("operational_url_claims") or ():
+                if isinstance(claim, Mapping):
+                    add(
+                        str(claim.get("field") or "claim"),
+                        claim.get("url"),
+                        claim.get("source_url"),
+                    )
+            for url in research.get("evidence_urls") or ():
+                add("evidence", url)
+        for event in raw_events:
+            event_type = str(event.get("event_type") or "")
+            if not event_type.startswith("onboarding_signup_"):
+                continue
+            payload = event.get("payload")
+            if isinstance(payload, Mapping):
+                add(event_type.removeprefix("onboarding_"), payload.get("detail"))
+        return citations
 
     @staticmethod
     def _timeline_event(projected: ProjectedTimelineEvent) -> TimelineEvent:
@@ -2119,6 +2231,38 @@ class LocalRunService:
             ),
         )
 
+    async def get_model_catalog(self) -> ModelCatalogResponse:
+        """What this deployment can be asked to think with.
+
+        Derived from settings on every call rather than cached: a key added to
+        the environment and a restart is how a provider appears, and a cached
+        catalog would keep denying a model the chain would now happily build.
+        Reads no database and performs no provider I/O.
+        """
+
+        options = available_models(self._settings)
+        default = next((option for option in options if option.is_default), None)
+        return ModelCatalogResponse(
+            models=[
+                ModelOptionView(
+                    id=option.id,
+                    provider=option.provider,
+                    model=option.model,
+                    label=option.label,
+                    description=option.description,
+                    supports_effort=option.supports_effort,
+                    effort_values=list(option.effort_values),
+                    is_default=option.is_default,
+                )
+                for option in options
+            ],
+            default_model_id=None if default is None else default.id,
+            default_effort=(
+                None if default is None else (default_effort_for(self._settings, default.provider))
+            )
+            or None,
+        )
+
     async def create_run(
         self,
         request: CreateRunRequest,
@@ -2134,6 +2278,18 @@ class LocalRunService:
             # unknown display name at the API boundary instead of letting a
             # KeyError escape as a misleading 500 after the operator submits.
             raise AppNotFoundError("unknown")
+        # Resolve the pinned decision model BEFORE anything durable happens. An id
+        # this deployment cannot serve is refused rather than quietly replaced:
+        # a run record naming a model that never ran would be a lie told to the
+        # operator on every subsequent page load.
+        try:
+            selection = resolve_selection(
+                self._settings,
+                model_id=request.decision_model,
+                effort=request.decision_effort,
+            )
+        except ValueError:
+            raise InvalidRequestError("body.decision_model") from None
         work_email_ref = request.company.work_email_ref or _work_email_ref_for_app(request.app_name)
         company = CompanyProfile(
             legal_name=request.company.legal_name,
@@ -2179,6 +2335,7 @@ class LocalRunService:
             idempotency_key,
             request.execution_mode,
             browser_login,
+            selection,
         )
         for step, step_detail in research_steps:
             self._service.storage.append_audit_event(

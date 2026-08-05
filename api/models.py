@@ -17,6 +17,7 @@ from pydantic import (
 )
 
 from ops.browser.setup_values import normalize_provider_setup_fields
+from ops.core.model_catalog import EFFORT_VALUES
 from ops.core.models import AccountMode, OperationalResearch
 from ops.core.state import AccessRoute, BrowserProvider, CredentialCreationPolicy, RunStatus
 from ops.onboarding.action_loop import LoopStage
@@ -293,6 +294,39 @@ class CreateRunRequest(StrictApiModel):
     # Optional operator hint for provider research. A bounded HTTPS URL, never a
     # search phrase, so a hint cannot smuggle prose into the research prompt.
     provider_hint_url: BoundedHttpUrl | None = None
+    # The decision model this run is pinned to, as a catalog id from
+    # ``GET /ops/models`` (``"<provider>:<model>"``), and the reasoning effort it
+    # runs at. Shape is checked here; whether the id names a provider THIS
+    # deployment has a key for is checked at the route, where the settings the
+    # catalog is derived from are in hand. Both absent is the ordinary case and
+    # means "use the deployment's chain unchanged".
+    decision_model: str | None = Field(default=None, max_length=120)
+    decision_effort: str | None = Field(default=None, max_length=20)
+
+    @field_validator("decision_model")
+    @classmethod
+    def decision_model_is_catalog_shaped(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        candidate = value.strip()
+        if not candidate:
+            return None
+        provider, separator, model = candidate.partition(":")
+        if not separator or not provider or not model:
+            raise ValueError("decision_model must be '<provider>:<model>'")
+        return candidate
+
+    @field_validator("decision_effort")
+    @classmethod
+    def decision_effort_is_known(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        candidate = value.strip()
+        if not candidate:
+            return None
+        if candidate not in EFFORT_VALUES:
+            raise ValueError("decision_effort is not a recognized reasoning effort")
+        return candidate
 
     @field_validator("provider_setup")
     @classmethod
@@ -320,6 +354,10 @@ class CreateRunRequest(StrictApiModel):
             )
         if self.account_mode == "create_account" and self.browser_login is not None:
             raise ValueError("browser_login is only accepted when account_mode='existing_account'")
+        if self.decision_effort is not None and self.decision_model is None:
+            # An effort names a dial on a specific model. Accepting one with no
+            # model would record a preference on the run that nothing applied.
+            raise ValueError("decision_effort requires decision_model")
         return self
 
 
@@ -779,12 +817,72 @@ class RunProgressEventView(StrictApiModel):
     recorded_at: IsoTimestamp
 
 
+class RunDecisionView(StrictApiModel):
+    """What the agent chose on one loop iteration, and what it said about it.
+
+    Joins to :class:`RunProgressEventView` on ``step_index`` within a phase —
+    one-to-one, because the loop writes exactly one progress row per iteration.
+
+    ``reason`` is MODEL-AUTHORED PROSE read off a live third-party page. It was
+    length-capped, control-character-stripped and secret-screened before it was
+    stored, and it must be rendered inert: never as markdown, never linkified,
+    and never allowed to drive a control, a URL, or an enabled state.
+    ``reason_withheld`` is true when the screen refused the text — the honest
+    answer is "withheld", not a blank line.
+    """
+
+    step_index: int = Field(ge=1, le=100_000)
+    onboarding_phase: OnboardingPhase
+    decision: Literal["select_candidate", "report_hitl", "report_blocked", "rejected"]
+    reason_code: str | None = Field(default=None, max_length=120)
+    # The chosen control's sanitized accessible name — never a selector.
+    candidate_label: str | None = Field(default=None, max_length=120)
+    action: str | None = Field(default=None, max_length=40)
+    # Host only. A full URL with a query is never projected here.
+    target_host: str | None = Field(default=None, max_length=253)
+    reason: str | None = Field(default=None, max_length=400)
+    reason_withheld: bool = False
+    recorded_at: IsoTimestamp
+
+
+class RunCitationView(StrictApiModel):
+    """One source this run's conclusions rest on.
+
+    Assembled ENTIRELY from URLs that were already fetched and host-policy
+    validated during research or signup. Nothing here is fetched to build the
+    timeline and no new host is ever introduced: a citation the run did not
+    already earn does not appear.
+    """
+
+    # Which claim this source backs: an operational URL field, "evidence" for a
+    # page the research read, or the signup step that recorded it.
+    kind: str = Field(max_length=60)
+    url: BoundedHttpUrl
+    # The page the claim was read ON, when the claim names one.
+    source_url: BoundedHttpUrl | None = None
+
+    @field_validator("url", "source_url")
+    @classmethod
+    def citation_is_https(cls, value: str | None) -> str | None:
+        return _validate_http_url(value) if value is not None else None
+
+
 class TimelineResponse(StrictApiModel):
     run_id: str
     items: list[TimelineEvent]
     # Newest first, capped by ``onboarding_progress_window``. A separate field
     # rather than rows in ``items``, which keeps ``event_id`` uniqueness intact.
     progress: list[RunProgressEventView] = []
+    # The agent's own chain of thought, and the sources under it. Both are
+    # additive and default empty, so a legacy run and an older client keep
+    # exactly the response they had.
+    decisions: list[RunDecisionView] = []
+    citations: list[RunCitationView] = []
+    # What decided, when the run pinned a model. Absent means the deployment's
+    # own chain — the honest answer, rather than naming a default that may have
+    # changed since the run started.
+    decision_model: str | None = Field(default=None, max_length=120)
+    decision_effort: str | None = Field(default=None, max_length=20)
 
 
 class LiveViewResponse(StrictApiModel):
@@ -1168,6 +1266,37 @@ class AppResearchResponse(StrictApiModel):
     signup_source: Literal["reviewed", "runtime_research", "unavailable"] = "unavailable"
     # The page a reviewed URL was found on, when one is recorded.
     signup_evidence_url: str | None = None
+
+
+class ModelOptionView(StrictApiModel):
+    """One decision model this deployment can actually run a run on.
+
+    Mirrors :class:`ops.core.model_catalog.ModelOption` field for field. Only
+    configured providers ever reach this view, so an option the operator can see
+    is one the chain would build.
+    """
+
+    id: str
+    provider: str
+    model: str
+    label: str
+    description: str
+    supports_effort: bool
+    effort_values: list[str]
+    is_default: bool
+
+
+class ModelCatalogResponse(StrictApiModel):
+    """The picker's whole world.
+
+    ``models`` is empty when no provider key is set — the same condition under
+    which a run cannot make a model decision at all. The UI says so rather than
+    rendering an empty dropdown.
+    """
+
+    models: list[ModelOptionView]
+    default_model_id: str | None = None
+    default_effort: str | None = None
 
 
 class InvalidRequestResponse(StrictApiModel):

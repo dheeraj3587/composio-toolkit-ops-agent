@@ -87,6 +87,14 @@ class CreateSessionRequest(_Strict):
     # checking first. Empty means no run allow-list: the reviewed recipe policy in
     # the worker stays the only boundary.
     allowed_host_patterns: tuple[str, ...] = Field(default=(), max_length=MAX_ALLOWED_HOST_PATTERNS)
+    # The decision model this run was pinned to, as a catalog id
+    # ("<provider>:<model>"), and the reasoning effort it asked for. Advisory:
+    # the service resolves them against its OWN keys and silently keeps its
+    # deployment chain for a model it cannot serve, because a preference must
+    # never be able to fail a run. Bounded and pattern-checked so an unusable
+    # value is refused here rather than reaching the chain builder.
+    decision_model: str | None = Field(default=None, max_length=120, pattern=r"^[A-Za-z0-9_.:/-]*$")
+    decision_effort: str | None = Field(default=None, max_length=20, pattern=r"^[a-z]*$")
 
     @model_validator(mode="after")
     def _storage_state_requires_account_binding(self) -> CreateSessionRequest:

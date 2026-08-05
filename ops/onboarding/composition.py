@@ -44,6 +44,7 @@ import httpx
 
 from ops.core.config import Settings
 from ops.core.inference import DecisionOutcome, JsonInference, build_json_inference
+from ops.core.model_catalog import ModelSelection
 from ops.core.redaction import install_redacting_filter
 from ops.core.secret_store import SQLiteSecretStore
 from ops.core.storage import OperationsStorage
@@ -56,6 +57,7 @@ from ops.onboarding.action_loop import (
     LoopTelemetry,
     PhaseGoal,
     StepDeadlines,
+    StepDecision,
 )
 from ops.onboarding.credentials import (
     CredentialValidatorPort,
@@ -212,6 +214,32 @@ class RunDenialTelemetry:
         if durable is None:
             return
         durable.progress(step_index=step_index, stage=stage, elapsed_ms=elapsed_ms)
+
+    def decision(
+        self,
+        *,
+        step_index: int,
+        decision: StepDecision,
+        reason_code: OnboardingReasonCode | None = None,
+        candidate_label: str | None = None,
+        action: str | None = None,
+        target_host: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Record one iteration's decision against the run's phase."""
+
+        durable = self._durable()
+        if durable is None:
+            return
+        durable.decision(
+            step_index=step_index,
+            decision=decision,
+            reason_code=reason_code,
+            candidate_label=candidate_label,
+            action=action,
+            target_host=target_host,
+            reason=reason,
+        )
 
     def record_attempt(self, *, provider: str, outcome: DecisionOutcome, latency_ms: int) -> None:
         """Record one inference attempt against the run's phase (R4.3)."""
@@ -466,6 +494,7 @@ class OnboardingPorts:
         logins: LoginReferenceBinder | None = None,
         verification_binding: VerificationBinding | None = None,
         telemetry: LoopTelemetry | None = None,
+        selection: ModelSelection | None = None,
     ) -> OnboardingDeps:
         """Compose the driver's dependencies for one run.
 
@@ -482,6 +511,11 @@ class OnboardingPorts:
         The decider is required: a run driven with no inference backend would reach
         the first loop phase and exhaust its model-call budget, which reports a
         bound as though it had been spent. Refusing here says the true thing.
+
+        ``selection`` is the run's own pinned decision model. It is why the decider
+        is built here rather than shared: this root is constructed once per
+        deployment, but the chain order belongs to the run. With no selection the
+        deployment's chain is used unchanged, which is the ordinary case.
         """
 
         if self.decider is None:
@@ -500,7 +534,14 @@ class OnboardingPorts:
             and isinstance(sink, RunDenialTelemetry)
             and self.inference is not None
         ):
-            decider = InferenceCandidateDecider(self.inference.with_attempts(sink))
+            chain = self.inference
+            if selection is not None:
+                # A selection that no longer builds — a key rotated out since the
+                # run was accepted — leaves the deployment chain in place rather
+                # than failing the run over a preference.
+                pinned = build_json_inference(self.settings, selection=selection)
+                chain = pinned if pinned is not None else chain
+            decider = InferenceCandidateDecider(chain.with_attempts(sink))
         return OnboardingDeps(
             leases=self.leases,
             phases=self.phases,

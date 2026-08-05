@@ -24,6 +24,7 @@ from pydantic import SecretStr
 from ops.browser.worker import BrowserWorker
 from ops.core.config import Settings
 from ops.core.effect_ledger import SQLiteEffectStore
+from ops.core.model_catalog import ModelSelection
 from ops.core.models import (
     CapabilityAvailability,
     CompanyProfile,
@@ -1505,6 +1506,7 @@ class RunService:
         idempotency_key: str | None = None,
         execution_mode: Literal["plan_only", "execute_when_configured"] = "plan_only",
         browser_login: Mapping[str, SecretStr] | None = None,
+        selection: ModelSelection | None = None,
     ) -> dict[str, Any]:
         """Create and route one run without invoking an external provider.
 
@@ -1523,6 +1525,7 @@ class RunService:
                 idempotency_key=idempotency_key,
                 execution_mode=execution_mode,
                 browser_login=browser_login,
+                selection=selection,
             )
         if execution_mode == "execute_when_configured":
             raise CredentialSubmissionError("reviewed_recipe_required")
@@ -1533,6 +1536,7 @@ class RunService:
             idempotency_key=idempotency_key,
             execution_mode="plan_only",
             browser_login=None,
+            selection=selection,
         )
 
     def _spawn_async_browser(
@@ -1740,6 +1744,9 @@ class RunService:
 
     def get_progress_events(self, run_id: str, *, limit: int) -> list[dict[str, Any]]:
         return self._queries.get_progress_events(run_id, limit=limit)
+
+    def get_step_decisions(self, run_id: str, *, limit: int) -> list[dict[str, Any]]:
+        return self._queries.get_step_decisions(run_id, limit=limit)
 
     def get_research(self, run_id: str) -> OperationalResearch | None:
         """Return the persisted sanitized research projection for a run."""
