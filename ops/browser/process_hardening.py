@@ -76,7 +76,11 @@ def chromium_launch_environment(display: str | None, *, headless: bool) -> dict[
     """Return the strict environment supplied to every Chromium launch."""
 
     launch_env = _allowlisted_environment(_PROCESS_ENV_ALLOWLIST)
-    target_display = display or os.environ.get("DISPLAY")
+    # A leased display always wins. A headed worker with no lease may fall back to
+    # the process display for local development; a headless launch renders nothing,
+    # so it is never given one. Inheriting it there would let a missing lease
+    # silently draw on whatever display the parent held instead of failing closed.
+    target_display = display or (None if headless else os.environ.get("DISPLAY"))
     if target_display:
         launch_env["DISPLAY"] = target_display
 
