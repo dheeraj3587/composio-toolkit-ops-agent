@@ -17,6 +17,8 @@ addopts = "-ra"
 asyncio_mode = "auto"
 pythonpath = ["."]
 testpaths = ["tests"]
+timeout = 60
+timeout_method = "signal"
 markers = [
     "live: opt-in test that may call a configured external provider or perform a controlled side effect",
     "browser: real-Chromium integration test against the local test app (must not skip when REQUIRE_REAL_BROWSER_TESTS=1)",
