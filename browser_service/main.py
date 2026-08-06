@@ -65,6 +65,7 @@ from ops.browser.host_policy import (
     navigation_target_urls,
 )
 from ops.browser.process_hardening import harden_browser_service_process
+from ops.core.logging_setup import configure_logging
 from ops.core.redaction import install_redacting_filter
 from ops.providers.errors import ProviderOperationError
 
@@ -139,6 +140,11 @@ def install_browser_service_log_filters() -> None:
     after-Uvicorn-configuration enforcement point.
     """
 
+    # The browser worker runs the action loop, which is where a run most often
+    # dies, and it had no sink at all: no env_file, no handler, root at the
+    # stdlib default. Attach the redaction-covered stdout handler first so the
+    # records below have somewhere to go.
+    configure_logging()
     for logger in (
         logging.getLogger(),
         LOGGER,

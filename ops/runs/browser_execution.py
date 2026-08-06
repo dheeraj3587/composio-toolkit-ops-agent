@@ -24,6 +24,7 @@ from typing import Any, Protocol, cast
 from ops.browser.link_log import log_event
 from ops.browser.provider import BrowserProvider as BrowserWorker
 from ops.browser.worker import BrowserSessionContext
+from ops.core.logging_setup import run_context
 from ops.core.models import OperationalResearch, OperationsRequest
 from ops.core.secret_store import SQLiteSecretStore
 from ops.core.state import BrowserProvider, RunStatus, validate_status_transition
@@ -105,8 +106,25 @@ class RunBrowserExecutionService:
         is a no-op and the bounded onboarding task runs against the live session.
         When the task pauses (HITL) or finishes, the terminal state is applied to
         the run so the frontend transitions from browser_running.
+
+        The run id is bound for the whole thread. A ContextVar set by the caller
+        does NOT reach a ``threading.Thread`` target -- a new thread starts from an
+        empty context -- so the binding has to happen here, at the top of the
+        thread, or every line this path logs would be uncorrelated.
         """
 
+        with run_context(run_id):
+            self._run_async_browser(run_id, thread_id, request, research, context, sensitive_data)
+
+    def _run_async_browser(
+        self,
+        run_id: str,
+        thread_id: str,
+        request: OperationsRequest,
+        research: OperationalResearch,
+        context: Any,
+        sensitive_data: dict[str, str] | None,
+    ) -> None:
         workflow = self._context._workflow
         if workflow is None:  # pragma: no cover - guarded by caller
             return
@@ -135,7 +153,11 @@ class RunBrowserExecutionService:
                 thread_id=thread_id,
                 error=type(exc).__name__,
             )
-            self.mark_async_browser_failed(run_id)
+            self.mark_async_browser_failed(
+                run_id,
+                reason="browser_workflow_error",
+                detail=type(exc).__name__,
+            )
             # The run is terminal, so its pre-created session must not keep the
             # single Playwright slot until the idle sweep.
             self.release_browser_session(
@@ -510,8 +532,22 @@ class RunBrowserExecutionService:
             capability_scope=run_id,
         )
 
-    def mark_async_browser_failed(self, run_id: str) -> None:
-        """Best-effort transition of a stuck browser_running run to failed."""
+    def mark_async_browser_failed(
+        self,
+        run_id: str,
+        *,
+        reason: str = "browser_async_failed",
+        detail: str | None = None,
+    ) -> None:
+        """Best-effort transition of a stuck browser_running run to failed.
+
+        ``reason`` and ``detail`` are what make the resulting timeline entry
+        readable. Every other terminal transition in this file writes a
+        ``reason_code``; this one did not, so a run that died here left an audit
+        trail whose last event said only ``{"status": "failed"}`` and the operator
+        had nothing to act on. ``detail`` carries the exception type only -- never
+        its message, which in the browser paths can quote page content.
+        """
 
         try:
             lock = self._context._run_lock(run_id)
@@ -532,13 +568,29 @@ class RunBrowserExecutionService:
                         last_projected_revision=revision,
                         external_actions=True,
                     )
+                    payload: dict[str, object] = {
+                        "status": "failed",
+                        "external_actions": True,
+                        "reason_code": reason,
+                    }
+                    if detail is not None:
+                        payload["error"] = detail
                     transaction.append_audit_event(
                         run_id=run_id,
                         event_type="browser_failed",
-                        payload={"status": "failed", "external_actions": True},
+                        payload=payload,
                     )
-        except Exception:  # pragma: no cover - defensive
-            pass
+        except Exception as exc:  # pragma: no cover - defensive
+            # Swallowing this silently is how a run ends up stuck in
+            # browser_running with no explanation anywhere. The transition is
+            # still best-effort, but the fact that it failed is now on the record.
+            log_event(
+                "browser.async.mark_failed_error",
+                level=40,
+                run_id=run_id,
+                reason=reason,
+                error=type(exc).__name__,
+            )
 
 
 __all__ = [

@@ -259,6 +259,13 @@ services:
       BROWSER_SECRET_BROKER_URL: http://api:8000  # pragma: allowlist secret
       BROWSER_SECRET_BROKER_TOKEN: ${BROWSER_SECRET_BROKER_TOKEN:?BROWSER_SECRET_BROKER_TOKEN is required}
       BROWSER_SECRET_BROKER_TIMEOUT_SECONDS: ${BROWSER_SECRET_BROKER_TIMEOUT_SECONDS:-10}
+      # This service has no env_file, so without this line the operator has no way
+      # to turn the action loop's verbosity up while a run is failing. INFO is the
+      # level the code is written for; DEBUG additionally requires
+      # OPS_ALLOW_DEBUG_LOGGING=true, because debug records here can carry rendered
+      # page text.
+      OPS_LOG_LEVEL: ${OPS_LOG_LEVEL:-INFO}
+      OPS_ALLOW_DEBUG_LOGGING: ${OPS_ALLOW_DEBUG_LOGGING:-false}
       PYTHONPATH: /app
     volumes:
       - browser_profiles:/browser-data

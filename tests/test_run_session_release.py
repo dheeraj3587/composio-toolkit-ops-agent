@@ -113,7 +113,12 @@ def test_release_never_stops_a_browser_use_session() -> None:
 
 # --- the terminal paths must actually call the release ------------------------
 def test_async_workflow_and_apply_errors_release_the_session() -> None:
-    source = inspect.getsource(RunBrowserExecutionService.run_async_browser)
+    # ``run_async_browser`` is now the run-id binding wrapper; the terminal paths
+    # this guards live in the body it delegates to. Both are read so the guard
+    # cannot be satisfied by a wrapper that stopped calling its body.
+    wrapper = inspect.getsource(RunBrowserExecutionService.run_async_browser)
+    source = inspect.getsource(RunBrowserExecutionService._run_async_browser)
+    assert "_run_async_browser" in wrapper
     # Matches both the collaborator's own release_browser_session and a
     # _release_browser_session call made back through the service.
     assert source.count("release_browser_session") >= 2

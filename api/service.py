@@ -303,6 +303,22 @@ _LEGACY_EVENT_SUMMARIES: Final[dict[str, str]] = {
     "completed": "Run completed.",
 }
 
+# Terminal and near-terminal events that the allow-list did not name, so every
+# one of them projected as the generic "Run state updated." — including the
+# ``browser_failed`` row that is the LAST event on a run that died in the browser.
+# An operator reading the timeline of a failed run saw the run stop with no
+# statement that it had failed at all. These are static strings like every other
+# summary here: the durable payload's ``reason_code`` is not read to build them.
+_FAILURE_EVENT_SUMMARIES: Final[dict[str, str]] = {
+    "browser_failed": "The browser run ended in failure.",
+    "browser_outcome_recorded": "Browser navigation outcome recorded.",
+    "provider_operation_failed": "A provider call failed.",
+    "managed_connection_failed": "Managed connection setup failed.",
+    "managed_connection_poll_failed": "Managed connection status could not be read.",
+    "outreach_send_failed": "Provider outreach could not be sent.",
+    "run_reconciled_on_startup": "Run reconciled after a service restart.",
+}
+
 # The 14 onboarding progress events of Requirement 17.2, with the LL-7 summaries.
 # Every summary is a STATIC constant: it is looked up by event type and is never
 # derived from a durable payload, so a run cannot author timeline text.
@@ -401,6 +417,7 @@ _ONBOARDING_SIGNUP_RESEARCH_SUMMARIES: Final[dict[str, str]] = {
 
 _EVENT_SUMMARIES: Final[dict[str, str]] = {
     **_LEGACY_EVENT_SUMMARIES,
+    **_FAILURE_EVENT_SUMMARIES,
     **_ONBOARDING_SIGNUP_RESEARCH_SUMMARIES,
     **_ONBOARDING_PROGRESS_SUMMARIES,
     **_ONBOARDING_EXCEPTION_SUMMARIES,

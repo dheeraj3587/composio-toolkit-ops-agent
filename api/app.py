@@ -66,6 +66,7 @@ from api.service import (
     RunNotFoundError,
     RunService,
 )
+from ops.core.logging_setup import configure_logging
 from ops.core.redaction import install_redacting_filter
 from ops.providers.errors import ConfigurationRequiredError
 from ops.runs.errors import ProviderReadinessError
@@ -310,6 +311,15 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         active_service = service or LocalRunService(db_path)
+        # Give the application a sink before anything else. Until this call
+        # there is no handler on the root logger and its level is the stdlib
+        # default, so every LOGGER.info below and throughout ops/ is discarded
+        # unformatted -- which is why production had four log lines and no way
+        # to see why a run failed. The handler carries its own redacting filter,
+        # which is what actually covers the composio_ops.* loggers: the loop
+        # below attaches filters to loggers, and a logger's filters are not
+        # consulted for records that reach a handler by propagation.
+        configure_logging()
         # Uvicorn installs its handlers before entering application lifespan.
         # Attach the general redactor now so access/error output receives the
         # same provider-key and credential filtering as application logs.

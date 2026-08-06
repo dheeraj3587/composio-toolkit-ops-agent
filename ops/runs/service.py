@@ -1628,10 +1628,16 @@ class RunService:
 
         return self._browser_execution.session_context_for(run_id)
 
-    def _mark_async_browser_failed(self, run_id: str) -> None:
+    def _mark_async_browser_failed(
+        self,
+        run_id: str,
+        *,
+        reason: str = "browser_async_failed",
+        detail: str | None = None,
+    ) -> None:
         """Best-effort transition of a stuck browser_running run to failed."""
 
-        self._browser_execution.mark_async_browser_failed(run_id)
+        self._browser_execution.mark_async_browser_failed(run_id, reason=reason, detail=detail)
 
     def _run_enrichment_probe(
         self,

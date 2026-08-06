@@ -35,6 +35,7 @@ from ops.browser.worker import (
     BrowserSessionContext,
     HumanActionType,
 )
+from ops.core.logging_setup import run_context
 from ops.core.model_catalog import ModelSelection
 from ops.core.models import OperationalResearch, OperationsRequest
 from ops.core.secret_store import AccountLoginStateError, SQLiteSecretStore, parse_vault_reference
@@ -1627,6 +1628,36 @@ class CanonicalRuntime:
         )
 
     def _drive_browser(
+        self,
+        *,
+        run_id: str,
+        context: BrowserSessionContext,
+        request: OperationsRequest,
+        research: OperationalResearch,
+        recipe: AppRecipe,
+        sensitive: dict[str, str] | None,
+        transient_secrets: bool,
+    ) -> None:
+        """Bind the run id for the thread, then drive it.
+
+        A thread target starts from an empty context, so a ContextVar the caller
+        set never arrives here. Binding at the top of the target is what makes
+        every log line this run emits -- across the whole navigate -- carry the
+        run id an operator greps for.
+        """
+
+        with run_context(run_id):
+            self._drive_browser_bound(
+                run_id=run_id,
+                context=context,
+                request=request,
+                research=research,
+                recipe=recipe,
+                sensitive=sensitive,
+                transient_secrets=transient_secrets,
+            )
+
+    def _drive_browser_bound(
         self,
         *,
         run_id: str,
