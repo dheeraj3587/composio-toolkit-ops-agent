@@ -44,10 +44,17 @@ from pydantic import SecretStr
 EFFORT_VALUES: Final[tuple[str, ...]] = ("instant", "low", "medium", "high")
 _GPT_OSS_EFFORTS: Final[tuple[str, ...]] = ("low", "medium", "high")
 
-# The default the loop wants when the operator expresses no preference: it is
-# choosing between eight candidates on a page it can already see, so latency
-# bounds the run far more than deliberation does.
-DEFAULT_EFFORT: Final = "low"
+# What a provider with a dial runs at when the operator expresses no preference.
+#
+# ``high`` is the top of ``EFFORT_VALUES`` and of ``_GPT_OSS_EFFORTS`` alike, so
+# this is the maximum every dialled provider here accepts — there is no level
+# above it to ask for. It used to be ``low``, on the argument that the loop is
+# choosing between a handful of candidates on a page it can already see. The
+# pages that actually end runs are the ambiguous ones, where a misread costs the
+# whole run and deliberation costs seconds, so the default now favours the
+# reading over the latency. ``ops.core.config.Settings.mercury_reasoning_effort``
+# is set to match, and MERCURY_REASONING_EFFORT still overrides it per deployment.
+DEFAULT_EFFORT: Final = "high"
 
 
 @dataclass(frozen=True, slots=True)

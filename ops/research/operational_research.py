@@ -11,7 +11,7 @@ import socket
 from collections.abc import Callable, Mapping, Sequence
 from datetime import timedelta
 from html.parser import HTMLParser
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
@@ -428,28 +428,46 @@ class PerplexitySearchDiscovery:
         return tuple(urls)
 
 
-class GeminiStructuredExtractor:
-    """Gemini structured-output adapter (google-genai>=2.12, ``google.genai``).
+class StructuredExtractor:
+    """Turns an evidence pack into an :class:`OperationalResearch` record.
 
-    Uses the current public async client
+    Gemini first, when a key is configured: the current public async client
     (``client.aio.models.generate_content``) with a strict JSON schema and a
-    pinned production model. The returned JSON is validated by Pydantic, and the
-    enricher separately rejects any evidence/scope URL outside the fetched pack,
-    so the model cannot inject fabricated URLs, scopes, or identities.
+    pinned production model. Then ``fallback`` — the deployment's ordinary
+    inference chain, which leads with Mercury — over a compacted copy of the same
+    evidence.
+
+    Either source may be absent. With no Gemini key the Gemini loop is skipped
+    entirely and the chain does the extraction, which is what lets a
+    Mercury-only deployment research at all; with no ``fallback`` a Gemini outage
+    is terminal, as it always was. Both absent is a construction error, because
+    nothing would be left to ask.
+
+    This class was called ``GeminiStructuredExtractor`` while Gemini was the only
+    thing it could use. The returned JSON is validated by Pydantic whichever
+    source produced it, and the enricher separately rejects any evidence/scope URL
+    outside the fetched pack, so no model here can inject a fabricated URL, scope,
+    or identity.
     """
 
     def __init__(
         self,
-        api_key: SecretStr | str,
+        api_key: SecretStr | str | None,
         *,
         model: str | Sequence[str] = "gemini-3.6-flash",
         fallback: JsonInference | None = None,
     ) -> None:
-        self._api_key = api_key if isinstance(api_key, SecretStr) else SecretStr(api_key)
-        models = (model,) if isinstance(model, str) else tuple(model)
-        self._models = tuple(dict.fromkeys(name for name in models if name))
-        if not self._models:
-            raise ValueError("at least one Gemini model id is required")
+        if api_key is None:
+            self._api_key: SecretStr | None = None
+            self._models: tuple[str, ...] = ()
+        else:
+            self._api_key = api_key if isinstance(api_key, SecretStr) else SecretStr(api_key)
+            models = (model,) if isinstance(model, str) else tuple(model)
+            self._models = tuple(dict.fromkeys(name for name in models if name))
+            if not self._models:
+                raise ValueError("at least one Gemini model id is required")
+        if not self._models and fallback is None:
+            raise ValueError("a Gemini key or a fallback inference chain is required")
         self._fallback = fallback
         # The model that actually produced the last successful response.
         self.model_used: str | None = None
@@ -462,16 +480,22 @@ class GeminiStructuredExtractor:
         documents: tuple[EvidenceDocument, ...],
     ) -> OperationalResearch:
         prompt = _render_extraction_prompt(app_name, p1_record, documents)
-        genai = importlib.import_module("google.genai")
-        types = importlib.import_module("google.genai.types")
-        client = genai.Client(api_key=self._api_key.get_secret_value())
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_json_schema=OperationalResearch.model_json_schema(),
-            temperature=0,
-            http_options=types.HttpOptions(timeout=int(GEMINI_TIMEOUT_SECONDS * 1000)),
-        )
         last_error: Exception | None = None
+        client: Any = None
+        config: Any = None
+        if self._models and self._api_key is not None:
+            # Imported here rather than at module scope so a deployment with no
+            # Gemini key — which has no models to loop over — never needs
+            # google-genai installed to research.
+            genai = importlib.import_module("google.genai")
+            types = importlib.import_module("google.genai.types")
+            client = genai.Client(api_key=self._api_key.get_secret_value())
+            config = types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_json_schema=OperationalResearch.model_json_schema(),
+                temperature=0,
+                http_options=types.HttpOptions(timeout=int(GEMINI_TIMEOUT_SECONDS * 1000)),
+            )
         for model in self._models:
             try:
                 response = await client.aio.models.generate_content(
@@ -532,9 +556,13 @@ class GeminiStructuredExtractor:
             else:
                 self.model_used = result.provider
                 return OperationalResearch.model_validate(result.payload)
-        raise RuntimeError(
-            f"all structured extractors failed ({', '.join(self._models)})"
-        ) from last_error
+        # Name what was actually tried. With no Gemini key ``_models`` is empty,
+        # and the old message read "all structured extractors failed ()" — which
+        # says nothing about the chain that did the work and failed.
+        tried = [*self._models]
+        if self._fallback is not None:
+            tried.append("inference chain")
+        raise RuntimeError(f"all structured extractors failed ({', '.join(tried)})") from last_error
 
 
 def _compact_extraction_evidence(text: str, *, limit: int = 6_000) -> str:

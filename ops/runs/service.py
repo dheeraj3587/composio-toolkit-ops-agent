@@ -27,6 +27,7 @@ from pydantic import SecretStr
 from ops.browser.provider import BrowserProvider as BrowserWorker
 from ops.core.config import Settings
 from ops.core.effect_ledger import SQLiteEffectStore
+from ops.core.inference import build_json_inference
 from ops.core.model_catalog import ModelSelection
 from ops.core.models import (
     CapabilityAvailability,
@@ -83,12 +84,12 @@ from ops.recipes.app_recipes import (
 )
 from ops.research.cache import SqliteResearchCache
 from ops.research.operational_research import (
-    GeminiStructuredExtractor,
     OfficialEvidenceFetcher,
     OperationalResearchEnricher,
     PerplexitySearchDiscovery,
     ResearchEnricher,
     ResearchEnrichmentOutcome,
+    StructuredExtractor,
 )
 from ops.research.p1_adapter import (
     DEFAULT_P1_ROOT,
@@ -989,7 +990,7 @@ class RunService:
         return self._email.poll_waiting_runs(limit=limit)
 
     def _build_research_enricher(self, settings: Settings) -> ResearchEnricher | None:
-        """Build the enricher only when Gemini is configured; own its HTTP client(s).
+        """Build the enricher when any extraction model is configured; own its HTTP client(s).
 
         Discovery order: You.com Search (primary, when ``you_search_configured``)
         then Perplexity (fallback, when configured) via
@@ -997,20 +998,33 @@ class RunService:
         (primary, when ``you_contents_configured``) then the pre-existing
         guarded HTTP fetcher (fallback, always available). You.com Research is
         optional, disabled by default, and only ever supplies MORE candidate
-        pages for the SAME canonical Gemini extraction below.
+        pages for the SAME canonical extraction below.
 
-        Fully backward-compatible: when ``YDC_API_KEY`` is absent, this
-        builds the EXACT pre-existing Perplexity + guarded-HTTP wiring with
-        none of the new dependencies set, so ``OperationalResearchEnricher``
-        runs its original code path unchanged.
+        Two things about the extraction model changed together.
+        ``build_json_inference`` — the Mercury-first chain the browser decider
+        runs on — is now passed as the extractor's ``fallback``. That parameter
+        has existed since the extractor was written and nothing ever supplied it,
+        so a Gemini outage ended research outright even with four other providers
+        configured. And the gate below is no longer "Gemini or nothing": a
+        deployment with a Mercury key and no Gemini key used to get no enricher at
+        all, which is the only reason research could not run on Mercury.
+
+        Still backward-compatible: with ``GOOGLE_GENAI_API_KEY`` set and
+        ``YDC_API_KEY`` absent this builds the EXACT pre-existing Perplexity +
+        guarded-HTTP wiring, Gemini still extracts first, and
+        ``OperationalResearchEnricher`` runs its original code path unchanged.
         """
 
-        if settings.google_genai_api_key is None:
+        # Same chain, same order, as the browser decision loop: Mercury, Groq,
+        # Cerebras, OpenRouter, Gemini. ``None`` when no provider key is set.
+        fallback = build_json_inference(settings)
+        if settings.google_genai_api_key is None and fallback is None:
             return None
 
-        extractor = GeminiStructuredExtractor(
+        extractor = StructuredExtractor(
             settings.google_genai_api_key,
             model=settings.gemini_model_chain,
+            fallback=fallback,
         )
         self._http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(20.0, connect=10.0),

@@ -11,7 +11,8 @@ Inception added 2026-07-31):
 * Inception Mercury — ``https://api.inceptionlabs.ai/v1/chat/completions``,
   OpenAI-shaped, model ``mercury-2``, strict ``json_schema`` documented, and
   ``max_tokens`` rather than ``max_completion_tokens``. A ``reasoning_effort``
-  dial trades deliberation for latency ("instant"/"low" are the fast settings).
+  dial trades deliberation for latency ("instant"/"low" are the fast settings,
+  "high" the most deliberate — and the one this chain runs at by default).
 * OpenRouter — ``https://openrouter.ai/api/v1/chat/completions``, OpenAI-shaped,
   ``response_format={"type":"json_object"}``.
 * Groq — ``https://api.groq.com/openai/v1/chat/completions``. Strict
@@ -249,9 +250,10 @@ class GroqJsonBackend(_OpenAICompatibleBackend):
     """gpt-oss on Groq.
 
     ``reasoning_effort`` is a real field on the gpt-oss models this backend
-    targets, so it is forwarded when a run asks for one. It stays out of the
-    payload entirely by default rather than being sent as a hardcoded level: the
-    vendor's own default is the right answer when nobody chose.
+    targets, so it is forwarded when asked for. The class default is still ``""``
+    — send nothing, let the vendor's own default stand — because a backend
+    constructed directly should not invent a level. ``build_json_inference`` does
+    choose one: ``high``, matching the rest of the chain.
     """
 
     name = "groq"
@@ -624,8 +626,12 @@ def build_json_inference(
         backends["mercury"] = MercuryJsonBackend(
             mercury_key,
             model=model_for("mercury", model),
+            # Mirrors ``ops.core.model_catalog.DEFAULT_EFFORT``, spelled out rather
+            # than imported: this module imports nothing from ``ops`` at runtime
+            # (see the TYPE_CHECKING note above), and only reaches this literal
+            # when the settings object carries no effort at all.
             reasoning_effort=effort_for(
-                "mercury", getattr(settings, "mercury_reasoning_effort", "") or "low"
+                "mercury", getattr(settings, "mercury_reasoning_effort", "") or "high"
             ),
             max_completion_tokens=max_completion_tokens,
         )
@@ -636,7 +642,11 @@ def build_json_inference(
         backends["groq"] = GroqJsonBackend(
             groq_key,
             model=model_for("groq", model),
-            reasoning_effort=effort_for("groq", ""),
+            # gpt-oss takes low/medium/high. The fallback used to be "" — send
+            # nothing, let the vendor default stand — but a run that has fallen
+            # past Mercury is on a page Mercury could not settle, which is the
+            # last place to economize on deliberation.
+            reasoning_effort=effort_for("groq", "high"),
             max_completion_tokens=max_completion_tokens,
         )
 
@@ -646,7 +656,7 @@ def build_json_inference(
         backends["cerebras"] = CerebrasJsonBackend(
             cerebras_key,
             model=model_for("cerebras", model),
-            reasoning_effort=effort_for("cerebras", ""),
+            reasoning_effort=effort_for("cerebras", "high"),  # see the Groq note above
             max_completion_tokens=max_completion_tokens,
         )
 

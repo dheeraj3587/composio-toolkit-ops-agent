@@ -177,7 +177,9 @@ def test_browser_decision_providers_reach_the_browser_worker() -> None:
 
     assert environment["MERCURY_API_KEY"] == "${MERCURY_API_KEY:-}"
     assert environment["MERCURY_MODEL"] == "${MERCURY_MODEL:-mercury-2}"
-    assert environment["MERCURY_REASONING_EFFORT"] == "${MERCURY_REASONING_EFFORT:-low}"
+    # "high" is the top of Inception's instant/low/medium/high dial, and the
+    # default everywhere: config, the catalog, and the compose default here.
+    assert environment["MERCURY_REASONING_EFFORT"] == "${MERCURY_REASONING_EFFORT:-high}"
     assert environment["GROQ_API_KEY"] == "${GROQ_API_KEY:-}"
 
 

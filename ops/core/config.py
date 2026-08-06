@@ -187,10 +187,16 @@ class Settings(BaseModel):
     cerebras_model: str = "gpt-oss-120b"
     # Mercury 2 is Inception's chat model and supports strict json_schema.
     mercury_model: str = "mercury-2"
-    # Inception exposes a reasoning dial. The action loop wants latency over
-    # deliberation on a page it can already see, so default to the low setting;
-    # "instant", "medium", and "high" are the other documented values.
-    mercury_reasoning_effort: str = "low"
+    # Inception exposes a reasoning dial: "instant", "low", "medium", "high" —
+    # there is no level above "high", so that is what "maximum effort" means here.
+    #
+    # This used to default to "low", arguing the loop wants latency over
+    # deliberation on a page it can already see. That argument holds for a page
+    # the loop reads correctly the first time and is exactly wrong for the pages
+    # that end runs: a stacked federated button above an email form, a "Next" that
+    # is a div, a consent gate that looks like a signup. Those cost a whole run
+    # when misread and a few seconds of tokens when deliberated over.
+    mercury_reasoning_effort: str = "high"
 
     # The self-hosted Playwright harness is the only browser backend. The paid
     # Browser Use cloud adapter was removed: it could not run the reviewed
@@ -698,7 +704,7 @@ class Settings(BaseModel):
             "mercury_reasoning_effort": _choice(
                 source.get("MERCURY_REASONING_EFFORT"),
                 ("instant", "low", "medium", "high"),
-                default="low",
+                default="high",
             ),
             "openrouter_model": _optional(source.get("OPENROUTER_MODEL"))
             or "nvidia/nemotron-3-ultra-550b-a55b:free",

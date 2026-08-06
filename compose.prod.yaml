@@ -201,14 +201,18 @@ services:
       BROWSER_DISPLAY_NUM: ${BROWSER_DISPLAY_NUM:-99}
       # The policy-constrained browser action loop needs at least one JSON
       # inference backend. Values stay inside this private service.
-      # Mercury (Inception) is FIRST in build_json_inference's chain: the action
-      # loop spends one decision per page state, so first-token latency bounds the
-      # whole run. Groq follows as the strict-schema free tier. Both must be passed
-      # through here, or the loop has no backend and every ambiguous page becomes a
-      # human gate.
+      # Mercury (Inception) is FIRST in build_json_inference's chain and is now
+      # also the first backend for the email loop and the research extractor, so
+      # one key covers every model task this deployment runs. Groq follows as the
+      # strict-schema free tier. Both must be passed through here, or the loop has
+      # no backend and every ambiguous page becomes a human gate.
+      #
+      # The dial runs at "high" — the top of the documented instant/low/medium/high
+      # range. Reading an ambiguous page wrong costs a whole run; deliberating over
+      # it costs seconds.
       MERCURY_API_KEY: ${MERCURY_API_KEY:-}
       MERCURY_MODEL: ${MERCURY_MODEL:-mercury-2}
-      MERCURY_REASONING_EFFORT: ${MERCURY_REASONING_EFFORT:-low}
+      MERCURY_REASONING_EFFORT: ${MERCURY_REASONING_EFFORT:-high}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
       CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}

@@ -1,9 +1,10 @@
 """LLM-backed outreach composition and reply analysis for the Gmail loop.
 
-Primary backend is OpenRouter (OpenAI-compatible chat completions); Gemini is
-the fallback. Callers keep a deterministic template fallback for when every LLM
-backend is unavailable. Inputs use only supplied company facts and the already
-sanitized (secret-free) reply text; no secret value is ever sent or emitted.
+Primary backend is Inception Mercury, then OpenRouter, then Gemini — all three
+OpenAI-shaped or structured-output JSON, tried in order. Callers keep a
+deterministic template fallback for when every LLM backend is unavailable. Inputs
+use only supplied company facts and the already sanitized (secret-free) reply
+text; no secret value is ever sent or emitted.
 """
 
 from __future__ import annotations
@@ -19,6 +20,9 @@ from ops.core.models import CompanyProfile, OperationalResearch
 
 _TIMEOUT_SECONDS = 45.0
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_MERCURY_URL = "https://api.inceptionlabs.ai/v1/chat/completions"
+# Sized for the largest field either schema allows: a 6,000-character reply body.
+_MAX_TOKENS = 4_096
 
 ReplyClass = Literal[
     "no_reply",
@@ -109,6 +113,56 @@ class _Backend(Protocol):
     def generate_json(self, prompt: str) -> dict[str, object]: ...
 
 
+class MercuryBackend:
+    """Inception Mercury, OpenAI-shaped (``api.inceptionlabs.ai``).
+
+    Added so the email loop reaches the same primary model as every other model
+    task in this deployment. It was the one loop Mercury could not serve: the
+    browser decider and the research extractor both route through
+    ``ops.core.inference.build_json_inference``, which leads with Mercury, while
+    this chain started at OpenRouter and could never get there.
+
+    Plain ``json_object`` mode rather than a strict schema. The two response
+    shapes here are small but not flat — ``ReplyAnalysisAI`` carries three string
+    arrays — and :class:`EmailAssistant` validates every payload with Pydantic
+    afterwards regardless, so a strict schema would only add a vendor-specific way
+    to fail. ``max_tokens`` (not ``max_completion_tokens``) is what Inception
+    documents, and it is sized for a full 6,000-character reply body.
+    """
+
+    def __init__(self, api_key: SecretStr, *, model: str, reasoning_effort: str) -> None:
+        self._api_key = api_key
+        self._model = model
+        self._reasoning_effort = reasoning_effort
+
+    def generate_json(self, prompt: str) -> dict[str, object]:
+        headers = {
+            "Authorization": f"Bearer {self._api_key.get_secret_value()}",
+            "Content-Type": "application/json",
+        }
+        payload: dict[str, object] = {
+            "model": self._model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You output only a single valid JSON object, no prose or markdown.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.3,
+            "response_format": {"type": "json_object"},
+            "max_tokens": _MAX_TOKENS,
+        }
+        if self._reasoning_effort:
+            payload["reasoning_effort"] = self._reasoning_effort
+        with httpx.Client(timeout=_TIMEOUT_SECONDS) as client:
+            response = client.post(_MERCURY_URL, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        return _loads_json_object(content)
+
+
 class OpenRouterBackend:
     """OpenAI-compatible chat-completions backend (OpenRouter)."""
 
@@ -175,7 +229,7 @@ class GeminiBackend:
 
 
 class EmailAssistant:
-    """Try each configured backend in order (OpenRouter first, Gemini fallback)."""
+    """Try each configured backend in order (Mercury, then OpenRouter, then Gemini)."""
 
     def __init__(self, backends: tuple[_Backend, ...]) -> None:
         if not backends:
@@ -230,9 +284,27 @@ def _loads_json_object(text: str) -> dict[str, object]:
 
 
 def build_email_assistant(settings: object) -> EmailAssistant | None:
-    """Build the assistant with OpenRouter primary and Gemini fallback."""
+    """Build the chain: Mercury primary, then OpenRouter, then Gemini.
+
+    Mercury leads for the same reason it leads ``build_json_inference`` — it is
+    this deployment's primary model — and the two providers behind it are
+    untouched, so a deployment with no Mercury key gets exactly the previous
+    OpenRouter-then-Gemini chain and one that has a key keeps both as fallbacks.
+    """
 
     backends: list[_Backend] = []
+    mercury_key = getattr(settings, "mercury_api_key", None)
+    if isinstance(mercury_key, SecretStr):
+        backends.append(
+            MercuryBackend(
+                mercury_key,
+                model=getattr(settings, "mercury_model", "") or "mercury-2",
+                # The same dial the decision chain runs at. Composing outreach and
+                # classifying a vendor's reply are judgement calls made once per
+                # message, where latency does not bound anything.
+                reasoning_effort=getattr(settings, "mercury_reasoning_effort", "") or "high",
+            )
+        )
     openrouter_key = getattr(settings, "openrouter_api_key", None)
     if isinstance(openrouter_key, SecretStr):
         model = (
@@ -252,6 +324,7 @@ def build_email_assistant(settings: object) -> EmailAssistant | None:
 __all__ = [
     "EmailAssistant",
     "GeminiBackend",
+    "MercuryBackend",
     "OpenRouterBackend",
     "OutreachDraftAI",
     "ReplyAnalysisAI",

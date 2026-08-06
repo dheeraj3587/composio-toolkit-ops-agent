@@ -124,12 +124,30 @@ export function ModelPickerField({
   )
 }
 
+/**
+ * What the dial reads before the operator touches it.
+ *
+ * This used to take `effort_values[0]` — the *lowest* level the model accepts,
+ * "instant" on Mercury. The form submits whatever the dial shows, so leaving it
+ * alone silently ran at the floor while the backend's own no-preference answer
+ * (`default_effort_for`) was the deployment default. The catalog's answer comes
+ * first now, and the fallback is the highest level the model takes rather than
+ * the lowest, so an unread catalog cannot quietly downgrade a run either.
+ */
 function defaultEffort(
   catalog: ModelCatalogResponse,
   option: ModelOption | null,
 ): ThinkingEffort {
-  const preferred = option?.effort_values?.[0] ?? catalog.default_effort
-  return isEffort(preferred) ? preferred : "low"
+  const accepted = option?.effort_values ?? []
+  const deploymentDefault = catalog.default_effort
+  if (
+    isEffort(deploymentDefault) &&
+    (!accepted.length || accepted.includes(deploymentDefault))
+  ) {
+    return deploymentDefault
+  }
+  const highest = accepted[accepted.length - 1]
+  return isEffort(highest) ? highest : "high"
 }
 
 /** Map a catalog entry onto the shape `ModelSelect` renders. */
