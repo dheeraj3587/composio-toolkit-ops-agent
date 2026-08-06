@@ -15,20 +15,20 @@ function renderProvider(
 }
 
 describe("ProviderStateCard", () => {
-  it("renders configured adapters as awaiting run evidence rather than a failure", () => {
+  it("renders configured adapters as not yet checked rather than as a failure", () => {
     const html = renderProvider({
       provider: "browser_use",
       status: "configured_not_verified",
       detail: "Adapter configuration was found.",
     })
 
-    expect(html).toContain("Readiness")
-    expect(html).toContain("Awaiting run evidence")
-    expect(html).toContain("text-sky-800")
+    expect(html).toContain("Checked")
+    expect(html).toContain(">Not yet<")
+    expect(html).toContain("text-blue-800")
     expect(html).not.toContain("text-red-800")
   })
 
-  it("renders ready adapters as runtime initialized", () => {
+  it("renders ready adapters as checked and working", () => {
     const html = renderProvider(
       {
         provider: "browser_use",
@@ -38,8 +38,8 @@ describe("ProviderStateCard", () => {
       "run",
     )
 
-    expect(html).toContain("Runtime initialized")
-    expect(html).toContain("Runtime wiring plus run timeline")
+    expect(html).toContain("Yes, working")
+    expect(html).toContain("A live check, plus this run")
     expect(html).toContain("text-emerald-800")
   })
 
@@ -62,21 +62,20 @@ describe("ProviderStateCard", () => {
     })
 
     expect(html).toContain("Legacy checkpoint configuration")
-    expect(html).toContain("Not part of canonical runtime")
-    expect(html).toContain("Key presence only; reader wiring not reported")
-    expect(html).not.toContain("Runtime initialized")
+    expect(html).toContain("Not part of this runtime")
+    expect(html).not.toContain("Yes, working")
     expect(html).not.toContain("Encrypted checkpoint compatibility")
   })
 
-  it("displays disabled status as policy-disabled, not as a failure", () => {
+  it("displays disabled status as deliberate, not as a failure", () => {
     const html = renderProvider({
       provider: "browser_use",
       status: "disabled",
       detail: "Live browser execution is policy-disabled.",
     })
 
-    expect(html).toContain("Policy disabled")
-    expect(html).toContain("text-indigo-800")
+    expect(html).toContain("Turned off")
+    expect(html).toContain("This is not a fault")
     expect(html).not.toContain("text-red-800")
   })
 
@@ -87,8 +86,7 @@ describe("ProviderStateCard", () => {
       detail: "Live browser execution is policy-disabled.",
     })
 
-    expect(html).toContain("Not reported by this state")
-    expect(html).not.toMatch(/>Configured</)
+    expect(html).not.toMatch(/>Yes</)
   })
 
   it("renders Composio as the capability preflight rather than only Gmail", () => {
@@ -99,7 +97,6 @@ describe("ProviderStateCard", () => {
     })
 
     expect(html).toContain("Composio capability preflight")
-    expect(html).toContain("Read-only preflight")
     expect(html).toContain("Gmail delivery is a separate policy-controlled action")
   })
 
@@ -110,9 +107,7 @@ describe("ProviderStateCard", () => {
       detail: "Structured extraction runs only against fetched official evidence.",
     })
 
-    expect(html).toContain(
-      "Configuration is present. Execute-mode evidence will promote this capability to Ready",
-    )
+    expect(html).toContain("It is marked working once a live check confirms it")
     expect(html).not.toContain("Live verified")
     expect(html).not.toContain("Live tested")
   })
@@ -126,10 +121,10 @@ describe("ProviderStateCard", () => {
 
     expect(html).toContain("Not reported")
     expect(html).not.toContain(">Disabled<")
-    expect(html).not.toContain(">Configured<")
+    expect(html).not.toContain(">Yes<")
   })
 
-  it("keeps system configuration separate from run-specific evidence", () => {
+  it("keeps deployment configuration separate from run-specific evidence", () => {
     const systemHtml = renderProvider(
       { provider: "browser_use", status: "configured_not_verified", detail: "d" },
       "system",
@@ -139,38 +134,27 @@ describe("ProviderStateCard", () => {
       "run",
     )
 
-    for (const label of ["Configuration", "Policy", "Readiness", "Evidence source"]) {
+    for (const label of ["Set up", "Checked", "Based on"]) {
       expect(systemHtml).toContain(label)
     }
-    expect(systemHtml).toContain("System configuration/policy only")
-    expect(runHtml).toContain("See run phases and timeline")
+    expect(systemHtml).toContain("This deployment&#x27;s configuration")
+    expect(runHtml).toContain(">This run<")
   })
 
-  it("shows Browser Use policy as Allowed", () => {
-    const html = renderProvider({
-      provider: "browser_use",
-      status: "ready",
-      detail: "Browser runtime ready.",
-    })
-
-    expect(html).toContain(">Allowed<")
-  })
-
-  it("shows No policy gate for providers without a policy gate", () => {
-    const html = renderProvider({
-      provider: "perplexity",
-      status: "ready",
-      detail: "Search is wired into execute-mode enrichment.",
-    })
-
-    expect(html).toContain("No policy gate")
+  it("names the capabilities an operator actually sees on the system page", () => {
+    expect(renderProvider({ provider: "vault", status: "ready", detail: "d" })).toContain(
+      "Credential vault",
+    )
+    expect(renderProvider({ provider: "gmail", status: "ready", detail: "d" })).toContain(
+      "Signup inbox",
+    )
+    expect(
+      renderProvider({ provider: "composio_managed_auth", status: "ready", detail: "d" }),
+    ).toContain("Managed account connections")
   })
 
   it("does not retain stale demo or placeholder-record wording", () => {
-    const dashboardSource = readFileSync(
-      join(process.cwd(), "src/app/page.tsx"),
-      "utf8",
-    )
+    const dashboardSource = readFileSync(join(process.cwd(), "src/app/page.tsx"), "utf8")
 
     expect(dashboardSource).not.toMatch(/demo records|placeholder records/i)
   })

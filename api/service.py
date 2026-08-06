@@ -895,6 +895,24 @@ class LocalRunService:
             self._gmail_preflight_cache = entry
             return entry
 
+    def _vault_self_test(self) -> bool:
+        """Whether the bound credential vault passes its own probe.
+
+        Absent or probe-less stores report ``False`` rather than ``True``: this
+        answer becomes a green "ready" badge, so the only safe default for a
+        store we cannot ask is the one that claims nothing.
+        """
+
+        store = getattr(self._service, "_secret_store", None)
+        probe = getattr(store, "self_test", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            LOGGER.warning("credential vault self-test raised", exc_info=True)
+            return False
+
     def _provider_states(
         self,
         *,
@@ -987,6 +1005,7 @@ class LocalRunService:
                     "reason_code": browser_health.reason_code,
                 }
             )
+        vault_ready = settings.secret_vault_key is not None and self._vault_self_test()
         return [
             state(
                 "recipes",
@@ -997,7 +1016,20 @@ class LocalRunService:
             state(
                 "vault",
                 configured=settings.secret_vault_key is not None,
-                detail="The credential vault requires a separate Fernet key.",
+                # A key being present never proved the vault works. The probe
+                # round-trips a throwaway value through the configured key and
+                # confirms the store's schema is readable, which is the whole of
+                # what "the vault is usable" means here. It writes nothing.
+                ready=vault_ready,
+                detail=(
+                    "The credential vault encrypted and decrypted a probe value "
+                    "and its store is readable."
+                    if vault_ready
+                    else "The credential vault key is present but did not pass its "
+                    "encrypt/decrypt and storage probe."
+                    if settings.secret_vault_key is not None
+                    else "The credential vault requires a separate Fernet key."
+                ),
             ),
             state(
                 "composio_managed_auth",

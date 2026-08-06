@@ -313,6 +313,32 @@ class SQLiteSecretStore:
                 if column not in existing:
                     connection.execute(ddl)
 
+    def self_test(self) -> bool:
+        """Whether this vault can actually do the job it is configured for.
+
+        "Configured" only says a key was supplied. This exercises the two things
+        that make the vault usable and that a bad deployment silently breaks: the
+        key round-trips a value through Fernet, and the storage file is readable
+        and holds the schema. It writes nothing, reads no stored ciphertext, and
+        the probe value never leaves this frame -- so a failure is reportable
+        without telling the caller anything about the key or the contents.
+        """
+
+        probe = secrets.token_urlsafe(16)
+        try:
+            if (
+                self._fernet.decrypt(self._fernet.encrypt(probe.encode("utf-8"))).decode("utf-8")
+                != probe
+            ):
+                return False
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vault_entries'"
+                ).fetchone()
+        except (InvalidToken, sqlite3.Error, OSError, ValueError):
+            return False
+        return row is not None
+
     def put(self, *, app_slug: str, kind: str, value: str) -> str:
         if _APP_SLUG.fullmatch(app_slug) is None:
             raise ValueError("app_slug must contain lowercase letters, digits, or hyphens")

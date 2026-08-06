@@ -59,9 +59,9 @@ export default async function AppResearchPage({ params }: { params: Promise<{ sl
 
       <Alert className="rounded-md border-brand-200 bg-brand-50/60">
         <FileCheck2 className="text-brand-600" aria-hidden="true" />
-        <AlertTitle>Evidence-derived, not routing authority</AlertTitle>
+        <AlertTitle>What research found, not what a run will do</AlertTitle>
         <AlertDescription>
-          This profile reflects the verified P1 snapshot and operational enrichment. A run’s deterministic router remains the final authority.
+          This page shows what was researched about the app. When a run starts, it decides its own route from the app’s live site, and that decision is the one that counts.
         </AlertDescription>
       </Alert>
 
@@ -98,15 +98,15 @@ function researchErrorCopy(error: unknown): {
 } {
   if (error instanceof ApiError && error.code === "INVALID_API_RESPONSE") {
     return {
-      title: "Response contract mismatch",
-      copy: "The backend returned a sanitized payload that does not match the frontend contract. No synthetic app details are shown.",
+      title: "Unexpected response",
+      copy: "The backend returned something this page does not recognize. Nothing is shown in its place rather than guessed details.",
     }
   }
 
   if (error instanceof ApiError && error.status === 503) {
     return {
       title: "Backend unavailable",
-      copy: "The operations API is unreachable or not configured for this deployment. No synthetic app details are shown.",
+      copy: "The operations API is unreachable or not configured for this deployment. Nothing is shown in its place rather than guessed details.",
     }
   }
 

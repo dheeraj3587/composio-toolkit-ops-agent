@@ -162,8 +162,8 @@ describe("AppResearchPage", () => {
 
     render(await AppResearchPage({ params: Promise.resolve({ slug: "github" }) }))
 
-    expect(screen.getByRole("heading", { name: "Response contract mismatch" })).toBeInTheDocument()
-    expect(screen.getByText(/does not match the frontend contract/i)).toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: "Unexpected response" })).toBeInTheDocument()
+    expect(screen.getByText(/returned something this page does not recognize/i)).toBeInTheDocument()
   })
 
   it("shows a backend-unavailable state for unreachable API failures", async () => {

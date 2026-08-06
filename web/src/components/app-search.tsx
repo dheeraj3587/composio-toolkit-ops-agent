@@ -41,9 +41,9 @@ export function AppSearch() {
             Choose an app to inspect
           </h2>
           <p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">
-            Every app in the immutable P1 snapshot is listed below. Open a card to read its
-            evidence, or use <span className="font-medium text-foreground">Run</span> to start a run
-            for that app directly. These are backend records, not generated suggestions.
+            These are the apps this deployment knows how to set up. Open one to read what the
+            agent found about it, or use <span className="font-medium text-foreground">Run</span> to
+            start straight away. Every entry is a backend record, not a suggestion.
           </p>
         </div>
         <div className="p-5 lg:p-6">

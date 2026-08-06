@@ -19,8 +19,8 @@ export function RunTable({ runs }: { runs: RunSummary[] }) {
   if (runs.length === 0) {
     return (
       <EmptyState
-        title="The ledger is blank"
-        description="Create a local dry run to establish a sanitized record. No provider, browser, or email action will be implied."
+        title="No integrations yet"
+        description="Start one and it will appear here. Nothing happens on a real website until you pick an app and confirm."
         action
       />
     )

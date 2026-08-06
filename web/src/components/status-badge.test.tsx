@@ -7,43 +7,54 @@ describe("StatusBadge", () => {
   it("renders the exact backend status without promoting configuration-required to success", () => {
     render(<StatusBadge status="configuration_required" />)
 
-    const badge = screen.getByText("Configuration Required")
-    expect(badge).toHaveClass("text-orange-800")
+    const badge = screen.getByText("Needs setup")
+    expect(badge).toHaveClass("text-amber-800")
     expect(screen.queryByText("Ready")).not.toBeInTheDocument()
   })
 
+  // Tone answers "what does this mean for me?", so several statuses share one.
+  // What must never collapse is the distinction between done, working, and
+  // needing a person.
   it.each([
-    ["self_serve", "text-emerald-800"],
-    ["partner_gated", "text-brand-800"],
-    ["unknown", "text-slate-600"],
-    ["configuration_required", "text-orange-800"],
-    ["waiting_for_reply", "text-sky-800"],
-    ["waiting_for_hitl", "text-amber-800"],
-    ["completed", "text-emerald-800"],
-    ["failed", "text-red-800"],
-  ])("gives %s a distinct truthful treatment", (status, className) => {
-    render(<StatusBadge status={status} />)
-    expect(screen.getByText(status.replaceAll("_", " "), { exact: false })).toHaveClass(className)
+    ["self_serve", "Self serve", "text-emerald-800"],
+    ["completed", "Completed", "text-emerald-800"],
+    ["running", "Running", "text-blue-800"],
+    ["waiting_for_reply", "Waiting For Reply", "text-blue-800"],
+    ["partner_gated", "Partner approval", "text-amber-800"],
+    ["configuration_required", "Needs setup", "text-amber-800"],
+    ["waiting_for_hitl", "Needs you", "text-amber-800"],
+    ["failed", "Failed", "text-red-800"],
+    ["unknown", "Unknown", "text-slate-600"],
+  ])("gives %s a truthful treatment", (_status, label, className) => {
+    render(<StatusBadge status={_status} />)
+    expect(screen.getByText(label)).toHaveClass(className)
   })
 
-  it("gives disabled a distinct policy treatment, not a failure treatment", () => {
+  it("gives disabled a quiet treatment, not a failure treatment", () => {
     render(<StatusBadge status="disabled" />)
     const badge = screen.getByText("Disabled")
-    expect(badge).toHaveClass("text-indigo-800")
+    expect(badge).toHaveClass("text-slate-600")
     expect(badge).not.toHaveClass("text-red-800")
   })
 
-  it("gives configured_not_verified an informational configuration treatment", () => {
+  it("does not ask for attention when configuration is merely unverified", () => {
     render(<StatusBadge status="configured_not_verified" />)
-    const badge = screen.getByText("Configured Not Verified")
-    expect(badge).toHaveClass("text-sky-800")
+    const badge = screen.getByText("Not yet checked")
+    expect(badge).toHaveClass("text-blue-800")
     expect(badge).not.toHaveClass("text-amber-800")
   })
 
-  it("gives not_configured a distinct missing-configuration treatment", () => {
+  it("gives not_configured the same attention treatment as any other blocker", () => {
     render(<StatusBadge status="not_configured" />)
-    const badge = screen.getByText("Not Configured")
-    expect(badge).toHaveClass("text-orange-800")
+    expect(screen.getByText("Not Configured")).toHaveClass("text-amber-800")
+  })
+
+  it("explains what a status means in plain language", () => {
+    render(<StatusBadge status="waiting_for_hitl" />)
+    expect(screen.getByText("Needs you")).toHaveAttribute(
+      "title",
+      "Paused: the website needs a person to act.",
+    )
   })
 
   it("is accessible for a failed status", async () => {

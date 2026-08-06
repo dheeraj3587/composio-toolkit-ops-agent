@@ -70,8 +70,8 @@ export default async function LoginPage({
   return (
     <main className="relative grid min-h-svh overflow-hidden bg-background lg:grid-cols-[1.05fr_0.95fr]">
       <div className="relative hidden overflow-hidden bg-rail p-12 text-white lg:flex lg:flex-col lg:justify-between">
-        <div className="absolute -left-24 top-24 size-96 rounded-full bg-brand-500/20 blur-3xl" />
-        <div className="absolute -bottom-32 right-0 size-[30rem] rounded-full bg-brand-700/20 blur-3xl" />
+        <div className="absolute -left-24 top-24 size-96 rounded-full bg-brand-500/12 blur-3xl" />
+        <div className="absolute -bottom-32 right-0 size-[30rem] rounded-full bg-brand-500/8 blur-3xl" />
         <div className="relative flex items-center gap-3">
           <span className="grid size-11 place-items-center rounded-xl border border-white/15 bg-white/10 font-mono text-[12px] tracking-[0.16em]">
             C/O
@@ -79,7 +79,7 @@ export default async function LoginPage({
           <div>
             <p className="text-base font-medium">Composio Operations</p>
             <p className="mt-0.5 font-mono text-[11px] uppercase tracking-[0.16em] text-white/45">
-              Secure workspace
+              Private workspace
             </p>
           </div>
         </div>
@@ -89,22 +89,24 @@ export default async function LoginPage({
             <Sparkles className="size-5" aria-hidden="true" />
           </div>
           <h1 className="text-5xl font-medium leading-[1.02] tracking-[-0.05em]">
-            Access credentials,
+            Set up apps
             <br />
             without the busywork.
           </h1>
           <p className="mt-6 max-w-lg text-base leading-7 text-white/55">
-            Watch the agent sign in, handle verification, navigate developer settings,
-            and securely prepare each integration.
+            The agent signs in, handles email verification, finds the developer settings, and
+            stores each credential where nothing can read it back out.
           </p>
         </div>
 
-        <div className="relative flex items-center gap-6 text-xs text-white/45">
+        <div className="relative flex flex-wrap items-center gap-x-6 gap-y-2 text-xs text-white/45">
           <span className="flex items-center gap-2">
-            <ShieldCheck className="size-4 text-emerald-300" /> Encrypted sessions
+            <ShieldCheck className="size-4 text-brand-300" aria-hidden="true" /> Sessions signed
+            server-side
           </span>
           <span className="flex items-center gap-2">
-            <LockKeyhole className="size-4 text-brand-300" /> HTTP-only access
+            <LockKeyhole className="size-4 text-brand-300" aria-hidden="true" /> Credentials never
+            reach the browser
           </span>
         </div>
       </div>
@@ -119,9 +121,9 @@ export default async function LoginPage({
           </div>
 
           <p className="eyebrow">Operator access</p>
-          <h2 className="mt-3 text-3xl font-medium tracking-[-0.04em]">Welcome back</h2>
+          <h2 className="mt-3 text-3xl font-medium tracking-[-0.04em]">Sign in</h2>
           <p className="mt-3 text-sm leading-6 text-muted-foreground">
-            Sign in to manage integration runs and live browser sessions.
+            Use the operator account configured for this deployment.
           </p>
 
           {invalid || rateLimited || configurationError ? (
@@ -141,8 +143,8 @@ export default async function LoginPage({
                 {rateLimited
                   ? `Sign-in is temporarily paused. Try again in about ${retryAfter} seconds.`
                   : invalid
-                    ? "The username or password was not accepted."
-                    : "Set the operator username, a password of at least 8 characters, and a 32-character session secret."}
+                    ? "That username and password combination was not accepted. Nothing about which of the two was wrong is reported, deliberately."
+                    : "This deployment has no operator account configured. It needs a username, a password of at least 8 characters, and a 32-character session secret."}
               </AlertDescription>
             </Alert>
           ) : null}

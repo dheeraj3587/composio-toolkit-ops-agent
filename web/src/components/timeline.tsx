@@ -7,16 +7,16 @@ import type { TimelineItem } from "@/lib/types"
 function summary(item: TimelineItem): string {
   if (item.summary) return item.summary.slice(0, 240)
   if (item.status) return `Status: ${item.status.replaceAll("_", " ")}`
-  return "Sanitized event recorded."
+  return "Event recorded."
 }
 
 export function Timeline({ items }: { items: TimelineItem[] }) {
   if (items.length === 0) {
-    return <EmptyState title="No events recorded" description="The backend has not reported a sanitized timeline for this run." />
+    return <EmptyState title="No events yet" description="Nothing has been recorded for this run. Events appear here as the agent works." />
   }
 
   return (
-    <ol className="panel rounded-md" aria-label="Sanitized run timeline">
+    <ol className="panel rounded-md" aria-label="Run timeline">
       {items.map((item) => (
         <li key={item.event_id} className="grid gap-4 border-b border-border px-5 py-5 last:border-0 sm:grid-cols-[145px_24px_1fr]">
           <time className="text-xs text-muted-foreground" dateTime={item.created_at} title={formatTimestamp(item.created_at)}>

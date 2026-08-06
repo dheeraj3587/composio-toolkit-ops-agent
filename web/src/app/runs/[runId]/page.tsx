@@ -328,9 +328,9 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
       </section>
 
       <section aria-labelledby="timeline">
-        <div className="mb-3"><p className="eyebrow">Sanitized audit</p><h2 id="timeline" className="mt-1 text-xl font-semibold">Run timeline</h2></div>
+        <div className="mb-3"><p className="eyebrow">Audit trail</p><h2 id="timeline" className="mt-1 text-xl font-medium">Run timeline</h2></div>
         {timelineUnavailable ? (
-          <Alert className="rounded-md border-amber-300 bg-amber-50 dark:border-amber-500/35 dark:bg-amber-500/12 dark:text-amber-200"><AlertTitle>Timeline unavailable</AlertTitle><AlertDescription>The backend could not return sanitized events. This is not treated as an empty timeline.</AlertDescription></Alert>
+          <Alert className="rounded-md border-amber-300 bg-amber-50 dark:border-amber-500/35 dark:bg-amber-500/12 dark:text-amber-200"><AlertTitle>The timeline could not be loaded</AlertTitle><AlertDescription>The backend did not return this run’s events. That is shown here rather than as an empty timeline, which would read as “nothing happened”.</AlertDescription></Alert>
         ) : <Timeline items={timeline} />}
       </section>
 
@@ -352,7 +352,7 @@ function planOnlyPhases(phases: PhaseCollection): PhaseState[] {
     name: "Research",
     phase: "2",
     status: "ready",
-    detail: "Verified P1 research and deterministic access routing are available.",
+    detail: "Research for this app and its access route are available.",
     available: true,
   }
 
@@ -404,6 +404,6 @@ function RouteCard({ decision, fallbackRoute }: { decision: { route: string; rea
 
 function BackendUnavailable() {
   return (
-    <div className="mx-auto grid min-h-[65vh] max-w-xl place-items-center text-center"><div><CircleOff className="mx-auto size-6 text-muted-foreground" aria-hidden="true" /><p className="eyebrow mt-4">Run unavailable</p><h1 className="mt-2 text-2xl font-semibold">The ledger could not read this run.</h1><p className="mt-3 text-sm leading-6 text-muted-foreground">No run state is fabricated. Confirm the server-only API origin and retry.</p><Button asChild variant="outline" className="mt-6 rounded-md"><Link href="/"><ArrowLeft aria-hidden="true" /> Overview</Link></Button></div></div>
+    <div className="mx-auto grid min-h-[65vh] max-w-xl place-items-center text-center"><div><CircleOff className="mx-auto size-6 text-muted-foreground" aria-hidden="true" /><p className="eyebrow mt-4">Run unavailable</p><h1 className="mt-2 text-2xl font-medium">This run could not be loaded</h1><p className="mt-3 text-sm leading-6 text-muted-foreground">The backend did not return it. Nothing is shown in its place rather than guessed state.</p><Button asChild variant="outline" className="mt-6 rounded-md"><Link href="/"><ArrowLeft aria-hidden="true" /> Overview</Link></Button></div></div>
   )
 }
