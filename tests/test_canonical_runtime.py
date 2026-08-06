@@ -352,6 +352,12 @@ class _RuntimeContext:
             managed_auth_callback_base_url="https://ops.example.test",
             browser_login_credential_reuse=True,
             secret_vault_key=SecretStr(vault_key),
+            # The sign-in readiness guard asks the same question of the browser
+            # that the signup guard does, so these tests' fake context has to
+            # answer it. ``with_browser`` is what these runs actually execute
+            # against, and the in-process sandbox is the shape of it.
+            allow_live_browser=with_browser,
+            playwright_in_process_sandbox=with_browser,
         )
         self._browser_threads: list[threading.Thread] = []
         self._secret_store = SQLiteSecretStore(

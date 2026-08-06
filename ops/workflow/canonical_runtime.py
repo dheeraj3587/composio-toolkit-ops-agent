@@ -769,6 +769,38 @@ class CanonicalRuntime:
                     ),
                 )
 
+        # The same readiness question for the sign-in path, asked before a row
+        # exists. Every credential handling step below runs inside
+        # ``route_kind == "playwright"``, so on any other route a submitted
+        # password was accepted, never staged, never injected, and never
+        # mentioned again -- the run simply proceeded as though the operator
+        # had supplied nothing. Refusing here says so while the answer is
+        # still actionable, and leaves no dead run row behind. Only
+        # credentials the operator actually submitted are gated: an
+        # existing-account run with none is the managed-auth path and is
+        # unaffected.
+        executable_login = (
+            execution_mode != "plan_only"
+            and request.account_mode == "existing_account"
+            and browser_login is not None
+        )
+        if executable_login:
+            if recipe.route_kind != "playwright" or recipe.browser is None:
+                raise ProviderReadinessError(
+                    provider="playwright",
+                    reason_code="reviewed_login_recipe_not_available",
+                )
+            if not browser_configuration_state(self._context._settings, "playwright"):
+                raise ProviderReadinessError(
+                    provider="playwright",
+                    reason_code="playwright_configuration_required",
+                )
+            if self._context._secret_store is None:
+                raise ProviderReadinessError(
+                    provider="playwright",
+                    reason_code="existing_login_vault_required",
+                )
+
         run_id = f"run_{uuid4().hex}"
         thread_id = f"sqlite_{uuid4().hex}"
         submitted_existing_login = (

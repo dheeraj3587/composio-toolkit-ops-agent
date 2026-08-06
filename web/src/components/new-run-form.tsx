@@ -150,6 +150,11 @@ export function NewRunForm({
   // research at run time is not a reviewed route, so it says so plainly rather
   // than borrowing the reviewed wording — but that is not a reason to disable
   // the control.
+  const browserSignInUnavailable = browserSignInUnavailableReason({
+    selectedAppName: selectedApp?.app_name,
+    capabilitiesReady: appCapabilities.isSuccess,
+    connectRoute: appCapabilities.data?.connect_route,
+  })
   const signupSource = appCapabilities.data?.signup_source
   const signupResearchCaveat =
     createAccountUnavailable || signupSource !== "runtime_research"
@@ -166,6 +171,17 @@ export function NewRunForm({
       resetField("app_login_password")
     }
   }, [accountMode, resetField])
+
+  // A password typed for one app must not follow the operator to the next one.
+  // The fields are hidden rather than unmounted, so without this a value
+  // entered before switching apps would still be submitted — and refused by
+  // the backend for a route the operator can no longer see the fields for.
+  useEffect(() => {
+    if (browserSignInUnavailable) {
+      resetField("app_login_email")
+      resetField("app_login_password")
+    }
+  }, [browserSignInUnavailable, resetField])
 
   useEffect(() => {
     if (accountMode === "create_account" && createAccountUnavailable) {
@@ -335,11 +351,18 @@ export function NewRunForm({
               <div>
                 <h3 className="text-sm font-medium">Existing account sign-in</h3>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                  Optional for OAuth apps. For browser sign-in, both values are used once and never saved in the run record.
+                  {browserSignInUnavailable ??
+                    "Optional for OAuth apps. For browser sign-in, both values are used once and never saved in the run record."}
                 </p>
               </div>
             </div>
-            <div className="grid gap-4 sm:grid-cols-2">
+            <div
+              className="grid gap-4 sm:grid-cols-2"
+              // Hidden rather than unmounted so the fields stay registered and
+              // the effect above can clear them; unmounting would drop them
+              // from the form while any typed value stayed in the submission.
+              hidden={browserSignInUnavailable !== null}
+            >
               <Field label="Account email or username" htmlFor="app_login_email" error={errors.app_login_email?.message}>
                 {(a11y) => (
                   <Input
@@ -679,6 +702,38 @@ function accountCreationUnavailableReason({
     return `${selectedAppName} does not have a reviewed signup route in this deployment.`
   }
   if (!gmail.ready) return gmail.detail
+  return null
+}
+
+/**
+ * Whether a typed password would actually be used, and if not, why.
+ *
+ * Only the browser route signs in with one: every credential step in the
+ * runtime sits inside ``route_kind == "playwright"``, so on any other route
+ * the field was offered, filled, submitted, and then dropped without a word.
+ * The backend refuses that run now, but a form that asks for a password it
+ * cannot use has already lost the operator's trust by the time it does.
+ *
+ * Returns null while the answer is unknown — an unselected app or a
+ * capability lookup that is pending or failed. Nothing is hidden on a guess;
+ * an unverified route leaves the fields exactly as they were.
+ */
+function browserSignInUnavailableReason({
+  selectedAppName,
+  capabilitiesReady,
+  connectRoute,
+}: {
+  selectedAppName?: string
+  capabilitiesReady: boolean
+  connectRoute: ConnectRoute | null | undefined
+}): string | null {
+  if (!selectedAppName || !capabilitiesReady) return null
+  if (connectRoute === "managed_auth") {
+    return `${selectedAppName} connects through Composio's managed OAuth. You authorize it in ${selectedAppName}'s own window, so the agent never handles your password — there is nothing to enter here.`
+  }
+  if (connectRoute === "gated") {
+    return `${selectedAppName} is reached through a vendor-granted route rather than a sign-in page the agent can drive, so a password entered here would not be used.`
+  }
   return null
 }
 

@@ -34,9 +34,25 @@ const REFUSAL_REASONS: Record<string, string> = {
     "This app has no reviewed recipe, so the agent cannot run against it. It can still be researched in plan-only mode.",
   onboarding_driver_not_wired:
     "The autonomous onboarding driver is not wired to a browser in this deployment.",
+  // Signing in with a submitted password is a browser route, and only a
+  // browser route stages one. Every code above described creating an account;
+  // an operator handing the agent their own credentials got none of them.
+  reviewed_login_recipe_not_available:
+    "This app's reviewed recipe has no browser sign-in for the agent to drive, so the password you entered would never be used. Start the run without one and connect the app through its own authorization flow instead.",
+  existing_login_vault_required:
+    "Signing in on your behalf requires the encrypted credential vault, and it is not configured in this deployment. The password was not stored. Configure the vault on the system health page and try again.",
 }
 
 function refusalMessage(error: unknown): string | null {
+  // Supplying sign-in credentials at create time is an owner action, and the
+  // backend answers a disabled or non-local caller with a plain 403 rather
+  // than a phase conflict. That fell through to "the backend rejected this
+  // run request", which sends the operator to check a request that is fine:
+  // the server has autonomous sign-in switched off. Same sentence the resume
+  // path already shows for the same refusal.
+  if (error instanceof ApiError && error.status === 403) {
+    return "Autonomous sign-in is disabled on this server (owner opt-in required), so a run cannot be started with an account password. Start the run without one and sign in when it asks, or enable the owner opt-in on the server."
+  }
   if (!(error instanceof PhaseConflictError)) return null
   const reason = error.conflict.reason_code
   return (reason && REFUSAL_REASONS[reason]) ?? null
