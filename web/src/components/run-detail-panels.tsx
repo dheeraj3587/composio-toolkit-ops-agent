@@ -202,14 +202,14 @@ export function HitlPanel({ request, action }: { request: HitlRequest | null | u
   }
 
   return (
-    <Card className="h-full rounded-lg border-amber-300 bg-amber-50 py-0 shadow-none">
+    <Card className="h-full rounded-lg border-amber-300 bg-amber-50 py-0 shadow-none dark:border-amber-500/35 dark:bg-amber-500/10">
       <CardContent className="flex min-h-52 flex-col justify-between px-5 py-5">
-        <div className="flex items-start justify-between gap-3"><span className="grid size-8 place-items-center rounded-md bg-amber-100"><UserRoundCheck className="size-4 text-amber-700" aria-hidden="true" /></span><StatusBadge status="waiting_for_hitl" /></div>
+        <div className="flex items-start justify-between gap-3"><span className="grid size-8 place-items-center rounded-md bg-amber-100 dark:bg-amber-500/20"><UserRoundCheck className="size-4 text-amber-700 dark:text-amber-300" aria-hidden="true" /></span><StatusBadge status="waiting_for_hitl" /></div>
         <div>
-          <p className="font-mono text-[9px] uppercase tracking-[0.12em] text-amber-800">Human action · {humanize(request.action_type)}</p>
+          <p className="font-mono text-[9px] uppercase tracking-[0.12em] text-amber-800 dark:text-amber-300">Human action · {humanize(request.action_type)}</p>
           <h3 className="mt-1 text-base font-semibold text-amber-950">{humanize(request.action_type)}</h3>
-          <p className="mt-2 text-xs leading-5 text-amber-900/70">{request.message}</p>
-          <p className="mt-3 font-mono text-[9px] uppercase tracking-[0.1em] text-amber-800/80">
+          <p className="mt-2 text-xs leading-5 text-amber-900/70 dark:text-amber-300/70">{request.message}</p>
+          <p className="mt-3 font-mono text-[9px] uppercase tracking-[0.1em] text-amber-800/80 dark:text-amber-300/80">
             Resume signal · {humanize(request.expected_completion_signal)}
           </p>
           {action ? <div className="mt-4 border-t border-amber-200 pt-4">{action}</div> : null}
@@ -224,9 +224,9 @@ export function OutputPanel({ output }: { output: IntegratorOutput | null }) {
 
   const referenceCount = Object.keys(output.credential_refs).length
   return (
-    <Card className="h-full rounded-lg border-emerald-300 bg-emerald-50/60 py-0 shadow-none">
-      <CardHeader className="border-b border-emerald-200 px-5 py-4">
-        <p className="font-mono text-[9px] uppercase tracking-[0.13em] text-emerald-700">Output · references only</p>
+    <Card className="h-full rounded-lg border-emerald-300 bg-emerald-50/60 py-0 shadow-none dark:border-emerald-500/35 dark:bg-emerald-500/10">
+      <CardHeader className="border-b border-emerald-200 dark:border-emerald-500/25 px-5 py-4">
+        <p className="font-mono text-[9px] uppercase tracking-[0.13em] text-emerald-700 dark:text-emerald-300">Output · references only</p>
         <CardTitle className="mt-1 text-lg font-semibold">Integrator bundle</CardTitle>
       </CardHeader>
       <CardContent className="grid gap-4 px-5 py-5 sm:grid-cols-2">
@@ -234,7 +234,7 @@ export function OutputPanel({ output }: { output: IntegratorOutput | null }) {
         <DataPoint label="Auth scheme" value={output.auth_scheme} />
         <DataPoint label="Granted scopes" value={String(output.scopes.length)} />
         <DataPoint label="Vault references held" value={String(referenceCount)} />
-        <p className="sm:col-span-2 flex items-start gap-2 border-t border-emerald-200 pt-4 text-xs leading-5 text-emerald-800"><CheckCircle2 className="mt-0.5 size-4 shrink-0" aria-hidden="true" />Only reference counts and validation status are presented; values remain within the vault boundary.</p>
+        <p className="sm:col-span-2 flex items-start gap-2 border-t border-emerald-200 dark:border-emerald-500/25 pt-4 text-xs leading-5 text-emerald-800 dark:text-emerald-300"><CheckCircle2 className="mt-0.5 size-4 shrink-0" aria-hidden="true" />Only reference counts and validation status are presented; values remain within the vault boundary.</p>
       </CardContent>
     </Card>
   )

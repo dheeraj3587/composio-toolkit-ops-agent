@@ -100,7 +100,7 @@ export function RunProgress({
   return (
     <section
       aria-label="Run progress"
-      className="overflow-hidden rounded-2xl border border-brand-200 bg-gradient-to-br from-white via-white to-brand-50/70 shadow-[0_12px_40px_rgba(30,126,232,0.08)]"
+      className="overflow-hidden rounded-2xl border border-brand-200 bg-gradient-to-br from-card via-card to-brand-50/70 shadow-[0_12px_40px_rgba(0,0,0,0.18)]"
     >
       <div className="flex flex-col gap-3 border-b border-brand-100 px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
         <div>
@@ -110,7 +110,7 @@ export function RunProgress({
         <div className="flex flex-wrap items-center gap-2">
           <div
             className={`flex w-fit items-center gap-2 rounded-full px-3 py-1.5 text-[11px] font-medium ${
-              terminal ? "bg-secondary text-muted-foreground" : "bg-emerald-50 text-emerald-700"
+              terminal ? "bg-secondary text-muted-foreground" : "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/12 dark:text-emerald-300"
             }`}
             aria-live="polite"
           >
@@ -156,7 +156,7 @@ export function RunProgress({
 
       <div className="px-5 py-5 sm:px-6">
         <div
-          className="relative mb-5 h-2 overflow-hidden rounded-full bg-slate-100"
+          className="relative mb-5 h-2 overflow-hidden rounded-full bg-muted"
           role="progressbar"
           aria-label="Run completion"
           aria-valuemin={0}
@@ -170,7 +170,7 @@ export function RunProgress({
             }`}
             style={{ width: `${percent}%` }}
           />
-          {!terminal ? <div className="progress-shimmer absolute inset-y-0 w-24 bg-gradient-to-r from-transparent via-white/45 to-transparent" /> : null}
+          {!terminal ? <div className="progress-shimmer absolute inset-y-0 w-24 bg-gradient-to-r from-transparent via-foreground/25 to-transparent" /> : null}
         </div>
 
         <ol className="grid grid-cols-5 gap-2">
@@ -186,12 +186,12 @@ export function RunProgress({
                 <span
                   className={`mb-2 grid size-6 place-items-center rounded-full border ${
                     complete
-                      ? "border-brand-600 bg-brand-600 text-white"
+                      ? "border-brand-500 bg-brand-500 text-primary-foreground"
                       : active
                         ? failed
-                          ? "border-amber-400 bg-amber-50 text-amber-700"
+                          ? "border-amber-400 bg-amber-50 text-amber-700 dark:border-amber-500/45 dark:bg-amber-500/12 dark:text-amber-300"
                           : "border-brand-500 bg-brand-50 text-brand-700"
-                        : "border-border bg-white text-muted-foreground/45"
+                        : "border-border bg-card text-muted-foreground/45"
                   }`}
                 >
                   {complete ? (

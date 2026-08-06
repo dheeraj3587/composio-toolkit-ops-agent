@@ -39,21 +39,21 @@ const configMissing = new Set(["not_configured", "outreach_review_required"])
 
 function tone(status: string): string {
   // Policy: distinct indigo treatment — not a failure, not neutral
-  if (policy.has(status)) return "border-indigo-300 bg-indigo-50 text-indigo-800"
+  if (policy.has(status)) return "border-indigo-300 bg-indigo-50 text-indigo-800 dark:border-indigo-500/35 dark:bg-indigo-500/12 dark:text-indigo-300"
   // Configuration present: informational blue rather than warning amber
-  if (configPresent.has(status)) return "border-sky-300 bg-sky-50 text-sky-800"
+  if (configPresent.has(status)) return "border-sky-300 bg-sky-50 text-sky-800 dark:border-sky-500/35 dark:bg-sky-500/12 dark:text-sky-300"
   // Configuration missing: distinct slate/orange treatment
-  if (configMissing.has(status)) return "border-orange-300 bg-orange-50 text-orange-800"
+  if (configMissing.has(status)) return "border-orange-300 bg-orange-50 text-orange-800 dark:border-orange-500/35 dark:bg-orange-500/12 dark:text-orange-300"
   // Run-specific states
-  if (status === "configuration_required") return "border-orange-300 bg-orange-50 text-orange-800"
-  if (status === "waiting_for_reply" || status === "outreach_sent") return "border-sky-300 bg-sky-50 text-sky-800"
-  if (status === "waiting_for_hitl" || status === "waiting") return "border-amber-300 bg-amber-50 text-amber-800"
+  if (status === "configuration_required") return "border-orange-300 bg-orange-50 text-orange-800 dark:border-orange-500/35 dark:bg-orange-500/12 dark:text-orange-300"
+  if (status === "waiting_for_reply" || status === "outreach_sent") return "border-sky-300 bg-sky-50 text-sky-800 dark:border-sky-500/35 dark:bg-sky-500/12 dark:text-sky-300"
+  if (status === "waiting_for_hitl" || status === "waiting") return "border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-500/35 dark:bg-amber-500/12 dark:text-amber-300"
   if (gated.has(status)) return "border-brand-300 bg-brand-50 text-brand-800"
-  if (positive.has(status)) return "border-emerald-300 bg-emerald-50 text-emerald-800"
-  if (negative.has(status)) return "border-red-300 bg-red-50 text-red-800"
-  if (running.has(status)) return "border-blue-300 bg-blue-50 text-blue-800"
-  if (unknown.has(status)) return "border-slate-300 bg-slate-50 text-slate-600"
-  return "border-border bg-white text-muted-foreground"
+  if (positive.has(status)) return "border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-500/35 dark:bg-emerald-500/12 dark:text-emerald-300"
+  if (negative.has(status)) return "border-red-300 bg-red-50 text-red-800 dark:border-red-500/35 dark:bg-red-500/12 dark:text-red-300"
+  if (running.has(status)) return "border-blue-300 bg-blue-50 text-blue-800 dark:border-blue-500/35 dark:bg-blue-500/12 dark:text-blue-300"
+  if (unknown.has(status)) return "border-slate-300 bg-slate-50 text-slate-600 dark:border-border dark:bg-muted dark:text-muted-foreground"
+  return "border-border bg-card text-muted-foreground"
 }
 
 export function StatusBadge({ status, className }: { status?: string | null; className?: string }) {

@@ -12,13 +12,17 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@base-ui/react": "^1.7.0",
     "@hookform/resolvers": "5.4.0",
+    "@hugeicons/core-free-icons": "^4.2.3",
+    "@hugeicons/react": "^1.1.9",
     "@novnc/novnc": "1.7.0",
     "@tanstack/react-query": "5.101.4",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "date-fns": "4.4.0",
     "lucide-react": "^1.25.0",
+    "motion": "^13.0.0",
     "next": "16.2.11",
     "qrcode": "1.5.4",
     "radix-ui": "^1.6.4",

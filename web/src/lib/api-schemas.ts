@@ -618,6 +618,51 @@ const runProgressEventSchema = z.strictObject({
   recorded_at: isoTimestamp,
 })
 
+const runDecisionSchema = z.strictObject({
+  step_index: z.number().int().min(1).max(100_000),
+  onboarding_phase: onboardingPhaseSchema,
+  decision: z.enum([
+    "select_candidate",
+    "report_hitl",
+    "report_blocked",
+    "rejected",
+  ]),
+  reason_code: safeToken.nullish().default(null),
+  candidate_label: boundedText(200).nullish().default(null),
+  action: safeToken.nullish().default(null),
+  target_host: boundedText(255).nullish().default(null),
+  // Model-authored prose. Bounded here and rendered inert by AgentTrace; it
+  // never becomes markdown, a link, or a control.
+  reason: boundedText(400).nullish().default(null),
+  reason_withheld: z.boolean().default(false),
+  recorded_at: isoTimestamp,
+})
+
+const runCitationSchema = z.strictObject({
+  kind: safeToken,
+  url: httpUrl,
+  source_url: httpUrl.nullish().default(null),
+})
+
+export const modelCatalogResponseSchema = z.strictObject({
+  models: z
+    .array(
+      z.strictObject({
+        id: safeToken,
+        provider: safeToken,
+        model: boundedText(120),
+        label: boundedText(120),
+        description: boundedText(300),
+        supports_effort: z.boolean(),
+        effort_values: z.array(safeToken).max(8),
+        is_default: z.boolean(),
+      }),
+    )
+    .max(50),
+  default_model_id: safeToken.nullish().default(null),
+  default_effort: safeToken.nullish().default(null),
+})
+
 export const timelineResponseSchema = z.strictObject({
   run_id: runId,
   items: z
@@ -636,6 +681,10 @@ export const timelineResponseSchema = z.strictObject({
     )
     .max(1_000),
   progress: z.array(runProgressEventSchema).max(200).default([]),
+  decisions: z.array(runDecisionSchema).max(200).default([]),
+  citations: z.array(runCitationSchema).max(200).default([]),
+  decision_model: safeToken.nullish().default(null),
+  decision_effort: safeToken.nullish().default(null),
 })
 
 const integratorBundle = z.strictObject({

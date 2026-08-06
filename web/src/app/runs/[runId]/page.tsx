@@ -2,8 +2,9 @@ import type { Metadata } from "next"
 import Link from "next/link"
 import { notFound } from "next/navigation"
 import { connection } from "next/server"
-import { ArrowLeft, CircleOff, Clock3, Fingerprint, Globe2, Mail, Route, Settings2 } from "lucide-react"
+import { ArrowLeft, CircleOff, Clock3, Cpu, Fingerprint, Globe2, Mail, Route, Settings2 } from "lucide-react"
 
+import { AgentTrace } from "@/components/agent-trace"
 import { HitlLiveControls, OnboardingControlBar } from "@/components/hitl-live-controls"
 import { CanonicalPrimaryAction } from "@/components/canonical-primary-action"
 import { PhaseActionForm } from "@/components/phase-action-form"
@@ -25,9 +26,9 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ApiError, getProviderProfile, getRun, getRunOutput, getTimeline } from "@/lib/api"
-import { formatTimestamp, humanize, relativeTimestamp } from "@/lib/format"
+import { formatTimestamp, humanize } from "@/lib/format"
 import { phaseMap } from "@/lib/phases"
-import type { PhaseCollection, PhaseState, RetryCapability, RunProgressEvent } from "@/lib/types"
+import type { PhaseCollection, PhaseState, RetryCapability } from "@/lib/types"
 
 export const metadata: Metadata = { title: "Run detail" }
 
@@ -57,6 +58,17 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
   // fetched but never surfaced in the UI.
   const liveProgress =
     timelineResult.status === "fulfilled" ? timelineResult.value.progress ?? [] : []
+  // The reasoning the model authored for each of those steps, plus every source
+  // the run actually recorded. Both ride the same response; neither is fetched
+  // separately and neither is reconstructed client-side.
+  const decisions =
+    timelineResult.status === "fulfilled" ? timelineResult.value.decisions ?? [] : []
+  const citations =
+    timelineResult.status === "fulfilled" ? timelineResult.value.citations ?? [] : []
+  const decisionModel =
+    timelineResult.status === "fulfilled" ? timelineResult.value.decision_model ?? null : null
+  const decisionEffort =
+    timelineResult.status === "fulfilled" ? timelineResult.value.decision_effort ?? null : null
   const timelineUnavailable = timelineResult.status === "rejected"
   const output = outputResult.status === "fulfilled" ? outputResult.value : null
   const profile = profileResult.status === "fulfilled" ? profileResult.value : null
@@ -142,11 +154,22 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
           <h1 className="mt-3 text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">{detail.run.app_name}</h1>
           <p className="mt-3 break-all font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">{detail.run.run_id}</p>
         </div>
-        <div className="grid overflow-hidden rounded-xl border border-border bg-border sm:grid-cols-2 xl:min-w-[660px] xl:grid-cols-4">
+        <div className="grid overflow-hidden rounded-xl border border-border bg-border sm:grid-cols-2 xl:min-w-[660px] xl:grid-cols-3">
           <Meta icon={Route} label="Access route" value={humanize(detail.run.route_kind ?? detail.run.access_route)} />
           <Meta icon={Settings2} label="Account" value={detail.run.account_mode ? humanize(detail.run.account_mode) : "Not reported"} />
           <Meta icon={Globe2} label="Browser" value={humanize(detail.run.browser_provider)} />
           <Meta icon={Clock3} label="Updated · UTC" value={formatTimestamp(detail.run.updated_at)} />
+          <Meta
+            icon={Cpu}
+            label="Decision model"
+            value={
+              decisionModel
+                ? decisionEffort
+                  ? `${decisionModel} · ${decisionEffort}`
+                  : decisionModel
+                : "Deployment default"
+            }
+          />
         </div>
       </header>
 
@@ -185,7 +208,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
       ) : null}
 
       {isPlanOnly ? (
-        <Alert className="rounded-md border-sky-300 bg-sky-50 text-sky-950">
+        <Alert className="rounded-md border-sky-300 bg-sky-50 text-sky-950 dark:border-sky-500/35 dark:bg-sky-500/12 dark:text-sky-200">
           <AlertTitle>Planning completed</AlertTitle>
           <AlertDescription>
             Browser, email, HITL, and credential validation were not attempted. Create a new run with Execute when configured to request approved provider actions.
@@ -194,7 +217,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
       ) : null}
 
       {missingFields.length ? (
-        <Alert className="rounded-md border-amber-300 bg-amber-50 text-amber-950">
+        <Alert className="rounded-md border-amber-300 bg-amber-50 text-amber-950 dark:border-amber-500/35 dark:bg-amber-500/12 dark:text-amber-200">
           <AlertTitle>{isPlanOnly ? "Baseline planning completed" : "Configuration or evidence is incomplete"}</AlertTitle>
           <AlertDescription>
             {isPlanOnly
@@ -307,50 +330,18 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
       <section aria-labelledby="timeline">
         <div className="mb-3"><p className="eyebrow">Sanitized audit</p><h2 id="timeline" className="mt-1 text-xl font-semibold">Run timeline</h2></div>
         {timelineUnavailable ? (
-          <Alert className="rounded-md border-amber-300 bg-amber-50"><AlertTitle>Timeline unavailable</AlertTitle><AlertDescription>The backend could not return sanitized events. This is not treated as an empty timeline.</AlertDescription></Alert>
+          <Alert className="rounded-md border-amber-300 bg-amber-50 dark:border-amber-500/35 dark:bg-amber-500/12 dark:text-amber-200"><AlertTitle>Timeline unavailable</AlertTitle><AlertDescription>The backend could not return sanitized events. This is not treated as an empty timeline.</AlertDescription></Alert>
         ) : <Timeline items={timeline} />}
       </section>
 
-      {liveProgress.length ? (
-        <RunProgressFeed events={liveProgress} />
-      ) : null}
+      <AgentTrace
+        progress={liveProgress}
+        decisions={decisions}
+        citations={citations}
+        decisionModel={decisionModel}
+        decisionEffort={decisionEffort}
+      />
     </div>
-  )
-}
-
-function RunProgressFeed({ events }: { events: RunProgressEvent[] }) {
-  return (
-    <section aria-labelledby="live-progress">
-      <div className="mb-3">
-        <p className="eyebrow">Live agent progress</p>
-        <h2 id="live-progress" className="mt-1 text-xl font-semibold">Agent steps</h2>
-      </div>
-      <ol className="panel rounded-md" aria-label="Live agent step progress">
-        {events.map((event) => (
-          <li
-            key={event.step_index}
-            className="grid items-center gap-2 border-b border-border px-5 py-4 last:border-0 sm:grid-cols-[80px_1fr_auto]"
-          >
-            <span className="font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
-              {event.stage.replaceAll("_", " ")}
-            </span>
-            <div>
-              <p className="text-sm font-medium">Step {event.step_index}</p>
-              <p className="mt-1 font-mono text-[9px] uppercase tracking-[0.1em] text-muted-foreground">
-                Onboarding phase · {humanize(event.onboarding_phase)} · {Math.round(event.elapsed_ms / 1000)}s
-              </p>
-            </div>
-            <time
-              className="text-xs text-muted-foreground"
-              dateTime={event.recorded_at}
-              title={formatTimestamp(event.recorded_at)}
-            >
-              {relativeTimestamp(event.recorded_at)}
-            </time>
-          </li>
-        ))}
-      </ol>
-    </section>
   )
 }
 

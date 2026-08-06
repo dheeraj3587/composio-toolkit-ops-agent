@@ -7,6 +7,7 @@ import {
   admissionDecisionResponseSchema,
   appCatalogResponseSchema,
   appResearchResponseSchema,
+  modelCatalogResponseSchema,
   appSearchResponseSchema,
   healthResponseSchema,
   liveViewResponseSchema,
@@ -34,6 +35,7 @@ import type {
   IntegratorOutput,
   LiveViewResponse,
   ManagedConnectionResponse,
+  ModelCatalogResponse,
   OnboardingPhase,
   OperationsRequestInput,
   PauseResponse,
@@ -243,6 +245,15 @@ export function listRuns(limit = 25, offset = 0): Promise<RunListResponse> {
 
 export function getRun(runId: string): Promise<RunDetailResponse> {
   return apiRequest(runPath(runId), runDetailResponseSchema)
+}
+
+/**
+ * The models a run may be pinned to. Derived from the backend's configured
+ * provider keys on every call, so a provider whose key is removed disappears
+ * from the picker rather than being offered and then failing at run time.
+ */
+export function getModelCatalog(): Promise<ModelCatalogResponse> {
+  return apiRequest("/api/models", modelCatalogResponseSchema)
 }
 
 export function getTimeline(runId: string): Promise<TimelineResponse> {

@@ -55,8 +55,8 @@ export default async function DashboardPage() {
       </header>
 
       {unavailable ? (
-        <Alert className="rounded-md border-amber-300 bg-amber-50 text-amber-950">
-          <RadioTower className="text-amber-700" aria-hidden="true" />
+        <Alert className="rounded-md border-amber-300 bg-amber-50 text-amber-950 dark:border-amber-500/35 dark:bg-amber-500/12 dark:text-amber-200">
+          <RadioTower className="text-amber-700 dark:text-amber-300" aria-hidden="true" />
           <AlertTitle>Backend state is partially unavailable</AlertTitle>
           <AlertDescription>
             No run or health state is inferred while the backend is unavailable. Start the operations API configured by the server-only OPS_API_URL.

@@ -499,10 +499,67 @@ export interface RunProgressEvent {
   recorded_at: string
 }
 
+export type RunDecisionKind =
+  | "select_candidate"
+  | "report_hitl"
+  | "report_blocked"
+  | "rejected"
+
+/**
+ * One iteration of the onboarding action loop, as the model decided it.
+ *
+ * `reason` is prose the model authored about a live third-party page. It is
+ * capped and DLP-screened server-side, and the UI renders it as inert text
+ * marked unverified — never markdown, never a link, never a control. When the
+ * screen refused the text the server sends `reason: null` with
+ * `reason_withheld: true`, which the UI must say out loud rather than showing
+ * an empty fold.
+ */
+export interface RunDecision {
+  step_index: number
+  onboarding_phase: OnboardingPhase
+  decision: RunDecisionKind
+  reason_code?: string | null
+  candidate_label?: string | null
+  action?: string | null
+  target_host?: string | null
+  reason?: string | null
+  reason_withheld: boolean
+  recorded_at: string
+}
+
+/** A source the run actually recorded — never a URL the UI invented. */
+export interface RunCitation {
+  kind: string
+  url: string
+  source_url?: string | null
+}
+
 export interface TimelineResponse {
   run_id: string
   items: TimelineItem[]
   progress: RunProgressEvent[]
+  decisions: RunDecision[]
+  citations: RunCitation[]
+  decision_model?: string | null
+  decision_effort?: string | null
+}
+
+export interface ModelOption {
+  id: string
+  provider: string
+  model: string
+  label: string
+  description: string
+  supports_effort: boolean
+  effort_values: string[]
+  is_default: boolean
+}
+
+export interface ModelCatalogResponse {
+  models: ModelOption[]
+  default_model_id?: string | null
+  default_effort?: string | null
 }
 
 export interface SnapshotHealth {
@@ -573,6 +630,10 @@ export interface OperationsRequestInput {
   // Optional app sign-in credentials for autonomous login. Injected into
   // the selected provider's secret boundary at session creation; never persisted.
   browser_login?: { email: string; password: string } | null
+  // The model this run's action loop should decide with, as `<provider>:<model>`.
+  // Absent means the deployment's own inference chain, unchanged.
+  decision_model?: string | null
+  decision_effort?: string | null
 }
 
 export interface IntegratorOutput {

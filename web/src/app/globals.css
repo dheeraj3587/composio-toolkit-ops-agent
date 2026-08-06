@@ -44,19 +44,36 @@
   --color-ink: var(--ink);
   --color-rail: var(--rail);
   --color-brand: var(--brand);
-  --color-brand-50: #eaf4ff;
-  --color-brand-200: #b9ddff;
-  --color-brand-300: #8cc5ff;
-  --color-brand-400: #51a2ff;
-  --color-brand-500: #3590f5;
-  --color-brand-600: #1f7ee8;
-  --color-brand-800: #0b4f91;
-  --color-brand-950: #082747;
+  /* The ramp is theme-varied, not fixed: `bg-brand-50` must stay a soft
+     wash and `text-brand-950` must stay legible on it in *both* themes.
+     Defining each stop as a variable keeps ~180 existing utility usages
+     correct without touching a single component. */
+  --color-brand-50: var(--brand-50);
+  --color-brand-100: var(--brand-100);
+  --color-brand-200: var(--brand-200);
+  --color-brand-300: var(--brand-300);
+  --color-brand-400: var(--brand-400);
+  --color-brand-500: var(--brand-500);
+  --color-brand-600: var(--brand-600);
+  --color-brand-700: var(--brand-700);
+  --color-brand-800: var(--brand-800);
+  --color-brand-900: var(--brand-900);
+  --color-brand-950: var(--brand-950);
   --color-brand-hover: var(--brand-hover);
   --color-brand-active: var(--brand-active);
   --color-brand-soft: var(--brand-soft);
   --color-brand-ink: var(--brand-ink);
   --color-brand-dev: var(--brand-dev);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-neon: var(--neon);
+  --color-status-active: var(--status-active);
+  --color-status-sleeping: var(--status-sleeping);
+  --color-status-scaling: var(--status-scaling);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
   --font-sans: var(--font-abc-diatype);
   --font-mono: var(--font-jetbrains-mono);
   --font-heading: var(--font-abc-diatype);
@@ -68,34 +85,117 @@
   --radius-xl: 0.75rem;
 }
 
+/* Neon tokens (https://ui.neon.com/theming). Light stays available behind
+   the `.light` class; `.dark` is the app default, set in app/layout.tsx. */
 :root {
-  --paper: #f6f6f6;
-  --ink: #0f0f0f;
-  --rail: #0f0f0f;
-  --brand: #51a2ff;
-  --brand-hover: #3590f5;
-  --brand-active: #1f7ee8;
-  --brand-soft: #eaf4ff;
-  --brand-ink: #0b4f91;
-  --brand-dev: #0007cd;
+  --radius: 0.5rem;
+  --paper: #ffffff;
+  --ink: #0c0d0d;
+  --rail: #0c0d0d;
+  --brand: #00a36f;
+  --brand-hover: #00b37a;
+  --brand-active: #00845c;
+  --brand-soft: #e9fbf4;
+  --brand-ink: #056647;
+  --brand-dev: #005c3e;
+  --brand-50: #e9fbf4;
+  --brand-100: #d3f7e8;
+  --brand-200: #a8efd3;
+  --brand-300: #6de7ba;
+  --brand-400: #34d39c;
+  --brand-500: #00b37a;
+  --brand-600: #00a36f;
+  --brand-700: #00845c;
+  --brand-800: #056647;
+  --brand-900: #05432f;
+  --brand-950: #032a1e;
   --background: var(--paper);
   --foreground: var(--ink);
   --card: #ffffff;
   --card-foreground: var(--ink);
-  --popover: #fafafa;
+  --popover: #ffffff;
   --popover-foreground: var(--ink);
-  --primary: var(--brand);
-  --primary-foreground: #0f0f0f;
-  --secondary: #f0f0f0;
-  --secondary-foreground: #1e1e1e;
-  --muted: #f0f0f0;
-  --muted-foreground: #626262;
-  --accent: var(--brand-soft);
-  --accent-foreground: var(--brand-ink);
-  --destructive: oklch(0.577 0.215 27.3);
-  --border: #eaeaea;
-  --input: #d7d7d7;
-  --ring: var(--brand-active);
+  --primary: #00a36f;
+  --primary-foreground: #ffffff;
+  --secondary: #f3f4f6;
+  --secondary-foreground: var(--ink);
+  --muted: #f3f4f6;
+  --muted-foreground: #5b6472;
+  --accent: #f3f4f6;
+  --accent-foreground: var(--ink);
+  --destructive: #e5484d;
+  --destructive-foreground: #ffffff;
+  --border: #e5e7eb;
+  --input: #e5e7eb;
+  --ring: #00a36f;
+  --neon: #00b37a;
+  --status-active: #00b37a;
+  --status-sleeping: #6b7280;
+  --status-scaling: #d97706;
+  --chart-1: #34c79a;
+  --chart-2: #00a870;
+  --chart-3: #008054;
+  --chart-4: #005c3e;
+  --chart-5: #0d3a2a;
+  --selection: #b6f2dc;
+  --selection-ink: #032a1e;
+  --panel-shadow: 0 1px 2px rgb(15 15 15 / 0.04), 0 12px 32px rgb(15 15 15 / 0.035);
+}
+
+.dark {
+  --paper: #0c0d0d;
+  --ink: #f3f4f6;
+  --rail: #131414;
+  --brand: #00e599;
+  --brand-hover: #34eaad;
+  --brand-active: #00b37a;
+  --brand-soft: #0a1f18;
+  --brand-ink: #9df5d4;
+  --brand-dev: #00e599;
+  /* Inverted: the low stops are surface washes, the high stops are the
+     legible foregrounds that sit on them. */
+  --brand-50: #0a1f18;
+  --brand-100: #0e2a20;
+  --brand-200: #17402f;
+  --brand-300: #34d39c;
+  --brand-400: #4ade9f;
+  --brand-500: #00e599;
+  --brand-600: #5eeab5;
+  --brand-700: #7ff0c6;
+  --brand-800: #9df5d4;
+  --brand-900: #c3f9e4;
+  --brand-950: #d8fbee;
+  --background: var(--paper);
+  --foreground: var(--ink);
+  --card: #131414;
+  --card-foreground: var(--ink);
+  --popover: #1a1b1b;
+  --popover-foreground: var(--ink);
+  --primary: #00e599;
+  --primary-foreground: #0c0d0d;
+  --secondary: #1a1b1b;
+  --secondary-foreground: var(--ink);
+  --muted: #1a1b1b;
+  --muted-foreground: #9ca3af;
+  --accent: #1a1b1b;
+  --accent-foreground: var(--ink);
+  --destructive: #ef4444;
+  --destructive-foreground: #ffffff;
+  --border: #262727;
+  --input: #262727;
+  --ring: #00e599;
+  --neon: #00e599;
+  --status-active: #00e599;
+  --status-sleeping: #6b7280;
+  --status-scaling: #f59e0b;
+  --chart-1: #7ff5cf;
+  --chart-2: #00e599;
+  --chart-3: #00a870;
+  --chart-4: #0a6647;
+  --chart-5: #14362b;
+  --selection: #14362b;
+  --selection-ink: #d8fbee;
+  --panel-shadow: 0 1px 2px rgb(0 0 0 / 0.5), 0 12px 32px rgb(0 0 0 / 0.35);
 }
 
 @layer base {
@@ -138,8 +238,8 @@
   }
 
   ::selection {
-    background: #cfe7ff;
-    color: #0f0f0f;
+    background: var(--selection);
+    color: var(--selection-ink);
   }
 
   a,
@@ -206,7 +306,8 @@
   }
 
   .panel {
-    @apply rounded-lg border border-border bg-card shadow-[0_1px_2px_rgba(15,15,15,0.04),0_12px_32px_rgba(15,15,15,0.035)];
+    @apply rounded-lg border border-border bg-card;
+    box-shadow: var(--panel-shadow);
   }
 
   .metric-value {
@@ -258,5 +359,101 @@
     animation-iteration-count: 1 !important;
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+/* ── Neon component utilities ──────────────────────────────────────────
+   Folded in from the Neon registry's tokens.css. Only the utilities the
+   installed components actually reference are kept; `shimmer` is
+   reimplemented here because the registry inherits it from
+   shadcn/tailwind.css, which this app does not import. */
+
+@utility shimmer {
+  --_spread: var(--shimmer-spread, calc(3ch + 40px));
+  --_base: currentColor;
+  --_highlight: var(
+    --shimmer-color,
+    oklch(from currentColor max(0.8, calc(l + 0.4)) c h / calc(alpha + 0.4))
+  );
+  animation: neon-shimmer var(--shimmer-duration, 2s) linear infinite;
+  background-clip: text;
+  background-image: linear-gradient(
+    calc(90deg + var(--shimmer-angle, 20deg)),
+    var(--_base) calc(50% - var(--_spread)),
+    color-mix(in oklch, var(--_highlight), var(--_base) 50%)
+      calc(50% - var(--_spread) * 0.5),
+    var(--_highlight) 50%,
+    color-mix(in oklch, var(--_highlight), var(--_base) 50%)
+      calc(50% + var(--_spread) * 0.5),
+    var(--_base) calc(50% + var(--_spread))
+  );
+  background-position: 0 0;
+  background-repeat: no-repeat;
+  background-size: calc(200% + var(--_spread) * 2) 100%;
+  color: transparent;
+}
+
+@utility shimmer-duration-* {
+  --shimmer-duration: calc(--value(integer) * 1ms);
+}
+
+@keyframes neon-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: 0 0;
+  }
+}
+
+@keyframes neon-status-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+    opacity: 0.45;
+  }
+  50% {
+    box-shadow: 0 0 6px 1px color-mix(in oklch, currentColor 45%, transparent);
+    opacity: 1;
+  }
+}
+
+.neon-status-breathe {
+  animation: neon-status-breathe 2.6s ease-in-out infinite;
+}
+
+.neon-scroll-fade {
+  scrollbar-color: var(--border) transparent;
+  scrollbar-width: thin;
+}
+
+.neon-scroll-fade::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.neon-scroll-fade::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.neon-scroll-fade::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 999px;
+}
+
+.neon-scroll-fade::-webkit-scrollbar-thumb:hover {
+  background: var(--muted-foreground);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shimmer {
+    animation: none;
+    background-image: none;
+    color: currentColor;
+  }
+
+  .neon-status-breathe {
+    animation: none;
+    opacity: 1;
   }
 }

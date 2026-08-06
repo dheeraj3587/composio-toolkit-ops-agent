@@ -159,7 +159,7 @@ export default async function LoginPage({
                 maxLength={320}
                 autoComplete="username"
                 autoFocus
-                className="h-12 rounded-xl bg-white px-4"
+                className="h-12 rounded-xl bg-card px-4"
                 placeholder="Operator username"
               />
             </div>
@@ -172,7 +172,7 @@ export default async function LoginPage({
                 required
                 maxLength={1_024}
                 autoComplete="current-password"
-                className="h-12 rounded-xl bg-white px-4"
+                className="h-12 rounded-xl bg-card px-4"
                 placeholder="Your password"
               />
             </div>

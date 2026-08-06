@@ -76,7 +76,7 @@ export function BrowserEngineField<TValues extends BrowserEngineValues>({
                   className={`group relative rounded-lg border p-4 outline-none transition-[border-color,box-shadow,background-color] ${
                     selected
                       ? "border-brand-500 bg-brand-50/80 shadow-[0_0_0_1px_var(--color-brand-500)]"
-                      : "border-border bg-white"
+                      : "border-border bg-card"
                   } ${selectable ? "cursor-pointer hover:border-brand-300" : "cursor-not-allowed opacity-60"}`}
                 >
                   <input
@@ -90,7 +90,7 @@ export function BrowserEngineField<TValues extends BrowserEngineValues>({
                     className="peer sr-only"
                   />
                   <span className="flex items-start justify-between gap-3 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-4 peer-focus-visible:outline-brand-600">
-                    <span className="grid size-8 place-items-center rounded-md border border-border bg-white text-brand-700">
+                    <span className="grid size-8 place-items-center rounded-md border border-border bg-card text-brand-700">
                       <Icon className="size-4" aria-hidden="true" />
                     </span>
                     <span
@@ -106,7 +106,7 @@ export function BrowserEngineField<TValues extends BrowserEngineValues>({
                     {option.description}
                   </span>
                   {!selectable ? (
-                    <span className="mt-3 block border-t border-border pt-3 text-[10px] leading-4 text-amber-800">
+                    <span className="mt-3 block border-t border-border pt-3 text-[10px] leading-4 text-amber-800 dark:text-amber-300">
                       {state?.detail ?? "Provider readiness could not be confirmed."}
                     </span>
                   ) : null}

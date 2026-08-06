@@ -59,7 +59,7 @@ export function AppSearch() {
               value={query}
               onChange={(event) => setQuery(event.target.value.slice(0, 120))}
               placeholder="Filter by name, slug, or category — optional"
-              className="h-11 rounded-md bg-white pl-10"
+              className="h-11 rounded-md bg-card pl-10"
               autoComplete="off"
             />
           </div>
@@ -131,7 +131,7 @@ export function AppSearch() {
  */
 function AppCard({ app }: { app: AppSearchItem }) {
   return (
-    <div className="group relative flex min-h-32 flex-col justify-between rounded-md border border-border bg-white p-4 transition-colors focus-within:border-brand-300 hover:border-brand-300 hover:bg-brand-50/35">
+    <div className="group relative flex min-h-32 flex-col justify-between rounded-md border border-border bg-card p-4 transition-colors focus-within:border-brand-300 hover:border-brand-300 hover:bg-brand-50/35">
       <Link
         href={`/apps/${encodeURIComponent(app.app_slug)}`}
         className="absolute inset-0 z-0 rounded-md focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500"
@@ -153,7 +153,7 @@ function AppCard({ app }: { app: AppSearchItem }) {
         </span>
         <Link
           href={`/runs/new?app=${encodeURIComponent(app.app_name)}`}
-          className="relative z-10 inline-flex items-center gap-1 rounded-md border border-border bg-white px-2 py-1 text-[11px] font-medium text-foreground transition-colors hover:border-brand-300 hover:bg-brand-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500"
+          className="relative z-10 inline-flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium text-foreground transition-colors hover:border-brand-300 hover:bg-brand-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500"
         >
           Run<span className="sr-only"> {app.app_name}</span>
           <ArrowRight className="size-3.5 transition-transform group-hover:translate-x-0.5" aria-hidden="true" />

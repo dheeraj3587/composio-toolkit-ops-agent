@@ -19,6 +19,7 @@ import { createRunAction, type CreateRunFormState } from "@/app/runs/new/actions
 import { AppNameField } from "@/components/app-name-field"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { BrowserEngineField, browserProviderIsSelectable } from "@/components/browser-engine-field"
+import { ModelPickerField } from "@/components/model-picker-field"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
@@ -44,6 +45,10 @@ const runFormSchema = z
       error: "Choose an available browser.",
     }),
     credential_creation_policy: z.enum(["reuse_only", "create_if_missing"]),
+    // A per-run model pin. Empty means "use the deployment's chain"; the
+    // backend is the authority on whether a named model is serviceable.
+    decision_model: z.string().max(120),
+    decision_effort: z.enum(["", "instant", "low", "medium", "high"]),
     callback_urls: z.string().max(2_000).refine((value) => {
       const urls = value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean)
       return urls.length <= 10 && urls.every((url) => safeUrl.safeParse(url).success)
@@ -118,6 +123,8 @@ export function NewRunForm({
       execution_mode: "execute_when_configured",
       browser_provider: defaultProvider,
       credential_creation_policy: "create_if_missing",
+      decision_model: "",
+      decision_effort: "",
       callback_urls: "",
     },
   })
@@ -128,6 +135,7 @@ export function NewRunForm({
   const accountMode = watch("account_mode")
   const executionMode = watch("execution_mode")
   const appName = watch("app_name")
+  const decisionEffort = watch("decision_effort")
   const catalog = useAppCatalog()
   const selectedApp = catalog.data?.items.find((app) => app.app_name === appName)
   const appCapabilities = useAppCapabilities(selectedApp?.app_slug)
@@ -202,7 +210,7 @@ export function NewRunForm({
   return (
     <form onSubmit={handleSubmit(submit)} noValidate className="space-y-6">
       <section className="panel overflow-hidden rounded-2xl">
-        <div className="border-b border-border bg-gradient-to-r from-white to-brand-50/50 px-5 py-5 sm:px-7">
+        <div className="border-b border-border bg-gradient-to-r from-card to-brand-50/50 px-5 py-5 sm:px-7">
           <p className="eyebrow">Step 1</p>
           <h2 className="mt-1 text-xl font-medium">Choose the app and account</h2>
           <p className="mt-2 text-sm text-muted-foreground">
@@ -269,7 +277,7 @@ export function NewRunForm({
             <p
               id="account-creation-readiness"
               className={`text-xs leading-5 ${
-                createAccountUnavailable ? "text-amber-800" : "text-emerald-700"
+                createAccountUnavailable ? "text-amber-800 dark:text-amber-300" : "text-emerald-700 dark:text-emerald-300"
               }`}
               aria-live="polite"
             >
@@ -278,7 +286,7 @@ export function NewRunForm({
             {signupResearchCaveat ? (
               <p
                 id="account-creation-research-caveat"
-                className="text-xs leading-5 text-amber-800"
+                className="text-xs leading-5 text-amber-800 dark:text-amber-300"
                 aria-live="polite"
               >
                 {signupResearchCaveat.detail}{" "}
@@ -297,19 +305,39 @@ export function NewRunForm({
           </fieldset>
         </div>
 
-        <div className="border-t border-border bg-white px-5 py-6 sm:px-7">
+        <div className="border-t border-border bg-card px-5 py-6 sm:px-7">
           <BrowserEngineField
             control={control}
             providerStates={providerStates}
             error={errors.browser_provider}
             serverInvalid={serverInvalid.has("browser_provider")}
           />
+          <div className="mt-6 border-t border-border pt-6">
+            <Controller
+              control={control}
+              name="decision_model"
+              render={({ field }) => (
+                <ModelPickerField
+                  value={{
+                    modelId: field.value || null,
+                    effort: decisionEffort || null,
+                  }}
+                  onChange={(next) => {
+                    field.onChange(next.modelId ?? "")
+                    setValue("decision_effort", next.effort ?? "", {
+                      shouldDirty: true,
+                    })
+                  }}
+                />
+              )}
+            />
+          </div>
         </div>
 
         {accountMode === "existing_account" ? (
           <div className="border-t border-border bg-muted/25 px-5 py-6 sm:px-7">
             <div className="mb-4 flex items-start gap-3">
-              <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-white text-brand-700 shadow-sm">
+              <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-card text-brand-700 shadow-sm">
                 <LockKeyhole className="size-4" aria-hidden="true" />
               </span>
               <div>
@@ -436,7 +464,7 @@ export function NewRunForm({
                   <Select name={field.name} value={field.value} onValueChange={field.onChange}>
                     <SelectTrigger
                       id="requested_scope_policy"
-                      className="w-full bg-white"
+                      className="w-full bg-card"
                       aria-invalid={invalid("requested_scope_policy")}
                       {...a11y}
                     >
@@ -468,7 +496,7 @@ export function NewRunForm({
                   <Select name={field.name} value={field.value} onValueChange={field.onChange}>
                     <SelectTrigger
                       id="credential_creation_policy"
-                      className="w-full bg-white"
+                      className="w-full bg-card"
                       aria-invalid={invalid("credential_creation_policy")}
                       {...a11y}
                     >
@@ -500,7 +528,7 @@ export function NewRunForm({
                   <Select name={field.name} value={field.value} onValueChange={field.onChange}>
                     <SelectTrigger
                       id="execution_mode"
-                      className="w-full bg-white"
+                      className="w-full bg-card"
                       aria-invalid={invalid("execution_mode")}
                       {...a11y}
                     >
@@ -530,9 +558,9 @@ export function NewRunForm({
         </Alert>
       ) : null}
 
-      <div className="sticky bottom-4 z-20 flex flex-col gap-4 rounded-2xl border border-white/70 bg-white/90 p-4 shadow-[0_20px_60px_rgba(15,23,42,0.16)] backdrop-blur-xl sm:flex-row sm:items-center sm:justify-between">
+      <div className="sticky bottom-4 z-20 flex flex-col gap-4 rounded-2xl border border-border bg-card/90 p-4 shadow-[0_20px_60px_rgba(0,0,0,0.28)] backdrop-blur-xl sm:flex-row sm:items-center sm:justify-between">
         <p className="flex max-w-2xl items-start gap-2 text-xs leading-5 text-muted-foreground">
-          <Check className="mt-0.5 size-4 shrink-0 text-emerald-600" aria-hidden="true" />
+          <Check className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-300" aria-hidden="true" />
           The app-specific vault destination is created automatically. You never need to enter a vault address.
         </p>
         <Button type="submit" size="lg" disabled={pending} className="h-11 rounded-xl px-6">
@@ -572,7 +600,7 @@ function AccountChoice({
       className={`relative rounded-xl border p-4 text-left transition ${
         selected
           ? "border-brand-500 bg-brand-50 shadow-[0_0_0_1px_var(--color-brand-500)]"
-          : "border-border bg-white"
+          : "border-border bg-card"
       } ${
         disabled
           ? "cursor-not-allowed opacity-55"

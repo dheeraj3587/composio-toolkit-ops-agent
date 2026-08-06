@@ -61,7 +61,7 @@ export function AppNameField<TValues extends FieldValues>({
             >
               <SelectTrigger
                 id="app_name"
-                className="w-full rounded-md bg-white"
+                className="w-full rounded-md bg-card"
                 aria-invalid={invalid}
                 aria-describedby={describedBy}
                 aria-errormessage={errorMessage}

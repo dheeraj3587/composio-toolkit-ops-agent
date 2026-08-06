@@ -121,7 +121,7 @@ describe("RunDetailPage", () => {
     expect(screen.getByText("Access route selected.")).toBeInTheDocument()
   })
 
-  it("surfaces the agent's live loop-step progress from the timeline response", async () => {
+  it("surfaces the agent's reasoning trace, its decisions, and the run's sources", async () => {
     const runId = "run_progress_1234567890abcdef"
     mocks.getRun.mockResolvedValue({
       run: {
@@ -167,18 +167,52 @@ describe("RunDetailPage", () => {
           recorded_at: "2026-07-23T10:03:00Z",
         },
       ],
+      decisions: [
+        {
+          step_index: 2,
+          onboarding_phase: "route_selected_signup",
+          decision: "select_candidate",
+          reason_code: null,
+          candidate_label: "Sign up",
+          action: "click",
+          target_host: "app.pipedrive.com",
+          reason: "The sign-up control is the only route to an account.",
+          reason_withheld: false,
+          recorded_at: "2026-07-23T10:03:00Z",
+        },
+      ],
+      citations: [
+        {
+          kind: "signup_route_found",
+          url: "https://app.pipedrive.com/signup",
+          source_url: null,
+        },
+      ],
+      decision_model: "groq:openai/gpt-oss-120b",
+      decision_effort: "low",
     })
     mocks.getRunOutput.mockRejectedValue(new Error("No output"))
 
     render(await RunDetailPage({ params: Promise.resolve({ runId }) }))
 
-    expect(screen.getByRole("heading", { name: "Agent steps" })).toBeInTheDocument()
-    expect(screen.getByRole("list", { name: "Live agent step progress" })).toBeInTheDocument()
-    expect(screen.getByText("Step 1")).toBeInTheDocument()
-    expect(screen.getByText("Step 2")).toBeInTheDocument()
-    expect(screen.getAllByText(/observe|decide/).length).toBeGreaterThan(0)
-    expect(screen.getByText(/onboarding phase · research/i)).toBeInTheDocument()
-    expect(screen.getByText(/onboarding phase · route selected signup/i)).toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: "Chain of thought" })).toBeInTheDocument()
+    expect(screen.getByText(/Step 1 · Observe/)).toBeInTheDocument()
+    expect(screen.getByText(/Step 2 · Decide/)).toBeInTheDocument()
+    expect(screen.getAllByText("Research").length).toBeGreaterThan(0)
+    expect(screen.getAllByText("Route Selected Signup").length).toBeGreaterThan(0)
+    // The decision the model made, and the tool call it produced.
+    expect(screen.getByText("Chose an element to act on")).toBeInTheDocument()
+    expect(screen.getByText("click")).toBeInTheDocument()
+    expect(screen.getAllByText("app.pipedrive.com").length).toBeGreaterThan(0)
+    // Model prose is always marked as model-authored and unverified.
+    expect(screen.getByText(/model-authored · unverified/i)).toBeInTheDocument()
+    expect(
+      screen.getByText("The sign-up control is the only route to an account."),
+    ).toBeInTheDocument()
+    // Sources come from what the run recorded, never from the UI.
+    expect(screen.getByText("Sources · 1")).toBeInTheDocument()
+    // And the run reports which model actually decided.
+    expect(screen.getAllByText(/groq:openai\/gpt-oss-120b/).length).toBeGreaterThan(0)
   })
 
   it("shows frozen canonical metadata and only the backend-authorized primary action", async () => {

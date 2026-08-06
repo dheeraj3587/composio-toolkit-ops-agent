@@ -75,6 +75,20 @@ export async function createRunAction(
   const browserProvider = ["browser_use", "playwright"].includes(requestedBrowserProvider)
     ? (requestedBrowserProvider as OperationsRequestInput["browser_provider"])
     : null
+  // The pinned decision model is a preference, not a requirement: it is shape-
+  // checked here and authoritatively validated by the backend against the
+  // providers it actually has keys for. An unparseable value is dropped rather
+  // than failing the run, which then proceeds on the deployment default.
+  const requestedModel = value(formData, "decision_model", 120)
+  const decisionModel = /^[a-z0-9_.-]+:[A-Za-z0-9_./:-]+$/i.test(requestedModel)
+    ? requestedModel
+    : null
+  const requestedEffort = value(formData, "decision_effort", 20)
+  const decisionEffort =
+    decisionModel && ["instant", "low", "medium", "high"].includes(requestedEffort)
+      ? requestedEffort
+      : null
+
   const requestedCreationPolicy = value(formData, "credential_creation_policy", 40)
   const creationPolicy = ["reuse_only", "create_if_missing"].includes(
     requestedCreationPolicy,
@@ -131,6 +145,8 @@ export async function createRunAction(
       accountMode === "existing_account" && appLoginEmail && appLoginPassword
         ? { email: appLoginEmail, password: appLoginPassword }
         : null,
+    decision_model: decisionModel,
+    decision_effort: decisionEffort,
   }
 
   // This value is returned to client-side action state so it must not be

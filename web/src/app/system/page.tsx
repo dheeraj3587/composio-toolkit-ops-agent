@@ -35,8 +35,8 @@ export default async function SystemPage() {
       </header>
 
       {!health ? (
-        <Alert className="rounded-md border-red-200 bg-red-50 text-red-950">
-          <CircleOff className="text-red-600" aria-hidden="true" />
+        <Alert className="rounded-md border-red-200 bg-red-50 text-red-950 dark:border-red-500/35 dark:bg-red-500/12 dark:text-red-200">
+          <CircleOff className="text-red-600 dark:text-red-300" aria-hidden="true" />
           <AlertTitle>Health endpoint unavailable</AlertTitle>
           <AlertDescription>The control plane cannot verify runtime posture. No healthy state is inferred.</AlertDescription>
         </Alert>
@@ -49,7 +49,7 @@ export default async function SystemPage() {
             {health.checks.map((check) => (
               <div key={check.name} className="flex flex-col gap-3 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex items-start gap-3">
-                  {check.status === "pass" ? <CheckCircle2 className="mt-0.5 size-4 text-emerald-600" aria-hidden="true" /> : <CircleOff className="mt-0.5 size-4 text-amber-600" aria-hidden="true" />}
+                  {check.status === "pass" ? <CheckCircle2 className="mt-0.5 size-4 text-emerald-600 dark:text-emerald-300" aria-hidden="true" /> : <CircleOff className="mt-0.5 size-4 text-amber-600 dark:text-amber-300" aria-hidden="true" />}
                   <div><p className="text-sm font-medium">{humanize(check.name)}</p>{check.detail ? <p className="mt-1 text-xs leading-5 text-muted-foreground">{check.detail}</p> : null}</div>
                 </div>
                 <StatusBadge status={check.status} />

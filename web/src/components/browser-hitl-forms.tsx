@@ -230,7 +230,7 @@ export function BrowserLoginForm({ runId }: { runId: string }) {
       <FormSubmitButton label="Sign in and continue" pendingLabel="Signing in…" />
       {loginState.message ? (
         <p
-          className={loginState.tone === "error" ? "text-xs text-destructive" : "text-xs text-emerald-700"}
+          className={loginState.tone === "error" ? "text-xs text-destructive" : "text-xs text-emerald-700 dark:text-emerald-300"}
           role={loginState.tone === "error" ? "alert" : "status"}
         >
           {loginState.message}
@@ -331,7 +331,7 @@ export function BrowserVerificationForm({ runId }: { runId: string }) {
           className={
             verificationState.tone === "error"
               ? "text-xs text-destructive"
-              : "text-xs text-emerald-700"
+              : "text-xs text-emerald-700 dark:text-emerald-300"
           }
           role={verificationState.tone === "error" ? "alert" : "status"}
         >
@@ -398,7 +398,7 @@ export function CredentialSubmitForm({
       <FormSubmitButton label="Submit credential securely" pendingLabel="Submitting…" />
       {submitState.message ? (
         <p
-          className={submitState.tone === "error" ? "text-xs text-destructive" : "text-xs text-emerald-700"}
+          className={submitState.tone === "error" ? "text-xs text-destructive" : "text-xs text-emerald-700 dark:text-emerald-300"}
           role={submitState.tone === "error" ? "alert" : "status"}
         >
           {submitState.message}
