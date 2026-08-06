@@ -43,7 +43,7 @@ export function AppShell({
       >
         <div className="flex h-20 items-center border-b border-white/10 px-6">
           <Link href="/" className="group flex items-center gap-3" aria-label="Composio Operations home">
-            <span className="grid size-9 place-items-center rounded-md border border-brand-dev bg-brand-dev font-mono text-[10px] font-semibold tracking-[0.16em] text-white transition-colors group-hover:border-brand-400 group-hover:bg-brand-dev/80">
+            <span className="grid size-9 place-items-center rounded-md border border-brand-dev bg-brand-dev font-mono text-[10px] font-semibold tracking-[0.16em] text-rail transition-colors group-hover:border-brand-400 group-hover:bg-brand-dev/80">
               C/O
             </span>
             <span>

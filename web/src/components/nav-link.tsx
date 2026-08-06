@@ -31,7 +31,7 @@ export function NavLink({
         compact
           ? "size-9 justify-center text-muted-foreground hover:bg-secondary hover:text-foreground"
           : "min-h-10 px-3 text-white/55 hover:bg-white/[0.055] hover:text-white",
-        active && !compact && "bg-white/[0.075] text-white shadow-[inset_2px_0_0_#0007cd]",
+        active && !compact && "bg-white/[0.075] text-white shadow-[inset_2px_0_0_var(--brand)]",
         active && compact && "bg-secondary text-foreground",
       )}
     >

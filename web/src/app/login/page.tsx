@@ -68,7 +68,7 @@ export default async function LoginPage({
   const configurationError = error === "configuration" || !configured
 
   return (
-    <main className="relative grid min-h-svh overflow-hidden bg-[#f5f7fb] lg:grid-cols-[1.05fr_0.95fr]">
+    <main className="relative grid min-h-svh overflow-hidden bg-background lg:grid-cols-[1.05fr_0.95fr]">
       <div className="relative hidden overflow-hidden bg-rail p-12 text-white lg:flex lg:flex-col lg:justify-between">
         <div className="absolute -left-24 top-24 size-96 rounded-full bg-brand-500/20 blur-3xl" />
         <div className="absolute -bottom-32 right-0 size-[30rem] rounded-full bg-indigo-700/30 blur-3xl" />
