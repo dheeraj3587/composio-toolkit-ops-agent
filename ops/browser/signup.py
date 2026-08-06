@@ -774,22 +774,27 @@ async def _own_submit(form: Any) -> tuple[str, Any | None]:
     return "unique", matches[0]
 
 
-async def _identity_handoff_control(form: Any, provider: str) -> tuple[str, Any | None]:
-    """The single control on this form that hands registration to ``provider``.
+async def _identity_handoff_control(root: Any, provider: str) -> tuple[str, Any | None]:
+    """The single control under ``root`` that hands registration to ``provider``.
 
     Resolved the same way :func:`_own_submit` resolves the form's own submit: off
-    the live page, among visible enabled controls of a form that has already been
+    the live page, among visible enabled controls of a root that has already been
     accepted, requiring exactly one match. "Continue with Google" and "Continue
     with GitHub" sitting side by side is precisely why the provider is named
     rather than inferred -- with a name, each is unambiguous; without one, both
     are candidates and nothing may be clicked.
+
+    ``root`` is normally the accepted form. It is the PAGE only on the branch
+    where the page offers no email form at all, because then there is no form to
+    scope to -- see :func:`_drive_identity_handoff` for why that wider scope is
+    still bounded.
     """
 
     pattern = _IDENTITY_HANDOFF_PROVIDERS.get(provider)
     if pattern is None:
         return "missing", None
     controls = await _visible_enabled(
-        form.locator("button, input[type='submit'], a[role='button'], a"), limit=16
+        root.locator("button, input[type='submit'], a[role='button'], a"), limit=16
     )
     matches = [control for control in controls if pattern.search(await _submit_text(control))]
     if not matches:
@@ -802,16 +807,29 @@ async def _identity_handoff_control(form: Any, provider: str) -> tuple[str, Any 
 async def _drive_identity_handoff(
     *,
     page: Any,
-    form: Any,
+    root: Any,
     provider: str,
     patterns: Sequence[str],
     state: SignupSessionState,
 ) -> SignupResult | None:
     """Click the vendor's own identity-provider control, at most once.
 
-    Returns ``None`` when no unambiguous control for ``provider`` is on this
-    form, which leaves the caller's original outcome intact -- the handoff is an
-    alternative to a dead end, never a replacement for a working email path.
+    Returns ``None`` when no unambiguous control for ``provider`` is under
+    ``root``, which leaves the caller's original outcome intact -- the handoff is
+    an alternative to a dead end, never a replacement for a working email path.
+    Every caller tries the email route first and reaches this only once that
+    route is closed.
+
+    ``root`` is the accepted form wherever one exists. Where the page offers no
+    email form at all it is the page, and that wider scope is the one real
+    relaxation here, so it is worth being exact about what still holds: the page
+    was already accepted by the host and entry-path checks, the provider is one
+    the operator named, exactly one visible enabled match on the whole page is
+    required (two "Continue with Google" controls still stop), the click happens
+    at most once per session, and the destination is confined by
+    :func:`navigation_allowed` to identity-provider hosts the recipe already
+    declares. What it does add is that the control need not sit inside a form
+    element -- which is the actual shape of a page whose only route is OAuth.
 
     The click is recorded on the session BEFORE it happens, so a navigation that
     times out is an outcome-unknown handoff and is never clicked a second time.
@@ -821,7 +839,7 @@ async def _drive_identity_handoff(
 
     if state.identity_handoff_attempted:
         return None
-    status, control = await _identity_handoff_control(form, provider)
+    status, control = await _identity_handoff_control(root, provider)
     if status != "unique" or control is None:
         return None
 
@@ -1360,6 +1378,21 @@ async def _drive_email_first_signup(
 
     surfaces = await _email_only_surfaces(page, patterns)
     if not surfaces:
+        # No email form on the page is not always a broken page. Plenty of
+        # vendors register through an identity provider only, so the page is
+        # exactly what it looks like: the email rung of the ladder is absent and
+        # the authorized provider is the next one down. Scoped to the page
+        # because there is no form here to scope to.
+        if identity_handoff is not None:
+            handoff = await _drive_identity_handoff(
+                page=page,
+                root=page,
+                provider=identity_handoff,
+                patterns=patterns,
+                state=state,
+            )
+            if handoff is not None:
+                return handoff
         return SignupResult(
             status="human_action_required",
             reason_code="signup_email_step_not_supported",
@@ -1404,7 +1437,7 @@ async def _drive_email_first_signup(
             if identity_handoff is not None:
                 handoff = await _drive_identity_handoff(
                     page=page,
-                    form=form,
+                    root=form,
                     provider=identity_handoff,
                     patterns=patterns,
                     state=state,
@@ -1459,7 +1492,7 @@ async def _drive_email_first_signup(
         if identity_handoff is not None:
             handoff = await _drive_identity_handoff(
                 page=page,
-                form=form,
+                root=form,
                 provider=identity_handoff,
                 patterns=patterns,
                 state=state,
@@ -1743,6 +1776,19 @@ async def _drive_email_password_signup(
 
     surfaces = await _email_password_surfaces(page, patterns)
     if not surfaces:
+        # Same rung as the email-first branch: no email-and-password form means
+        # the email route is not on offer here, so try the provider the operator
+        # authorized before handing the page to a human.
+        if identity_handoff is not None:
+            handoff = await _drive_identity_handoff(
+                page=page,
+                root=page,
+                provider=identity_handoff,
+                patterns=patterns,
+                state=state,
+            )
+            if handoff is not None:
+                return handoff
         return SignupResult(
             status="human_action_required",
             reason_code="signup_surface_not_supported",
@@ -1846,7 +1892,7 @@ async def _drive_email_password_signup(
         if identity_handoff is not None:
             handoff = await _drive_identity_handoff(
                 page=page,
-                form=form,
+                root=form,
                 provider=identity_handoff,
                 patterns=patterns,
                 state=state,
