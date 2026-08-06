@@ -73,12 +73,12 @@ export default async function LoginPage({
         <div className="absolute -left-24 top-24 size-96 rounded-full bg-brand-500/12 blur-3xl" />
         <div className="absolute -bottom-32 right-0 size-[30rem] rounded-full bg-brand-500/8 blur-3xl" />
         <div className="relative flex items-center gap-3">
-          <span className="grid size-11 place-items-center rounded-xl border border-white/15 bg-white/10 font-mono text-[12px] tracking-[0.16em]">
+          <span className="grid size-11 place-items-center rounded-xl border border-white/15 bg-white/10 font-mono text-2xs tracking-[0.16em]">
             C/O
           </span>
           <div>
             <p className="text-base font-medium">Composio Operations</p>
-            <p className="mt-0.5 font-mono text-[11px] uppercase tracking-[0.16em] text-white/45">
+            <p className="mt-0.5 font-mono text-2xs uppercase tracking-[0.16em] text-white/45">
               Private workspace
             </p>
           </div>
@@ -114,7 +114,7 @@ export default async function LoginPage({
       <div className="flex items-center justify-center px-5 py-12 sm:px-10">
         <div className="w-full max-w-md">
           <div className="mb-10 flex items-center gap-3 lg:hidden">
-            <span className="grid size-10 place-items-center rounded-xl bg-rail font-mono text-[12px] tracking-[0.15em] text-white">
+            <span className="grid size-10 place-items-center rounded-xl bg-rail font-mono text-2xs tracking-[0.15em] text-white">
               C/O
             </span>
             <span className="font-medium">Composio Operations</span>

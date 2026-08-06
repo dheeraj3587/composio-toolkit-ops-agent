@@ -6,7 +6,7 @@ export default function Loading() {
       <div className="space-y-4 border-b border-border pb-7">
         <Skeleton className="h-3 w-40 rounded-md" />
         <Skeleton className="h-9 max-w-xl rounded-md" />
-        <Skeleton className="h-4 max-w-2xl rounded-md" />
+        <Skeleton className="h-4 max-w-text rounded-md" />
       </div>
       <div className="grid gap-px overflow-hidden rounded-lg border border-border bg-border sm:grid-cols-2 xl:grid-cols-4">
         {["a", "b", "c", "d"].map((key) => (

@@ -141,7 +141,7 @@ function AppCard({ app }: { app: AppSearchItem }) {
       <div className="pointer-events-none flex items-start justify-between gap-3">
         <div>
           <p className="text-sm font-semibold">{app.app_name}</p>
-          <p className="mt-1 font-mono text-[11px] uppercase tracking-[0.12em] text-muted-foreground">
+          <p className="mt-1 font-mono text-2xs uppercase tracking-[0.12em] text-muted-foreground">
             {app.app_slug}
           </p>
         </div>
@@ -153,7 +153,7 @@ function AppCard({ app }: { app: AppSearchItem }) {
         </span>
         <Link
           href={`/runs/new?app=${encodeURIComponent(app.app_name)}`}
-          className="relative z-10 inline-flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 text-[12px] font-medium text-foreground transition-colors hover:border-brand-300 hover:bg-brand-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500"
+          className="relative z-10 inline-flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 text-2xs font-medium text-foreground transition-colors hover:border-brand-300 hover:bg-brand-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500"
         >
           Run<span className="sr-only"> {app.app_name}</span>
           <ArrowRight className="size-3.5 transition-transform group-hover:translate-x-0.5" aria-hidden="true" />

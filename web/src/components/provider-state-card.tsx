@@ -112,17 +112,17 @@ export function ProviderStateCard({
       <div className="mt-5">
         <h3 className="text-base font-medium">{title}</h3>
         {description ? (
-          <p className="mt-1.5 text-[12px] leading-5 text-muted-foreground">{description}</p>
+          <p className="mt-1.5 text-2xs leading-5 text-muted-foreground">{description}</p>
         ) : null}
       </div>
-      <p className="mt-3 text-[12px] leading-5 text-muted-foreground/70">
+      <p className="mt-3 text-2xs leading-5 text-muted-foreground/70">
         {providerExplanation(provider)}
       </p>
       <dl className="mt-auto grid gap-3 border-t border-border pt-4 sm:grid-cols-3">
         {facts.map(([label, value]) => (
           <div key={label}>
             <dt className="data-label">{label}</dt>
-            <dd className="mt-1 text-[12px] leading-5">{value}</dd>
+            <dd className="mt-1 text-2xs leading-5">{value}</dd>
           </div>
         ))}
       </dl>

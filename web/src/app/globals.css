@@ -83,6 +83,53 @@
   --radius-md: 0.5rem;
   --radius-lg: 0.5rem;
   --radius-xl: 0.75rem;
+
+  /* ── Type scale ────────────────────────────────────────────────────────
+     This console read small because it took Tailwind's default ladder and
+     then lived at the bottom of it: 181 of its 232 size utilities were
+     `text-xs` (12px) or `text-sm` (14px), and 92 more bypassed the ladder
+     entirely for a literal `text-[11px]` or `text-[12px]`. The fix is the
+     same one the brand ramp above already proved — redefine the token and
+     every existing usage moves with it, without touching a component.
+
+     Each step is redefined one notch larger, and `--text-2xs` gives the
+     dense mono labels a real name at the bottom so nothing needs to reach
+     for a pixel literal again. 12px is the floor, not the body size.
+
+     Line heights ride along with the size. A component that sets its own
+     `leading-*` still wins, which is why the existing overrides are left
+     alone rather than churned out. */
+  --text-2xs: 0.75rem;
+  --text-2xs--line-height: 1.125rem;
+  --text-xs: 0.8125rem;
+  --text-xs--line-height: 1.25rem;
+  --text-sm: 0.9375rem;
+  --text-sm--line-height: 1.5rem;
+  --text-base: 1.0625rem;
+  --text-base--line-height: 1.625rem;
+  --text-lg: 1.1875rem;
+  --text-lg--line-height: 1.75rem;
+  --text-xl: 1.375rem;
+  --text-xl--line-height: 1.875rem;
+  --text-2xl: 1.625rem;
+  --text-2xl--line-height: 2rem;
+  /* Display sizes are fluid rather than stepped: they are the only text big
+     enough that a fixed size is either cramped on a phone or overbearing on a
+     wide monitor, and clamp() removes the breakpoint jump between the two. */
+  --text-3xl: clamp(1.75rem, 1.5rem + 1.1vw, 2.125rem);
+  --text-3xl--line-height: 1.15;
+  --text-4xl: clamp(2.125rem, 1.7rem + 1.9vw, 2.75rem);
+  --text-4xl--line-height: 1.1;
+  --text-5xl: clamp(2.5rem, 1.9rem + 2.8vw, 3.5rem);
+  --text-5xl--line-height: 1.05;
+
+  /* ── Measure ───────────────────────────────────────────────────────────
+     Two widths, both of which were magic numbers before: the page column
+     (`max-w-[1336px]` on main, `max-w-[1240px]` on the footer under it — two
+     numbers for one column) and the reading measure that eight descriptive
+     paragraphs were each spelling `max-w-2xl`. */
+  --container-page: 84rem;
+  --container-text: 46rem;
 }
 
 /* Neon tokens (https://ui.neon.com/theming). Light stays available behind
@@ -255,10 +302,19 @@
 }
 
 @layer components {
+  /* The page column, in one place. `main` and the footer under it used to
+     carry two different max widths and two different gutter ramps, so the
+     footer rule never lined up with the content above it. Both wear this
+     now, and a new page gets the column by asking for it rather than by
+     copying a pixel value out of the shell. */
+  .page-container {
+    @apply mx-auto w-full max-w-page px-5 sm:px-8 lg:px-10 xl:px-12;
+  }
+
   .eyebrow,
   .data-label {
     font-family: var(--font-jetbrains-mono), monospace;
-    font-size: 0.75rem;
+    font-size: var(--text-2xs);
     font-weight: 500;
     letter-spacing: 0.05em;
     line-height: 1.25;

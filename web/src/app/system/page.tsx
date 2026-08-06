@@ -39,7 +39,7 @@ export default async function SystemPage() {
           <h1 className="mt-3 text-3xl font-medium tracking-[-0.035em] sm:text-4xl">
             What is set up, and what has been checked
           </h1>
-          <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground">
+          <p className="mt-3 max-w-text text-sm leading-6 text-muted-foreground">
             This page reports whether each capability is configured and whether that has been
             confirmed by a live check. It never shows configuration values, file paths, provider
             responses, or anything held in the credential vault.
@@ -71,7 +71,7 @@ export default async function SystemPage() {
           <h2 id="core-checks" className="mt-1 text-xl font-medium tracking-[-0.02em]">
             Integrity checks
           </h2>
-          <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+          <p className="mt-2 max-w-text text-sm leading-6 text-muted-foreground">
             Run once when the control plane starts. A failure here means the deployment itself is
             not sound, not that a single integration is.
           </p>
@@ -117,7 +117,7 @@ export default async function SystemPage() {
           <h2 id="capabilities" className="mt-1 text-xl font-medium tracking-[-0.02em]">
             What the agent can use
           </h2>
-          <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+          <p className="mt-2 max-w-text text-sm leading-6 text-muted-foreground">
             Each capability reports two separate things: whether it is set up, and whether a live
             check has confirmed it works. The second never follows from the first.
           </p>
@@ -208,7 +208,7 @@ function Unavailable({ copy }: { copy: string }) {
 function Boundary({ label, value }: { label: string; value: string }) {
   return (
     <div className="border-b border-white/10 pb-3">
-      <p className="font-mono text-[11px] uppercase tracking-[0.13em] text-white/40">{label}</p>
+      <p className="font-mono text-2xs uppercase tracking-[0.13em] text-white/40">{label}</p>
       <p className="mt-1 text-sm text-white/85">{value}</p>
     </div>
   )

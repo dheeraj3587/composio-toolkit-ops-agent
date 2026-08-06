@@ -65,7 +65,7 @@ export function BrowserLiveSurface({
             <MonitorPlay className="size-3 text-brand-600" aria-hidden="true" />
             {providerLabel}
           </p>
-          <p className="mt-1 text-[12px] leading-4 text-muted-foreground">
+          <p className="mt-1 text-2xs text-muted-foreground">
             {isPlaywright
               ? isInteractiveHitl
                 ? "Automation is paused. Mouse and keyboard input stay in this isolated session."
@@ -127,7 +127,7 @@ export function BrowserLiveSurface({
               onError={() => setFailedFrameUrl(liveState.screenshotUrl)}
             />
           </div>
-          <div className="flex flex-wrap items-center justify-between gap-2 text-[12px] leading-4 text-muted-foreground">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-2xs text-muted-foreground">
             <span className="inline-flex items-center gap-1.5">
               <RefreshCw className="size-3" aria-hidden="true" />
               {liveState.mode === "unavailable"

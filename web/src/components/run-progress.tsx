@@ -109,7 +109,7 @@ export function RunProgress({
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <div
-            className={`flex w-fit items-center gap-2 rounded-full px-3 py-1.5 text-[12px] font-medium ${
+            className={`flex w-fit items-center gap-2 rounded-full px-3 py-1.5 text-2xs font-medium ${
               terminal ? "bg-secondary text-muted-foreground" : "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/12 dark:text-emerald-300"
             }`}
             aria-live="polite"
@@ -173,7 +173,10 @@ export function RunProgress({
           {!terminal ? <div className="progress-shimmer absolute inset-y-0 w-24 bg-gradient-to-r from-transparent via-foreground/25 to-transparent" /> : null}
         </div>
 
-        <ol className="grid grid-cols-5 gap-2">
+        {/* Five columns only once there is room for five labels. On a phone
+            that was ~55px a stage, so "Open API settings" truncated to "Open…"
+            and the stepper stopped naming the step it was on. */}
+        <ol className="grid grid-cols-2 gap-x-3 gap-y-4 sm:grid-cols-5 sm:gap-2">
           {stages.map((stage, index) => {
             const complete = index < current || status === "completed" || planOnly
             const active = index === current && status !== "completed" && !planOnly
@@ -202,7 +205,7 @@ export function RunProgress({
                     <Circle className="size-2" aria-hidden="true" />
                   )}
                 </span>
-                <span className={`block truncate text-[12px] sm:text-xs ${active || complete ? "text-foreground" : "text-muted-foreground"}`}>
+                <span className={`block text-2xs sm:text-xs ${active || complete ? "text-foreground" : "text-muted-foreground"}`}>
                   {stage}
                 </span>
               </li>

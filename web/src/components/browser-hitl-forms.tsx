@@ -83,7 +83,7 @@ export function AdmissionDecisionForm({
         <UserPlus className="size-3 text-brand-600" aria-hidden="true" />
         Admission decision
       </p>
-      <p className="text-[12px] leading-4 text-muted-foreground">
+      <p className="text-2xs text-muted-foreground">
         No credential for {subject} is in the vault. Creating an account is the one decision the
         agent never makes for you. Approving it lets the agent sign up on the provider&apos;s own
         site; cancelling ends the run without creating anything.
@@ -105,7 +105,7 @@ export function AdmissionDecisionForm({
           </form>
         ))}
       </div>
-      <p className="font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
+      <p className="font-mono text-2xs uppercase tracking-[0.1em] text-muted-foreground">
         Profile digest · {profileDigest.slice(0, 12)}
       </p>
       <ActionMessage message={decisionState.message} tone={decisionState.tone} />
@@ -145,7 +145,7 @@ export function CaptchaResumeForm({
         <ShieldQuestion className="size-3 text-brand-600" aria-hidden="true" />
         Human verification required
       </p>
-      <p className="text-[12px] leading-4 text-muted-foreground">
+      <p className="text-2xs text-muted-foreground">
         The provider is showing a challenge only a person may complete. Solve it in the live browser
         above, then hand the same session back to the agent. Nothing you type there is read by the
         agent or stored on the run.
@@ -159,7 +159,7 @@ export function CaptchaResumeForm({
           </form>
         ) : (
           <p
-            className="text-[12px] leading-4 text-muted-foreground"
+            className="text-2xs text-muted-foreground"
             data-testid="resume-withheld-reason"
           >
             Handing this session back is withheld · {humanize(withheldReason)}
@@ -202,7 +202,7 @@ export function BrowserLoginForm({ runId }: { runId: string }) {
         <LogIn className="size-3 text-brand-600" aria-hidden="true" />
         Continue with account credentials
       </p>
-      <p className="text-[12px] leading-4 text-muted-foreground">
+      <p className="text-2xs text-muted-foreground">
         The backend requested a login resume. These values pass through the selected provider&apos;s
         one-time secret boundary and never enter model prompts or durable run state.
       </p>
@@ -269,7 +269,7 @@ export function BrowserVerificationForm({ runId }: { runId: string }) {
           <MailCheck className="size-3 text-brand-600" aria-hidden="true" />
           Manual email verification fallback
         </p>
-        <p className="mt-1 text-[12px] leading-4 text-muted-foreground">
+        <p className="mt-1 text-2xs text-muted-foreground">
           Gmail checking remains primary. Use this only when the automatic inbox path cannot
           resolve the provider message; the value is consumed once and is not retained.
         </p>
@@ -391,7 +391,7 @@ export function CredentialSubmitForm({
         className={`${FIELD_CLASS} font-mono`}
         placeholder="Paste the token once; it is encrypted immediately"
       />
-      <p className="text-[12px] leading-4 text-muted-foreground">
+      <p className="text-2xs text-muted-foreground">
         The value is written straight to the encrypted vault. Only a vault:// reference is stored;
         the raw token never enters run state, logs, or this page.
       </p>

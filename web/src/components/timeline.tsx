@@ -27,7 +27,7 @@ export function Timeline({ items }: { items: TimelineItem[] }) {
             <Circle className="size-3 fill-brand-500 text-brand-500" />
           </span>
           <div>
-            <p className="flex items-center gap-2 font-mono text-[12px] uppercase tracking-[0.12em]">
+            <p className="flex items-center gap-2 font-mono text-2xs uppercase tracking-[0.12em]">
               <TerminalSquare className="size-3.5 text-brand-600" aria-hidden="true" />
               {item.event_type.replaceAll("_", " ")}
             </p>
@@ -36,7 +36,7 @@ export function Timeline({ items }: { items: TimelineItem[] }) {
                 closed-vocabulary values only: the phase the event belongs to, the
                 attempt it was recorded under, and its reason code. */}
             {item.correlation ? (
-              <p className="mt-2 font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
+              <p className="mt-2 font-mono text-2xs uppercase tracking-[0.1em] text-muted-foreground">
                 Phase · {humanize(item.correlation.onboarding_phase)} · Attempt {item.correlation.attempt} ·{" "}
                 {humanize(item.correlation.reason_code)}
               </p>

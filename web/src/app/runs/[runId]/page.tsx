@@ -135,31 +135,35 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
 
   return (
     <div className="page-enter page-stack">
-      <Button asChild variant="ghost" size="sm" className="-ml-2 font-mono text-[12px] uppercase tracking-[0.1em]"><Link href="/"><ArrowLeft aria-hidden="true" /> Overview</Link></Button>
+      <Button asChild variant="ghost" size="sm" className="-ml-2 font-mono text-2xs uppercase tracking-[0.1em]"><Link href="/"><ArrowLeft aria-hidden="true" /> Overview</Link></Button>
 
       <header className="flex flex-col gap-6 border-b border-border pb-7 xl:flex-row xl:items-end xl:justify-between">
         <div>
           <div className="flex flex-wrap items-center gap-3">
             <p className="eyebrow">Run · {detail.run.app_slug}</p>
             <StatusBadge status={detail.run.status} />
-            <Badge variant="outline" className="rounded-md font-mono text-[11px] uppercase tracking-[0.1em]">
+            <Badge variant="outline" className="rounded-md font-mono text-2xs uppercase tracking-[0.1em]">
               {isPlanOnly ? "Plan only" : "Live run"}
             </Badge>
             {onboarding ? (
-              <Badge variant="outline" className="rounded-md font-mono text-[11px] uppercase tracking-[0.1em]">
+              <Badge variant="outline" className="rounded-md font-mono text-2xs uppercase tracking-[0.1em]">
                 Phase · {humanize(onboarding.phase)}
               </Badge>
             ) : null}
           </div>
           <h1 className="mt-3 text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">{detail.run.app_name}</h1>
-          <p className="mt-3 break-all font-mono text-[12px] uppercase tracking-[0.1em] text-muted-foreground">{detail.run.run_id}</p>
+          <p className="mt-3 break-all font-mono text-2xs uppercase tracking-[0.1em] text-muted-foreground">{detail.run.run_id}</p>
         </div>
         <div className="grid overflow-hidden rounded-xl border border-border bg-border sm:grid-cols-2 xl:min-w-[660px] xl:grid-cols-3">
           <Meta icon={Route} label="Access route" value={humanize(detail.run.route_kind ?? detail.run.access_route)} />
           <Meta icon={Settings2} label="Account" value={detail.run.account_mode ? humanize(detail.run.account_mode) : "Not reported"} />
           <Meta icon={Globe2} label="Browser" value={humanize(detail.run.browser_provider)} />
           <Meta icon={Clock3} label="Updated · UTC" value={formatTimestamp(detail.run.updated_at)} />
+          {/* Five cells in a two- or three-column grid leaves one empty, and
+              the container's border colour filled it as a blank grey panel.
+              The last cell takes the slack instead. */}
           <Meta
+            className="sm:col-span-2"
             icon={Cpu}
             label="Decision model"
             value={
@@ -188,7 +192,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
               <p className="eyebrow">Autonomous onboarding</p>
               <h2 id="onboarding-console" className="mt-1 text-xl font-semibold">What the agent is doing now</h2>
             </div>
-            <Badge variant="outline" className="rounded-md font-mono text-[11px] uppercase tracking-[0.1em]">Backend projection</Badge>
+            <Badge variant="outline" className="rounded-md font-mono text-2xs uppercase tracking-[0.1em]">Backend projection</Badge>
           </div>
           <div className="grid items-stretch gap-6 xl:grid-cols-2">
             <OnboardingFocusPanel state={onboarding} />
@@ -232,7 +236,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
       ) : null}
 
       <section aria-labelledby="phase-map">
-        <div className="mb-3 flex items-end justify-between gap-4"><div><p className="eyebrow">Durable workflow</p><h2 id="phase-map" className="mt-1 text-xl font-semibold">Operational phases</h2></div><Badge variant="outline" className="rounded-md font-mono text-[11px] uppercase tracking-[0.1em]">Backend state</Badge></div>
+        <div className="mb-3 flex items-end justify-between gap-4"><div><p className="eyebrow">Durable workflow</p><h2 id="phase-map" className="mt-1 text-xl font-semibold">Operational phases</h2></div><Badge variant="outline" className="rounded-md font-mono text-2xs uppercase tracking-[0.1em]">Backend state</Badge></div>
         <PhaseGrid phases={displayPhases} />
       </section>
 
@@ -374,11 +378,11 @@ function RetryControl({ label, runId, capability, enabled }: { label: string; ru
 }
 
 function ControlUnavailable() {
-  return <p className="font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">No action available in current state</p>
+  return <p className="font-mono text-2xs uppercase tracking-[0.1em] text-muted-foreground">No action available in current state</p>
 }
 
-function Meta({ icon: Icon, label, value }: { icon: typeof Fingerprint; label: string; value: string }) {
-  return <div className="bg-card p-4 [&:not(:last-child)]:border-b [&:not(:last-child)]:border-border sm:[&:not(:last-child)]:border-b-0 sm:[&:not(:last-child)]:border-r"><span className="flex items-center gap-1.5 data-label"><Icon className="size-3 text-brand-600" aria-hidden="true" />{label}</span><p className="mt-2 text-xs leading-5">{value}</p></div>
+function Meta({ icon: Icon, label, value, className = "" }: { icon: typeof Fingerprint; label: string; value: string; className?: string }) {
+  return <div className={`bg-card p-4 [&:not(:last-child)]:border-b [&:not(:last-child)]:border-border sm:[&:not(:last-child)]:border-b-0 sm:[&:not(:last-child)]:border-r ${className}`}><span className="flex items-center gap-1.5 data-label"><Icon className="size-3 text-brand-600" aria-hidden="true" />{label}</span><p className="mt-2 text-xs leading-5">{value}</p></div>
 }
 
 function RouteCard({ decision, fallbackRoute }: { decision: { route: string; reason_code: string; explanation: string; is_final?: boolean } | null; fallbackRoute: string | null }) {
@@ -389,7 +393,7 @@ function RouteCard({ decision, fallbackRoute }: { decision: { route: string; rea
         <span className="grid size-8 place-items-center rounded-md bg-secondary"><Route className="size-4 text-brand-600" aria-hidden="true" /></span>
         <div className="flex flex-wrap justify-end gap-2">
           <StatusBadge status={reportedRoute} />
-          <Badge variant="outline" className="rounded-md font-mono text-[11px] uppercase tracking-[0.1em]">
+          <Badge variant="outline" className="rounded-md font-mono text-2xs uppercase tracking-[0.1em]">
             {decision?.is_final ? "Final decision" : "Evidence input"}
           </Badge>
         </div>
@@ -397,7 +401,7 @@ function RouteCard({ decision, fallbackRoute }: { decision: { route: string; rea
       <p className="mt-5 data-label">Deterministic route</p>
       <h3 className="mt-1 text-base font-semibold">{humanize(reportedRoute)}</h3>
       <p className="mt-2 text-xs leading-5 text-muted-foreground">{decision?.explanation ?? "The backend has not reported a final route decision."}</p>
-      {decision?.reason_code ? <p className="mt-3 font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">Route reason code · {humanize(decision.reason_code)}</p> : null}
+      {decision?.reason_code ? <p className="mt-3 font-mono text-2xs uppercase tracking-[0.1em] text-muted-foreground">Route reason code · {humanize(decision.reason_code)}</p> : null}
     </div>
   )
 }

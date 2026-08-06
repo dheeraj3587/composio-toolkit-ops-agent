@@ -33,14 +33,14 @@ export default async function NewRunPage({
 
   return (
     <div className="page-enter page-stack mx-auto max-w-6xl">
-      <Button asChild variant="ghost" size="sm" className="-ml-2 font-mono text-[12px] uppercase tracking-[0.1em]">
+      <Button asChild variant="ghost" size="sm" className="-ml-2 font-mono text-2xs uppercase tracking-[0.1em]">
         <Link href="/"><ArrowLeft aria-hidden="true" /> Overview</Link>
       </Button>
       <header className="grid gap-6 border-b border-border pb-8 lg:grid-cols-[1fr_0.8fr] lg:items-end">
         <div>
           <p className="eyebrow">New integration</p>
           <h1 className="mt-3 text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">Let the agent set it up</h1>
-          <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground">
+          <p className="mt-3 max-w-text text-sm leading-6 text-muted-foreground">
             Choose an app, tell us whether an account exists, and follow the run live. The agent handles the routine browser and email steps.
           </p>
         </div>

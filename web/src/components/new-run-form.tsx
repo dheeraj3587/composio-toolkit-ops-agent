@@ -551,7 +551,7 @@ export function NewRunForm({
       ) : null}
 
       <div className="sticky bottom-4 z-20 flex flex-col gap-4 rounded-2xl border border-border bg-card/90 p-4 shadow-[0_20px_60px_rgba(0,0,0,0.28)] backdrop-blur-xl sm:flex-row sm:items-center sm:justify-between">
-        <p className="flex max-w-2xl items-start gap-2 text-xs leading-5 text-muted-foreground">
+        <p className="flex max-w-text items-start gap-2 text-xs leading-5 text-muted-foreground">
           <Check className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-300" aria-hidden="true" />
           The app-specific vault destination is created automatically. You never need to enter a vault address.
         </p>
@@ -729,7 +729,7 @@ function Field({
     <div className="space-y-2">
       <div className="flex items-center justify-between gap-3">
         <label htmlFor={htmlFor} className="text-sm font-medium">{label}</label>
-        {error ? <span className="font-mono text-[11px] uppercase text-destructive">Review</span> : null}
+        {error ? <span className="font-mono text-2xs uppercase text-destructive">Review</span> : null}
       </div>
       {children({
         "aria-describedby": hasMessage ? messageId : undefined,

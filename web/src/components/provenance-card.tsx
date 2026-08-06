@@ -22,7 +22,7 @@ export function ProvenanceCard({ snapshot }: { snapshot: SnapshotHealth | null }
           </div>
           <Badge
             variant="outline"
-            className="shrink-0 rounded-md border-border font-mono text-[11px] uppercase tracking-[0.1em]"
+            className="shrink-0 rounded-md border-border font-mono text-2xs uppercase tracking-[0.1em]"
             title={
               verified
                 ? "The copied files still hash to the values recorded when they were copied."
@@ -46,7 +46,7 @@ export function ProvenanceCard({ snapshot }: { snapshot: SnapshotHealth | null }
             {snapshot?.source_repository ?? "The backend did not report a source."}
           </p>
         </div>
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid gap-4 sm:grid-cols-2">
           <div>
             <span className="data-label">Commit</span>
             <p className="mt-1 flex items-center gap-1.5 font-mono text-xs">
@@ -59,7 +59,7 @@ export function ProvenanceCard({ snapshot }: { snapshot: SnapshotHealth | null }
             <p className="mt-1 font-mono text-xs">{short(snapshot?.copied_at, 20)}</p>
           </div>
         </div>
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid gap-4 sm:grid-cols-2">
           <div>
             <span className="data-label">Results checksum</span>
             <p className="mt-1 font-mono text-xs" title={snapshot?.results_sha256}>

@@ -411,7 +411,7 @@ export const ModelSelect = ({
                 ) : (
                   groupByProvider(filtered).map(([provider, group]) => (
                     <SelectGroup key={provider}>
-                      <SelectLabel className="font-mono text-[12px] uppercase tracking-wide">
+                      <SelectLabel className="font-mono text-2xs uppercase tracking-wide">
                         {provider}
                       </SelectLabel>
                       {group.map((model) => (
@@ -425,12 +425,12 @@ export const ModelSelect = ({
                             <ProviderLogo logo={logos?.[model.provider]} />
                             <span className="shrink-0">{model.name}</span>
                             {model.tag ? (
-                              <span className="shrink-0 border border-border/60 px-1 py-px font-mono text-[11px] text-muted-foreground uppercase leading-none tracking-wide">
+                              <span className="shrink-0 border border-border/60 px-1 py-px font-mono text-2xs text-muted-foreground uppercase leading-none tracking-wide">
                                 {model.tag}
                               </span>
                             ) : null}
                             <span
-                              className="ml-auto truncate pl-3 font-mono text-[12px] text-muted-foreground/70"
+                              className="ml-auto truncate pl-3 font-mono text-2xs text-muted-foreground/70"
                               title={model.id}
                             >
                               {model.id}
