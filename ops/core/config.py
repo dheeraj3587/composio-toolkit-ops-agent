@@ -154,6 +154,13 @@ class Settings(BaseModel):
     # expose the mailbox address to the browser workflow, so the address is an
     # explicit private deployment input and is never requested in the UI.
     gmail_signup_address: SecretStr | None = Field(default=None, repr=False)
+    # The one identity provider the agent may hand registration to when a vendor
+    # refuses the email path for the configured address -- Apify rejects every
+    # ``@gmail.com`` address and offers only "Continue with Google", so without
+    # this the signup is unreachable rather than merely gated. Unset means the
+    # original behavior: such a route stops for a human. The accepted cost is
+    # that the run completes as whichever account the provider signs in.
+    signup_identity_handoff_provider: str | None = None
     # Public, same-origin return location for managed OAuth. The adapter validates
     # it as a stable HTTPS URL and never persists the provider redirect URL.
     managed_auth_callback_base_url: str | None = None
@@ -509,6 +516,25 @@ class Settings(BaseModel):
             raise ValueError("GMAIL_SIGNUP_ADDRESS must be one email address")
         return value
 
+    @field_validator("signup_identity_handoff_provider")
+    @classmethod
+    def validate_signup_identity_handoff_provider(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        provider = value.strip().lower()
+        if not provider:
+            return None
+        # Kept as a literal rather than imported from ops.browser.signup so the
+        # settings module stays free of the browser stack. The driver checks the
+        # name again against its own table and ignores anything it does not
+        # recognize, so a name that slips past here still cannot click anything.
+        if provider not in {"google", "github", "gitlab", "microsoft", "apple"}:
+            raise ValueError(
+                "SIGNUP_IDENTITY_HANDOFF_PROVIDER must be one of "
+                "google, github, gitlab, microsoft, apple"
+            )
+        return provider
+
     @field_validator("browser_session_capability_key")
     @classmethod
     def validate_browser_session_capability_key(cls, value: SecretStr | None) -> SecretStr | None:
@@ -705,6 +731,9 @@ class Settings(BaseModel):
                 or source.get("COMPOSIO_GMAIL_CONNECTED_ACCOUNT_ID")
             ),
             "gmail_signup_address": _secret(source.get("GMAIL_SIGNUP_ADDRESS")),
+            "signup_identity_handoff_provider": _optional(
+                source.get("SIGNUP_IDENTITY_HANDOFF_PROVIDER")
+            ),
             "managed_auth_callback_base_url": _optional(
                 source.get("MANAGED_AUTH_CALLBACK_BASE_URL")
             ),

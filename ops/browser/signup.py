@@ -185,6 +185,39 @@ _THIRD_PARTY_IDENTITY = re.compile(
     r"(?i)\b(google|github|gitlab|apple|microsoft|facebook|twitter|slack|okta|auth0|linkedin"
     r"|sso|saml|single\s+sign[\s-]?on)\b"
 )
+# The handoff above, taken deliberately instead of refused.
+#
+# Some vendors do not merely prefer an identity provider, they REQUIRE one for a
+# given identity: Apify rejects every ``@gmail.com`` address in its own email
+# field and tells the operator to use "Continue with Google". For those routes
+# the email path is not blocked by a gate of ours that could be relaxed -- it is
+# closed by the vendor -- so refusing the handoff refuses the signup itself.
+#
+# The operator authorized this per deployment. What the authorization does NOT
+# do is loosen anything else:
+#
+# * Only a provider named in ``SIGNUP_IDENTITY_HANDOFF_PROVIDER`` is eligible,
+#   and its control must be the single unambiguous match on a form that already
+#   passed the surface, host and form-action checks. Two candidates still stop.
+# * The click happens at most once per session (``identity_handoff_attempted``),
+#   under the same submit-at-most-once discipline as a real submit.
+# * The destination must be an ``identity_provider_hosts`` entry the recipe
+#   already declares, so egress is unchanged -- the handoff cannot introduce a
+#   host the run was not already allowed to reach.
+# * Authenticating AT the provider is still a human's job. The agent does not
+#   type a Google password; it lands on the provider and hands over.
+#
+# The residual risk is the real one and it is the operator's to accept: the run
+# completes as whichever account the identity provider signs in, so the vault
+# ends up holding a credential for that account rather than for an address we
+# chose. That is recorded on the session for the audit trail.
+_IDENTITY_HANDOFF_PROVIDERS: dict[str, re.Pattern[str]] = {
+    "google": re.compile(r"(?i)\bgoogle\b"),
+    "github": re.compile(r"(?i)\bgithub\b"),
+    "gitlab": re.compile(r"(?i)\bgitlab\b"),
+    "microsoft": re.compile(r"(?i)\bmicrosoft\b"),
+    "apple": re.compile(r"(?i)\bapple\b"),
+}
 
 
 @dataclass(slots=True)
@@ -204,6 +237,11 @@ class SignupSessionState:
     #: label. Populated only on the authorized partner path; the record is what
     #: makes an autonomous acceptance auditable later.
     legal_accepted: list[str] = field(default_factory=list)
+    #: Set before the identity-provider control is clicked, never after, so a
+    #: click whose outcome is unknown is not retried into a second handoff.
+    identity_handoff_attempted: bool = False
+    #: The provider actually handed off to, kept for the audit trail.
+    identity_handoff_provider: str | None = None
     human_submit_pending: bool = False
     pending_submit_path: str | None = None
     submitted_path: str | None = None
@@ -736,6 +774,90 @@ async def _own_submit(form: Any) -> tuple[str, Any | None]:
     return "unique", matches[0]
 
 
+async def _identity_handoff_control(form: Any, provider: str) -> tuple[str, Any | None]:
+    """The single control on this form that hands registration to ``provider``.
+
+    Resolved the same way :func:`_own_submit` resolves the form's own submit: off
+    the live page, among visible enabled controls of a form that has already been
+    accepted, requiring exactly one match. "Continue with Google" and "Continue
+    with GitHub" sitting side by side is precisely why the provider is named
+    rather than inferred -- with a name, each is unambiguous; without one, both
+    are candidates and nothing may be clicked.
+    """
+
+    pattern = _IDENTITY_HANDOFF_PROVIDERS.get(provider)
+    if pattern is None:
+        return "missing", None
+    controls = await _visible_enabled(
+        form.locator("button, input[type='submit'], a[role='button'], a"), limit=16
+    )
+    matches = [control for control in controls if pattern.search(await _submit_text(control))]
+    if not matches:
+        return "missing", None
+    if len(matches) != 1:
+        return "ambiguous", None
+    return "unique", matches[0]
+
+
+async def _drive_identity_handoff(
+    *,
+    page: Any,
+    form: Any,
+    provider: str,
+    patterns: Sequence[str],
+    state: SignupSessionState,
+) -> SignupResult | None:
+    """Click the vendor's own identity-provider control, at most once.
+
+    Returns ``None`` when no unambiguous control for ``provider`` is on this
+    form, which leaves the caller's original outcome intact -- the handoff is an
+    alternative to a dead end, never a replacement for a working email path.
+
+    The click is recorded on the session BEFORE it happens, so a navigation that
+    times out is an outcome-unknown handoff and is never clicked a second time.
+    Landing on the provider is where the agent stops: signing in there is the
+    operator's, because it is the operator's identity being spent.
+    """
+
+    if state.identity_handoff_attempted:
+        return None
+    status, control = await _identity_handoff_control(form, provider)
+    if status != "unique" or control is None:
+        return None
+
+    label = await _submit_text(control)
+    state.identity_handoff_attempted = True
+    state.identity_handoff_provider = provider
+    LOGGER.info("signup handing off to identity provider %s via %r", provider, label)
+    try:
+        await control.click(timeout=10_000)
+    except Exception:
+        return SignupResult(status="failed", reason_code="signup_identity_handoff_failed")
+
+    # Give the provider's page time to become the thing the operator sees. The
+    # destination is not asserted here: egress already confines navigation to the
+    # recipe's declared identity-provider hosts, so a redirect somewhere else is
+    # refused by the boundary rather than by a string comparison.
+    deadline = monotonic() + _SURFACE_RENDER_BUDGET_SECONDS
+    while monotonic() < deadline:
+        if not navigation_allowed(_page_url(page), tuple(patterns)):
+            return SignupResult(status="failed", reason_code="signup_origin_unsafe")
+        if _current_path(page) != "/" and _page_url(page):
+            break
+        await asyncio.sleep(_SURFACE_RENDER_POLL_SECONDS)
+
+    return SignupResult(
+        status="human_action_required",
+        reason_code="signup_identity_provider_signin",
+        action_type="account_selection",
+        instruction=(
+            f"This provider requires {provider.title()} sign-in for the configured "
+            "email, so the agent opened it. Complete the sign-in in the live "
+            "browser; the run continues from the account you choose."
+        ),
+    )
+
+
 async def _fill_company_fields(
     form: Any,
     fields: Mapping[str, str],
@@ -1114,6 +1236,7 @@ async def _drive_email_first_signup(
     state: SignupSessionState,
     policy: SignupPolicy,
     resume_signal: str | None,
+    identity_handoff: str | None = None,
 ) -> SignupResult:
     """Drive a reviewed email-first registration for a catalog app."""
 
@@ -1272,6 +1395,22 @@ async def _drive_email_first_signup(
         except Exception:
             present = False
         if not present:
+            # The configured email went in and the vendor took it back out. That
+            # is the shape of an identity the provider refuses -- Apify empties
+            # the field for any ``@gmail.com`` address and points at "Continue
+            # with Google" -- so where the operator has authorized a handoff,
+            # take the route the vendor is actually offering instead of parking
+            # a signup that the email path can never complete.
+            if identity_handoff is not None:
+                handoff = await _drive_identity_handoff(
+                    page=page,
+                    form=form,
+                    provider=identity_handoff,
+                    patterns=patterns,
+                    state=state,
+                )
+                if handoff is not None:
+                    return handoff
             return SignupResult(
                 status="human_action_required",
                 reason_code="signup_credentials_required",
@@ -1313,6 +1452,20 @@ async def _drive_email_first_signup(
         # recipe keeps its strict label match and never reaches this line.
         submit_status, submit = await _own_submit(form)
     if submit_status == "missing" or submit is None:
+        # The email is in the field and the submit control is not available --
+        # typically because the vendor has disabled it, which ``_visible_enabled``
+        # reads as absent. That is the same refusal as a cleared field wearing a
+        # different shape, so it gets the same authorized alternative.
+        if identity_handoff is not None:
+            handoff = await _drive_identity_handoff(
+                page=page,
+                form=form,
+                provider=identity_handoff,
+                patterns=patterns,
+                state=state,
+            )
+            if handoff is not None:
+                return handoff
         return SignupResult(
             status="human_action_required",
             reason_code="signup_submit_not_found",
@@ -1376,6 +1529,7 @@ async def _drive_email_first_signup(
         state=state,
         policy=policy,
         resume_signal=resume_signal,
+        identity_handoff=identity_handoff,
     )
 
 
@@ -1388,6 +1542,7 @@ async def _drive_dom_detected_signup(
     state: SignupSessionState,
     policy: SignupPolicy,
     resume_signal: str | None,
+    identity_handoff: str | None = None,
 ) -> SignupResult:
     """Drive a researched route whose step ordering is read off the live form.
 
@@ -1447,6 +1602,7 @@ async def _drive_dom_detected_signup(
             state=state,
             policy=policy,
             resume_signal=resume_signal,
+            identity_handoff=identity_handoff,
         )
     return await _drive_email_password_signup(
         page=page,
@@ -1457,6 +1613,7 @@ async def _drive_dom_detected_signup(
         resume_signal=resume_signal,
         researched=True,
         accept_legal=_partner_acceptance_authorized(policy),
+        identity_handoff=identity_handoff,
     )
 
 
@@ -1469,16 +1626,28 @@ async def drive_signup(
     state: SignupSessionState,
     signup_policy: SignupPolicy | None = None,
     resume_signal: str | None = None,
+    identity_handoff: str | None = None,
 ) -> SignupResult:
     """Fill and submit one reviewed signup form, at most once.
 
     ``state.submit_attempted`` is set *before* the click.  A click timeout is an
     outcome-unknown failure and is never retried, which prevents duplicate vendor
     accounts after a slow response.
+
+    ``identity_handoff`` names the one identity provider the operator authorized
+    this deployment to fall back to when the vendor refuses the email path
+    outright; ``None`` keeps the original behavior, where such a route stops for
+    a human. See :data:`_IDENTITY_HANDOFF_PROVIDERS` for what the authorization
+    does and does not permit.
     """
 
     if not navigation_allowed(_page_url(page), tuple(patterns)):
         return SignupResult(status="failed", reason_code="signup_origin_unsafe")
+    if identity_handoff is not None and identity_handoff not in _IDENTITY_HANDOFF_PROVIDERS:
+        # An unrecognized provider name is a misconfiguration, and the safe
+        # reading of a misconfigured authorization is that nothing was authorized.
+        LOGGER.warning("ignoring unknown identity handoff provider %r", identity_handoff)
+        identity_handoff = None
     fields = normalize_signup_fields(approved_fields)
     if signup_policy is None:
         return await _drive_email_password_signup(
@@ -1488,6 +1657,7 @@ async def drive_signup(
             fields=fields,
             state=state,
             resume_signal=resume_signal,
+            identity_handoff=identity_handoff,
         )
     if signup_policy.flow == "email_first":
         return await _drive_email_first_signup(
@@ -1498,6 +1668,7 @@ async def drive_signup(
             state=state,
             policy=signup_policy,
             resume_signal=resume_signal,
+            identity_handoff=identity_handoff,
         )
     if signup_policy.flow != "dom_detected":
         return SignupResult(status="failed", reason_code="signup_policy_unsupported")
@@ -1509,6 +1680,7 @@ async def drive_signup(
         state=state,
         policy=signup_policy,
         resume_signal=resume_signal,
+        identity_handoff=identity_handoff,
     )
 
 
@@ -1522,6 +1694,7 @@ async def _drive_email_password_signup(
     resume_signal: str | None,
     researched: bool = False,
     accept_legal: bool = False,
+    identity_handoff: str | None = None,
 ) -> SignupResult:
     """Fill and submit one single-step email-and-password registration form.
 
@@ -1670,6 +1843,16 @@ async def _drive_email_password_signup(
         # keep the plain count; only a researched route looks past them.
         submit_status, submit = await _own_submit(form)
     if submit_status == "missing" or submit is None:
+        if identity_handoff is not None:
+            handoff = await _drive_identity_handoff(
+                page=page,
+                form=form,
+                provider=identity_handoff,
+                patterns=patterns,
+                state=state,
+            )
+            if handoff is not None:
+                return handoff
         return SignupResult(
             status="human_action_required",
             reason_code="signup_submit_not_found",

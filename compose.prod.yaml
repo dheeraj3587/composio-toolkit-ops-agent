@@ -225,6 +225,10 @@ services:
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
       BROWSER_STORAGE_STATE_KEY: ${BROWSER_STORAGE_STATE_KEY:-}
       BROWSER_STORAGE_STATE_DIR: /browser-data/storage-state
+      # A provider name, not a secret: which identity provider the signup driver
+      # may hand registration to when the vendor refuses the email path for our
+      # address. Empty keeps the old behavior of stopping for a human.
+      SIGNUP_IDENTITY_HANDOFF_PROVIDER: ${SIGNUP_IDENTITY_HANDOFF_PROVIDER:-}
       # This capability can only consume an exact run-scoped transient secret or
       # write one reviewed captured kind. The browser has no vault key/database.
       BROWSER_SECRET_BROKER_URL: http://api:8000  # pragma: allowlist secret

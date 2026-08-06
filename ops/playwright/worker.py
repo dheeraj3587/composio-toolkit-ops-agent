@@ -1312,6 +1312,9 @@ class PlaywrightBrowserWorker:
                     state=state,
                     signup_policy=signup_policy,
                     resume_signal=resume_signal,
+                    identity_handoff=getattr(
+                        self._settings, "signup_identity_handoff_provider", None
+                    ),
                 )
 
         try:
