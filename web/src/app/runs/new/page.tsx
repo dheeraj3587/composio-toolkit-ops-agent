@@ -33,7 +33,7 @@ export default async function NewRunPage({
 
   return (
     <div className="page-enter page-stack mx-auto max-w-6xl">
-      <Button asChild variant="ghost" size="sm" className="-ml-2 font-mono text-[10px] uppercase tracking-[0.1em]">
+      <Button asChild variant="ghost" size="sm" className="-ml-2 font-mono text-[12px] uppercase tracking-[0.1em]">
         <Link href="/"><ArrowLeft aria-hidden="true" /> Overview</Link>
       </Button>
       <header className="grid gap-6 border-b border-border pb-8 lg:grid-cols-[1fr_0.8fr] lg:items-end">

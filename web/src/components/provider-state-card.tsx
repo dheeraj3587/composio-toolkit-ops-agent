@@ -127,7 +127,7 @@ export function ProviderStateCard({
       <div className="mt-5">
         <h3 className="text-base font-semibold">{title}</h3>
         {description ? (
-          <p className="mt-1 text-[10px] leading-4 text-muted-foreground/60">
+          <p className="mt-1 text-[12px] leading-4 text-muted-foreground/60">
             {description}
           </p>
         ) : null}

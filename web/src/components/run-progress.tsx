@@ -109,7 +109,7 @@ export function RunProgress({
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <div
-            className={`flex w-fit items-center gap-2 rounded-full px-3 py-1.5 text-[11px] font-medium ${
+            className={`flex w-fit items-center gap-2 rounded-full px-3 py-1.5 text-[12px] font-medium ${
               terminal ? "bg-secondary text-muted-foreground" : "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/12 dark:text-emerald-300"
             }`}
             aria-live="polite"
@@ -202,7 +202,7 @@ export function RunProgress({
                     <Circle className="size-2" aria-hidden="true" />
                   )}
                 </span>
-                <span className={`block truncate text-[10px] sm:text-xs ${active || complete ? "text-foreground" : "text-muted-foreground"}`}>
+                <span className={`block truncate text-[12px] sm:text-xs ${active || complete ? "text-foreground" : "text-muted-foreground"}`}>
                   {stage}
                 </span>
               </li>

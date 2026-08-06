@@ -720,7 +720,7 @@ function Field({
     <div className="space-y-2">
       <div className="flex items-center justify-between gap-3">
         <label htmlFor={htmlFor} className="text-sm font-medium">{label}</label>
-        {error ? <span className="font-mono text-[9px] uppercase text-destructive">Review</span> : null}
+        {error ? <span className="font-mono text-[11px] uppercase text-destructive">Review</span> : null}
       </div>
       {children({
         "aria-describedby": hasMessage ? messageId : undefined,

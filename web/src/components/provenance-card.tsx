@@ -21,7 +21,7 @@ export function ProvenanceCard({ snapshot }: { snapshot: SnapshotHealth | null }
           </div>
           <Badge
             variant="outline"
-            className="rounded-md border-border font-mono text-[9px] uppercase tracking-[0.1em]"
+            className="rounded-md border-border font-mono text-[11px] uppercase tracking-[0.1em]"
           >
             {snapshot?.verified ? <Check aria-hidden="true" /> : <FileWarning aria-hidden="true" />}
             {snapshot?.verified ? "Hash verified" : "Not verified"}

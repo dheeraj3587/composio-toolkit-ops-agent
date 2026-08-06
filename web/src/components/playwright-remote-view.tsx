@@ -261,7 +261,7 @@ export const PlaywrightRemoteView = forwardRef<
             aria-hidden="true"
           />
           <MonitorDot className="size-3.5 text-zinc-400" aria-hidden="true" />
-          <p role="status" aria-live="polite" className="font-mono text-[10px] uppercase tracking-[0.1em]">
+          <p role="status" aria-live="polite" className="font-mono text-[12px] uppercase tracking-[0.1em]">
             Browser connection · {state}
           </p>
         </div>
@@ -297,7 +297,7 @@ export const PlaywrightRemoteView = forwardRef<
           <div className="min-w-[220px] flex-1">
             <label
               htmlFor="remote-clipboard-out"
-              className="mb-1 block font-mono text-[10px] uppercase tracking-[0.1em] text-zinc-400"
+              className="mb-1 block font-mono text-[12px] uppercase tracking-[0.1em] text-zinc-400"
             >
               Send text into the remote browser
             </label>
@@ -343,7 +343,7 @@ export const PlaywrightRemoteView = forwardRef<
         <div>
           <label
             htmlFor="remote-clipboard-in"
-            className="mb-1 block font-mono text-[10px] uppercase tracking-[0.1em] text-zinc-400"
+            className="mb-1 block font-mono text-[12px] uppercase tracking-[0.1em] text-zinc-400"
           >
             Copied inside the remote browser
           </label>
@@ -369,12 +369,12 @@ export const PlaywrightRemoteView = forwardRef<
           </div>
         </div>
 
-        <p role="status" aria-live="polite" className="text-[11px] text-zinc-400">
+        <p role="status" aria-live="polite" className="text-[12px] text-zinc-400">
           {clipboardNotice}
         </p>
       </div>
       ) : (
-        <p className="border-t border-white/10 bg-zinc-950 px-3 py-3 text-[11px] text-zinc-400">
+        <p className="border-t border-white/10 bg-zinc-950 px-3 py-3 text-[12px] text-zinc-400">
           Live view is read-only while the agent is working. Controls unlock only at a human handoff.
         </p>
       )}

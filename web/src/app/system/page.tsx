@@ -96,5 +96,5 @@ function Unavailable({ copy }: { copy: string }) {
 }
 
 function Boundary({ label, value }: { label: string; value: string }) {
-  return <div className="border-b border-white/10 pb-3"><p className="font-mono text-[9px] uppercase tracking-[0.13em] text-white/40">{label}</p><p className="mt-1 text-sm text-white/85">{value}</p></div>
+  return <div className="border-b border-white/10 pb-3"><p className="font-mono text-[11px] uppercase tracking-[0.13em] text-white/40">{label}</p><p className="mt-1 text-sm text-white/85">{value}</p></div>
 }

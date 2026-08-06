@@ -71,14 +71,14 @@ export default async function LoginPage({
     <main className="relative grid min-h-svh overflow-hidden bg-background lg:grid-cols-[1.05fr_0.95fr]">
       <div className="relative hidden overflow-hidden bg-rail p-12 text-white lg:flex lg:flex-col lg:justify-between">
         <div className="absolute -left-24 top-24 size-96 rounded-full bg-brand-500/20 blur-3xl" />
-        <div className="absolute -bottom-32 right-0 size-[30rem] rounded-full bg-indigo-700/30 blur-3xl" />
+        <div className="absolute -bottom-32 right-0 size-[30rem] rounded-full bg-brand-700/20 blur-3xl" />
         <div className="relative flex items-center gap-3">
-          <span className="grid size-11 place-items-center rounded-xl border border-white/15 bg-white/10 font-mono text-[11px] tracking-[0.16em]">
+          <span className="grid size-11 place-items-center rounded-xl border border-white/15 bg-white/10 font-mono text-[12px] tracking-[0.16em]">
             C/O
           </span>
           <div>
             <p className="text-base font-medium">Composio Operations</p>
-            <p className="mt-0.5 font-mono text-[9px] uppercase tracking-[0.16em] text-white/45">
+            <p className="mt-0.5 font-mono text-[11px] uppercase tracking-[0.16em] text-white/45">
               Secure workspace
             </p>
           </div>
@@ -112,7 +112,7 @@ export default async function LoginPage({
       <div className="flex items-center justify-center px-5 py-12 sm:px-10">
         <div className="w-full max-w-md">
           <div className="mb-10 flex items-center gap-3 lg:hidden">
-            <span className="grid size-10 place-items-center rounded-xl bg-rail font-mono text-[10px] tracking-[0.15em] text-white">
+            <span className="grid size-10 place-items-center rounded-xl bg-rail font-mono text-[12px] tracking-[0.15em] text-white">
               C/O
             </span>
             <span className="font-medium">Composio Operations</span>

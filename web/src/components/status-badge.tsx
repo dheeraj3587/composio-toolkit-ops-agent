@@ -62,7 +62,7 @@ export function StatusBadge({ status, className }: { status?: string | null; cla
     <Badge
       variant="outline"
       className={cn(
-        "max-w-full rounded-md px-2 py-1 font-mono text-[9px] uppercase tracking-[0.1em]",
+        "max-w-full rounded-md px-2 py-1 font-mono text-[11px] uppercase tracking-[0.1em]",
         tone(value),
         className,
       )}

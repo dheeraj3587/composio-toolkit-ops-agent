@@ -88,7 +88,7 @@ export const InlineCitationCardTrigger = ({
   return (
     <PreviewCard.Trigger
       className={cn(
-        "ml-1 inline-flex max-w-40 items-center gap-1 rounded-sm border border-border/60 bg-muted/50 px-1 align-text-bottom font-mono text-[10px] text-muted-foreground leading-4 no-underline transition-colors hover:border-border hover:text-foreground focus-visible:border-primary focus-visible:outline-none",
+        "ml-1 inline-flex max-w-40 items-center gap-1 rounded-sm border border-border/60 bg-muted/50 px-1 align-text-bottom font-mono text-[12px] text-muted-foreground leading-4 no-underline transition-colors hover:border-border hover:text-foreground focus-visible:border-primary focus-visible:outline-none",
         className
       )}
       data-slot="inline-citation-card-trigger"

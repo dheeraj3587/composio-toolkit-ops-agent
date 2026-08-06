@@ -155,7 +155,7 @@ export function AgentTrace({
           </h2>
         </div>
         {decisionModel ? (
-          <p className="font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
+          <p className="font-mono text-[12px] uppercase tracking-[0.1em] text-muted-foreground">
             {decisionModel}
             {decisionEffort ? ` · effort ${decisionEffort}` : null}
           </p>
@@ -240,13 +240,13 @@ function TraceStepView({ step, isLast }: { step: TraceStep; isLast: boolean }) {
       ) : null}
 
       {decision?.candidate_label && !decision.action ? (
-        <p className="pt-1 font-mono text-[10px] text-muted-foreground/70">
+        <p className="pt-1 font-mono text-[12px] text-muted-foreground/70">
           {decision.candidate_label}
         </p>
       ) : null}
 
       {decision?.reason_code ? (
-        <p className="pt-1 font-mono text-[9px] uppercase tracking-[0.1em] text-muted-foreground/60">
+        <p className="pt-1 font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground/60">
           {humanize(decision.reason_code)}
         </p>
       ) : null}

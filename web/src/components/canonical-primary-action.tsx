@@ -80,7 +80,7 @@ export function CanonicalPrimaryAction({
           <p className="mt-2 max-w-2xl text-xs leading-5 text-muted-foreground">
             {copy.detail}
           </p>
-          <p className="mt-3 font-mono text-[9px] uppercase tracking-[0.1em] text-muted-foreground">
+          <p className="mt-3 font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
             Reason · {humanize(action.reason_code)}
           </p>
         </div>

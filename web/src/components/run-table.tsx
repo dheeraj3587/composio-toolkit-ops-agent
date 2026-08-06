@@ -31,10 +31,10 @@ export function RunTable({ runs }: { runs: RunSummary[] }) {
       <Table>
         <TableHeader>
           <TableRow className="border-border bg-muted/45 hover:bg-muted/45">
-            <TableHead className="font-mono text-[10px] uppercase tracking-[0.14em]">Application</TableHead>
-            <TableHead className="font-mono text-[10px] uppercase tracking-[0.14em]">Route</TableHead>
-            <TableHead className="font-mono text-[10px] uppercase tracking-[0.14em]">Status</TableHead>
-            <TableHead className="hidden font-mono text-[10px] uppercase tracking-[0.14em] lg:table-cell">
+            <TableHead className="font-mono text-[12px] uppercase tracking-[0.14em]">Application</TableHead>
+            <TableHead className="font-mono text-[12px] uppercase tracking-[0.14em]">Route</TableHead>
+            <TableHead className="font-mono text-[12px] uppercase tracking-[0.14em]">Status</TableHead>
+            <TableHead className="hidden font-mono text-[12px] uppercase tracking-[0.14em] lg:table-cell">
               Updated · UTC
             </TableHead>
             <TableHead className="w-20"><span className="sr-only">Open run</span></TableHead>
@@ -45,12 +45,12 @@ export function RunTable({ runs }: { runs: RunSummary[] }) {
             <TableRow key={run.run_id} className="border-border hover:bg-brand-50/35">
               <TableCell>
                 <span className="block text-sm font-semibold leading-tight">{run.app_name}</span>
-                <span className="mt-1 block max-w-64 truncate font-mono text-[10px] text-muted-foreground">
+                <span className="mt-1 block max-w-64 truncate font-mono text-[12px] text-muted-foreground">
                   {humanize(run.browser_provider)} · recipe {run.recipe_version ?? "legacy"}
                 </span>
               </TableCell>
               <TableCell>
-                <span className="block font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
+                <span className="block font-mono text-[12px] uppercase tracking-[0.1em] text-muted-foreground">
                   {humanize(run.route_kind ?? run.access_route)}
                 </span>
                 <StatusBadge status={run.readiness_tier} className="mt-1" />

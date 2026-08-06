@@ -258,15 +258,17 @@
   .eyebrow,
   .data-label {
     font-family: var(--font-jetbrains-mono), monospace;
-    font-size: 0.6875rem;
+    font-size: 0.75rem;
     font-weight: 500;
     letter-spacing: 0.05em;
-    line-height: 1.2;
+    line-height: 1.25;
     text-transform: uppercase;
   }
 
+  /* The accent itself, not the pale tint of it: an eyebrow is the one place the
+     brand colour is read as a colour rather than as a surface wash. */
   .eyebrow {
-    color: var(--brand-ink);
+    color: var(--neon);
   }
 
   .data-label {

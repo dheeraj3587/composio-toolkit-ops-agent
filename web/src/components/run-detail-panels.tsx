@@ -52,7 +52,7 @@ export function PhaseGrid({ phases }: { phases: PhaseCollection }) {
               <StatusBadge status={phase?.status ?? "unavailable"} />
             </div>
             <div>
-              <p className="font-mono text-[9px] uppercase tracking-[0.12em] text-muted-foreground">{phase ? "Backend reported" : "Not reported"}</p>
+              <p className="font-mono text-[11px] uppercase tracking-[0.12em] text-muted-foreground">{phase ? "Backend reported" : "Not reported"}</p>
               <h3 className="mt-1 text-sm font-semibold">{phase?.name ?? name}</h3>
               <p className="mt-1 line-clamp-3 text-xs leading-5 text-muted-foreground">{phase?.detail ?? copy}</p>
             </div>
@@ -86,7 +86,7 @@ export function ResearchPanel({ research }: { research: OperationalResearch | nu
       <CardHeader className="border-b border-border px-5 py-4">
         <div className="flex items-center justify-between gap-3">
           <div><p className="eyebrow">Evidence record</p><CardTitle className="mt-1 text-lg font-semibold">Operational research</CardTitle></div>
-          <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">{Math.round(research.confidence * 100)}% confidence</Badge>
+          <Badge variant="outline" className="rounded-md font-mono text-[11px] uppercase tracking-[0.1em]">{Math.round(research.confidence * 100)}% confidence</Badge>
         </div>
       </CardHeader>
       <CardContent className="grid gap-5 px-5 py-5 sm:grid-cols-2">
@@ -149,14 +149,14 @@ export function SecurityPanel({ security }: { security: SecurityState | null }) 
   return (
     <Card className="h-full rounded-lg border-white/10 bg-rail py-0 text-white shadow-none">
       <CardHeader className="border-b border-white/10 px-5 py-4">
-        <p className="font-mono text-[9px] uppercase tracking-[0.14em] text-brand-300">Security boundary</p>
+        <p className="font-mono text-[11px] uppercase tracking-[0.14em] text-brand-300">Security boundary</p>
         <CardTitle className="mt-1 text-lg font-semibold text-white">Reference-only credential handling</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3 px-5 py-5">
         {safeguards.map(({ label, value, icon: Icon }) => (
           <div key={label} className="flex items-center justify-between gap-4 border-b border-white/10 pb-3 last:border-0 last:pb-0">
             <span className="flex items-center gap-2 text-xs text-white/65"><Icon className="size-3.5 text-brand-300" aria-hidden="true" />{label}</span>
-            <span className="text-right font-mono text-[9px] uppercase tracking-[0.1em] text-white/85">{controlValue(value)}</span>
+            <span className="text-right font-mono text-[11px] uppercase tracking-[0.1em] text-white/85">{controlValue(value)}</span>
           </div>
         ))}
         <p className="pt-2 text-xs leading-5 text-white/45">Credential values are never rendered. This view accepts only sanitized backend control state.</p>
@@ -206,10 +206,10 @@ export function HitlPanel({ request, action }: { request: HitlRequest | null | u
       <CardContent className="flex min-h-52 flex-col justify-between px-5 py-5">
         <div className="flex items-start justify-between gap-3"><span className="grid size-8 place-items-center rounded-md bg-amber-100 dark:bg-amber-500/20"><UserRoundCheck className="size-4 text-amber-700 dark:text-amber-300" aria-hidden="true" /></span><StatusBadge status="waiting_for_hitl" /></div>
         <div>
-          <p className="font-mono text-[9px] uppercase tracking-[0.12em] text-amber-800 dark:text-amber-300">Human action · {humanize(request.action_type)}</p>
+          <p className="font-mono text-[11px] uppercase tracking-[0.12em] text-amber-800 dark:text-amber-300">Human action · {humanize(request.action_type)}</p>
           <h3 className="mt-1 text-base font-semibold text-amber-950">{humanize(request.action_type)}</h3>
           <p className="mt-2 text-xs leading-5 text-amber-900/70 dark:text-amber-300/70">{request.message}</p>
-          <p className="mt-3 font-mono text-[9px] uppercase tracking-[0.1em] text-amber-800/80 dark:text-amber-300/80">
+          <p className="mt-3 font-mono text-[11px] uppercase tracking-[0.1em] text-amber-800/80 dark:text-amber-300/80">
             Resume signal · {humanize(request.expected_completion_signal)}
           </p>
           {action ? <div className="mt-4 border-t border-amber-200 pt-4">{action}</div> : null}
@@ -226,7 +226,7 @@ export function OutputPanel({ output }: { output: IntegratorOutput | null }) {
   return (
     <Card className="h-full rounded-lg border-emerald-300 bg-emerald-50/60 py-0 shadow-none dark:border-emerald-500/35 dark:bg-emerald-500/10">
       <CardHeader className="border-b border-emerald-200 dark:border-emerald-500/25 px-5 py-4">
-        <p className="font-mono text-[9px] uppercase tracking-[0.13em] text-emerald-700 dark:text-emerald-300">Output · references only</p>
+        <p className="font-mono text-[11px] uppercase tracking-[0.13em] text-emerald-700 dark:text-emerald-300">Output · references only</p>
         <CardTitle className="mt-1 text-lg font-semibold">Integrator bundle</CardTitle>
       </CardHeader>
       <CardContent className="grid gap-4 px-5 py-5 sm:grid-cols-2">
@@ -267,7 +267,7 @@ export function OnboardingFocusPanel({ state }: { state: OnboardingStateView | n
           </div>
           <div className="flex flex-wrap justify-end gap-2">
             <StatusBadge status={state.phase} />
-            <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">
+            <Badge variant="outline" className="rounded-md font-mono text-[11px] uppercase tracking-[0.1em]">
               Attempt {state.attempt}
             </Badge>
           </div>
@@ -287,7 +287,7 @@ export function OnboardingFocusPanel({ state }: { state: OnboardingStateView | n
         <DataPoint label="Reason code" value={humanize(state.reason_code)} />
         <DataPoint label="Operator prompts" value={`${state.admission_prompts} admission · ${state.captcha_prompts} CAPTCHA`} />
         <DataPoint label="Profile digest" value={state.profile_digest.slice(0, 12)} />
-        <p className="sm:col-span-2 border-t border-border pt-4 font-mono text-[9px] uppercase tracking-[0.1em] text-muted-foreground">
+        <p className="sm:col-span-2 border-t border-border pt-4 font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
           Correlation · {state.correlation_id}
         </p>
       </CardContent>
@@ -329,10 +329,10 @@ export function ProviderProfilePanel({ profile }: { profile: ProviderProfileView
             <CardTitle className="mt-1 text-lg font-semibold">{profile.provider_name || humanize(profile.app_slug)}</CardTitle>
           </div>
           <div className="flex flex-wrap justify-end gap-2">
-            <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">
+            <Badge variant="outline" className="rounded-md font-mono text-[11px] uppercase tracking-[0.1em]">
               {Math.round(profile.confidence * 100)}% confidence
             </Badge>
-            <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">
+            <Badge variant="outline" className="rounded-md font-mono text-[11px] uppercase tracking-[0.1em]">
               Digest {profile.profile_digest.slice(0, 12)}
             </Badge>
           </div>
@@ -353,7 +353,7 @@ export function ProviderProfilePanel({ profile }: { profile: ProviderProfileView
           <div className="mt-2 flex flex-wrap gap-2">
             {profile.allowed_host_patterns.length
               ? profile.allowed_host_patterns.map((pattern) => (
-                  <Badge key={pattern} variant="outline" className="rounded-md font-mono text-[10px]">{pattern}</Badge>
+                  <Badge key={pattern} variant="outline" className="rounded-md font-mono text-[12px]">{pattern}</Badge>
                 ))
               : <span className="text-sm text-muted-foreground">Not reported</span>}
           </div>
@@ -364,8 +364,8 @@ export function ProviderProfilePanel({ profile }: { profile: ProviderProfileView
             {profile.auxiliary_hosts.length
               ? profile.auxiliary_hosts.map((host) => (
                   <li key={`${host.kind}:${host.host}`} className="flex flex-wrap items-center gap-2">
-                    <span className="font-mono text-[10px]">{host.host}</span>
-                    <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">{humanize(host.kind)}</Badge>
+                    <span className="font-mono text-[12px]">{host.host}</span>
+                    <Badge variant="outline" className="rounded-md font-mono text-[11px] uppercase tracking-[0.1em]">{humanize(host.kind)}</Badge>
                   </li>
                 ))
               : <li className="text-muted-foreground">No auxiliary host is declared.</li>}
@@ -410,10 +410,10 @@ function FlowRow({ flow }: { flow: FlowSpecView }) {
         <div className="flex flex-wrap justify-end gap-2">
           <StatusBadge status={flow.supported ? "ready" : "unavailable"} />
           {flow.requires_approval ? (
-            <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">Approval required</Badge>
+            <Badge variant="outline" className="rounded-md font-mono text-[11px] uppercase tracking-[0.1em]">Approval required</Badge>
           ) : null}
           {flow.requires_billing ? (
-            <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">Billing required</Badge>
+            <Badge variant="outline" className="rounded-md font-mono text-[11px] uppercase tracking-[0.1em]">Billing required</Badge>
           ) : null}
         </div>
       </div>
@@ -437,13 +437,13 @@ function EvidenceRow({ evidence }: { evidence: FieldEvidenceView }) {
     <li className="rounded-md border border-border p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="text-xs font-semibold">{humanize(evidence.field)}</span>
-        <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.1em]">
+        <Badge variant="outline" className="rounded-md font-mono text-[11px] uppercase tracking-[0.1em]">
           {Math.round(evidence.confidence * 100)}% · {evidence.corroborations} corroborations
         </Badge>
       </div>
-      <p className="mt-1 break-words font-mono text-[10px]">{evidence.value}</p>
+      <p className="mt-1 break-words font-mono text-[12px]">{evidence.value}</p>
       <p className="mt-1 min-w-0 text-xs"><SafeLink href={evidence.source_url}>{evidence.source_url}</SafeLink></p>
-      <p className="mt-1 font-mono text-[9px] uppercase tracking-[0.1em] text-muted-foreground">
+      <p className="mt-1 font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
         Adapters · {evidence.adapters.length ? evidence.adapters.map(humanize).join(", ") : "Not reported"}
       </p>
     </li>

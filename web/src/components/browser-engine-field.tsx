@@ -43,7 +43,7 @@ export function BrowserEngineField<TValues extends BrowserEngineValues>({
     >
       <legend className="flex w-full items-center justify-between gap-3 text-sm font-medium">
         Browser engine
-        {invalid ? <span className="font-mono text-[9px] uppercase text-destructive">Review</span> : null}
+        {invalid ? <span className="font-mono text-[11px] uppercase text-destructive">Review</span> : null}
       </legend>
       <Controller
         name={"browser_provider" as Path<TValues>}
@@ -98,15 +98,15 @@ export function BrowserEngineField<TValues extends BrowserEngineValues>({
                       aria-hidden="true"
                     />
                   </span>
-                  <span className="mt-4 block font-mono text-[9px] uppercase tracking-[0.13em] text-muted-foreground">
+                  <span className="mt-4 block font-mono text-[11px] uppercase tracking-[0.13em] text-muted-foreground">
                     {option.eyebrow}
                   </span>
                   <span className="mt-1 block text-sm font-semibold">{option.title}</span>
-                  <span className="mt-1 block text-[11px] leading-5 text-muted-foreground">
+                  <span className="mt-1 block text-[12px] leading-5 text-muted-foreground">
                     {option.description}
                   </span>
                   {!selectable ? (
-                    <span className="mt-3 block border-t border-border pt-3 text-[10px] leading-4 text-amber-800 dark:text-amber-300">
+                    <span className="mt-3 block border-t border-border pt-3 text-[12px] leading-4 text-amber-800 dark:text-amber-300">
                       {state?.detail ?? "Provider readiness could not be confirmed."}
                     </span>
                   ) : null}

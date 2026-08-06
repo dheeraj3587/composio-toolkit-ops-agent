@@ -32,7 +32,7 @@ export default async function AppResearchPage({ params }: { params: Promise<{ sl
 
   return (
     <div className="page-enter page-stack">
-      <Button asChild variant="ghost" size="sm" className="-ml-2 font-mono text-[10px] uppercase tracking-[0.1em]">
+      <Button asChild variant="ghost" size="sm" className="-ml-2 font-mono text-[12px] uppercase tracking-[0.1em]">
         <Link href="/#app-catalog"><ArrowLeft aria-hidden="true" /> App catalog</Link>
       </Button>
 
@@ -43,7 +43,7 @@ export default async function AppResearchPage({ params }: { params: Promise<{ sl
             <StatusBadge status={app.verification_status} />
           </div>
           <h1 className="mt-3 text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">{app.app_name}</h1>
-          <p className="mt-2 font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">{app.app_slug}</p>
+          <p className="mt-2 font-mono text-[12px] uppercase tracking-[0.12em] text-muted-foreground">{app.app_slug}</p>
         </div>
         <Button asChild className="w-fit rounded-md">
           <Link href={`/runs/new?app=${encodeURIComponent(app.app_name)}`}>Create run <ArrowRight aria-hidden="true" /></Link>

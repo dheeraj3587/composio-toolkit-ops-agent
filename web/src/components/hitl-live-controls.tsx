@@ -227,7 +227,7 @@ export function HitlLiveControls({
               onResumeSubmit={isInteractiveHitl ? disconnectBeforeResume : undefined}
             />
           ) : (
-            <p className="text-[10px] leading-4 text-muted-foreground">
+            <p className="text-[12px] leading-4 text-muted-foreground">
               The agent is driving this session. Operator controls for this run come from the
               onboarding console above, and no credential is ever typed on this page.
             </p>
@@ -287,7 +287,7 @@ function LegacyBrowserSurfaces({
         >
           <input type="hidden" name="run_id" value={runId} />
           <input type="hidden" name="action" value="resume" />
-          <p className="text-[10px] leading-4 text-muted-foreground">
+          <p className="text-[12px] leading-4 text-muted-foreground">
             Finish the human-only step in the remote browser, then disconnect control and resume the
             same Playwright session.
           </p>
@@ -314,11 +314,11 @@ function LegacyBrowserSurfaces({
           fieldLabel={fieldLabel}
         />
       ) : browser?.credential_page_verified ? (
-        <p className="border-t border-border pt-4 text-[10px] leading-4 text-muted-foreground">
+        <p className="border-t border-border pt-4 text-[12px] leading-4 text-muted-foreground">
           The credential page is verified, but manual submission is disabled by the owner-action policy.
         </p>
       ) : (
-        <p className="border-t border-border pt-4 text-[10px] leading-4 text-muted-foreground">
+        <p className="border-t border-border pt-4 text-[12px] leading-4 text-muted-foreground">
           Credential submission unlocks only after the backend verifies the official credential-management page.
         </p>
       )}
@@ -372,7 +372,7 @@ export function OnboardingControlBar({
           <p className="eyebrow">Backend-projected capability</p>
           <h3 className="mt-1 text-lg font-semibold">Operator controls</h3>
         </div>
-        <p className="font-mono text-[9px] uppercase tracking-[0.1em] text-muted-foreground">
+        <p className="font-mono text-[11px] uppercase tracking-[0.1em] text-muted-foreground">
           Control reason · {humanize(controls.reason_code)}
         </p>
       </div>

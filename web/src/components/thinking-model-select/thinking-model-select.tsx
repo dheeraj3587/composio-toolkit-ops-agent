@@ -44,7 +44,7 @@ const EffortReadout = ({ effort }: { effort: ThinkingEffort }) => (
   <span
     aria-hidden="true"
     className={cn(
-      "ml-0.5 w-[5ch] shrink-0 font-mono text-[10px] leading-none",
+      "ml-0.5 w-[5ch] shrink-0 font-mono text-[12px] leading-none",
       effort === "instant" ? "text-muted-foreground/70" : "text-primary"
     )}
   >
@@ -109,7 +109,7 @@ export const ThinkingModelSelect = ({
               size={FOOTER_SLIDER_SIZE[size]}
               value={effort}
             />
-            <kbd className="mr-1 shrink-0 border border-border/40 px-1 py-px font-mono text-[9px] text-muted-foreground/60 lowercase">
+            <kbd className="mr-1 shrink-0 border border-border/40 px-1 py-px font-mono text-[11px] text-muted-foreground/60 lowercase">
               tab
             </kbd>
           </div>

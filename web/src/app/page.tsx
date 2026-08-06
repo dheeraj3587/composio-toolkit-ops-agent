@@ -67,7 +67,7 @@ export default async function DashboardPage() {
       <section aria-labelledby="system-pulse">
         <div className="mb-3 flex items-center justify-between gap-4">
           <h2 id="system-pulse" className="text-sm font-semibold">System pulse</h2>
-          <Badge variant="outline" className="rounded-md font-mono text-[9px] uppercase tracking-[0.12em]">Backend reported</Badge>
+          <Badge variant="outline" className="rounded-md font-mono text-[11px] uppercase tracking-[0.12em]">Backend reported</Badge>
         </div>
         <div className="grid overflow-hidden rounded-md border border-border bg-border sm:grid-cols-2 xl:grid-cols-4">
           <Metric icon={Database} label="Integrations" value={runs ? String(runs.total) : "—"} note="Saved runs" />
@@ -94,7 +94,7 @@ export default async function DashboardPage() {
             <p className="eyebrow">Recent activity</p>
             <h2 id="recent-runs" className="mt-1 text-xl font-semibold tracking-[-0.02em]">Integration runs</h2>
           </div>
-          <Button asChild variant="ghost" size="sm" className="font-mono text-[10px] uppercase tracking-[0.1em]">
+          <Button asChild variant="ghost" size="sm" className="font-mono text-[12px] uppercase tracking-[0.1em]">
             <Link href="/runs/new">New integration <ArrowRight aria-hidden="true" /></Link>
           </Button>
         </div>
