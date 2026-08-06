@@ -1,7 +1,7 @@
 -r requirements.txt
 -r requirements-providers.txt
 pytest==9.0.3
-pytest-asyncio>=1.1,<2
+pytest-asyncio>=1.4.0,<2
 pytest-timeout>=2.3,<3
 hypothesis>=6.100,<7
 ruff>=0.12,<1
