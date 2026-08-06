@@ -275,7 +275,7 @@ print(json.dumps({
                 # research extractor, outreach email loop -- run here. The
                 # validator requires the key in this container as well as in
                 # browser-worker, so a real render always carries both.
-                "MERCURY_API_KEY": "test-mercury-key",
+                "MERCURY_API_KEY": "test-mercury-key",  # pragma: allowlist secret
                 "MERCURY_MODEL": "mercury-2",
                 # Operator credentials, including the TOTP secret, stay withheld
                 # from the API container: that containment rule is retained.
@@ -296,7 +296,7 @@ print(json.dumps({
                 # decides whether Mercury is in the chain here: this service has
                 # no env_file, so its only source is the ${MERCURY_API_KEY:-}
                 # interpolation, and the validator requires it.
-                "MERCURY_API_KEY": "test-mercury-key",
+                "MERCURY_API_KEY": "test-mercury-key",  # pragma: allowlist secret
                 "MERCURY_MODEL": "mercury-2",
             },
         },
@@ -1458,7 +1458,18 @@ def test_release_scripts_declare_drain_backup_and_immutable_helper_contracts() -
     assert "stop_uncertain_rollback_stack" in deploy
     assert '[ ! -L "$ENV_FILE" ]' in deploy
     assert "permission_bits & 077" in deploy
-    assert "compose logs" not in deploy
+    # Container logs must never reach the deploy's own stdout, which is a CI log.
+    # The release now captures the OUTGOING containers' logs before recreating
+    # them -- that evidence is otherwise destroyed with the container, and it is
+    # what explains a run that failed just before a bad deploy. So the guard
+    # checks the destination instead of banning the command: every `compose logs`
+    # must be redirected into the 0700 recovery directory on the same line.
+    for line in deploy.splitlines():
+        if "compose logs" in line:
+            assert '>"$capture_path"' in line, line
+    assert 'capture_path="$log_directory/$service.log"' in deploy
+    assert "capture_outgoing_logs" in deploy
+    assert "prune_predeploy_backups" in deploy
 
     drain_index = backup.index("begin_browser_drain ||")
     stop_index = backup.index('compose stop "$service"')

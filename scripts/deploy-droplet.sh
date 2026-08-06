@@ -28,6 +28,9 @@ readonly BROWSER_APPARMOR_PROFILE_NAME="composio-ops-browser-v1"
 # for an ACME order plus retry, short enough that a genuinely broken TLS setup
 # still fails the release instead of hanging it.
 readonly PUBLIC_CERTIFICATE_TIMEOUT_SECONDS=240
+# How many pre-deploy recovery directories survive a release. Enough to roll back
+# past several bad deploys; bounded so the backups do not outgrow the disk.
+readonly PREDEPLOY_BACKUP_RETENTION=5
 readonly BROWSER_APPARMOR_SOURCE="deploy/composio-ops-browser.apparmor"
 readonly BROWSER_APPARMOR_DESTINATION="/etc/apparmor.d/composio-ops-browser-v1"
 
@@ -273,6 +276,59 @@ docker_command() {
 
 compose() {
 	docker_command compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
+}
+
+capture_outgoing_logs() {
+	# Recreating a container destroys its json-file log. Everything the release
+	# being replaced ever said about a failed run goes with it, which is exactly
+	# the evidence someone wants the morning after a bad deploy. Capture it beside
+	# the recovery archive, while the outgoing containers still exist.
+	#
+	# Best-effort by design: a deployment must not fail because a diagnostic copy
+	# could not be written. The logs already pass the application's redacting
+	# handler, and the destination is the 0700 backup directory.
+	#
+	# Every capture is redirected to a file. Container output must never reach
+	# this script's own stdout, which is a CI log -- a far weaker boundary than
+	# the host directory this writes to.
+	local destination="$1" service capture_path
+	local log_directory="$destination/logs"
+	mkdir -p "$log_directory" 2>/dev/null || return 0
+	chmod 0700 "$log_directory" 2>/dev/null || true
+	for service in "${RELEASE_SERVICES[@]}"; do
+		capture_path="$log_directory/$service.log"
+		if compose logs --no-color --timestamps --tail 5000 "$service" >"$capture_path" 2>&1; then
+			chmod 0600 "$capture_path" 2>/dev/null || true
+		else
+			rm -f "$capture_path"
+		fi
+	done
+	log "Captured the outgoing release's container logs."
+}
+
+prune_predeploy_backups() {
+	# One directory per deploy, each holding a full database archive, and nothing
+	# has ever removed them. On a host that has been near 80% full, the backup
+	# that protects a deploy is also the thing most likely to break the next one.
+	# Newest ${PREDEPLOY_BACKUP_RETENTION} are kept; the timestamp in the name is
+	# fixed-width, so a lexicographic sort is a chronological one.
+	local retained=() candidate remove_count index
+	shopt -s nullglob
+	local directories=("$REPO_ROOT"/backups/predeploy-*)
+	shopt -u nullglob
+	[ "${#directories[@]}" -gt "$PREDEPLOY_BACKUP_RETENTION" ] || return 0
+	while IFS= read -r candidate; do
+		retained+=("$candidate")
+	done < <(printf '%s\n' "${directories[@]}" | sort)
+	remove_count=$((${#retained[@]} - PREDEPLOY_BACKUP_RETENTION))
+	for ((index = 0; index < remove_count; index++)); do
+		# Never remove the archive this deployment is relying on to roll back.
+		case "$PREDEPLOY_ARCHIVE" in
+			"${retained[index]}"/*) continue ;;
+		esac
+		rm -rf -- "${retained[index]}" || true
+	done
+	log "Pruned ${remove_count} superseded pre-deploy backup(s)."
 }
 
 install_browser_apparmor_profile() {
@@ -1372,6 +1428,7 @@ if [ "$PREVIOUS_STACK" -eq 1 ]; then
 		./scripts/restore-production-data.sh --dry-run "${BACKUP_ARCHIVES[0]}" \
 		|| fail "Pre-deploy archive validation failed."
 	PREDEPLOY_ARCHIVE="${BACKUP_ARCHIVES[0]}"
+	capture_outgoing_logs "$BACKUP_DIR"
 else
 	log "No previous stack exists; this is a first deployment."
 	ROLLBACK_REQUIRED=1
@@ -1417,6 +1474,9 @@ ROLLBACK_REQUIRED=0
 cleanup_rollback_bundle
 cleanup_browser_preflight
 trap - EXIT INT TERM
+# Only now, with the release accepted and rollback no longer armed, is an older
+# recovery directory genuinely superseded.
+prune_predeploy_backups
 log "Service status:"
 if ! compose ps; then
 	log "Deployment is accepted, but the final status display was unavailable."
