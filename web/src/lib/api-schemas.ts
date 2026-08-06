@@ -22,6 +22,12 @@ const boundedText = (maximum: number) => z.string().min(1).max(maximum)
 const optionalText = (maximum: number) => z.string().max(maximum).nullable()
 const nullableText = (maximum: number) => z.string().max(maximum).nullish().default(null)
 const safeToken = z.string().regex(/^[a-z0-9][a-z0-9_.:-]{0,119}$/i)
+// A catalog model id is "<provider>:<model>", and vendor model names routinely
+// carry a namespace slash -- "groq:openai/gpt-oss-120b". safeToken forbids the
+// slash, which silently failed the whole catalog response and left the picker
+// reporting that the catalog could not be read. Same character class, plus the
+// slash, and still no whitespace, quotes, or angle brackets.
+const modelId = z.string().regex(/^[a-z0-9][a-z0-9_.:/-]{0,119}$/i)
 const httpUrl = z.string().min(8).max(MAX_URL_LENGTH).refine(safeHttpUrl)
 const nullableHttpUrl = httpUrl.nullish().default(null)
 const nullableBoolean = z.boolean().nullish().default(null)
@@ -648,7 +654,7 @@ export const modelCatalogResponseSchema = z.strictObject({
   models: z
     .array(
       z.strictObject({
-        id: safeToken,
+        id: modelId,
         provider: safeToken,
         model: boundedText(120),
         label: boundedText(120),
@@ -659,7 +665,7 @@ export const modelCatalogResponseSchema = z.strictObject({
       }),
     )
     .max(50),
-  default_model_id: safeToken.nullish().default(null),
+  default_model_id: modelId.nullish().default(null),
   default_effort: safeToken.nullish().default(null),
 })
 
@@ -683,7 +689,7 @@ export const timelineResponseSchema = z.strictObject({
   progress: z.array(runProgressEventSchema).max(200).default([]),
   decisions: z.array(runDecisionSchema).max(200).default([]),
   citations: z.array(runCitationSchema).max(200).default([]),
-  decision_model: safeToken.nullish().default(null),
+  decision_model: modelId.nullish().default(null),
   decision_effort: safeToken.nullish().default(null),
 })
 

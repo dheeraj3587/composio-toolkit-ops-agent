@@ -681,15 +681,20 @@ function accountCreationUnavailableReason({
 /**
  * The caveat shown when no reviewed signup route exists and the agent will
  * research one from the app's own site at run time. There is nothing to link
- * yet — the route does not exist until the run researches it — so the copy
- * promises the research and points at where it becomes visible.
+ * yet — the route does not exist until the run researches it.
+ *
+ * The copy says "may not find one" rather than promising a route, because the
+ * research is bounded to the app's reviewed navigation hosts and legitimately
+ * comes back empty for apps whose registration lives on a host outside them.
+ * When it does, the run is refused and nothing is created — so promising the
+ * route here left that refusal looking like a malfunction.
  */
 function researchedSignupCaveat(appName: string): {
   detail: string
   evidenceUrl: string | null
 } {
   return {
-    detail: `The signup route for ${appName} has not been reviewed by a human. The agent will find it on ${appName}'s own site when the run starts, and each page it reads appears on the run timeline.`,
+    detail: `The signup route for ${appName} has not been reviewed by a human. When you start the run, the agent looks for one on ${appName}'s own reviewed site and shows each page it reads on the run timeline. If it finds no signup form there, the run is refused and nothing is created — a route is never guessed.`,
     evidenceUrl: null,
   }
 }

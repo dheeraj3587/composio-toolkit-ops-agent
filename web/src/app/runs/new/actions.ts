@@ -4,8 +4,43 @@ import { createHash, randomBytes } from "node:crypto"
 
 import { redirect } from "next/navigation"
 
-import { ApiError, createRun } from "@/lib/api"
+import { ApiError, PhaseConflictError, createRun } from "@/lib/api"
 import type { OperationsRequestInput } from "@/lib/types"
+
+/**
+ * Why a run was refused, in the operator's words.
+ *
+ * The backend answers a refusal with a closed reason code and creates nothing.
+ * Collapsing every one of those into "the backend rejected this request" was
+ * the whole problem: the refusals below are each actionable, and the operator
+ * could not tell "this app has no signup route" from "a key is missing".
+ *
+ * Codes are matched exactly. An unrecognized one falls through to the generic
+ * sentence rather than being shown raw, so a new backend code can never leak
+ * internal vocabulary into the page.
+ */
+const REFUSAL_REASONS: Record<string, string> = {
+  reviewed_signup_recipe_not_available:
+    "No signup route is available for this app. Its reviewed recipe has no signup page, and the agent could not find one on the app's own reviewed site, so there is nowhere to register. Choose “I have an account”, or pick another app.",
+  playwright_required_for_reviewed_signup:
+    "Creating an account uses the self-hosted Playwright engine. Select Playwright as the browser engine and try again.",
+  playwright_configuration_required:
+    "The self-hosted browser engine is not configured in this deployment, so no browser run can start.",
+  gmail_signup_address_not_configured:
+    "Creating an account needs a verified work inbox to receive the confirmation email, and none is configured for this deployment.",
+  gmail_signup_preflight_failed:
+    "The work inbox did not answer its readiness check, so the confirmation email could not be received. Check the inbox on the system health page and try again.",
+  reviewed_recipe_required:
+    "This app has no reviewed recipe, so the agent cannot run against it. It can still be researched in plan-only mode.",
+  onboarding_driver_not_wired:
+    "The autonomous onboarding driver is not wired to a browser in this deployment.",
+}
+
+function refusalMessage(error: unknown): string | null {
+  if (!(error instanceof PhaseConflictError)) return null
+  const reason = error.conflict.reason_code
+  return (reason && REFUSAL_REASONS[reason]) ?? null
+}
 
 export interface CreateRunFormState {
   error: string | null
@@ -172,10 +207,12 @@ export async function createRunAction(
     runId = detail.run.run_id
   } catch (error) {
     const unavailable = error instanceof ApiError && error.status >= 500
+    const refused = refusalMessage(error)
     return {
       error: unavailable
         ? "The operations API is unavailable. We could not confirm whether the run was persisted. Check the ledger before retrying."
-        : "The backend rejected this run request. Review the request and try again.",
+        : (refused ??
+          "The backend rejected this run request. Review the request and try again."),
       fields: [],
       idempotencyKey,
       requestFingerprint,

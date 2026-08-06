@@ -187,6 +187,8 @@ async function apiRequest<T>(
         external_actions:
           typeof detail?.external_actions === "boolean" ? detail.external_actions : null,
         message: typeof detail?.message === "string" ? detail.message.slice(0, 240) : null,
+        reason_code: safeToken(detail?.reason_code),
+        provider: safeToken(detail?.provider),
       })
     }
 

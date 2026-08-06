@@ -724,6 +724,12 @@ export interface PhaseConflict {
   available_in: string[]
   external_actions: boolean | null
   message?: string | null
+  // A provider-readiness refusal (409 provider_not_ready) names which capability
+  // was not ready and why. Both come from closed backend vocabularies, so they
+  // are safe to turn into a sentence; dropping them left the operator with
+  // "the backend rejected this request" and nothing to act on.
+  reason_code?: string | null
+  provider?: string | null
 }
 
 export interface AppSearchItem {
