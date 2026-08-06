@@ -270,6 +270,13 @@ print(json.dumps({
                 "APP_REVISION": revision,
                 "OPS_DEPLOY_ACCEPTANCE_NONCE": acceptance_nonce,
                 "OPS_DEPLOY_ACCEPTANCE_MARKER_PATH": "/data/deploy-acceptance.json",
+                # Mercury heads every inference chain, and four of the five
+                # model-answered tasks -- run planner, onboarding decider,
+                # research extractor, outreach email loop -- run here. The
+                # validator requires the key in this container as well as in
+                # browser-worker, so a real render always carries both.
+                "MERCURY_API_KEY": "test-mercury-key",
+                "MERCURY_MODEL": "mercury-2",
                 # Operator credentials, including the TOTP secret, stay withheld
                 # from the API container: that containment rule is retained.
                 "OPS_AUTH_USERNAME": "",
@@ -284,8 +291,12 @@ print(json.dumps({
                 "PLAYWRIGHT_MAX_SESSIONS": "2",
                 "BROWSER_OPERATION_TIMEOUT_SECONDS": "300",
                 "BROWSER_SERVICE_OWNER": "production-owner",
-                # compose.prod.yaml gives this a default, so a real render always
-                # carries it and the contract validator requires it.
+                # compose.prod.yaml gives the model a default, so a real render
+                # always carries it. The key is the variable that actually
+                # decides whether Mercury is in the chain here: this service has
+                # no env_file, so its only source is the ${MERCURY_API_KEY:-}
+                # interpolation, and the validator requires it.
+                "MERCURY_API_KEY": "test-mercury-key",
                 "MERCURY_MODEL": "mercury-2",
             },
         },
