@@ -61,7 +61,7 @@ class _StubStorage:
 def _service(records: list[dict[str, Any]]) -> RunService:
     service = RunService.__new__(RunService)
     service.storage = _StubStorage(records)  # type: ignore[assignment]
-    service._settings = Settings(browser_use_task_timeout_seconds=180)
+    service._settings = Settings(browser_service_client_timeout_seconds=180)
     service._released: list[tuple[str, str]] = []  # type: ignore[attr-defined]
 
     def _release(context: object, provider: str, *, reason: str) -> None:
@@ -104,7 +104,7 @@ def test_recently_updated_browser_run_is_left_alone() -> None:
 
 
 def test_threshold_exceeds_the_provider_operation_timeout() -> None:
-    # 180s operation timeout must not be reclaimed at 4 minutes of idleness.
+    # 180s browser-service client timeout must not be reclaimed at 4 minutes idle.
     service = _service([_record(run_id="run_edge", status="browser_running", minutes_idle=4)])
     assert service.reconcile_idle_browser_runs() == 0
     assert service.storage.get_run("run_edge")["status"] == "browser_running"

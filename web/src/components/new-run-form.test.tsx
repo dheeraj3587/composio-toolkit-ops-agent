@@ -72,7 +72,6 @@ describe("NewRunForm", () => {
         defaultAppName="Pipedrive"
         providerStates={[
           { provider: "playwright", status: "configured_not_verified", detail: "Configured." },
-          { provider: "browser_use", status: "configured_not_verified", detail: "Configured." },
           {
             provider: "gmail",
             status: "configured_not_verified",
@@ -88,7 +87,10 @@ describe("NewRunForm", () => {
     expect(screen.getByRole("textbox", { name: "Company name" })).toBeInTheDocument()
     expect(screen.getByRole("textbox", { name: "Company website" })).toBeInTheDocument()
     expect(screen.getByRole("textbox", { name: "What will this integration do?" })).toBeInTheDocument()
-    expect(screen.getByRole("radio", { name: /playwright/i })).toBeChecked()
+    // The engine is stated, not chosen: Playwright is the only backend.
+    const engineGroup = screen.getByRole("region", { name: "Browser engine" })
+    expect(within(engineGroup).getByText("Playwright")).toBeVisible()
+    expect(within(engineGroup).queryAllByRole("radio")).toHaveLength(0)
 
     await user.click(screen.getByText("Advanced settings"))
     const mode = screen.getByRole("combobox", { name: "Run mode" })
@@ -100,53 +102,34 @@ describe("NewRunForm", () => {
     expect(screen.getByText(/vault destination is created automatically/i)).toBeInTheDocument()
   })
 
-  it("falls back to Browser Use and keeps unavailable engines visible", () => {
+  it("reports why the browser is unusable instead of offering another engine", () => {
     render(
       <NewRunForm
         providerStates={[
           { provider: "playwright", status: "not_configured", detail: "Service token missing." },
-          { provider: "browser_use", status: "ready", detail: "Ready." },
         ]}
       />,
     )
 
-    expect(screen.getByRole("radio", { name: /playwright/i })).toBeDisabled()
+    // There is no second backend to fall back to, so the readiness detail IS the
+    // answer. Hiding it would leave the operator with a form that silently fails.
     expect(screen.getByText("Service token missing.")).toBeVisible()
-    expect(screen.getByRole("radio", { name: /browser use/i })).toBeChecked()
+    const engineGroup = screen.getByRole("region", { name: "Browser engine" })
+    expect(within(engineGroup).queryAllByRole("radio")).toHaveLength(0)
   })
 
-  it("leaves the group unselected when neither provider is available", () => {
-    render(
-      <NewRunForm
-        providerStates={[
-          { provider: "playwright", status: "disabled", detail: "Policy disabled." },
-          { provider: "browser_use", status: "not_configured", detail: "Key missing." },
-        ]}
-      />,
-    )
-
-    const browserGroup = screen.getByRole("group", { name: "Browser engine" })
-    const radios = within(browserGroup).getAllByRole("radio")
-    expect(radios).toHaveLength(2)
-    for (const radio of radios) expect(radio).not.toBeChecked()
-  })
-
-  it("supports native keyboard selection between available engines", async () => {
-    const user = userEvent.setup()
+  it("says nothing about readiness once the browser is configured", () => {
     render(
       <NewRunForm
         providerStates={[
           { provider: "playwright", status: "ready", detail: "Ready." },
-          { provider: "browser_use", status: "ready", detail: "Ready." },
         ]}
       />,
     )
 
-    const playwright = screen.getByRole("radio", { name: /playwright/i })
-    const browserUse = screen.getByRole("radio", { name: /browser use/i })
-    playwright.focus()
-    await user.keyboard("{ArrowRight}")
-    expect(browserUse).toBeChecked()
+    const engineGroup = screen.getByRole("region", { name: "Browser engine" })
+    expect(within(engineGroup).getByText("Playwright")).toBeVisible()
+    expect(within(engineGroup).queryByText("Ready.")).toBeNull()
   })
 
   it("disables account creation until the connected signup inbox is ready", () => {

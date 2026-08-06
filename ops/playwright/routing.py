@@ -49,10 +49,10 @@ def select_initial_target(
 ) -> str | None:
     """Choose the shared account-aware reviewed starting URL for Playwright.
 
-    The shared selector preserves Playwright's conservative compatibility fallback:
-    an unverified developer-portal field is considered only when this app has no
+    The shared selector preserves the conservative compatibility fallback: an
+    unverified developer-portal field is considered only when this app has no
     reviewed trace.  Field-level claims, trace host validation, and strict URL
-    rejection are centralized with the Browser Use implementation.
+    rejection are centralized in ``select_browser_target``.
     """
 
     return select_browser_target(
@@ -61,7 +61,6 @@ def select_initial_target(
         allowed_domains=patterns,
         account_state=account_state,
         is_allowed_url=is_allowed_browser_url,
-        fallback_mode="playwright",
     )
 
 

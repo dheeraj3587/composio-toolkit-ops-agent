@@ -18,14 +18,14 @@ import {
 import { createRunAction, type CreateRunFormState } from "@/app/runs/new/actions"
 import { AppNameField } from "@/components/app-name-field"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import { BrowserEngineField, browserProviderIsSelectable } from "@/components/browser-engine-field"
+import { BrowserEngineStatus } from "@/components/browser-engine-field"
 import { ModelPickerField } from "@/components/model-picker-field"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { useAppCapabilities, useAppCatalog } from "@/lib/app-catalog"
-import type { BrowserProvider, ConnectRoute, ProviderStatus } from "@/lib/types"
+import type { ConnectRoute, ProviderStatus } from "@/lib/types"
 
 const safeUrl = z.url({ protocol: /^https$/ })
 
@@ -41,9 +41,10 @@ const runFormSchema = z
     app_login_password: z.string().max(512),
     requested_scope_policy: z.enum(["minimum", "recommended", "maximum"]),
     execution_mode: z.enum(["plan_only", "execute_when_configured"]),
-    browser_provider: z.enum(["playwright", "browser_use"], {
-      error: "Choose an available browser.",
-    }),
+    // Not a choice any more: the self-hosted Playwright harness is the only
+    // backend. Kept in the payload because the value is frozen onto the run and
+    // retries/resumes are checked against it.
+    browser_provider: z.literal("playwright"),
     credential_creation_policy: z.enum(["reuse_only", "create_if_missing"]),
     // A per-run model pin. Empty means "use the deployment's chain"; the
     // backend is the authority on whether a named model is serviceable.
@@ -90,11 +91,6 @@ export function NewRunForm({
   defaultAppName?: string
   providerStates: ProviderStatus[]
 }) {
-  const defaultProvider: BrowserProvider | undefined = browserProviderIsSelectable(providerStates, "playwright")
-    ? "playwright"
-    : browserProviderIsSelectable(providerStates, "browser_use")
-      ? "browser_use"
-      : undefined
   const [state, formAction] = useActionState(createRunAction, initialCreateRunState)
   const [pending, startTransition] = useTransition()
   const advancedDetailsRef = useRef<HTMLDetailsElement>(null)
@@ -121,7 +117,7 @@ export function NewRunForm({
       app_login_password: "",
       requested_scope_policy: "recommended",
       execution_mode: "execute_when_configured",
-      browser_provider: defaultProvider,
+      browser_provider: "playwright",
       credential_creation_policy: "create_if_missing",
       decision_model: "",
       decision_effort: "",
@@ -307,12 +303,7 @@ export function NewRunForm({
         </div>
 
         <div className="border-t border-border bg-card px-5 py-6 sm:px-7">
-          <BrowserEngineField
-            control={control}
-            providerStates={providerStates}
-            error={errors.browser_provider}
-            serverInvalid={serverInvalid.has("browser_provider")}
-          />
+          <BrowserEngineStatus providerStates={providerStates} />
           <div className="mt-6 border-t border-border pt-6">
             <Controller
               control={control}

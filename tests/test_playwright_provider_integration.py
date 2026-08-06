@@ -1,8 +1,9 @@
 """Provider-aware live view, restart reconciliation, and provider state.
 
-The invariant behind every test here: adding the self-hosted provider must not
-change Browser Use behaviour, and Playwright's real limitations must be reported
-honestly rather than papered over.
+The invariant behind every test here: a live view describes only what this
+control plane can actually serve right now, and Playwright's real limitations are
+reported honestly rather than papered over. A run row recorded on the retired
+cloud adapter is named as recorded and granted nothing.
 """
 
 from __future__ import annotations
@@ -38,8 +39,15 @@ def _request(app_name: str = "Pipedrive") -> OperationsRequest:
     )
 
 
-# --- Live view: Browser Use unchanged, Playwright uses screenshot mode ---------
+# --- Live view: the only viewers are the ones this control plane serves --------
 class _HostedUrlWorker:
+    """A worker in the shape of the retired cloud backend: a URL on its own host.
+
+    Nothing routes to it any more — it is kept to prove the opposite of what it
+    used to prove. Even a worker that advertises a hosted URL cannot produce a
+    hosted live view, because the API has no mode to carry one.
+    """
+
     provider_name = "browser_use"
     supports_live_url = True
     supports_screenshot = False
@@ -80,18 +88,26 @@ def _service_with_worker(tmp_path: Path, worker: object, *, session_id: str = "s
     return service
 
 
-def test_browser_use_live_url_behaviour_is_unchanged(tmp_path: Path) -> None:
+def test_a_hosted_url_worker_has_no_query_left_to_answer(tmp_path: Path) -> None:
+    """The run service can no longer be asked for an externally hosted URL.
+
+    This used to assert the opposite — that ``get_browser_live_url`` returned the
+    cloud backend's signed URL. That method and its post-restart recovery path
+    (which replayed the provider session id out of the workflow checkpoint) went
+    with the ``hosted_url`` view mode they fed, so a worker advertising one now
+    yields nothing at all rather than a viewer no client can render.
+    """
+
     service = _service_with_worker(tmp_path, _HostedUrlWorker())
     run_id = service._test_run_id  # type: ignore[attr-defined]
-    assert service.get_browser_live_url(run_id) == "https://live.browser-use.example/session"
-    # A hosted-URL provider offers no screenshot; the field stays absent.
+    assert not hasattr(service, "get_browser_live_url")
+    # It offers no screenshot either, so there is no live surface of any kind.
     assert service.get_browser_screenshot(run_id) is None
 
 
-def test_playwright_exposes_a_screenshot_and_no_hosted_url(tmp_path: Path) -> None:
+def test_playwright_exposes_a_screenshot(tmp_path: Path) -> None:
     service = _service_with_worker(tmp_path, _ScreenshotWorker())
     run_id = service._test_run_id  # type: ignore[attr-defined]
-    assert service.get_browser_live_url(run_id) is None  # no AttributeError/500
     shot = service.get_browser_screenshot(run_id)
     assert shot is not None
     image, captured_at = shot
@@ -126,17 +142,16 @@ def test_playwright_grant_is_minted_for_running_and_hitl_without_being_persisted
 
 
 def test_live_view_modes_are_provider_aware_and_self_consistent() -> None:
-    # Browser Use keeps its hosted, interactive shape.
-    hosted = LiveViewResponse(
-        run_id="run_1",
-        provider="browser_use",
-        available=True,
-        mode="hosted_url",
-        live_url="https://x.example/s",
-        interaction_available=True,
-    )
-    assert hosted.mode == "hosted_url" and hosted.interaction_available is True
-    assert hosted.screenshot_url is None and hosted.interactive_url is None
+    # The hosted mode is not a value any more: a live view describes a session
+    # that exists right now, and no backend hosts one outside this control plane.
+    with pytest.raises(ValidationError):
+        LiveViewResponse(
+            run_id="run_1",
+            provider="browser_use",
+            available=True,
+            mode="hosted_url",  # type: ignore[arg-type]
+            interaction_available=True,
+        )
 
     # Playwright reports viewable-but-not-drivable masked frames.
     shot = LiveViewResponse(
@@ -147,7 +162,7 @@ def test_live_view_modes_are_provider_aware_and_self_consistent() -> None:
         screenshot_url="/api/runs/run_1/live-view/screenshot",
         captured_at="2026-07-25T00:00:00+00:00",
     )
-    assert shot.live_url is None and shot.interaction_available is False
+    assert shot.interaction_available is False
 
     interactive = LiveViewResponse(
         run_id="run_1",
@@ -172,16 +187,17 @@ def test_live_view_modes_are_provider_aware_and_self_consistent() -> None:
     "payload",
     [
         # A mode without its matching viewer URL.
-        {"provider": "browser_use", "available": True, "mode": "hosted_url"},
         {"provider": "playwright", "available": True, "mode": "screenshot"},
         {"provider": "playwright", "available": True, "mode": "interactive_remote"},
-        # An unavailable view must not carry a viewer URL at all.
+        # A retired mode, and the signed URL field it used to carry.
+        {"provider": "browser_use", "available": True, "mode": "hosted_url"},
         {
             "provider": "browser_use",
             "available": False,
             "mode": "unavailable",
             "live_url": "https://x.example/s",
         },
+        # An unavailable view must not carry a viewer URL at all.
         {
             "provider": "playwright",
             "available": False,
@@ -242,17 +258,23 @@ def test_live_view_rejects_unapproved_browser_service_addresses(address: str) ->
 
 
 class _FakeCoreService:
-    """Minimal core-service surface the live-view projection actually reads."""
+    """Minimal core-service surface the live-view projection actually reads.
+
+    It deliberately still answers ``get_browser_live_url`` with a hosted URL, as a
+    trap: the projection used to consult that first and serve whatever came back
+    as an interactive ``hosted_url`` view. If any of the views below ever carries
+    this address again, that branch has come back.
+    """
+
+    HOSTED_TRAP = "https://live.retired-cloud.example/session/abc?token=opaque"
 
     def __init__(
         self,
         *,
-        live_url: str | None,
         screenshot: tuple[bytes, str] | None,
         browser_provider: str,
         interactive_grant: tuple[str, str, str, bool] | None = None,
     ) -> None:
-        self._live_url = live_url
         self._screenshot = screenshot
         self._browser_provider = browser_provider
         self._interactive_grant = interactive_grant
@@ -266,7 +288,7 @@ class _FakeCoreService:
 
     def get_browser_live_url(self, run_id: str) -> str | None:
         del run_id
-        return self._live_url
+        return self.HOSTED_TRAP
 
     def get_browser_screenshot(self, run_id: str) -> tuple[bytes, str] | None:
         del run_id
@@ -279,39 +301,45 @@ class _FakeCoreService:
 
 def _projected_live_view(
     *,
-    live_url: str | None,
     screenshot: tuple[bytes, str] | None,
-    browser_provider: str = "browser_use",
+    browser_provider: str = "playwright",
     interactive_grant: tuple[str, str, str, bool] | None = None,
 ) -> LiveViewResponse:
     from api.service import LocalRunService
 
     service = LocalRunService(
         core_service=_FakeCoreService(
-            live_url=live_url,
             screenshot=screenshot,
             browser_provider=browser_provider,
             interactive_grant=interactive_grant,
         ),  # type: ignore[arg-type]
-        settings=Settings(browser_provider=browser_provider),  # type: ignore[arg-type]
+        # The run row's provider and the deployment's are separate facts: a row may
+        # name the retired adapter, but the deployment can only be configured for
+        # the backend that exists.
+        settings=Settings(browser_provider="playwright"),
     )
     return service._live_view_sync("run_1")  # noqa: SLF001 - projection under test
 
 
-def test_browser_use_live_view_stays_hosted_and_interactive() -> None:
-    view = _projected_live_view(
-        live_url="https://live.browser-use.example/session", screenshot=None
-    )
+def test_a_legacy_run_row_gets_no_hosted_view_it_cannot_serve() -> None:
+    """The retired cloud adapter is named as recorded, and offers nothing.
+
+    The fake core service below still answers with a hosted URL. The projection
+    must not reach for it: a run row that still says ``browser_use`` gets an
+    unavailable view, not an interactive one pointing at a session nothing can
+    answer.
+    """
+
+    view = _projected_live_view(screenshot=None, browser_provider="browser_use")
 
     assert view.provider == "browser_use"
-    assert view.mode == "hosted_url"
-    assert view.interaction_available is True
-    assert view.live_url == "https://live.browser-use.example/session"
+    assert view.mode == "unavailable"
+    assert view.interaction_available is False
+    assert _FakeCoreService.HOSTED_TRAP not in view.model_dump_json()
 
 
 def test_playwright_live_view_is_screenshot_only() -> None:
     view = _projected_live_view(
-        live_url=None,
         screenshot=(b"\x89PNG frame", "2026-07-25T00:00:00+00:00"),
         browser_provider="playwright",
     )
@@ -326,7 +354,6 @@ def test_playwright_live_view_is_screenshot_only() -> None:
 
 def test_playwright_hitl_live_view_returns_a_fresh_interactive_grant() -> None:
     view = _projected_live_view(
-        live_url=None,
         screenshot=None,
         browser_provider="playwright",
         interactive_grant=(
@@ -344,7 +371,6 @@ def test_playwright_hitl_live_view_returns_a_fresh_interactive_grant() -> None:
 
 def test_playwright_running_live_view_is_remote_and_view_only() -> None:
     view = _projected_live_view(
-        live_url=None,
         screenshot=None,
         browser_provider="playwright",
         interactive_grant=(
@@ -361,12 +387,13 @@ def test_playwright_running_live_view_is_remote_and_view_only() -> None:
 
 
 def test_idle_live_view_reports_the_configured_provider_without_a_viewer() -> None:
-    view = _projected_live_view(live_url=None, screenshot=None, browser_provider="playwright")
+    view = _projected_live_view(screenshot=None, browser_provider="playwright")
 
     assert view.provider == "playwright"
     assert view.mode == "unavailable"
     assert view.available is False
-    assert view.live_url is None and view.screenshot_url is None
+    assert view.screenshot_url is None and view.interactive_url is None
+    assert _FakeCoreService.HOSTED_TRAP not in view.model_dump_json()
     assert view.reason_code == "no_active_browser_session"
 
 
@@ -386,16 +413,11 @@ def test_provider_state_accepts_playwright() -> None:
     assert state.provider == "playwright"
 
 
-def test_configuration_state_helper_is_provider_aware() -> None:
+def test_configuration_state_helper_requires_an_execution_location() -> None:
+    # The live opt-in grants permission to drive a browser, not a place to drive
+    # one: the backend needs a browser service (or the explicit in-process
+    # sandbox) — the same rule the factory enforces.
     assert browser_configuration_state(Settings(allow_live_browser=True)) is False
-    assert (
-        browser_configuration_state(
-            Settings(allow_live_browser=True, browser_use_api_key=SecretStr("k"))
-        )
-        is True
-    )
-    # Playwright needs no Browser Use key, but it does need a browser service
-    # (or the explicit in-process sandbox) — the same rule the factory enforces.
     assert (
         browser_configuration_state(
             Settings(allow_live_browser=True, browser_provider="playwright")
@@ -531,7 +553,9 @@ def test_production_deployment_wires_isolated_playwright() -> None:
 def test_production_env_example_selects_playwright_for_the_rollout() -> None:
     example = (_REPO / ".env.production.example").read_text(encoding="utf-8")
     assert "BROWSER_PROVIDER=playwright" in example
-    assert "BROWSER_USE_COMPATIBILITY_ENABLED=false" in example
+    # No retired cloud-adapter switch remains: an operator who sees one in the
+    # template believes a remote backend is still selectable.
+    assert "BROWSER_USE" not in example
     assert "BROWSER_SERVICE_TOKEN=" in example
 
 

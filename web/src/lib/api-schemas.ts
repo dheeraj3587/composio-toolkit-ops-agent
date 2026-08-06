@@ -59,6 +59,11 @@ const runStatus = z.enum([
 ])
 // The wired browser backend and the view it can offer. Declared here because both
 // the run-detail projection (BrowserUiState) and the live-view response use them.
+//
+// "playwright" is the only backend that can run. "browser_use" stays in the READ
+// vocabulary because runs created before the cloud adapter was removed carry it in
+// their rows: dropping it would make the console reject those responses outright
+// (a strictObject failure is a 502, not a blank field) instead of showing history.
 export const browserProviderSchema = z.enum(["browser_use", "playwright"])
 export const accountModeSchema = z.enum(["existing_account", "create_account"])
 export const credentialCreationPolicySchema = z.enum(["reuse_only", "create_if_missing"])
@@ -79,12 +84,9 @@ export const primaryActionKindSchema = z.enum([
   "poll_reply",
   "none",
 ])
-export const liveViewModeSchema = z.enum([
-  "hosted_url",
-  "screenshot",
-  "interactive_remote",
-  "unavailable",
-])
+// "hosted_url" is gone, unlike the retired provider value above: a live view is
+// computed per request and never stored, so no historical response can carry it.
+export const liveViewModeSchema = z.enum(["screenshot", "interactive_remote", "unavailable"])
 
 const vaultReference = z
   .string()
@@ -162,7 +164,7 @@ export const runSummarySchema = z.strictObject({
   created_at: isoTimestamp,
   updated_at: isoTimestamp,
   execution_mode: z.enum(["plan_only", "execute_when_configured"]),
-  browser_provider: z.enum(["browser_use", "playwright"]),
+  browser_provider: browserProviderSchema,
   credential_creation_policy: credentialCreationPolicySchema.default("reuse_only"),
   recipe_version: boundedText(80).nullable().default(null),
   route_kind: routeKindSchema.nullable().default(null),
@@ -775,23 +777,6 @@ export const actionReceiptSchema = z.strictObject({
   onboarding: onboardingStateSchema.nullish().default(null),
 })
 
-// A signed hosted live-view URL may carry an opaque signature query, so the
-// token-bearing-query rejection is intentionally not applied here. It is a
-// short-lived owner-only URL and is never persisted client-side.
-const liveViewUrl = z
-  .string()
-  .min(8)
-  .max(MAX_URL_LENGTH)
-  .refine((value) => {
-    if (/[\u0000-\u0020\u007f]/.test(value)) return false
-    try {
-      const parsed = new URL(value)
-      return parsed.protocol === "https:" && !parsed.username && !parsed.password && !!parsed.hostname
-    } catch {
-      return false
-    }
-  })
-
 // A bounded, same-origin RELATIVE viewer path (api/models.py::RelativeViewerPath).
 // Deliberately NOT a URL: an absolute address — including the private
 // browser-service/noVNC host on the internal network — is rejected outright, so
@@ -854,7 +839,6 @@ export const liveViewResponseSchema = z
     provider: browserProviderSchema,
     available: z.boolean(),
     mode: liveViewModeSchema,
-    live_url: liveViewUrl.nullish().default(null),
     screenshot_url: relativeViewerPath("screenshot").nullish().default(null),
     interactive_url: privateInteractiveGrant.nullish().default(null),
     captured_at: isoTimestamp.nullish().default(null),
@@ -868,7 +852,6 @@ export const liveViewResponseSchema = z
   })
   .superRefine((value, context) => {
     const viewerUrls = {
-      hosted_url: { field: "live_url", url: value.live_url },
       screenshot: { field: "screenshot_url", url: value.screenshot_url },
       interactive_remote: { field: "interactive_url", url: value.interactive_url },
     } as const

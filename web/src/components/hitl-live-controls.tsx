@@ -39,7 +39,6 @@ import type {
 const initialLiveView: LiveViewState = {
   provider: null,
   mode: "unavailable",
-  liveUrl: null,
   screenshotUrl: null,
   interactivePath: null,
   capturedAt: null,
@@ -63,10 +62,11 @@ function SubmitButton({ label, pendingLabel }: { label: string; pendingLabel: st
 /**
  * Provider-aware owner controls for the browser phase.
  *
- * Browser Use supplies an interactive hosted iframe. Playwright supplies a
- * continuous same-origin noVNC stream. The signed grant is view-only while
- * autonomous work runs and permits control only while the workflow is paused for
- * HITL. Mutation controls come only from backend-authoritative capabilities.
+ * Playwright supplies a continuous same-origin noVNC stream. The signed grant is
+ * view-only while autonomous work runs and permits control only while the workflow
+ * is paused for HITL. Mutation controls come only from backend-authoritative
+ * capabilities. A run recorded on the retired cloud backend still renders as
+ * history, but it has no live session, so it gets no viewer and no poll.
  */
 export function HitlLiveControls({
   runId,
@@ -152,8 +152,9 @@ export function HitlLiveControls({
     remoteGrantIdentity.current = null
     requestLiveView()
 
-    // Browser Use and interactive noVNC remain connected after the first grant.
-    // Poll only read-only Playwright frames while the autonomous loop is active.
+    // Interactive noVNC stays connected after the first grant, and a run recorded
+    // on the retired cloud backend has no session at all. Poll only read-only
+    // Playwright frames, while the autonomous loop is active.
     if (!isPlaywright) return
 
     const timer = window.setInterval(() => {

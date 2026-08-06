@@ -56,10 +56,13 @@ def _legacy_request_fingerprints(request: OperationsRequest, execution_mode: str
     excluded_sets = [{"account_mode"}]
     if request.credential_creation_policy == "reuse_only":
         excluded_sets.append({"credential_creation_policy", "account_mode"})
-    if request.browser_provider == "browser_use":
-        excluded_sets.append({"browser_provider", "account_mode"})
-        if request.credential_creation_policy == "reuse_only":
-            excluded_sets.append({"browser_provider", "credential_creation_policy", "account_mode"})
+    # A body that omitted browser_provider fingerprints as if the field were absent.
+    # This used to be gated on the field equalling "browser_use", which was the
+    # default when the field was introduced; with one backend left there is nothing
+    # to discriminate, so the shape is always accepted.
+    excluded_sets.append({"browser_provider", "account_mode"})
+    if request.credential_creation_policy == "reuse_only":
+        excluded_sets.append({"browser_provider", "credential_creation_policy", "account_mode"})
     for excluded in excluded_sets:
         legacy_request = request.model_dump(mode="json", exclude=excluded)
         canonical = json.dumps(
@@ -73,7 +76,7 @@ def _legacy_request_fingerprints(request: OperationsRequest, execution_mode: str
 
 
 def _legacy_request_fingerprint(request: OperationsRequest, execution_mode: str) -> str:
-    """Return the oldest Browser Use fingerprint shape kept for test/client compatibility."""
+    """Return the oldest fingerprint shape kept for test/client compatibility."""
 
     legacy_request = request.model_dump(
         mode="json",

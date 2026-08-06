@@ -70,7 +70,11 @@ from typing import Any, Final, Protocol, cast
 from pydantic import SecretStr
 
 from ops.browser.link_log import log_event
-from ops.browser.worker import BrowserWorker
+
+# The backend contract, not a concrete backend: with Browser Use removed the
+# only implementation is the Playwright harness, and these call sites only ever
+# needed the protocol. Aliased so the annotations below read unchanged.
+from ops.browser.provider import BrowserProvider as BrowserWorker
 from ops.core.models import OperationalResearch, OperationsRequest
 from ops.core.secret_store import SQLiteSecretStore
 from ops.core.state import (
@@ -217,7 +221,7 @@ class RunResumeService:
                 sensitive_data = context._browser_login_payload(
                     provider=cast(
                         BrowserProvider,
-                        current.get("browser_provider", "browser_use"),
+                        current.get("browser_provider", "playwright"),
                     ),
                     app_slug=app_slug,
                     scope_id=run_id,
@@ -274,7 +278,7 @@ class RunResumeService:
                     request_obj = None
 
                 selected_worker = context._browser_worker_for(
-                    cast(BrowserProvider, current.get("browser_provider", "browser_use"))
+                    cast(BrowserProvider, current.get("browser_provider", "playwright"))
                 )
                 auto_capture = getattr(selected_worker, "auto_capture_credentials", None)
                 captured_refs: dict[str, str] | None = None
@@ -499,7 +503,7 @@ class RunResumeService:
                 # session is released here instead of lingering as a held slot.
                 context._release_browser_session(
                     context._session_context_for(run_id),
-                    cast(BrowserProvider, current.get("browser_provider", "browser_use")),
+                    cast(BrowserProvider, current.get("browser_provider", "playwright")),
                     reason=f"resume_{next_status}",
                 )
             return projected

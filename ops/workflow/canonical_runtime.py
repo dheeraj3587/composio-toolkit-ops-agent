@@ -26,13 +26,13 @@ from ops.browser.account_binding import (
     validate_browser_account_ref,
 )
 from ops.browser.link_log import log_event
+from ops.browser.provider import BrowserProvider as BrowserWorker
 from ops.browser.readiness import browser_configuration_state
 from ops.browser.setup_values import browser_setup_values
 from ops.browser.signup import normalize_signup_fields
 from ops.browser.worker import (
     BrowserObservation,
     BrowserSessionContext,
-    BrowserWorker,
     HumanActionType,
 )
 from ops.core.model_catalog import ModelSelection

@@ -17,7 +17,7 @@ function renderProvider(
 describe("ProviderStateCard", () => {
   it("renders configured adapters as not yet checked rather than as a failure", () => {
     const html = renderProvider({
-      provider: "browser_use",
+      provider: "playwright",
       status: "configured_not_verified",
       detail: "Adapter configuration was found.",
     })
@@ -31,9 +31,9 @@ describe("ProviderStateCard", () => {
   it("renders ready adapters as checked and working", () => {
     const html = renderProvider(
       {
-        provider: "browser_use",
+        provider: "playwright",
         status: "ready",
-        detail: "Browser Use is initialized with live execution enabled.",
+        detail: "The browser service is initialized with live execution enabled.",
       },
       "run",
     )
@@ -69,7 +69,7 @@ describe("ProviderStateCard", () => {
 
   it("displays disabled status as deliberate, not as a failure", () => {
     const html = renderProvider({
-      provider: "browser_use",
+      provider: "playwright",
       status: "disabled",
       detail: "Live browser execution is policy-disabled.",
     })
@@ -81,7 +81,7 @@ describe("ProviderStateCard", () => {
 
   it("does not infer configuration presence from disabled status", () => {
     const html = renderProvider({
-      provider: "browser_use",
+      provider: "playwright",
       status: "disabled",
       detail: "Live browser execution is policy-disabled.",
     })
@@ -126,11 +126,11 @@ describe("ProviderStateCard", () => {
 
   it("keeps deployment configuration separate from run-specific evidence", () => {
     const systemHtml = renderProvider(
-      { provider: "browser_use", status: "configured_not_verified", detail: "d" },
+      { provider: "playwright", status: "configured_not_verified", detail: "d" },
       "system",
     )
     const runHtml = renderProvider(
-      { provider: "browser_use", status: "configured_not_verified", detail: "d" },
+      { provider: "playwright", status: "configured_not_verified", detail: "d" },
       "run",
     )
 

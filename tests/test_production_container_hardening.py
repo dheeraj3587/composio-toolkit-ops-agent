@@ -162,15 +162,12 @@ def test_api_does_not_receive_browser_only_credentials() -> None:
     ):
         assert environment[name] == ""
 
-    # Browser Use is the exception: it executes in Browser Use Cloud rather than in
-    # Chromium here, so its key can only live in the control plane. It stays empty
-    # unless the deployment opts in, and deploy-droplet.sh refuses a key without
-    # BROWSER_USE_COMPATIBILITY_ENABLED=true.
-    assert environment["BROWSER_USE_API_KEY"] == "${BROWSER_USE_API_KEY:-}"
-    assert (
-        environment["BROWSER_USE_COMPATIBILITY_ENABLED"]
-        == "${BROWSER_USE_COMPATIBILITY_ENABLED:-false}"
-    )
+    # There used to be one exception: the metered cloud adapter ran off-host, so
+    # its key had to live in the control plane. Removing that backend removed the
+    # exception, and the API container must not be handed a browser credential of
+    # any kind — every browser action now happens inside the Chromium container.
+    assert "BROWSER_USE_API_KEY" not in environment
+    assert "BROWSER_USE_COMPATIBILITY_ENABLED" not in environment
 
 
 def test_browser_decision_providers_reach_the_browser_worker() -> None:

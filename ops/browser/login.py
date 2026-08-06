@@ -115,7 +115,8 @@ class LoginInspection:
 # --- Selectors and text patterns (structure-first, never body-text guessing) ---
 _EMAIL_SELECTOR = (
     "input[type='email'], input[name='email' i], input[name='username' i], "
-    "input[autocomplete='username'], input[id='email' i], input[id='username' i]"
+    "input[autocomplete='username'], input[autocomplete='email'], "
+    "input[name='login' i], input[id='email' i], input[id='username' i]"
 )
 _PASSWORD_SELECTOR = "input[type='password']"
 _OTP_SELECTOR = (
@@ -130,6 +131,17 @@ _SUBMIT_SELECTOR = (
 _ACCOUNT_CHOICE_SELECTOR = (
     "button:has-text('Continue as'), button:has-text('Use another account'), "
     "[role='button']:has-text('Continue as'), a:has-text('Choose an account')"
+)
+# Playwright's ``:has-text()`` is a SUBSTRING match, so ``button:has-text('Continue')``
+# in _SUBMIT_SELECTOR also matches "Continue with GitHub" and "Continue with Google".
+# Login pages routinely place those federated buttons ABOVE the email form, so
+# clicking the first match sent the run to a third-party identity provider instead of
+# submitting the credential the owner supplied. A control naming a provider is never
+# the form's own submit control; the ladder reaches an identity provider through the
+# reviewed handoff path, never by a click chosen here.
+_FEDERATED_CONTROL = re.compile(
+    r"(?i)\b(google|github|gitlab|bitbucket|microsoft|azure|apple|facebook|meta|"
+    r"linkedin|twitter|okta|auth0|saml|sso|single sign|slack|salesforce)\b"
 )
 _AUTH_FAIL = re.compile(
     r"(?i)(incorrect|invalid|wrong)\s+(password|email|username|credentials)"
@@ -399,6 +411,42 @@ async def inspect_login(page: Any, patterns: Sequence[str]) -> LoginInspection:
     )
 
 
+async def _form_action_is_safe(target: Any, patterns: Sequence[str], *, field: str) -> bool:
+    """False when the form enclosing ``field`` posts to an off-allowlist host.
+
+    A relative or absent action posts back to the current (already reviewed) origin,
+    so only an absolute http(s) action is checked.
+    """
+
+    from ops.playwright.worker import navigation_allowed
+
+    try:
+        action = await target.locator(f"form:has({field})").first.get_attribute(
+            "action", timeout=2_000
+        )
+    except Exception:
+        return True
+    if isinstance(action, str) and action.casefold().startswith(("http://", "https://")):
+        return navigation_allowed(action, tuple(patterns))
+    return True
+
+
+async def _email_origin_is_safe(page: Any, patterns: Sequence[str], surface: Any) -> bool:
+    """The email-first equivalent of :func:`_origin_safe_and_unique`.
+
+    An email-first page has no password field yet, so the password-uniqueness rule
+    cannot apply — but the page origin and the form's post target still must, because
+    an email address is account data. This path previously typed the owner's email
+    with no origin or action check at all.
+    """
+
+    from ops.playwright.worker import navigation_allowed
+
+    if not navigation_allowed(getattr(page, "url", "") or "", tuple(patterns)):
+        return False
+    return await _form_action_is_safe(surface, patterns, field=_EMAIL_SELECTOR)
+
+
 async def _origin_safe_and_unique(page: Any, patterns: Sequence[str], surface: Any = None) -> bool:
     """Credentials may be filled only on an approved origin with a single form.
 
@@ -414,16 +462,7 @@ async def _origin_safe_and_unique(page: Any, patterns: Sequence[str], surface: A
         return False
     if await _count_visible_enabled(target, _PASSWORD_SELECTOR) != 1:
         return False
-    try:
-        action = await target.locator("form:has(input[type='password'])").first.get_attribute(
-            "action", timeout=2_000
-        )
-    except Exception:
-        action = None
-    if isinstance(action, str) and action.casefold().startswith(("http://", "https://")):
-        if not navigation_allowed(action, tuple(patterns)):
-            return False
-    return True
+    return await _form_action_is_safe(target, patterns, field=_PASSWORD_SELECTOR)
 
 
 async def _fill_first(page: Any, selector: str, value: str) -> bool:
@@ -440,38 +479,81 @@ async def _fill_first(page: Any, selector: str, value: str) -> bool:
         return False
 
 
-async def _click_submit(surface: Any) -> bool:
+async def _control_label(control: Any) -> str:
+    """The visible label of a control, for ``input[type=submit]`` too.
+
+    An ``<input type=submit>`` has no text content — its label is the ``value``
+    attribute — so reading only ``inner_text`` would classify every one of them as
+    unlabelled and defeat the federated-control check.
+    """
+
+    for reader in ("inner_text", "get_attribute"):
+        try:
+            if reader == "inner_text":
+                text = await control.inner_text(timeout=1_000)
+            else:
+                text = await control.get_attribute("value", timeout=1_000)
+        except Exception:
+            continue
+        if isinstance(text, str) and text.strip():
+            return text.strip()[:200]
+    try:
+        label = await control.get_attribute("aria-label", timeout=1_000)
+    except Exception:
+        return ""
+    return label.strip()[:200] if isinstance(label, str) else ""
+
+
+async def _click_own_submit(surface: Any, *, limit: int = 8) -> bool:
+    """Click the form's OWN submit control, skipping federated sign-in buttons.
+
+    Every candidate is checked for visible+enabled and for a provider name before it
+    is clicked, rather than taking ``.first`` in DOM order. That ordering is exactly
+    what broke: the federated buttons are usually rendered above the email form.
+    """
+
     try:
         locator = surface.locator(_SUBMIT_SELECTOR)
-        if int(await locator.count()) >= 1:
-            await locator.first.click(timeout=5_000)
-            await _settle(surface)
-            return True
-    except Exception:
-        pass
-    try:
-        await surface.locator(_PASSWORD_SELECTOR).first.press("Enter", timeout=5_000)
-        await _settle(surface)
-        return True
+        total = min(int(await locator.count()), limit)
     except Exception:
         return False
+    for index in range(total):
+        control = locator.nth(index)
+        try:
+            if not (await control.is_visible() and await control.is_enabled()):
+                continue
+        except Exception:
+            continue
+        if _FEDERATED_CONTROL.search(await _control_label(control)):
+            continue
+        try:
+            await control.click(timeout=5_000)
+        except Exception:
+            continue
+        await _settle(surface)
+        return True
+    return False
+
+
+async def _press_enter(surface: Any, selector: str) -> bool:
+    try:
+        await surface.locator(selector).first.press("Enter", timeout=5_000)
+    except Exception:
+        return False
+    await _settle(surface)
+    return True
+
+
+async def _click_submit(surface: Any) -> bool:
+    if await _click_own_submit(surface):
+        return True
+    return await _press_enter(surface, _PASSWORD_SELECTOR)
 
 
 async def _click_email_continue(surface: Any) -> bool:
-    try:
-        locator = surface.locator(_SUBMIT_SELECTOR)
-        if int(await locator.count()) >= 1:
-            await locator.first.click(timeout=5_000)
-            await _settle(surface)
-            return True
-    except Exception:
-        pass
-    try:
-        await surface.locator(_EMAIL_SELECTOR).first.press("Enter", timeout=5_000)
-        await _settle(surface)
+    if await _click_own_submit(surface):
         return True
-    except Exception:
-        return False
+    return await _press_enter(surface, _EMAIL_SELECTOR)
 
 
 async def _settle(surface: Any) -> None:
@@ -609,26 +691,33 @@ async def drive_login(
             frame_path=inspection.frame_path,
         )
 
+    def _refused(reason: str, source: LoginInspection = inspection) -> LoginInspection:
+        return LoginInspection(
+            state="unknown",
+            email_field=source.email_field,
+            password_field=source.password_field,
+            otp_fields=(),
+            submit_control=source.submit_control,
+            current_url=getattr(page, "url", "") or "https://unknown.invalid/",
+            reason_code=reason,
+            frame_path=source.frame_path,
+        )
+
     # One-page email + password.
     if inspection.state == "credentials_ready":
         if not await _origin_safe_and_unique(page, patterns, surface):
-            return LoginInspection(
-                state="unknown",
-                email_field=inspection.email_field,
-                password_field=inspection.password_field,
-                otp_fields=(),
-                submit_control=inspection.submit_control,
-                current_url=getattr(page, "url", "") or "https://unknown.invalid/",
-                reason_code="login_origin_unsafe",
-                frame_path=inspection.frame_path,
-            )
-        if email:
-            await _fill_first(surface, _EMAIL_SELECTOR, email)
-        if password:
-            await _fill_first(surface, _PASSWORD_SELECTOR, password)
+            return _refused("login_origin_unsafe")
+        # A fill that silently failed used to be followed by a submit anyway, so the
+        # site rejected a blank field and the run reported "verification required" —
+        # a wrong reason that sent the owner looking for a device prompt that was
+        # never there. An unfilled field is its own, nameable outcome.
+        if email and not await _fill_first(surface, _EMAIL_SELECTOR, email):
+            return _refused("login_email_fill_failed")
+        if password and not await _fill_first(surface, _PASSWORD_SELECTOR, password):
+            return _refused("login_password_fill_failed")
         submitted = await _click_submit(surface)
         if not submitted:
-            return inspection
+            return _refused("login_submit_control_not_found")
         return await inspect_after_login_submit(
             page, previous="credentials_ready", patterns=patterns
         )
@@ -636,21 +725,25 @@ async def drive_login(
     # Email-first: submit the email, then handle the resulting password page.
     if inspection.state == "email_required":
         if email:
-            await _fill_first(surface, _EMAIL_SELECTOR, email)
+            if not await _email_origin_is_safe(page, patterns, surface):
+                return _refused("login_origin_unsafe")
+            if not await _fill_first(surface, _EMAIL_SELECTOR, email):
+                return _refused("login_email_fill_failed")
             submitted = await _click_email_continue(surface)
             if not submitted:
-                return inspection
+                return _refused("login_submit_control_not_found")
             after = await inspect_after_login_submit(
                 page, previous="email_required", patterns=patterns
             )
             next_surface = resolve_reviewed_frame(page, after.frame_path, patterns)
             if after.state == "password_required" and password and next_surface is not None:
                 if not await _origin_safe_and_unique(page, patterns, next_surface):
-                    return after
-                await _fill_first(next_surface, _PASSWORD_SELECTOR, password)
+                    return _refused("login_origin_unsafe", after)
+                if not await _fill_first(next_surface, _PASSWORD_SELECTOR, password):
+                    return _refused("login_password_fill_failed", after)
                 submitted = await _click_submit(next_surface)
                 if not submitted:
-                    return after
+                    return _refused("login_submit_control_not_found", after)
                 return await inspect_after_login_submit(
                     page, previous="password_required", patterns=patterns
                 )
@@ -659,11 +752,14 @@ async def drive_login(
 
     # Password page (email already submitted earlier).
     if inspection.state == "password_required":
-        if password and await _origin_safe_and_unique(page, patterns, surface):
-            await _fill_first(surface, _PASSWORD_SELECTOR, password)
+        if password:
+            if not await _origin_safe_and_unique(page, patterns, surface):
+                return _refused("login_origin_unsafe")
+            if not await _fill_first(surface, _PASSWORD_SELECTOR, password):
+                return _refused("login_password_fill_failed")
             submitted = await _click_submit(surface)
             if not submitted:
-                return inspection
+                return _refused("login_submit_control_not_found")
             return await inspect_after_login_submit(
                 page, previous="password_required", patterns=patterns
             )

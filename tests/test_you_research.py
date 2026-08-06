@@ -331,7 +331,7 @@ class TestConfiguration:
             Settings.from_env(env=env)
 
     def test_defaults_do_not_alter_browser_provider(self) -> None:
-        assert Settings().browser_provider == "browser_use"
+        assert Settings().browser_provider == "playwright"
 
 
 # ===========================================================================
@@ -1248,7 +1248,7 @@ class TestBrowserBoundary:
         from pydantic import SecretStr
 
         s = Settings(you_api_key=SecretStr("k"), you_search_enabled=True)
-        assert s.browser_provider == "browser_use"
+        assert s.browser_provider == "playwright"
         assert "you" not in Settings.model_fields["browser_provider"].annotation.__args__  # type: ignore[union-attr]
 
     def test_research_domains_do_not_modify_browser_allowlist(self) -> None:

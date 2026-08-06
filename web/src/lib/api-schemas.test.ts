@@ -4,6 +4,7 @@ vi.mock("server-only", () => ({}))
 
 import {
   appResearchResponseSchema,
+  browserProviderSchema,
   browserUiStateSchema,
   liveViewResponseSchema,
   managedConnectionResponseSchema,
@@ -371,6 +372,9 @@ describe("operational research contract synchronization", () => {
 })
 
 describe("live view contract synchronization", () => {
+  // The response a retired cloud backend used to send. Its mode no longer exists
+  // and its signed URL is no longer a field, so the whole shape must be refused
+  // rather than parsed into a viewer nothing can serve.
   const hosted = {
     run_id: RUN_ID,
     provider: "browser_use",
@@ -412,16 +416,14 @@ describe("live view contract synchronization", () => {
     reason_code: "no_active_browser_session",
   }
 
-  it("accepts the Browser Use hosted view as interactive", () => {
+  it("refuses the retired hosted view instead of rendering an unservable frame", () => {
     const parsed = liveViewResponseSchema.safeParse(hosted)
 
-    expect(parsed.success).toBe(true)
-    if (parsed.success) {
-      expect(parsed.data.provider).toBe("browser_use")
-      expect(parsed.data.mode).toBe("hosted_url")
-      expect(parsed.data.interaction_available).toBe(true)
-      expect(parsed.data.screenshot_url).toBeNull()
-    }
+    expect(parsed.success).toBe(false)
+    // A legacy *provider* is still readable — history renders — but a legacy
+    // *view mode* is not, because a live view is resolved per request and can
+    // only describe a session that exists right now.
+    expect(browserProviderSchema.safeParse("browser_use").success).toBe(true)
   })
 
   it("accepts the Playwright screenshot view as non-interactive", () => {
@@ -431,7 +433,7 @@ describe("live view contract synchronization", () => {
     if (parsed.success) {
       expect(parsed.data.provider).toBe("playwright")
       expect(parsed.data.interaction_available).toBe(false)
-      expect(parsed.data.live_url).toBeNull()
+      expect(parsed.data.screenshot_url).toBe(`/api/runs/${RUN_ID}/live-view/screenshot`)
     }
   })
 

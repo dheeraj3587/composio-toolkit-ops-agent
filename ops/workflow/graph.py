@@ -124,7 +124,7 @@ class WorkflowDependencies:
         if browser is not None:
             provider = cast(
                 BrowserProvider,
-                str(getattr(browser, "provider_name", "browser_use")),
+                str(getattr(browser, "provider_name", "playwright")),
             )
             self.browsers.setdefault(provider, browser)
         # Compatibility attribute for older tests/injections. Runtime nodes use
@@ -422,18 +422,18 @@ class DurableOperationsWorkflow:
         return "outreach_send"
 
     def _browser_for_state(self, state: OperationsState) -> WorkflowBrowser | None:
-        provider = state.get("browser_provider", "browser_use")
+        provider = state.get("browser_provider", "playwright")
         return self._dependencies.browsers.get(provider)
 
     def _browser_provider_name(self, state: OperationsState) -> str:
         """The effect-ledger provider identity of the wired browser backend.
 
-        Recording a Playwright run as a ``browser_use`` effect would corrupt audit,
-        reconciliation, and metrics, so the backend declares its own name and the
-        Browser Use worker keeps the historical default.
+        The backend declares its own name rather than having one inferred, so the
+        effect ledger records what actually ran. Playwright is the only backend, so
+        a wired object that declares nothing is one of ours.
         """
 
-        return str(getattr(self._browser_for_state(state), "provider_name", "browser_use"))
+        return str(getattr(self._browser_for_state(state), "provider_name", "playwright"))
 
     def _browser_start(self, state: OperationsState) -> dict[str, object]:
         if state.get("browser_session_id"):
@@ -444,7 +444,7 @@ class DurableOperationsWorkflow:
                 state,
                 ConfigurationRequiredError(
                     phase=5,
-                    capability=f"{state.get('browser_provider', 'browser_use')} browser provider",
+                    capability=f"{state.get('browser_provider', 'playwright')} browser provider",
                     reason_code="browser_adapter_missing",
                 ),
             )
@@ -463,8 +463,9 @@ class DurableOperationsWorkflow:
         try:
             # Supply the app slug, an OPAQUE account reference, the run scope (so
             # one-time login references are consumed only for this run) and the
-            # storage-state flag. Both providers accept this signature; Browser Use
-            # ignores the extra metadata, so its request is unchanged.
+            # storage-state flag. Storage-state reuse is asked for only of the real
+            # harness: a test double that declares no provider name gets a plain
+            # start, so wiring a stub never implies a persisted profile exists.
             is_playwright = getattr(browser, "provider_name", "") == "playwright"
             account_ref: str | None = None
             with contextlib.suppress(Exception):

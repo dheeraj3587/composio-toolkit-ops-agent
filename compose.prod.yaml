@@ -63,19 +63,13 @@ services:
       CEREBRAS_API_KEY: ""
       GROQ_API_KEY: ""
       MERCURY_API_KEY: ""
-      # Browser Use is a REMOTE provider: its work happens in Browser Use Cloud,
-      # not in Chromium here, so its key can only live in the control plane. It
-      # stays empty unless the deployment explicitly enables the compatibility
-      # path, and the release refuses a key without that opt-in.
-      BROWSER_USE_API_KEY: ${BROWSER_USE_API_KEY:-}
-      BROWSER_USE_MODEL: ${BROWSER_USE_MODEL:-}
-      BROWSER_USE_MAX_COST_USD: ${BROWSER_USE_MAX_COST_USD:-}
       # Owner-only credential submission / autonomous-login / reveal are gated by
       # this flag. It MUST be true for those operator actions to work; default
       # false keeps them disabled until explicitly enabled.
       ALLOW_LOCAL_CREDENTIAL_SUBMISSION: ${ALLOW_LOCAL_CREDENTIAL_SUBMISSION:-false}
+      # Still read so a host whose .env.production predates the removal starts
+      # cleanly, but "playwright" is now the only accepted value.
       BROWSER_PROVIDER: ${BROWSER_PROVIDER:-playwright}
-      BROWSER_USE_COMPATIBILITY_ENABLED: ${BROWSER_USE_COMPATIBILITY_ENABLED:-false}
       BROWSER_SERVICE_URL: http://browser-worker:8081
       BROWSER_SERVICE_TOKEN: ${BROWSER_SERVICE_TOKEN:?BROWSER_SERVICE_TOKEN is required}
       # API-only master key. The API derives one run-bound capability and sends

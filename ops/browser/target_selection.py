@@ -18,8 +18,6 @@ AccountState = Literal[
     "account_creation_required",
     "unknown",
 ]
-TargetFallbackMode = Literal["browser_use", "playwright"]
-
 _SENSITIVE_QUERY_NAMES = frozenset(
     {"access_token", "api_key", "code", "key", "password", "secret", "token"}
 )
@@ -145,15 +143,17 @@ def select_browser_target(
     allowed_domains: Sequence[str],
     account_state: AccountState,
     is_allowed_url: Any,
-    fallback_mode: TargetFallbackMode,
 ) -> str | None:
     """Pick the first safe reviewed target for the account's trusted state.
 
     Claims always outrank unverified research fields.  A trace is itself reviewed
-    and retains its account-state position.  For Playwright, the only unverified
-    fallback is the pre-existing trace-less developer-portal behavior.  Browser
-    Use retains its historical final fallback to the baseline API/evidence URLs,
-    after all state-aware reviewed candidates are exhausted.
+    and retains its account-state position.  The only unverified fallback is the
+    trace-less developer-portal behavior.
+
+    There used to be a second, looser fallback — the baseline API/evidence URLs —
+    reachable only by the Browser Use backend.  It went with that backend: an
+    evidence URL is a page the research cited, not a reviewed place to start
+    driving, and nothing selects it now.
     """
 
     validator = _TargetValidator(allowed_domains, is_allowed_url)
@@ -174,17 +174,6 @@ def select_browser_target(
         if developer_portal is not None:
             return developer_portal
 
-    if fallback_mode == "browser_use":
-        # Browser Use historically started from a baseline API/evidence page when
-        # enrichment had not yet produced a reviewed operational URL.  Keep that
-        # compatibility path isolated here and after every verified candidate.
-        for candidate in (
-            getattr(research, "api_base_url", None),
-            *(getattr(research, "evidence_urls", ()) or ()),
-        ):
-            safe = validator.accepts(candidate)
-            if safe is not None:
-                return safe
     return None
 
 
@@ -204,7 +193,6 @@ def _verified_claims(research: Any, validator: _TargetValidator) -> dict[str, st
 
 __all__ = [
     "AccountState",
-    "TargetFallbackMode",
     "derive_account_state",
     "ordered_target_kinds",
     "sanitize_target_url",

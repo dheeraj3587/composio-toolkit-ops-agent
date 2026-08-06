@@ -40,11 +40,10 @@ def browser_configuration_state(
     settings: Settings,
     provider: BrowserProvider | None = None,
 ) -> bool:
-    """Whether the SELECTED browser provider is configured to run.
+    """Whether the browser provider is configured to run.
 
-    Shared by wiring, health, and retry eligibility so a Playwright deployment is
-    never judged by whether a Browser Use key exists — and so all three agree with
-    the provider factory in ``ops.runs.service._build_browser_worker``.
+    Shared by wiring, health, and retry eligibility so all three agree with the
+    provider factory in ``ops.runs.service._build_browser_worker``.
 
     Playwright needs the live opt-in AND an actual place to execute: either the
     explicit in-process sandbox (tests/local debugging) or a reachable browser
@@ -52,18 +51,16 @@ def browser_configuration_state(
     alone is not "configured", because the factory fails closed in that state.
     """
 
-    selected = provider or settings.browser_provider
-    if selected == "playwright":
-        if not settings.allow_live_browser:
-            return False
-        if bool(getattr(settings, "playwright_in_process_sandbox", False)):
-            return True
-        return bool(
-            settings.browser_service_url
-            and settings.browser_service_token is not None
-            and settings.browser_session_capability_key is not None
-        )
-    return bool(settings.allow_live_browser and settings.browser_use_api_key is not None)
+    del provider  # Playwright is the only backend; the parameter is call-site sugar
+    if not settings.allow_live_browser:
+        return False
+    if bool(getattr(settings, "playwright_in_process_sandbox", False)):
+        return True
+    return bool(
+        settings.browser_service_url
+        and settings.browser_service_token is not None
+        and settings.browser_session_capability_key is not None
+    )
 
 
 async def probe_playwright(*, timeout_seconds: float = 30.0) -> BrowserReadiness:

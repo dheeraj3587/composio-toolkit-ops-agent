@@ -751,7 +751,7 @@ class LocalRunService:
             created_at=str(record["created_at"]),
             updated_at=str(record["updated_at"]),
             execution_mode=record.get("execution_mode", "plan_only"),  # type: ignore[arg-type]
-            browser_provider=record.get("browser_provider", "browser_use"),  # type: ignore[arg-type]
+            browser_provider=record.get("browser_provider", "playwright"),  # type: ignore[arg-type]
             credential_creation_policy=record.get("credential_creation_policy", "reuse_only"),  # type: ignore[arg-type]
             recipe_version=(
                 str(record["recipe_version"]) if record.get("recipe_version") else None
@@ -967,9 +967,6 @@ class LocalRunService:
             and settings.gmail_signup_address is not None
         )
         managed_configured = managed_auth_configuration_is_valid(settings)
-        browser_use_enabled = bool(
-            live_browser_enabled and settings.browser_use_compatibility_enabled
-        )
         playwright_configured = browser_configuration_state(settings, "playwright")
         if browser_health is None:
             playwright_state = state(
@@ -1072,32 +1069,15 @@ class LocalRunService:
                 expires_at=(gmail_preflight.expires_at if gmail_preflight is not None else None),
             ),
             playwright_state,
-            state(
-                "browser_use",
-                configured=(
-                    browser_use_enabled and browser_configuration_state(settings, "browser_use")
-                ),
-                enabled=browser_use_enabled,
-                detail=self._browser_provider_detail(
-                    provider="browser_use",
-                    settings=settings,
-                    live_enabled=browser_use_enabled,
-                ),
-            ),
         ]
 
     @staticmethod
     def _browser_provider_detail(*, provider: str, settings: Settings, live_enabled: bool) -> str:
         """Provider health detail. Never launches a browser from the API path."""
 
+        del provider  # Playwright is the only browser provider
         if not live_enabled:
-            if provider == "browser_use" and not settings.browser_use_compatibility_enabled:
-                return "Browser Use compatibility execution is disabled for this rollout."
             return "Live browser execution is policy-disabled."
-        if provider != "playwright":
-            if settings.browser_use_api_key is None:
-                return "Browser Use requires BROWSER_USE_API_KEY."
-            return "Browser configuration is present but has not been verified."
         if getattr(settings, "playwright_in_process_sandbox", False):
             return (
                 "In-process Playwright sandbox is enabled (tests and local debugging "
@@ -1115,26 +1095,16 @@ class LocalRunService:
 
     @staticmethod
     def _browser_phase_detail(*, provider: str, configured: bool) -> str:
-        """Describe the SELECTED browser provider's state in its own terms."""
+        """Describe the browser provider's state in its own terms."""
 
-        if provider == "playwright":
-            if not configured:
-                return (
-                    "The self-hosted browser harness requires the ALLOW_LIVE_BROWSER policy "
-                    "opt-in. No Browser Use key is needed for this provider."
-                )
-            return (
-                "The self-hosted harness enforces the host allowlist in-process via request "
-                "interception, and Chromium runs in the separate browser service so an API "
-                "restart does not end a live session. Readiness is proven by that service's "
-                "own health probe rather than by this image."
-            )
+        del provider  # Playwright is the only browser provider
         if not configured:
-            return "A Browser Use key and ALLOW_LIVE_BROWSER policy opt-in are required."
+            return "The self-hosted browser harness requires the ALLOW_LIVE_BROWSER policy opt-in."
         return (
-            "Browser Use v3 agent navigation fails closed because the installed SDK cannot "
-            "prove the mandatory domain allowlist. Trusted adapter-owned Playwright capture "
-            "remains a separate deterministic boundary."
+            "The self-hosted harness enforces the host allowlist in-process via request "
+            "interception, and Chromium runs in the separate browser service so an API "
+            "restart does not end a live session. Readiness is proven by that service's "
+            "own health probe rather than by this image."
         )
 
     def _phases(
@@ -1167,9 +1137,10 @@ class LocalRunService:
         route_kind = str(record.get("route_kind") or "")
         run_status = str(record.get("status") or "")
         run_phase = str(record.get("phase") or "")
-        browser_provider: BrowserProvider = (
-            "playwright" if record.get("browser_provider") == "playwright" else "browser_use"
-        )
+        # Playwright is the only backend. A legacy row may still carry the retired
+        # "browser_use" value, but readiness is reported for the backend that would
+        # actually run, not the one the row was written under.
+        browser_provider: BrowserProvider = "playwright"
         has_browser_configuration = browser_configuration_state(
             self._settings,
             browser_provider,
@@ -1371,7 +1342,7 @@ class LocalRunService:
                 screenshot_present = False
         return project_browser_ui(
             settings=self._settings,
-            browser_provider=record.get("browser_provider", "browser_use"),  # type: ignore[arg-type]
+            browser_provider=record.get("browser_provider", "playwright"),  # type: ignore[arg-type]
             run_status=run_status,
             event_types=event_types,
             browser_session_id=session_id,
@@ -1424,7 +1395,7 @@ class LocalRunService:
         context = self._service._session_context_for(run_id)
         if record is None or context is None:
             return False
-        provider = cast(BrowserProvider, record.get("browser_provider", "browser_use"))
+        provider = cast(BrowserProvider, record.get("browser_provider", "playwright"))
         self._service._release_browser_session(context, provider, reason=reason)
         return True
 
@@ -2653,7 +2624,7 @@ class LocalRunService:
         record = self._service.get_run(run_id)
         if record is None:
             raise RunNotFoundError(run_id)
-        provider = record.get("browser_provider", "browser_use")
+        provider = record.get("browser_provider", "playwright")
         if self._secret_capture_boundary_entered(record):
             # Requirement 18.8: once a capture surface has been reached the live
             # view is closed rather than masked, so no signed URL and no frame of
@@ -2666,19 +2637,12 @@ class LocalRunService:
                 interaction_available=False,
                 reason_code="secret_capture_boundary_entered",
             )
-        # Browser Use keeps its exact existing behavior: a signed hosted URL the
-        # owner can interact with directly.
-        live_url = self._service.get_browser_live_url(run_id)
-        if live_url is not None:
-            return LiveViewResponse(
-                run_id=run_id,
-                provider="browser_use",
-                available=True,
-                mode="hosted_url",
-                live_url=live_url,
-                interaction_available=True,
-                reason_code="hosted_session_live",
-            )
+        # This used to first ask the worker for a signed, externally hosted URL and
+        # serve it as ``hosted_url`` — an owner-drivable session on someone else's
+        # origin. Only the retired cloud backend ever produced one; every worker
+        # that can run here serves the session through this control plane, so the
+        # interactive grant below is the one path to a drivable view.
+        #
         # Playwright grants are minted for both autonomous viewing and HITL. The
         # browser service signs the capability: autonomous grants are view-only;
         # a live HITL pause may receive control. The private URL remains transient.

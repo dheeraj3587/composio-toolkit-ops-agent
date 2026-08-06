@@ -625,10 +625,12 @@ export interface OperationsRequestInput {
   company: CompanyProfileInput
   requested_scope_policy: "minimum" | "recommended" | "maximum"
   execution_mode: ExecutionMode
-  browser_provider: BrowserProvider
+  // Requests can only name the one backend that exists; the retired "browser_use"
+  // value is readable on responses but is never something a new run may ask for.
+  browser_provider: "playwright"
   credential_creation_policy: CredentialCreationPolicy
   // Optional app sign-in credentials for autonomous login. Injected into
-  // the selected provider's secret boundary at session creation; never persisted.
+  // the browser's secret boundary at session creation; never persisted.
   browser_login?: { email: string; password: string } | null
   // The model this run's action loop should decide with, as `<provider>:<model>`.
   // Absent means the deployment's own inference chain, unchanged.
@@ -667,16 +669,26 @@ export interface RunOutputResponse {
   integrator_bundle: IntegratorOutput
 }
 
-/** The browser backend the API actually has wired (api/models.py::BrowserProvider). */
+/**
+ * The browser backend a run was recorded against (api/models.py::BrowserProvider).
+ *
+ * Only `"playwright"` can be requested or run. `"browser_use"` is read-only
+ * history: rows written before the cloud adapter was removed still carry it, and
+ * they are rendered as recorded rather than relabelled.
+ */
 export type BrowserProvider = "browser_use" | "playwright"
 
-/** How the owner can watch, and possibly drive, a live browser session. */
-export type LiveViewMode = "hosted_url" | "screenshot" | "interactive_remote" | "unavailable"
+/**
+ * How the owner can watch, and possibly drive, a live browser session.
+ *
+ * Unlike `BrowserProvider` above, this carries no retired value: a live view is
+ * resolved from the running worker on every request and is never stored, so the
+ * removal of the `hosted_url` mode cannot strand a historical response.
+ */
+export type LiveViewMode = "screenshot" | "interactive_remote" | "unavailable"
 
 /**
  * Live view for a browser run. The viewer URL present depends on `mode`:
- * - `hosted_url`: a hosted provider (Browser Use) supplies a signed `live_url`,
- *   which the owner can interact with directly.
  * - `screenshot`: the self-hosted Playwright service has no hosted URL, so the
  *   client polls `screenshot_url` for masked PNG frames (cache-busted by
  *   `captured_at`). Frames are viewable only, so `interaction_available` is false.
@@ -694,7 +706,6 @@ export interface LiveViewResponse {
   provider: BrowserProvider
   available: boolean
   mode: LiveViewMode
-  live_url?: string | null
   screenshot_url?: string | null
   interactive_url?: string | null
   captured_at?: string | null

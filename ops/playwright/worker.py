@@ -144,14 +144,7 @@ from ops.playwright.gates import (  # noqa: F401
 from ops.playwright.gates import classify_structural_gate as classify_structural_gate
 from ops.playwright.gates import detect_human_gate as detect_human_gate
 from ops.playwright.live_mask import install_live_pixel_mask as _install_live_pixel_mask
-from ops.playwright.login_dom import (  # noqa: F401
-    _has_password_field,
-    _inject_login,
-    _login_frames_are_reviewed,
-    _login_origin_is_safe,
-    _submit_login,
-    _try_fill,
-)
+from ops.playwright.login_dom import _login_frames_are_reviewed
 
 # Imported for use below AND re-exported: ``ops.playwright.worker`` stays the
 # import home these names already have across ops, api and the tests.
@@ -2189,6 +2182,14 @@ class PlaywrightBrowserWorker:
         session.download_records.clear()
         return None
 
+    def _session_app_name(self, session: _PwSession) -> str:
+        """The bound app's display name for operator-facing prose, never a guess."""
+
+        recipe = get_app_recipe(session.app_slug) if session.app_slug else None
+        if recipe is not None:
+            return recipe.app_name
+        return session.app_slug or "The app"
+
     def _observation_from_login_result(
         self,
         session: _PwSession,
@@ -2208,11 +2209,16 @@ class PlaywrightBrowserWorker:
         if result.state == "authentication_failed":
             return self._failed_observation(session, "authentication_failed")
 
+        # The app the session is actually bound to. These messages named Pipedrive
+        # literally, so every other app's operator was told to look for a Pipedrive
+        # prompt that does not exist.
+        app = self._session_app_name(session)
+
         if reason in {"captcha_required", "login_verification_required"}:
             if reason == "captcha_required":
                 return self._bounded_login_handoff(
                     session,
-                    "Pipedrive requires a browser verification step. Complete the visible "
+                    f"{app} requires a browser verification step. Complete the visible "
                     "CAPTCHA or security prompt in the live browser, then resume.",
                     reason_code=reason,
                     action_type="captcha",
@@ -2220,7 +2226,7 @@ class PlaywrightBrowserWorker:
             return self._bounded_login_handoff(
                 session,
                 "The submitted login did not reach an authenticated page. Review "
-                "Pipedrive's verification or new-device prompt in the interactive "
+                f"{app}'s verification or new-device prompt in the interactive "
                 "browser, complete it, then resume.",
                 reason_code=reason,
                 action_type="provider_verification",
@@ -2229,6 +2235,23 @@ class PlaywrightBrowserWorker:
         # Hard blocks: a reviewed-frame or safe-link violation is a failure.
         if reason in {"login_frame_unreviewed", "verification_link_blocked"}:
             return self._failed_observation(session, reason)
+
+        # The deterministic driver could not act on the page: the field it needed was
+        # not fillable, or the form's own submit control was not reachable. Saying so
+        # is the point — these used to submit anyway and surface as a verification
+        # prompt, which sent the owner looking for the wrong thing.
+        if reason in {
+            "login_email_fill_failed",
+            "login_password_fill_failed",
+            "login_submit_control_not_found",
+        }:
+            return self._bounded_login_handoff(
+                session,
+                f"The {app} sign-in form could not be completed automatically "
+                f"({reason}). Finish signing in in the live browser, then resume.",
+                reason_code=reason,
+                action_type="provider_verification",
+            )
 
         # Ambiguity or an unverified surface needs a human, with an accurate reason.
         if reason in {

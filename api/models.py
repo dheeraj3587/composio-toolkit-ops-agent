@@ -54,7 +54,14 @@ BoundedHttpUrl = Annotated[
 ]
 
 # How the owner can watch (and possibly drive) a live browser session.
-LiveViewMode = Literal["hosted_url", "screenshot", "interactive_remote", "unavailable"]
+#
+# There used to be a fourth mode, ``hosted_url``, carrying a signed URL that a
+# cloud backend hosted and the console embedded in a cross-origin iframe. It went
+# with that backend: every worker that can run here is self-hosted and serves the
+# session through this control plane, so there is no external viewer to point at.
+# Unlike ``browser_provider``, this value is computed live per request and never
+# stored, so dropping it cannot orphan a historical row.
+LiveViewMode = Literal["screenshot", "interactive_remote", "unavailable"]
 
 # A bounded, same-origin RELATIVE viewer path. Deliberately not a URL type: the
 # private browser-service/noVNC address must never cross the API boundary, so an
@@ -272,7 +279,11 @@ class CreateRunRequest(StrictApiModel):
     account_mode: AccountMode
     requested_scope_policy: Literal["minimum", "recommended", "maximum"] = "maximum"
     execution_mode: Literal["plan_only", "execute_when_configured"] = "plan_only"
-    browser_provider: BrowserProvider = "browser_use"
+    # Narrower than the read type on purpose. ``BrowserProvider`` still accepts the
+    # retired "browser_use" so historical rows render as history, but a NEW run may
+    # not be created on a backend that no longer exists: the value is frozen onto
+    # the run and decides which backend a retry or resume is allowed to use.
+    browser_provider: Literal["playwright"] = "playwright"
     credential_creation_policy: CredentialCreationPolicy = "reuse_only"
     provider_setup: dict[str, str] = Field(default_factory=dict, max_length=20)
     # Deprecated compatibility alias for execution_mode="plan_only". Only an
@@ -401,9 +412,7 @@ class ProviderState(StrictApiModel):
         "perplexity",
         "gemini",
         "composio",
-        "browser_use",
-        # The self-hosted harness reports under its own identity so a Playwright
-        # deployment is never described as Browser Use.
+        # The only browser backend, reporting under its own identity.
         "playwright",
     ]
     status: Literal[
@@ -895,8 +904,6 @@ class LiveViewResponse(StrictApiModel):
     ``provider`` and ``mode`` are ALWAYS present so a client renders what the wired
     backend actually offers instead of assuming a hosted URL:
 
-    * ``hosted_url`` — a hosted provider (Browser Use) supplies a signed
-      ``live_url``, which the owner can interact with directly.
     * ``screenshot`` — the self-hosted Playwright harness has no hosted URL, so the
       client polls ``screenshot_url`` for masked PNG frames. Frames are viewable
       but not interactive, so ``interaction_available`` is False.
@@ -915,20 +922,12 @@ class LiveViewResponse(StrictApiModel):
     provider: BrowserProvider
     available: bool
     mode: LiveViewMode = "unavailable"
-    live_url: str | None = None
     screenshot_url: RelativeViewerPath | None = None
     interactive_url: InteractiveGrantUrl | None = None
     captured_at: str | None = None
     # Whether the owner can actually drive the browser through this view.
     interaction_available: bool = False
     reason_code: ReasonCode | None = None
-
-    @field_validator("live_url")
-    @classmethod
-    def live_url_is_hosted_https(cls, value: str | None) -> str | None:
-        """A hosted live URL is absolute HTTPS; its signed query is left intact."""
-
-        return _validate_http_url(value) if value is not None else None
 
     @field_validator("interactive_url")
     @classmethod
@@ -965,7 +964,6 @@ class LiveViewResponse(StrictApiModel):
     @model_validator(mode="after")
     def _validate_mode_contract(self) -> LiveViewResponse:
         viewer_urls = {
-            "hosted_url": self.live_url,
             "screenshot": self.screenshot_url,
             "interactive_remote": self.interactive_url,
         }
@@ -984,7 +982,7 @@ class LiveViewResponse(StrictApiModel):
             if not self.available:
                 raise ValueError(f"live view mode '{self.mode}' must report available=true")
             # Masked frames can be viewed but not driven, so a screenshot view must
-            # never claim interaction. Only a hosted or interactive viewer may.
+            # never claim interaction. Only the interactive remote may.
             if self.mode == "screenshot" and self.interaction_available:
                 raise ValueError("a screenshot live view is not interactive")
         if self.screenshot_url is not None and not self.screenshot_url.startswith(

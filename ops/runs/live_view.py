@@ -1,39 +1,41 @@
 """Ephemeral live-view surfaces for an in-flight browser session.
 
-All three operations resolve their answer from the in-memory browser worker at
-request time. Nothing they return is persisted: the masked screenshot bytes, the
-signed live-view URL and the interactive grant never reach SQLite, the checkpoint,
-the audit ledger, or the logs. That is the whole reason they are grouped together
-and kept out of the persistence paths.
+Both operations resolve their answer from the in-memory browser worker at request
+time. Nothing they return is persisted: the masked screenshot bytes and the
+interactive grant never reach SQLite, the checkpoint, the audit ledger, or the
+logs. That is the whole reason they are grouped together and kept out of the
+persistence paths.
 
-The only durable value any of them reads is the provider session id from the
-workflow checkpoint, which is non-secret and is what allows the embedded live view
-to reconnect after an API restart.
+A third query used to live here — ``get_browser_live_url``, which asked the worker
+for an externally hosted signed URL and, failing that, replayed the provider
+session id out of the workflow checkpoint to recover one after an API restart.
+Only the retired cloud backend ever returned such a URL; the self-hosted workers
+serve their session through this control plane, so the recovery path could not
+succeed and the API no longer has a ``hosted_url`` mode to spend it on.
 """
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Mapping
 from typing import Any, Protocol, cast
 
-from ops.browser.link_log import log_event
-from ops.browser.worker import BrowserWorker
+# The backend contract, not a concrete backend: with Browser Use removed the
+# only implementation is the Playwright harness, and these call sites only ever
+# needed the protocol. Aliased so the annotations below read unchanged.
+from ops.browser.provider import BrowserProvider as BrowserWorker
 from ops.core.storage import OperationsStorage
-from ops.workflow.graph import DurableOperationsWorkflow
 
 
 class RunLiveViewContext(Protocol):
     """The run-service state the live-view queries need."""
 
     storage: OperationsStorage
-    _workflow: DurableOperationsWorkflow | None
 
     def _browser_worker_for(self, record: Mapping[str, Any]) -> BrowserWorker | None: ...
 
 
 class RunLiveViewService:
-    """Resolve screenshots, signed live URLs and interactive grants on demand."""
+    """Resolve masked screenshots and interactive grants on demand."""
 
     def __init__(self, context: RunLiveViewContext) -> None:
         self._context = context
@@ -45,9 +47,8 @@ class RunLiveViewService:
     def get_browser_screenshot(self, run_id: str) -> tuple[bytes, str] | None:
         """Return the newest masked screenshot for a run's browser session.
 
-        Only the self-hosted Playwright provider offers this (Browser Use supplies a
-        hosted live URL instead). The bytes live solely in the worker's memory: they
-        are never written to SQLite, disk, logs, or the checkpoint.
+        The bytes live solely in the worker's memory: they are never written to
+        SQLite, disk, logs, or the checkpoint.
         """
 
         record = self.storage.get_run(run_id)
@@ -120,79 +121,6 @@ class RunLiveViewService:
         ):
             return cast("tuple[str, str, str, bool]", result)
         return None
-
-    def get_browser_live_url(self, run_id: str) -> str | None:
-        """Return the ephemeral signed live-view URL for a run, if one is active.
-
-        The URL is read from the in-memory BrowserWorker at request time and is
-        never persisted to run state, checkpoints, the ledger, logs, or Git. It
-        exists only while the worker holds the session, for owner interaction.
-        """
-
-        record = self.storage.get_run(run_id)
-        if record is None:
-            log_event("liveview.resolve.no_run", level=30, run_id=run_id)
-            return None
-        worker = self._context._browser_worker_for(record)
-        if worker is None:
-            log_event("liveview.resolve.no_worker", level=30, run_id=run_id)
-            return None
-        session_id = record.get("browser_session_id")
-        if not isinstance(session_id, str) or not session_id:
-            log_event(
-                "liveview.resolve.no_session",
-                run_id=run_id,
-                run_status=record.get("status"),
-            )
-            return None
-        live_url = worker.live_url(session_id)
-        if live_url:
-            log_event("liveview.resolve.cached", run_id=run_id, handle=session_id)
-            return live_url
-        # After an API restart the in-memory URL is gone but the provider session
-        # may still be running. Recover the signed URL from the durable
-        # checkpoint's (non-secret) provider session id so the embedded live view
-        # reconnects. The signed URL itself is never persisted.
-        recover = getattr(worker, "recover_live_url", None)
-        workflow = self._context._workflow
-        if not callable(recover) or workflow is None:
-            log_event("liveview.resolve.no_recover", level=30, run_id=run_id, handle=session_id)
-            return None
-        thread_id = record.get("thread_id")
-        if not isinstance(thread_id, str) or not thread_id:
-            return None
-        try:
-            checkpoint_state = workflow.get_state(thread_id)
-        except Exception:
-            log_event("liveview.resolve.checkpoint_error", level=30, run_id=run_id)
-            return None
-        provider_session = checkpoint_state.get("browser_provider_session_id")
-        if not isinstance(provider_session, str) or not provider_session:
-            log_event(
-                "liveview.resolve.no_provider_session",
-                level=30,
-                run_id=run_id,
-                handle=session_id,
-            )
-            return None
-        log_event("liveview.resolve.recover_attempt", run_id=run_id, handle=session_id)
-        try:
-            recovered = asyncio.run(recover(session_id, provider_session))
-        except Exception as exc:
-            log_event(
-                "liveview.resolve.recover_error",
-                level=30,
-                run_id=run_id,
-                error=type(exc).__name__,
-            )
-            return None
-        log_event(
-            "liveview.resolve.recover_result",
-            run_id=run_id,
-            handle=session_id,
-            recovered=bool(recovered),
-        )
-        return cast("str | None", recovered)
 
 
 __all__ = [

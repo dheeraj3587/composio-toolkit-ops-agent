@@ -22,7 +22,8 @@ from collections.abc import Mapping
 from typing import Any, Protocol, cast
 
 from ops.browser.link_log import log_event
-from ops.browser.worker import BrowserSessionContext, BrowserWorker
+from ops.browser.provider import BrowserProvider as BrowserWorker
+from ops.browser.worker import BrowserSessionContext
 from ops.core.models import OperationalResearch, OperationsRequest
 from ops.core.secret_store import SQLiteSecretStore
 from ops.core.state import BrowserProvider, RunStatus, validate_status_transition
@@ -444,9 +445,8 @@ class RunBrowserExecutionService:
         while a run genuinely still needs the browser (``waiting_for_hitl`` for the
         human, or ``browser_running`` while the action loop is active).
 
-        Deliberately Playwright-only: Browser Use has its own cleanup and
-        reconciliation semantics (its sessions are intentionally retained for
-        inspection), so this branch must never stop them.
+        The Playwright harness is the only backend, and its sessions are real local
+        Chromium processes, so a terminal run always releases its slot.
         """
 
         if next_status not in _TERMINAL_BROWSER_STATUSES:
@@ -476,8 +476,8 @@ class RunBrowserExecutionService:
         worker = self._context._browser_worker_for(provider)
         if context is None or worker is None:
             return
-        if str(getattr(worker, "provider_name", "browser_use")) != "playwright":
-            # Browser Use owns its own retention/reconciliation semantics.
+        if str(getattr(worker, "provider_name", "playwright")) != "playwright":
+            # Anything that is not the self-hosted harness owns its own retention.
             return
         try:
             asyncio.run(worker.stop(context))

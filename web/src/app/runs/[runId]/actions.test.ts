@@ -48,7 +48,6 @@ const RUN_ID = "run_11111111111111111111111111111111"
 const initialState: LiveViewState = {
   provider: null,
   mode: "unavailable",
-  liveUrl: null,
   screenshotUrl: null,
   interactivePath: null,
   capturedAt: null,
@@ -159,8 +158,7 @@ describe("openLiveView", () => {
     expect(result).toMatchObject({
       provider: "playwright",
       mode: "interactive_remote",
-      liveUrl: null,
-      screenshotUrl: null,
+          screenshotUrl: null,
       interactivePath:
         "/internal/browser/live-view/novnc?session=pw_session_1&token=signed-grant",
       interactionAvailable: true,

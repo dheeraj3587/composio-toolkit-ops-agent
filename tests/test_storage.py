@@ -249,7 +249,7 @@ def test_initialize_migrates_an_existing_database_for_internal_idempotency(tmp_p
     } <= columns
     assert "idx_runs_idempotency_key" in index_names
     assert stored == ("idem_0123456789abcdef0123456789abcdef", "a" * 64)
-    assert record["browser_provider"] == "browser_use"
+    assert record["browser_provider"] == "playwright"
     assert record["credential_creation_policy"] == "reuse_only"
 
 
@@ -265,7 +265,7 @@ def test_browser_provider_is_immutable_after_creation(tmp_path) -> None:
 
     assert created["browser_provider"] == "playwright"
     with pytest.raises(ValueError, match="unsupported"):
-        storage.update_run("run-provider", browser_provider="browser_use")
+        storage.update_run("run-provider", browser_provider="playwright")
 
 
 def test_credential_creation_policy_is_immutable_after_creation(tmp_path) -> None:

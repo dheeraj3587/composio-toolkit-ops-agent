@@ -1437,7 +1437,7 @@ class OperationsUnitOfWork:
         validation: Mapping[str, object] | None = None,
         scope_policy: str = "maximum",
         execution_mode: str = "local_dry_run",
-        browser_provider: str = "browser_use",
+        browser_provider: str = "playwright",
         credential_creation_policy: str = "reuse_only",
         recipe_version: str | None = None,
         recipe_snapshot: Mapping[str, object] | None = None,
@@ -1739,7 +1739,7 @@ class OperationsStorage:
                     validation_json TEXT,
                     scope_policy TEXT NOT NULL DEFAULT 'maximum',
                     execution_mode TEXT NOT NULL DEFAULT 'local_dry_run',
-                    browser_provider TEXT NOT NULL DEFAULT 'browser_use',
+                    browser_provider TEXT NOT NULL DEFAULT 'playwright',
                     credential_creation_policy TEXT NOT NULL DEFAULT 'reuse_only',
                     recipe_version TEXT,
                     recipe_snapshot_json TEXT,
@@ -1900,6 +1900,10 @@ class OperationsStorage:
                 "validation_json": "TEXT",
                 "scope_policy": "TEXT NOT NULL DEFAULT 'maximum'",
                 "execution_mode": "TEXT NOT NULL DEFAULT 'local_dry_run'",
+                # Deliberately still 'browser_use': this ALTER backfills rows in a
+                # database old enough to predate the column, and those runs really
+                # did execute on the cloud adapter. Fresh tables default to
+                # 'playwright' (the CREATE above), which is what every write supplies.
                 "browser_provider": "TEXT NOT NULL DEFAULT 'browser_use'",
                 "credential_creation_policy": "TEXT NOT NULL DEFAULT 'reuse_only'",
                 "recipe_version": "TEXT",
@@ -2002,7 +2006,7 @@ class OperationsStorage:
         validation: Mapping[str, object] | None = None,
         scope_policy: str = "maximum",
         execution_mode: str = "local_dry_run",
-        browser_provider: str = "browser_use",
+        browser_provider: str = "playwright",
         credential_creation_policy: str = "reuse_only",
         recipe_version: str | None = None,
         recipe_snapshot: Mapping[str, object] | None = None,
@@ -2097,7 +2101,7 @@ class OperationsStorage:
         validation: Mapping[str, object] | None = None,
         scope_policy: str = "maximum",
         execution_mode: str = "local_dry_run",
-        browser_provider: str = "browser_use",
+        browser_provider: str = "playwright",
         credential_creation_policy: str = "reuse_only",
         recipe_version: str | None = None,
         recipe_snapshot: Mapping[str, object] | None = None,

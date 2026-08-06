@@ -20,7 +20,6 @@ const SCREENSHOT_PATH =
 const unavailableEmbed: LiveViewState = {
   provider: "playwright",
   mode: "unavailable",
-  liveUrl: null,
   screenshotUrl: SCREENSHOT_PATH,
   interactivePath: null,
   capturedAt: "2025-01-01T00:00:00Z",

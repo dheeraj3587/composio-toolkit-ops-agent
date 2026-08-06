@@ -24,7 +24,10 @@ from typing import Any, Protocol
 
 from pydantic import SecretStr
 
-from ops.browser.worker import BrowserWorker
+# The backend contract, not a concrete backend: with Browser Use removed the
+# only implementation is the Playwright harness, and these call sites only ever
+# needed the protocol. Aliased so the annotations below read unchanged.
+from ops.browser.provider import BrowserProvider as BrowserWorker
 from ops.core.config import Settings
 from ops.core.secret_store import (
     REUSABLE_LOGIN_FIELDS,

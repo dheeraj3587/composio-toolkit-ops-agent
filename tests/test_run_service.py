@@ -182,15 +182,11 @@ def test_legacy_browser_use_fingerprint_replays_without_false_conflict(tmp_path:
     assert service.create_run(request, idempotency_key=idempotency_key) == first
 
 
-def test_idempotency_fingerprint_freezes_browser_provider(tmp_path: Path) -> None:
-    service = RunService.from_paths(db_path=tmp_path / "ops.db")
-    idempotency_key = "idem_2123456789abcdef0123456789abcdef"
-    browser_use = request_for("HubSpot")
-    playwright = browser_use.model_copy(update={"browser_provider": "playwright"})
-    service.create_run(browser_use, idempotency_key=idempotency_key)
-
-    with pytest.raises(IdempotencyConflictError):
-        service.create_run(playwright, idempotency_key=idempotency_key)
+# The companion "freezing browser_provider raises a conflict" case is gone with the
+# second backend: one legal value means two requests can never disagree on it. The
+# replay half of that behaviour — a body that omitted the field is not a false
+# conflict — is what remains true, and it is covered by the legacy-fingerprint test
+# above, whose excluded shape drops browser_provider.
 
 
 def test_idempotency_fingerprint_freezes_credential_creation_policy(tmp_path: Path) -> None:

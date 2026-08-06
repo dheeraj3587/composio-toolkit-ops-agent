@@ -30,7 +30,11 @@ from pydantic import SecretStr
 from ops.access.routing import RoutingDecision, decide_access
 from ops.browser.api_trace_catalog import get_browser_api_trace
 from ops.browser.link_log import log_event
-from ops.browser.worker import BrowserWorker
+
+# The backend contract, not a concrete backend: with Browser Use removed the
+# only implementation is the Playwright harness, and these call sites only ever
+# needed the protocol. Aliased so the annotations below read unchanged.
+from ops.browser.provider import BrowserProvider as BrowserWorker
 from ops.core.config import Settings
 from ops.core.model_catalog import ModelSelection
 from ops.core.models import CapabilityAvailability, OperationsRequest

@@ -106,10 +106,12 @@ export async function createRunAction(
   const executionMode = ["plan_only", "execute_when_configured"].includes(requestedExecutionMode)
     ? (requestedExecutionMode as OperationsRequestInput["execution_mode"])
     : "plan_only"
+  // The self-hosted Playwright harness is the only backend, so this is a record
+  // frozen onto the run rather than a choice. A form that posts anything else is
+  // rejected rather than coerced: the value decides which backend a retry or
+  // resume is allowed to run on.
   const requestedBrowserProvider = value(formData, "browser_provider", 40)
-  const browserProvider = ["browser_use", "playwright"].includes(requestedBrowserProvider)
-    ? (requestedBrowserProvider as OperationsRequestInput["browser_provider"])
-    : null
+  const browserProvider = requestedBrowserProvider === "playwright" ? "playwright" : null
   // The pinned decision model is a preference, not a requirement: it is shape-
   // checked here and authoritatively validated by the backend against the
   // providers it actually has keys for. An unparseable value is dropped rather
@@ -174,7 +176,7 @@ export async function createRunAction(
     },
     requested_scope_policy: policy ?? "minimum",
     execution_mode: executionMode,
-    browser_provider: browserProvider ?? "browser_use",
+    browser_provider: browserProvider ?? "playwright",
     credential_creation_policy: creationPolicy ?? "reuse_only",
     browser_login:
       accountMode === "existing_account" && appLoginEmail && appLoginPassword

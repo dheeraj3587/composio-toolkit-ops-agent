@@ -26,10 +26,9 @@ def _request(app_name: str = "HubSpot") -> OperationsRequest:
     )
 
 
-# ---- H2: Browser Use cost cap defaults high (not $1) -------------------------
-def test_browser_cost_cap_defaults_high() -> None:
-    settings = Settings.from_env(env={})
-    assert settings.browser_use_max_cost_usd == 50.0
+# H2 covered the per-task USD cost cap on the metered cloud adapter. That backend
+# is gone and the self-hosted Chromium harness is not billed per task, so there is
+# no cap left to default correctly — the setting was removed with the adapter.
 
 
 # ---- H10: SecurityState reports the actual state-storage boundary -------------

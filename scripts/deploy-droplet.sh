@@ -1243,14 +1243,16 @@ for name in (
         raise SystemExit(f"{name} must not be available to the API container")
 if not services["browser-worker"]["environment"].get("MERCURY_MODEL"):
     raise SystemExit("MERCURY_MODEL must be available to browser-worker")
-# Browser Use runs in Browser Use Cloud, so unlike the Chromium-only credentials
-# above its key has to live in the control plane. Tie the key to the explicit
-# compatibility opt-in instead of banning it outright: a key without the flag is
-# a configuration mistake, and the flag without a key can never execute.
-if api.get("BROWSER_USE_API_KEY") and api.get("BROWSER_USE_COMPATIBILITY_ENABLED") != "true":
+# The Browser Use cloud adapter is gone, so its key is no longer a supported
+# input. Refuse it outright rather than ignoring it: a key still present in
+# .env.production means the operator believes a remote backend is in play, and
+# every browser action actually runs in the Chromium container.
+if api.get("BROWSER_USE_API_KEY"):
     raise SystemExit(
-        "BROWSER_USE_API_KEY requires BROWSER_USE_COMPATIBILITY_ENABLED=true"
+        "BROWSER_USE_API_KEY is no longer supported; remove it from .env.production"
     )
+if api.get("BROWSER_PROVIDER", "playwright") != "playwright":
+    raise SystemExit("BROWSER_PROVIDER must be 'playwright' (the only backend)")
 if not api.get("BROWSER_SESSION_CAPABILITY_KEY"):
     raise SystemExit("BROWSER_SESSION_CAPABILITY_KEY must be available to API")
 if api.get("OPS_STARTUP_AUTOMATION_ENABLED") != "true":

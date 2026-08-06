@@ -136,7 +136,6 @@ class Settings(BaseModel):
     # Gmail can belong to a different Composio project than managed-auth/toolkit
     # discovery. It falls back to COMPOSIO_API_KEY for existing deployments.
     composio_gmail_api_key: SecretStr | None = Field(default=None, repr=False)
-    browser_use_api_key: SecretStr | None = Field(default=None, repr=False)
     langgraph_aes_key: SecretStr | None = Field(default=None, repr=False)
     secret_vault_key: SecretStr | None = Field(default=None, repr=False)
     ops_internal_api_token: SecretStr | None = Field(default=None, repr=False)
@@ -193,21 +192,14 @@ class Settings(BaseModel):
     # "instant", "medium", and "high" are the other documented values.
     mercury_reasoning_effort: str = "low"
 
-    # Session count is the real quota (not dollars), so use the most capable
-    # Browser Use model for reliable multi-step onboarding navigation. The latest
-    # Opus available on Browser Use Cloud is claude-opus-4.7 (there is no 4.8).
-    browser_use_model: str = "claude-opus-4.7"
-    # Per-session cost cap set high so a run never stops mid-task on the cap.
-    browser_use_max_cost_usd: float = Field(default=50.0, gt=0)
-    # Cloud tasks must not hold a run and paid session open forever if the SDK
-    # stalls. The worker stops the session when this wall-clock bound expires.
-    browser_use_task_timeout_seconds: int = Field(default=180, ge=30, le=600)
-    # Compatibility default for API/CLI callers that omit the immutable per-run
-    # selection. It does not prevent the other configured adapter from being wired.
-    browser_provider: Literal["browser_use", "playwright"] = "browser_use"
-    # A key alone must never authorize paid compatibility execution during the
-    # Playwright-only recovery rollout.
-    browser_use_compatibility_enabled: bool = False
+    # The self-hosted Playwright harness is the only browser backend. The paid
+    # Browser Use cloud adapter was removed: it could not run the reviewed
+    # credential ladder (its own docstring notes the SDK exposes no
+    # ``allowed_domains`` control), so host safety was reconstructed after the fact
+    # from a returned URL rather than enforced at the network layer the way
+    # ``make_egress_route_handler`` does. One backend also means one code path to
+    # audit for the rule that a credential is only ever typed on a reviewed origin.
+    browser_provider: Literal["playwright"] = "playwright"
     # Self-hosted Playwright limits. Each session is a real Chromium process, so the
     # cap is sized for a small VPS. --no-sandbox is opt-in (see _launch_args).
     #
@@ -714,7 +706,6 @@ class Settings(BaseModel):
             "composio_gmail_api_key": _secret(
                 source.get("COMPOSIO_GMAIL_API_KEY") or source.get("COMPOSIO_API_KEY")
             ),
-            "browser_use_api_key": _secret(source.get("BROWSER_USE_API_KEY")),
             "langgraph_aes_key": _secret(source.get("LANGGRAPH_AES_KEY")),
             "secret_vault_key": _secret(source.get("SECRET_VAULT_KEY")),
             "ops_internal_api_token": _secret(source.get("OPS_INTERNAL_API_TOKEN")),
@@ -738,20 +729,13 @@ class Settings(BaseModel):
                 source.get("MANAGED_AUTH_CALLBACK_BASE_URL")
             ),
             "gemini_model": _optional(source.get("GEMINI_MODEL")) or "gemini-3.6-flash",
-            "browser_use_model": _optional(source.get("BROWSER_USE_MODEL")) or "claude-opus-4.7",
-            "browser_use_max_cost_usd": _float(
-                source.get("BROWSER_USE_MAX_COST_USD"), default=50.0
-            ),
-            "browser_use_task_timeout_seconds": _integer(
-                source.get("BROWSER_USE_TASK_TIMEOUT_SECONDS"), default=180
-            ),
+            # BROWSER_PROVIDER is still read so a deployment that still sets it does
+            # not fail to start, but "playwright" is the only accepted value and the
+            # only backend that exists.
             "browser_provider": _choice(
                 source.get("BROWSER_PROVIDER"),
-                ("browser_use", "playwright"),
-                default="browser_use",
-            ),
-            "browser_use_compatibility_enabled": _boolean(
-                source.get("BROWSER_USE_COMPATIBILITY_ENABLED"), default=False
+                ("playwright",),
+                default="playwright",
             ),
             "playwright_max_sessions": _integer(source.get("PLAYWRIGHT_MAX_SESSIONS"), default=2),
             "playwright_disable_sandbox": _boolean(

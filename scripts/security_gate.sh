@@ -98,8 +98,6 @@ if [[ "${gate_scope}" == "all" || "${gate_scope}" == "backend" ]]; then
     BROWSER_SESSION_CAPABILITY_KEY= \
     BROWSER_SECRET_BROKER_TOKEN= \
     BROWSER_STORAGE_STATE_KEY= \
-    BROWSER_USE_API_KEY= \
-    BROWSER_USE_COMPATIBILITY_ENABLED=false \
     CEREBRAS_API_KEY= \
     COMPOSIO_API_KEY= \
     COMPOSIO_GMAIL_API_KEY= \

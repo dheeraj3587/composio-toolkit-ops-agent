@@ -2,7 +2,7 @@
 
 import Image from "next/image"
 import { useState, type RefObject } from "react"
-import { ExternalLink, MonitorPlay, RefreshCw, ShieldCheck } from "lucide-react"
+import { MonitorPlay, RefreshCw, ShieldCheck } from "lucide-react"
 
 import type { LiveViewState } from "@/app/runs/[runId]/actions"
 import {
@@ -12,13 +12,11 @@ import {
 import { Button } from "@/components/ui/button"
 import { SECRET_CAPTURE_BOUNDARY } from "@/lib/live-view"
 
-// Browser Use's signed viewer is a cross-origin application and requires its
-// own origin plus scripts to keep the interactive session authenticated. It
-// cannot become same-origin with this control plane, so the paired grants do
-// not let it remove the parent-owned sandbox. Downloads, top navigation,
-// presentation and storage-access escalation remain intentionally absent.
-const BROWSER_USE_IFRAME_SANDBOX =
-  "allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts"
+// This panel used to have a third branch: a cross-origin iframe pointed at a
+// cloud backend's signed viewer, sandboxed with allow-scripts AND allow-same-origin
+// (a pair that only holds because the frame can never share this origin), plus an
+// "open in a new tab" escape hatch to that host. Both went with the backend. Every
+// view below is served by this control plane.
 
 export function BrowserLiveSurface({
   liveState,
@@ -43,7 +41,6 @@ export function BrowserLiveSurface({
     isPlaywright &&
     liveState.mode === "interactive_remote" &&
     liveState.interactivePath !== null
-  const hostedEmbedVisible = liveState.mode === "hosted_url" && liveState.liveUrl !== null
   // Requirement 18.8: the capture boundary closes the view. This is the one
   // unavailable state that must never degrade to a frame.
   const captureBoundaryClosed = liveState.reasonCode === SECRET_CAPTURE_BOUNDARY
@@ -51,14 +48,14 @@ export function BrowserLiveSurface({
   // the fallback view — including while the grant reports the embed unavailable.
   const maskedFrameVisible =
     !captureBoundaryClosed &&
-    !hostedEmbedVisible &&
     !interactiveViewVisible &&
     liveState.screenshotUrl !== null &&
     liveState.screenshotUrl !== failedFrameUrl
-  const providerLabel =
-    (liveState.provider ?? (isPlaywright ? "playwright" : "browser_use")) === "playwright"
-      ? "Playwright browser"
-      : "Browser Use session"
+  // A run recorded before the cloud adapter was removed still reports its own
+  // provider, and it is named as recorded rather than relabelled after the fact.
+  // Naming it does not imply it can be watched: no backend serves that session.
+  const isRetiredProvider = liveState.provider === "browser_use"
+  const providerLabel = isRetiredProvider ? "Browser Use session (retired)" : "Playwright browser"
 
   return (
     <div className="space-y-2">
@@ -73,10 +70,12 @@ export function BrowserLiveSurface({
               ? isInteractiveHitl
                 ? "Automation is paused. Mouse and keyboard input stay in this isolated session."
                 : "Read-only live stream from the isolated Chromium service."
-              : "Interactive hosted browser session."}
+              : "This run was recorded on a backend that no longer exists, so there is no session to watch."}
           </p>
         </div>
-        {!interactiveViewVisible ? (
+        {/* Nothing can answer a connection request for a retired backend, so the
+            control is absent rather than offered and then refused. */}
+        {!interactiveViewVisible && isPlaywright ? (
           <Button
             type="button"
             variant="outline"
@@ -86,11 +85,7 @@ export function BrowserLiveSurface({
             className="rounded-md"
           >
             <RefreshCw className={livePending ? "animate-spin motion-reduce:animate-none" : ""} aria-hidden="true" />
-            {livePending
-              ? "Connecting…"
-              : isPlaywright && !isInteractiveHitl
-                ? "Refresh frame"
-                : "Request connection"}
+            {livePending ? "Connecting…" : isInteractiveHitl ? "Request connection" : "Refresh frame"}
           </Button>
         ) : null}
       </div>
@@ -106,22 +101,6 @@ export function BrowserLiveSurface({
             The live view is closed while this run is on a credential surface. No frame of that page
             is captured or shown — not even a masked one.
           </p>
-        </div>
-      ) : hostedEmbedVisible && liveState.liveUrl ? (
-        <div className="space-y-2">
-          <iframe
-            src={liveState.liveUrl}
-            title="Interactive Browser Use session"
-            className="h-[560px] w-full rounded-lg border border-border bg-black"
-            allow="clipboard-read; clipboard-write"
-            sandbox={BROWSER_USE_IFRAME_SANDBOX}
-          />
-          <Button asChild variant="outline" size="sm" className="rounded-md">
-            <a href={liveState.liveUrl} target="_blank" rel="noopener noreferrer">
-              <MonitorPlay className="size-3.5" aria-hidden="true" /> Open in a new tab
-              <ExternalLink className="size-3" aria-hidden="true" />
-            </a>
-          </Button>
         </div>
       ) : interactiveViewVisible && liveState.interactivePath ? (
         <PlaywrightRemoteView

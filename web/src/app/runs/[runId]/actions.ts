@@ -352,7 +352,9 @@ export async function refreshRunDetailAction(runId: string): Promise<void> {
 export interface LiveViewState {
   provider: BrowserProvider | null
   mode: LiveViewMode
-  liveUrl: string | null
+  // There is no `liveUrl` here any more. It held a signed URL on a backend's own
+  // origin, which the console embedded in a cross-origin iframe; the only backend
+  // that issued one is gone, and every viewer below is served by this origin.
   screenshotUrl: string | null
   interactivePath: string | null
   capturedAt: string | null
@@ -368,7 +370,6 @@ function unavailableLiveView(message: string, reasonCode: string | null = null):
   return {
     provider: null,
     mode: "unavailable",
-    liveUrl: null,
     screenshotUrl: null,
     interactivePath: null,
     capturedAt: null,
@@ -417,26 +418,10 @@ export async function openLiveView(
       }
     }
 
-    if (result.mode === "hosted_url" && result.live_url) {
-      return {
-        provider: result.provider,
-        mode: result.mode,
-        liveUrl: result.live_url,
-        screenshotUrl: null,
-        interactivePath: null,
-        capturedAt: result.captured_at ?? null,
-        interactionAvailable: result.interaction_available,
-        reasonCode: result.reason_code ?? null,
-        message: "Interactive hosted browser session ready.",
-        tone: "neutral",
-      }
-    }
-
     if (result.mode === "screenshot" && result.screenshot_url) {
       return {
         provider: result.provider,
         mode: result.mode,
-        liveUrl: null,
         screenshotUrl: maskedScreenshotPath(runId, result.captured_at ?? Date.now().toString()),
         interactivePath: null,
         capturedAt: result.captured_at ?? null,
@@ -451,7 +436,6 @@ export async function openLiveView(
       return {
         provider: result.provider,
         mode: "interactive_remote",
-        liveUrl: null,
         screenshotUrl: null,
         interactivePath: sameOriginInteractivePath(result.interactive_url),
         capturedAt: result.captured_at ?? null,

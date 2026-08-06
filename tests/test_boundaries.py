@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from ops.access.routing import classify_access
-from ops.browser.worker import BrowserObservation, BrowserWorker
+from ops.browser.worker import BrowserObservation
 from ops.credentials.capture import CredentialCapture
 from ops.email.outreach import correlation_subject
 from ops.gmail.worker import GMAIL_TOOL_ALLOWLIST, GmailWorker
@@ -73,9 +73,9 @@ def test_p1_and_final_routing_use_verified_phase_2_evidence() -> None:
 
 
 def test_browser_and_capture_boundaries_are_explicitly_unavailable() -> None:
-    with pytest.raises(PhaseUnavailableError, match="Phase 5"):
-        asyncio.run(BrowserWorker().start(None))
-
+    # The Phase 5 half of this assertion covered the placeholder BrowserWorker,
+    # which no longer exists: the Playwright harness is a real implementation and
+    # refuses with ConfigurationRequiredError, not a phase boundary.
     with pytest.raises(PhaseUnavailableError, match="Phase 6"):
         asyncio.run(
             CredentialCapture().capture_and_store(

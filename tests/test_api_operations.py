@@ -244,9 +244,9 @@ def test_execution_mode_defaults_to_plan_only() -> None:
     assert request.execution_mode == "plan_only"
 
 
-def test_browser_provider_defaults_to_browser_use_for_legacy_clients() -> None:
+def test_browser_provider_defaults_to_playwright_for_legacy_clients() -> None:
     request = CreateRunRequest.model_validate(_request_payload())
-    assert request.browser_provider == "browser_use"
+    assert request.browser_provider == "playwright"
 
 
 def test_credential_creation_policy_defaults_to_reuse_only_for_legacy_clients() -> None:
@@ -267,15 +267,18 @@ def test_credential_creation_policy_rejects_unknown_values() -> None:
         )
 
 
-@pytest.mark.parametrize("provider", ["browser_use", "playwright"])
-def test_browser_provider_accepts_both_canonical_values(provider: str) -> None:
-    request = CreateRunRequest.model_validate(_request_payload(browser_provider=provider))
-    assert request.browser_provider == provider
+def test_browser_provider_accepts_the_one_canonical_value() -> None:
+    request = CreateRunRequest.model_validate(_request_payload(browser_provider="playwright"))
+    assert request.browser_provider == "playwright"
 
 
-def test_browser_provider_rejects_unknown_values() -> None:
+@pytest.mark.parametrize("provider", ["automatic", "browser_use"])
+def test_browser_provider_rejects_unknown_values(provider: str) -> None:
+    # "browser_use" is rejected on the way IN even though it stays readable on the
+    # way out: an old run row is history, but a new run may not be created on a
+    # backend that no longer exists.
     with pytest.raises(ValidationError):
-        CreateRunRequest.model_validate(_request_payload(browser_provider="automatic"))
+        CreateRunRequest.model_validate(_request_payload(browser_provider=provider))
 
 
 def test_dry_run_true_normalizes_to_plan_only() -> None:

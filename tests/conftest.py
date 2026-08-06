@@ -75,7 +75,6 @@ _load_hypothesis_ci_profile()
 def set_env(monkeypatch):
     monkeypatch.setenv("OPS_INTERNAL_API_TOKEN", TEST_INTERNAL_API_TOKEN)
     monkeypatch.setenv("LANGGRAPH_AES_KEY", "")
-    monkeypatch.setenv("BROWSER_USE_API_KEY", "")
     monkeypatch.setenv("COMPOSIO_API_KEY", "")
     monkeypatch.setenv("SECRET_VAULT_KEY", "")
     monkeypatch.setenv("ALLOW_LIVE_BROWSER", "false")

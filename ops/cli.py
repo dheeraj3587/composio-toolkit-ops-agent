@@ -481,9 +481,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--browser-provider",
-        choices=("browser_use", "playwright"),
-        default="browser_use",
-        help="Freeze the browser engine for this run (default: browser_use).",
+        choices=("playwright",),
+        default="playwright",
+        help="Freeze the browser engine for this run (the self-hosted Playwright harness).",
     )
     run_parser.add_argument(
         "--credential-creation-policy",

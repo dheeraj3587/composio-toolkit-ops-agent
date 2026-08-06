@@ -116,9 +116,10 @@ class OperationsRequest(StrictModel):
     # from this field for all new requests.
     account_mode: AccountMode
     requested_scope_policy: Literal["minimum", "recommended", "maximum"] = "maximum"
-    # Immutable execution-engine choice. Older callers and checkpoints default to
-    # Browser Use; the website sends its explicit operator selection.
-    browser_provider: BrowserProvider = "browser_use"
+    # Immutable execution-engine record. The self-hosted Playwright harness is the
+    # only backend, so this is now a record of what ran rather than a choice; the
+    # retired "browser_use" value stays readable so historical checkpoints parse.
+    browser_provider: BrowserProvider = "playwright"
     # Immutable authorization boundary for developer-app/key creation. Legacy
     # API/CLI callers remain read-only unless they opt in explicitly.
     credential_creation_policy: CredentialCreationPolicy = "reuse_only"

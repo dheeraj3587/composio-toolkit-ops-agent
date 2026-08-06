@@ -166,7 +166,10 @@ def test_live_lifecycle_and_secret_injection() -> None:
         registered = context.session_id in worker._sessions
         session = worker._sessions[context.session_id]
 
-        from ops.playwright.worker import _has_password_field, _inject_login
+        # The live credential-typing path. This used to import a second copy of
+        # these helpers from ops.playwright.worker that production never called,
+        # so the test passed while the real login was broken.
+        from ops.browser.login import _PASSWORD_SELECTOR, _count_visible_enabled, _fill_first
 
         async def _drive() -> tuple[bool, str, str]:
             # A controlled local login form (no external network).
@@ -174,11 +177,9 @@ def test_live_lifecycle_and_secret_injection() -> None:
                 "<form><input type='email' name='email'>"
                 "<input type='password' name='password'></form>"
             )
-            had_password = await _has_password_field(session.page)
-            await _inject_login(
-                session.page,
-                {"login_email": "ops@example.test", "login_password": "  spaced secret  "},
-            )
+            had_password = await _count_visible_enabled(session.page, _PASSWORD_SELECTOR) == 1
+            await _fill_first(session.page, "input[type='email']", "ops@example.test")
+            await _fill_first(session.page, _PASSWORD_SELECTOR, "  spaced secret  ")
             email_val = await session.page.locator("input[type='email']").input_value()
             pw_val = await session.page.locator("input[type='password']").input_value()
             return had_password, email_val, pw_val

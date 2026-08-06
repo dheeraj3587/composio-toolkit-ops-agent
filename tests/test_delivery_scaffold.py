@@ -32,7 +32,6 @@ def test_environment_example_contains_only_safe_live_action_defaults() -> None:
         "PERPLEXITY_API_KEY",
         "GOOGLE_GENAI_API_KEY",
         "COMPOSIO_API_KEY",
-        "BROWSER_USE_API_KEY",
         "LANGGRAPH_AES_KEY",
         "SECRET_VAULT_KEY",
     }:
@@ -49,7 +48,6 @@ def test_provider_sdks_are_isolated_from_the_core_requirement_group() -> None:
     providers = _requirements("requirements-providers.txt")
 
     expected_providers = {
-        "browser-use-sdk",
         "composio",
         "google-genai",
         "langgraph",
@@ -69,11 +67,10 @@ def test_container_defaults_disable_live_actions_and_bind_host_ports_to_loopback
     assert "ALLOW_LIVE_BROWSER: ${ALLOW_LIVE_BROWSER:-false}" in production
     assert "ALLOW_LIVE_VENDOR_EMAIL: ${ALLOW_LIVE_VENDOR_EMAIL:-false}" in production
     # These are configurable now, but every one of them still defaults to off, so
-    # a deployment that says nothing gets no live provider.
-    assert (
-        "BROWSER_USE_COMPATIBILITY_ENABLED: ${BROWSER_USE_COMPATIBILITY_ENABLED:-false}"
-        in production
-    )
+    # a deployment that says nothing gets no live provider. The cloud browser
+    # adapter's opt-in is absent rather than defaulted off: the switch is gone
+    # because the backend it enabled is gone.
+    assert "BROWSER_USE" not in production
     assert "YOU_SEARCH_ENABLED: ${YOU_SEARCH_ENABLED:-false}" in production
     assert "YOU_CONTENTS_ENABLED: ${YOU_CONTENTS_ENABLED:-false}" in production
     assert "YOU_RESEARCH_ENABLED: ${YOU_RESEARCH_ENABLED:-false}" in production
@@ -86,7 +83,6 @@ def test_container_defaults_disable_live_actions_and_bind_host_ports_to_loopback
     assert '"127.0.0.1:${OPS_API_PORT:-8000}:8000"' in local
     assert '"127.0.0.1:${OPS_WEB_PORT:-3000}:3000"' in local
     for secret_name in {
-        "BROWSER_USE_API_KEY",
         "COMPOSIO_API_KEY",
         "GOOGLE_GENAI_API_KEY",
         "LANGGRAPH_AES_KEY",

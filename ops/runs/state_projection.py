@@ -102,7 +102,7 @@ class RunProjectionService:
         if projected_status in _TERMINAL_BROWSER_STATUSES:
             self._context._release_browser_session(
                 self._context._session_context_for(run_id),
-                cast(BrowserProvider, result.get("browser_provider", "browser_use")),
+                cast(BrowserProvider, result.get("browser_provider", "playwright")),
                 reason=f"project_{projected_status}",
             )
         return projected
@@ -194,7 +194,7 @@ class RunProjectionService:
                 )
                 projected = _public_run(updated)
                 release_provider = cast(
-                    BrowserProvider, updated.get("browser_provider", "browser_use")
+                    BrowserProvider, updated.get("browser_provider", "playwright")
                 )
         finally:
             lock.release()

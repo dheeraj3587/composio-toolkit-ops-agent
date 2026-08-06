@@ -21,7 +21,6 @@ const PROVIDER_TITLES: Record<string, string> = {
   perplexity: "Perplexity search",
   gemini: "Gemini extraction",
   composio: "Composio capability preflight",
-  browser_use: "Browser Use agent",
   playwright: "Browser service",
 }
 
@@ -37,7 +36,6 @@ const PROVIDER_DESCRIPTIONS: Record<string, string> = {
   gemini: "Structured extraction against fetched official evidence.",
   composio:
     "Read-only toolkit and connected-account capability evaluation. Gmail delivery is a separate policy-controlled action.",
-  browser_use: "Cloud browser agent for onboarding navigation and live evaluator inspection.",
   playwright: "The isolated Chromium the agent drives, with policy-bounded navigation.",
 }
 

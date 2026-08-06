@@ -56,13 +56,15 @@ def resolve_provider(
     settings: Settings,
     provider: BrowserProvider | None = None,
 ) -> BrowserProvider:
-    """Resolve an explicit run provider, with the legacy setting as fallback."""
+    """Resolve the backend this run's browser surface describes.
 
-    return provider or (
-        "playwright"
-        if str(getattr(settings, "browser_provider", "")) == "playwright"
-        else ("browser_use")
-    )
+    A historical run row may still carry the retired ``browser_use`` value. It is
+    reported back as recorded — the row is what happened — but Playwright is the
+    only backend anything can run on now, so an absent value resolves to it.
+    """
+
+    del settings  # the deployment no longer chooses; there is one backend
+    return provider or "playwright"
 
 
 def session_lost_recorded(events: Collection[Mapping[str, object]]) -> bool:
@@ -99,10 +101,7 @@ def project_browser_ui(
     """
 
     provider = resolve_provider(settings, browser_provider)
-    configured = browser_configuration_state(settings, provider) and not (
-        provider == "browser_use"
-        and not bool(getattr(settings, "browser_use_compatibility_enabled", False))
-    )
+    configured = browser_configuration_state(settings, provider)
     credential_page_verified = CREDENTIAL_PAGE_EVENT in event_types
     session_started = bool(browser_session_id) or "browser_session_started" in event_types
     terminal = run_status in TERMINAL_RUN_STATUSES
@@ -120,16 +119,15 @@ def project_browser_ui(
     # A live session is the precondition for any view at all.
     session_live = lifecycle in {"running", "waiting_for_hitl", "credential_page_ready"}
     live_view_mode = _live_view_mode(
-        provider=provider,
         lifecycle=lifecycle,
         session_live=session_live,
         screenshot_present=screenshot_present,
         interactive_enabled=bool(getattr(settings, "browser_interactive_hitl_enabled", False)),
     )
-    # Rule 9: interactivity is a provider capability, not a run state. Only a
-    # hosted provider view (or a real interactive remote) can be driven; masked
-    # Playwright frames never can be.
-    interaction_available = live_view_mode == "hosted_url" or (
+    # Rule 9: interactivity is a capability, not a run state. Only a real
+    # interactive remote during a human gate can be driven; a masked frame never
+    # can be. The "or a hosted provider view" term went with the hosted backend.
+    interaction_available = (
         live_view_mode == "interactive_remote" and lifecycle == "waiting_for_hitl"
     )
 
@@ -221,31 +219,30 @@ def _lifecycle(
 
 def _live_view_mode(
     *,
-    provider: BrowserProvider,
     lifecycle: BrowserLifecycle,
     session_live: bool,
     screenshot_present: bool,
     interactive_enabled: bool,
 ) -> LiveViewMode:
-    """The view this provider can actually offer right now.
+    """The view that can actually be served right now.
 
-    The signed hosted URL itself is resolved by the live-view endpoint from
-    in-memory worker state; run detail reports only that a hosted view is expected
-    for a live session, so a run projection never triggers a provider call.
-    Playwright uses the same continuous remote surface while autonomous work runs
+    This used to branch on the provider and hand a non-Playwright run
+    ``hosted_url``, which made the frame drivable. That branch is gone with the
+    backend it described: a legacy row still *reports* ``browser_use`` as its
+    recorded provider, but there is no hosted session behind it, and offering an
+    interactive view for a session nothing can serve is worse than offering none.
+    The one backend uses a continuous remote surface while autonomous work runs
     and while a human gate is active. Capability is separate from transport:
     running is server-enforced view-only; HITL may receive a control grant.
     """
 
     if not session_live:
         return "unavailable"
-    if provider == "playwright":
-        if lifecycle == "credential_page_ready":
-            return "unavailable"
-        if interactive_enabled:
-            return "interactive_remote"
-        return "screenshot" if screenshot_present else "unavailable"
-    return "hosted_url"
+    if lifecycle == "credential_page_ready":
+        return "unavailable"
+    if interactive_enabled:
+        return "interactive_remote"
+    return "screenshot" if screenshot_present else "unavailable"
 
 
 __all__ = [

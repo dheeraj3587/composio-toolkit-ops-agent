@@ -16,6 +16,10 @@ AccessRoute = Literal[
     "blocked",
     "unknown",
 ]
+# "playwright" is the only backend that exists. "browser_use" is retained as a
+# READ-ONLY legacy value: runs created before the cloud adapter was removed carry
+# it in their persisted rows and checkpoints, and narrowing this Literal would make
+# those rows fail validation in the console rather than render as history.
 BrowserProvider = Literal["browser_use", "playwright"]
 CredentialCreationPolicy = Literal["reuse_only", "create_if_missing"]
 

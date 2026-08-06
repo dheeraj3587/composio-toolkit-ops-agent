@@ -80,42 +80,64 @@ def test_matched_success_signals_can_match_via_url_or_title() -> None:
     )
 
 
-def test_submit_login_clicks_a_submit_control() -> None:
-    """Behavioral: _submit_login must actually click/press, not just exist."""
+def test_submit_login_clicks_the_forms_own_control_not_a_federated_one() -> None:
+    """Behavioral: the submit step must click, and must skip provider buttons.
 
-    from ops.playwright.worker import _submit_login
+    This guards ``ops.browser.login`` — the path the worker actually drives. It
+    used to guard a second copy in ``ops/playwright/login_dom.py`` that nothing
+    called, whose ``.first`` click landed on whichever control the site rendered
+    highest. On a page that stacks "Continue with Google" above the email form,
+    that submitted the wrong thing and the guard still passed.
+    """
+
+    from ops.browser.login import _click_submit
 
     clicked: list[str] = []
+    # DOM order deliberately puts the federated buttons first.
+    controls = ["Continue with Google", "Sign in with GitHub", "Log in"]
+
+    class _Control:
+        def __init__(self, label: str) -> None:
+            self._label = label
+
+        async def is_visible(self) -> bool:
+            return True
+
+        async def is_enabled(self) -> bool:
+            return True
+
+        async def inner_text(self, timeout: int = 0) -> str:
+            return self._label
+
+        async def click(self, timeout: int = 0) -> None:
+            clicked.append(self._label)
 
     class _Locator:
-        def __init__(self, selector: str, count: int) -> None:
-            self._selector = selector
-            self._count = count
+        def __init__(self) -> None:
             self.first = self
 
         async def count(self) -> int:
-            return self._count
+            return len(controls)
 
-        async def click(self, timeout: int = 0) -> None:
-            clicked.append(self._selector)
+        def nth(self, index: int) -> _Control:
+            return _Control(controls[index])
 
         async def press(self, key: str, timeout: int = 0) -> None:
             clicked.append(f"press:{key}")
 
     class _Page:
         def locator(self, selector: str) -> _Locator:
-            # Only the standard submit button exists on this page.
-            return _Locator(selector, 1 if selector == "button[type='submit']" else 0)
+            return _Locator()
 
         async def wait_for_load_state(self, state: str, timeout: int = 0) -> None:
-            clicked.append(f"wait:{state}")
+            return None
 
-    assert asyncio.run(_submit_login(_Page())) is True
-    assert "button[type='submit']" in clicked
+    assert asyncio.run(_click_submit(_Page())) is True
+    assert clicked == ["Log in"]
 
 
 def test_submit_login_falls_back_to_pressing_enter() -> None:
-    from ops.playwright.worker import _submit_login
+    from ops.browser.login import _click_submit
 
     pressed: list[str] = []
 
@@ -125,6 +147,9 @@ def test_submit_login_falls_back_to_pressing_enter() -> None:
 
         async def count(self) -> int:
             return 0  # no submit control anywhere
+
+        def nth(self, index: int) -> object:
+            raise AssertionError("no control to click")
 
         async def press(self, key: str, timeout: int = 0) -> None:
             pressed.append(key)
@@ -136,7 +161,7 @@ def test_submit_login_falls_back_to_pressing_enter() -> None:
         async def wait_for_load_state(self, state: str, timeout: int = 0) -> None:
             return None
 
-    assert asyncio.run(_submit_login(_Page())) is True
+    assert asyncio.run(_click_submit(_Page())) is True
     assert pressed == ["Enter"]
 
 
@@ -314,16 +339,16 @@ def test_configuration_state_is_provider_aware() -> None:
         )
         is False
     )
-    # Browser Use still requires its key.
+    # The live opt-in alone configures nothing: it grants permission to drive a
+    # browser, not a place to drive one.
     assert browser_configuration_state(Settings(allow_live_browser=True)) is False
+    # And an execution location without the opt-in is equally unconfigured.
     assert (
         browser_configuration_state(
-            Settings(allow_live_browser=True, browser_use_api_key=SecretStr("k"))
+            Settings(browser_provider="playwright", playwright_in_process_sandbox=True)
         )
-        is True
+        is False
     )
-    # The live opt-in still gates both.
-    assert browser_configuration_state(Settings(browser_provider="playwright")) is False
 
 
 # --- A13: effect-ledger provider identity follows the backend ------------------
@@ -374,7 +399,7 @@ def test_invalid_browser_provider_raises() -> None:
 
 
 def test_absent_browser_provider_uses_the_default() -> None:
-    assert Settings.from_env(env={}).browser_provider == "browser_use"
+    assert Settings.from_env(env={}).browser_provider == "playwright"
 
 
 # --- capacity guard ------------------------------------------------------------

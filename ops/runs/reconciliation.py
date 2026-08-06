@@ -60,7 +60,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal, Protocol, cast
 
 from ops.browser.link_log import log_event
-from ops.browser.worker import BrowserWorker
+
+# The backend contract, not a concrete backend: with Browser Use removed the
+# only implementation is the Playwright harness, and these call sites only ever
+# needed the protocol. Aliased so the annotations below read unchanged.
+from ops.browser.provider import BrowserProvider as BrowserWorker
 from ops.core.config import Settings
 from ops.core.state import BrowserProvider, RunStatus, validate_status_transition
 from ops.core.storage import OperationsStorage
@@ -139,14 +143,12 @@ class RunReconciliationService:
         Best-effort and never fatal to startup.
         """
 
-        # Provider capability decides which statuses are recoverable. Browser Use
-        # sessions live in the cloud and can be reattached by provider session id, so
-        # its waiting_for_hitl runs are left intact (unchanged behaviour). The
-        # in-process Playwright browser dies with the API process, so BOTH
-        # browser_running and waiting_for_hitl must be reconciled — claiming such a
-        # run is resumable would be false.
+        # Provider capability decides which statuses are recoverable. The in-process
+        # Playwright browser dies with the API process, so BOTH browser_running and
+        # waiting_for_hitl must be reconciled — claiming such a run is resumable
+        # would be false.
         #
-        # The browser SERVICE is the third case: Chromium is in its own container, so
+        # The browser SERVICE is the other case: Chromium is in its own container, so
         # a session can genuinely outlive an API restart. But the capability flag
         # alone is not evidence, so each waiting_for_hitl run is CHECKED against the
         # service (see _browser_session_is_live); only a session the service still
@@ -304,7 +306,7 @@ class RunReconciliationService:
                 if current is None or current.get("status") not in stranded_statuses:
                     return
                 release_provider = cast(
-                    BrowserProvider, current.get("browser_provider", "browser_use")
+                    BrowserProvider, current.get("browser_provider", "playwright")
                 )
                 previous_status = cast(RunStatus, current["status"])
                 revision = int(current.get("state_revision", 0) or 0) + 1
@@ -355,7 +357,11 @@ class RunReconciliationService:
         """
 
         settings = self._context._settings or Settings.from_env()
-        idle_seconds = max(600, int(getattr(settings, "browser_use_task_timeout_seconds", 180)) * 4)
+        # Derived from the longest single browser operation the client will wait on,
+        # with a wide safety factor. This used to read the retired Browser Use task
+        # timeout, which no longer exists — so the getattr fell through to its
+        # default and the threshold no longer tracked the timeout it claimed to.
+        idle_seconds = max(600, int(settings.browser_service_client_timeout_seconds) * 4)
         cutoff = datetime.now(UTC) - timedelta(seconds=idle_seconds)
         reconciled = 0
         for record in self.storage.list_runs(limit=limit, offset=0):

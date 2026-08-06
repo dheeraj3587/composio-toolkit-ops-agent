@@ -21,7 +21,10 @@ from typing import Any, Literal, Protocol, cast
 import httpx
 from pydantic import SecretStr
 
-from ops.browser.worker import BrowserWorker
+# The backend contract, not a concrete backend: with Browser Use removed the
+# only implementation is the Playwright harness, and these call sites only ever
+# needed the protocol. Aliased so the annotations below read unchanged.
+from ops.browser.provider import BrowserProvider as BrowserWorker
 from ops.core.config import Settings
 from ops.core.effect_ledger import SQLiteEffectStore
 from ops.core.model_catalog import ModelSelection
@@ -1190,7 +1193,7 @@ class RunService:
         )
 
         browsers: dict[BrowserProvider, BrowserWorker] = {}
-        for provider_name in ("browser_use", "playwright"):
+        for provider_name in ("playwright",):
             if not self._browser_provider_enabled(settings, provider_name):
                 self._record_wiring(
                     f"browser:{provider_name}",
@@ -1228,20 +1231,13 @@ class RunService:
     ) -> bool:
         """Whether a browser worker should be wired for the selected provider.
 
-        ``browser_use`` keeps the exact prod condition (live opt-in + an API key).
         ``playwright`` needs the live opt-in AND an execution location: the browser
-        service (URL + token) or the explicit in-process sandbox. No Browser Use
-        key is ever required for it.
+        service (URL + token) or the explicit in-process sandbox.
         """
 
         from ops.browser.readiness import browser_configuration_state
 
-        selected = provider or settings.browser_provider
-        if selected == "browser_use" and not settings.browser_use_compatibility_enabled:
-            return False
-        # One shared, provider-aware helper (also used by health + retry eligibility)
-        # so a Playwright deployment is never judged by a Browser Use key.
-        return browser_configuration_state(settings, selected)
+        return browser_configuration_state(settings, provider or settings.browser_provider)
 
     def _browser_worker_for(
         self,
@@ -1250,7 +1246,7 @@ class RunService:
         provider = (
             source
             if isinstance(source, str)
-            else cast(BrowserProvider, source.get("browser_provider", "browser_use"))
+            else cast(BrowserProvider, source.get("browser_provider", "playwright"))
         )
         workers = cast(
             dict[BrowserProvider, BrowserWorker],
@@ -1365,13 +1361,9 @@ class RunService:
         *,
         provider: BrowserProvider | None = None,
     ) -> BrowserWorker:
-        """Select the browser backend.
+        """Build the browser backend.
 
-        Browser Use uses the core compatibility adapter. It is wired only when its
-        own live opt-in and credential are configured; it is never selected as a
-        fallback for a Playwright run.
-
-        For ``playwright`` the NORMAL path is now the isolated browser service over
+        Playwright is the only backend. For it the NORMAL path is the isolated browser service over
         authenticated RPC. Previously this always returned the in-process worker, so
         the service, its RPC auth, restart reattachment, health and lifecycle manager
         were never used by the real application. Running Chromium inside the API is
@@ -1380,51 +1372,47 @@ class RunService:
         debugging, not a silent fallback when the service is unconfigured.
         """
 
-        selected = provider or settings.browser_provider
-        if selected == "playwright":
-            if getattr(settings, "playwright_in_process_sandbox", False):
-                try:
-                    from ops.playwright.worker import PlaywrightBrowserWorker
-                except ImportError:
-                    raise ConfigurationRequiredError(
-                        phase=5,
-                        capability="Playwright browser provider",
-                        reason_code="playwright_provider_unavailable",
-                    ) from None
-                return cast("BrowserWorker", PlaywrightBrowserWorker(settings=settings))
-
-            if (
-                not settings.browser_service_url
-                or settings.browser_service_token is None
-                or settings.browser_session_capability_key is None
-            ):
-                # Fail closed with an actionable reason rather than quietly starting
-                # a browser in the control plane.
+        del provider  # only one backend exists; kept for the call-site signature
+        if getattr(settings, "playwright_in_process_sandbox", False):
+            try:
+                from ops.playwright.worker import PlaywrightBrowserWorker
+            except ImportError:
                 raise ConfigurationRequiredError(
                     phase=5,
-                    capability="Playwright browser service",
-                    reason_code="browser_service_configuration_required",
-                )
-            from ops.browser.service_client import BrowserServiceClient
+                    capability="Playwright browser provider",
+                    reason_code="playwright_provider_unavailable",
+                ) from None
+            return cast("BrowserWorker", PlaywrightBrowserWorker(settings=settings))
 
-            return cast(
-                "BrowserWorker",
-                BrowserServiceClient(
-                    base_url=settings.browser_service_url,
-                    token=settings.browser_service_token,
-                    owner=settings.browser_service_owner,
-                    capability_key=settings.browser_session_capability_key,
-                    timeout_seconds=settings.browser_service_client_timeout_seconds,
-                    # The clearance probe is bounded on its own, well inside the
-                    # takeover interval, rather than inheriting the operation
-                    # budget above: a slow read is reported unread and the run
-                    # keeps waiting.
-                    takeover_probe_timeout_seconds=(
-                        settings.onboarding_takeover_probe_timeout_seconds
-                    ),
-                ),
+        if (
+            not settings.browser_service_url
+            or settings.browser_service_token is None
+            or settings.browser_session_capability_key is None
+        ):
+            # Fail closed with an actionable reason rather than quietly starting
+            # a browser in the control plane.
+            raise ConfigurationRequiredError(
+                phase=5,
+                capability="Playwright browser service",
+                reason_code="browser_service_configuration_required",
             )
-        return BrowserWorker(settings=settings)
+        from ops.browser.service_client import BrowserServiceClient
+
+        return cast(
+            "BrowserWorker",
+            BrowserServiceClient(
+                base_url=settings.browser_service_url,
+                token=settings.browser_service_token,
+                owner=settings.browser_service_owner,
+                capability_key=settings.browser_session_capability_key,
+                timeout_seconds=settings.browser_service_client_timeout_seconds,
+                # The clearance probe is bounded on its own, well inside the
+                # takeover interval, rather than inheriting the operation
+                # budget above: a slow read is reported unread and the run
+                # keeps waiting.
+                takeover_probe_timeout_seconds=(settings.onboarding_takeover_probe_timeout_seconds),
+            ),
+        )
 
     def _record_wiring(
         self,
@@ -1825,11 +1813,6 @@ class RunService:
         """Mint an ephemeral Playwright grant only for an active human handoff."""
 
         return self._live_view.get_browser_interactive_grant(run_id)
-
-    def get_browser_live_url(self, run_id: str) -> str | None:
-        """Return the ephemeral signed live-view URL for a run, if one is active."""
-
-        return self._live_view.get_browser_live_url(run_id)
 
     def _public_no_reply(self, record: Mapping[str, object]) -> dict[str, Any]:
         """Return the current run projection with a no-op reply marker."""

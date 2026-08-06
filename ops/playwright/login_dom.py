@@ -1,28 +1,27 @@
-"""The DOM primitives that type a credential, and the checks that gate them.
+"""The frame-origin check that gates typing a credential.
 
-Credentials are only ever typed when all of the following hold, which is why these
-checks live next to the fill/submit helpers rather than anywhere near a decision
-backend:
+A credential field inside an UNREVIEWED (e.g. third-party) iframe is never filled,
+even when the top-level page is approved — the main frame being allowlisted says
+nothing about who owns the nested document. This check runs before any fill, so it
+lives here rather than anywhere near a decision backend.
 
-* the main frame's URL is inside the reviewed host allowlist,
-* exactly one visible and enabled password input exists — zero or several means an
-  ambiguous or hidden multi-form page, and typing into it is refused,
-* the enclosing form does not post to an off-allowlist host, and
-* every frame that hosts a password field is itself on a reviewed origin. A
-  credential field inside an unreviewed third-party iframe is never filled, because
-  the top-level page being allowlisted says nothing about who owns the nested
-  document.
+It fails CLOSED: if frames cannot be enumerated or a check raises, the answer is
+"not safe".
 
-Every failure path fails CLOSED: if frames cannot be enumerated or a check raises,
-the answer is "not safe". Filled values are never logged and never reach an LLM.
-Filling alone never advances a login, so submission tries the reviewed submit
-controls, falls back to pressing Enter in the password field, and then waits
-(bounded) for the network to settle so the next observation sees the post-submit page.
+This module used to also hold ``_login_origin_is_safe``, ``_has_password_field``,
+``_inject_login``, ``_submit_login`` and ``_try_fill`` — a complete second
+implementation of the credential-typing path that nothing in production called.
+The live path is :mod:`ops.browser.login` (``inspect_login`` → ``drive_login``,
+reached through ``apply_resume_secrets``). Keeping the copy was actively harmful:
+it typed a password with no form-action check, and its submit step clicked the
+first control matching ``button:has-text('Sign in')`` — a substring match that
+lands on "Continue with Google" whenever the federated buttons render above the
+form. Those are the exact defects fixed in the live path, so a regression guard
+pointed here would have passed while the real login stayed broken.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
 
 from ops.browser.pages import frame_path_is_reviewed
@@ -30,46 +29,8 @@ from ops.playwright.page_inspection import _page_url
 from ops.playwright.routing import navigation_allowed
 
 
-async def _login_origin_is_safe(page: Any, patterns: tuple[str, ...]) -> bool:
-    """Verify the main frame is on a reviewed origin and the form is unambiguous.
-
-    Credentials are only ever typed when: the page URL is inside the reviewed host
-    allowlist, exactly one visible+enabled password input exists, and the enclosing
-    form does not post to an off-allowlist host.
-    """
-
-    if not navigation_allowed(_page_url(page), patterns):
-        return False
-    try:
-        passwords = page.locator("input[type='password']")
-        visible = 0
-        for index in range(min(int(await passwords.count()), 5)):
-            field = passwords.nth(index)
-            if await field.is_visible() and await field.is_enabled():
-                visible += 1
-        if visible != 1:
-            return False  # zero, or an ambiguous/hidden multi-form page
-    except Exception:
-        return False
-    try:
-        action = await page.locator("form:has(input[type='password'])").first.get_attribute(
-            "action", timeout=2_000
-        )
-    except Exception:
-        action = None
-    if isinstance(action, str) and action.casefold().startswith(("http://", "https://")):
-        if not navigation_allowed(action, patterns):
-            return False  # the form would post credentials off-allowlist
-    return True
-
-
 async def _login_frames_are_reviewed(page: Any, patterns: tuple[str, ...]) -> bool:
-    """True when every frame hosting a password field is on a reviewed origin.
-
-    A credential field inside an UNREVIEWED (e.g. third-party) iframe is never
-    filled, even when the top-level page is approved — the main frame being
-    allowlisted says nothing about who owns the nested document.
-    """
+    """True when every frame hosting a password field is on a reviewed origin."""
 
     from ops.browser.snapshot import frame_chain, frame_host
 
@@ -98,74 +59,3 @@ async def _login_frames_are_reviewed(page: Any, patterns: tuple[str, ...]) -> bo
         if not frame_path_is_reviewed(frame_chain(frame), patterns):
             return False
     return True
-
-
-async def _has_password_field(page: Any) -> bool:
-    try:
-        locator = page.locator("input[type='password']")
-        return bool(await locator.count() > 0)
-    except Exception:
-        return False
-
-
-async def _inject_login(page: Any, sensitive_data: Mapping[str, str]) -> None:
-    """Fill login fields by code from placeholder->value pairs; the value is never
-    logged and never passed to an LLM. Best-effort by common field heuristics."""
-
-    email = sensitive_data.get("login_email") or sensitive_data.get("email")
-    password = sensitive_data.get("login_password") or sensitive_data.get("password")
-    if email:
-        for selector in ("input[type='email']", "input[name='email']", "input[name='username']"):
-            if await _try_fill(page, selector, email):
-                break
-    if password:
-        await _try_fill(page, "input[type='password']", password)
-
-
-async def _submit_login(page: Any) -> bool:
-    """Submit the filled login form and wait for the page to settle.
-
-    Filling inputs alone never advances a login flow. Tries the submit control, then
-    falls back to pressing Enter in the password field. Always waits for the network
-    to go idle (bounded) so the next observation sees the post-submit page.
-    """
-
-    submitted = False
-    for selector in (
-        "button[type='submit']",
-        "input[type='submit']",
-        "button:has-text('Log in')",
-        "button:has-text('Sign in')",
-        "button:has-text('Continue')",
-    ):
-        try:
-            locator = page.locator(selector)
-            if await locator.count() >= 1:
-                await locator.first.click(timeout=5_000)
-                submitted = True
-                break
-        except Exception:
-            continue
-    if not submitted:
-        try:
-            await page.locator("input[type='password']").first.press("Enter", timeout=5_000)
-            submitted = True
-        except Exception:
-            submitted = False
-    if submitted:
-        try:
-            await page.wait_for_load_state("networkidle", timeout=20_000)
-        except Exception:
-            pass
-    return submitted
-
-
-async def _try_fill(page: Any, selector: str, value: str) -> bool:
-    try:
-        locator = page.locator(selector)
-        if await locator.count() >= 1:
-            await locator.first.fill(value, timeout=5_000)
-            return True
-    except Exception:
-        return False
-    return False

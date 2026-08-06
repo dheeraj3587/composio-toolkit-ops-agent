@@ -57,7 +57,6 @@ def test_shared_selector_applies_the_required_state_order(
         allowed_domains=_ALLOWED,
         account_state=account_state,  # type: ignore[arg-type]
         is_allowed_url=is_allowed_browser_url,
-        fallback_mode="playwright",
     )
     assert target == expected
 
@@ -110,6 +109,5 @@ def test_verified_claim_beats_an_unverified_preferred_field() -> None:
         allowed_domains=_ALLOWED,
         account_state="existing_account",
         is_allowed_url=is_allowed_browser_url,
-        fallback_mode="browser_use",
     )
     assert target == "https://app.example.test/login"

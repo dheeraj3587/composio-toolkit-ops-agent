@@ -1867,27 +1867,25 @@ class TestProviderAwareHealth:
         assert body["state"] in {"capacity_exhausted", "degraded", "configured_not_verified"}
         assert body["capacity_in_use"] == 1
 
-    def test_api_browser_phase_detail_is_provider_aware(self) -> None:
-        """The Playwright path must not report Browser Use's SDK limitation."""
+    def test_api_browser_phase_detail_describes_the_backend_that_would_run(self) -> None:
+        """The detail describes the harness, and never a retired backend's limits."""
 
         from api.service import LocalRunService
 
-        playwright_detail = LocalRunService._browser_phase_detail(
-            provider="playwright", configured=True
-        )
-        assert "Browser Use" not in playwright_detail
-        assert "self-hosted" in playwright_detail
+        detail = LocalRunService._browser_phase_detail(provider="playwright", configured=True)
+        assert "Browser Use" not in detail
+        assert "self-hosted" in detail
 
-        playwright_unconfigured = LocalRunService._browser_phase_detail(
+        unconfigured = LocalRunService._browser_phase_detail(
             provider="playwright", configured=False
         )
-        assert "No Browser Use key is needed" in playwright_unconfigured
+        assert "ALLOW_LIVE_BROWSER" in unconfigured
 
-        # Browser Use keeps its exact previous wording.
-        browser_use_detail = LocalRunService._browser_phase_detail(
-            provider="browser_use", configured=True
+        # A legacy run row names the retired adapter, but readiness is reported for
+        # the backend that would actually run — the row does not resurrect it.
+        assert (
+            LocalRunService._browser_phase_detail(provider="browser_use", configured=True) == detail
         )
-        assert "Browser Use v3" in browser_use_detail
 
     def test_client_detects_a_service_major_version_mismatch(self) -> None:
         import httpx
@@ -2497,9 +2495,11 @@ class TestProviderFactoryWiring:
         # In-process Chromium dies with the API, and says so.
         assert worker.supports_restart_reattach is False
 
-    def test_browser_use_remains_the_default_provider(self) -> None:
+    def test_the_self_hosted_harness_is_the_default_provider(self) -> None:
         settings = self._baseline_settings()
-        assert settings.browser_provider == "browser_use"
+        assert settings.browser_provider == "playwright"
+        # The default execution location is still the separate browser service:
+        # in-process Chromium remains an explicit opt-in, never a silent fallback.
         assert settings.playwright_in_process_sandbox is False
 
 
