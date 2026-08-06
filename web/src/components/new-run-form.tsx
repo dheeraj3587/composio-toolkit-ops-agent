@@ -25,7 +25,7 @@ import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { useAppCapabilities, useAppCatalog } from "@/lib/app-catalog"
-import type { BrowserProvider, ProviderStatus } from "@/lib/types"
+import type { BrowserProvider, ConnectRoute, ProviderStatus } from "@/lib/types"
 
 const safeUrl = z.url({ protocol: /^https$/ })
 
@@ -147,6 +147,7 @@ export function NewRunForm({
     capabilitiesUnavailable: Boolean(selectedApp) && appCapabilities.isError,
     accountCreationSupported:
       appCapabilities.data?.account_creation_supported ?? false,
+    connectRoute: appCapabilities.data?.connect_route,
     gmail,
   })
   // Shown only when the toggle is actually usable. A route the agent will
@@ -658,6 +659,7 @@ function accountCreationUnavailableReason({
   capabilitiesPending,
   capabilitiesUnavailable,
   accountCreationSupported,
+  connectRoute,
   gmail,
 }: {
   appName: string
@@ -665,6 +667,7 @@ function accountCreationUnavailableReason({
   capabilitiesPending: boolean
   capabilitiesUnavailable: boolean
   accountCreationSupported: boolean
+  connectRoute: ConnectRoute | null | undefined
   gmail: GmailSignupReadiness
 }): string | null {
   if (!appName.trim()) return "Choose an application to check whether signup is supported."
@@ -672,6 +675,16 @@ function accountCreationUnavailableReason({
   if (capabilitiesPending) return `Checking the reviewed signup route for ${selectedAppName}…`
   if (capabilitiesUnavailable) return `Signup capability for ${selectedAppName} could not be verified.`
   if (!accountCreationSupported) {
+    // Most apps land here, and "no reviewed signup route" is true but useless on
+    // its own — it reads as "this app is broken" when the app in fact connects
+    // perfectly well by another route. Name that route so the operator's next
+    // action is obvious rather than absent.
+    if (connectRoute === "managed_auth") {
+      return `${selectedAppName} connects through Composio's managed OAuth, so there is no signup form to fill in — an account is signed in, not registered. Choose “I have an account” and the agent authorizes it through Composio.`
+    }
+    if (connectRoute === "gated") {
+      return `${selectedAppName} does not offer self-serve registration — access is granted by the vendor (sales, approval, or an invitation). Once you hold an account, choose “I have an account”.`
+    }
     return `${selectedAppName} does not have a reviewed signup route in this deployment.`
   }
   if (!gmail.ready) return gmail.detail

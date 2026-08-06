@@ -1266,6 +1266,13 @@ class AppResearchResponse(StrictApiModel):
     signup_source: Literal["reviewed", "runtime_research", "unavailable"] = "unavailable"
     # The page a reviewed URL was found on, when one is recorded.
     signup_evidence_url: str | None = None
+    # How this app is connected at all, straight off the reviewed recipe's
+    # ``route_kind``. "unavailable" signup and "managed_auth" connect is not a
+    # broken app -- it is an app whose reviewed route is Composio's managed
+    # OAuth, where an account is signed in rather than registered. Without this
+    # the console could only say a signup route was missing, which read as "this
+    # app does not work" for the 36 of 50 apps that connect this way.
+    connect_route: Literal["managed_auth", "playwright", "gated"] | None = None
 
 
 class ModelOptionView(StrictApiModel):

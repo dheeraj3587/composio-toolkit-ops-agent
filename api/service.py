@@ -2253,6 +2253,7 @@ class LocalRunService:
             research=research,
             signup_source=signup_source,
             signup_evidence_url=None,
+            connect_route=recipe.route_kind,
             provenance=SnapshotHealth(
                 verified=True,
                 source_repository=provenance.source_repository,

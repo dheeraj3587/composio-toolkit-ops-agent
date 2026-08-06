@@ -968,4 +968,7 @@ export const appResearchResponseSchema = z.strictObject({
     .nullish()
     .transform((value) => value ?? "unavailable"),
   signup_evidence_url: nullableHttpUrl,
+  // How the app connects at all. Nullish-tolerant for the same reason as
+  // signup_source: an older api that does not send it must still parse.
+  connect_route: z.enum(["managed_auth", "playwright", "gated"]).nullish(),
 })

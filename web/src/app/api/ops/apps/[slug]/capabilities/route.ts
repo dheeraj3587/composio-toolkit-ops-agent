@@ -32,6 +32,11 @@ export async function GET(
         // extraction as a reviewed one.
         signup_source: signupSource,
         signup_evidence_url: result.signup_evidence_url ?? null,
+        // How the app connects when it cannot be signed up for. A managed_auth
+        // app has no signup route by design, and saying only "no reviewed
+        // signup route" left the operator with a dead end instead of the route
+        // the app actually has.
+        connect_route: result.connect_route ?? null,
         reason_code: !accountCreationSupported
           ? "signup_route_unavailable"
           : signupSource === "runtime_research"

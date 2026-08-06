@@ -761,12 +761,18 @@ export interface AppCatalogResponse {
  * differently. */
 export type SignupSource = "reviewed" | "runtime_research" | "unavailable"
 
+/** How an app is connected, from its reviewed recipe. "managed_auth" apps are
+ * connected through Composio's OAuth — an existing account is signed in, never
+ * registered — which is why they legitimately have no signup route. */
+export type ConnectRoute = "managed_auth" | "playwright" | "gated"
+
 export interface AppCapabilitiesResponse {
   app_slug: string
   account_creation_supported: boolean
   signup_source: SignupSource
   /** The page a reviewed URL was cited from, when one is recorded. */
   signup_evidence_url: string | null
+  connect_route: ConnectRoute | null
   reason_code:
     | "reviewed_signup_route"
     | "runtime_research_signup_route"
@@ -779,4 +785,5 @@ export interface AppResearchResponse {
   provenance?: SnapshotHealth | null
   signup_source: SignupSource
   signup_evidence_url?: string | null
+  connect_route?: ConnectRoute | null
 }
