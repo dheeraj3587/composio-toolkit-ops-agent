@@ -152,15 +152,27 @@ def test_edge_runs_read_only_with_only_the_bind_service_capability() -> None:
 def test_api_does_not_receive_browser_only_credentials() -> None:
     environment = _compose()["services"]["api"]["environment"]
 
-    for name in (
-        "BROWSER_STORAGE_STATE_KEY",
-        "CEREBRAS_API_KEY",
-        "GROQ_API_KEY",
-        # Mercury leads the browser-decision chain, so like the other decision
-        # providers its key belongs to browser-worker, not the control plane.
+    # Chromium storage encryption only. It decrypts captured session state at
+    # rest, the API image has no reader for it, and the API does not mount the
+    # volume it protects.
+    assert environment["BROWSER_STORAGE_STATE_KEY"] == ""
+
+    # The inference credentials are NOT browser-only and are no longer blanked
+    # here. The API plans runs, composes outreach and extracts research on this
+    # chain, and it derives the operator's model catalog from these same keys —
+    # blanking them made the catalog omit the deployment's preferred providers
+    # and 422 any run that pinned one, while OpenRouter and Gemini reached the
+    # container unscrubbed through env_file the whole time.
+    #
+    # Absent, not re-declared: `environment:` outranks `env_file:`, so spelling
+    # them here as ${MERCURY_API_KEY:-} would blank the chain again under any
+    # compose invocation that did not pass --env-file .env.production.
+    for supplied_by_env_file in (
         "MERCURY_API_KEY",
+        "GROQ_API_KEY",
+        "CEREBRAS_API_KEY",
     ):
-        assert environment[name] == ""
+        assert supplied_by_env_file not in environment
 
     # There used to be one exception: the metered cloud adapter ran off-host, so
     # its key had to live in the control plane. Removing that backend removed the

@@ -1233,12 +1233,14 @@ for name in (
 ):
     if api.get(name):
         raise SystemExit(f"{name} must not be available to the API container")
-for name in (
-    "BROWSER_STORAGE_STATE_KEY",
-    "CEREBRAS_API_KEY",
-    "GROQ_API_KEY",
-    "MERCURY_API_KEY",
-):
+# Only the Chromium storage key. The three inference credentials that used to sit
+# in this tuple - Mercury, Groq, Cerebras - belong to the control plane too: the
+# API plans runs, composes outreach and extracts research on them, and it serves
+# the model catalog operators pick from. Refusing them here made that catalog omit
+# the three providers this deployment prefers, while OpenRouter and Gemini, the
+# same class of key, passed through env_file untouched.
+# NOTE: this whole block is a single-quoted shell string. No apostrophes.
+for name in ("BROWSER_STORAGE_STATE_KEY",):
     if api.get(name):
         raise SystemExit(f"{name} must not be available to the API container")
 if not services["browser-worker"]["environment"].get("MERCURY_MODEL"):

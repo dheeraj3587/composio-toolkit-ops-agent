@@ -1423,11 +1423,14 @@ def test_release_scripts_declare_drain_backup_and_immutable_helper_contracts() -
     assert "env" in deploy
     assert "-i" in deploy
     assert "COMPOSE_*" in deploy
+    # Chromium storage encryption and the removed cloud-browser key are what the
+    # API container must still never hold. The inference credentials that used to
+    # be listed alongside them are the control plane's own chain — the API plans,
+    # composes outreach, extracts research and builds the operator's model catalog
+    # on them — so the deploy gate no longer refuses them and no longer names them.
     for browser_only_name in (
         "BROWSER_STORAGE_STATE_KEY",
         "BROWSER_USE_API_KEY",
-        "CEREBRAS_API_KEY",
-        "GROQ_API_KEY",
     ):
         assert browser_only_name in deploy
     assert "restore_previous_release" in deploy

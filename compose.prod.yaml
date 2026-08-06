@@ -56,13 +56,40 @@ services:
       OPS_AUTH_PASSWORD: ""
       OPS_AUTH_SESSION_SECRET: ""
       OPS_AUTH_TOTP_SECRET: ""
-      # Browser-only credentials stay out of the control plane. The API uses the
-      # isolated RPC client in production, so it has no reason to hold Chromium
-      # storage encryption or browser-decision-provider credentials.
+      # Chromium storage encryption stays out of the control plane. This key
+      # decrypts captured session state at rest; the API image has no reader for
+      # it and does not mount the volume it protects, so holding it would be pure
+      # blast radius.
       BROWSER_STORAGE_STATE_KEY: ""
-      CEREBRAS_API_KEY: ""
-      GROQ_API_KEY: ""
-      MERCURY_API_KEY: ""
+      # These three used to be blanked here too, alongside it, as "browser-
+      # decision-provider credentials". That was true when the only thing they
+      # answered was the action loop's per-page decision, which runs inside
+      # browser-worker. It is no longer true: Mercury leads the chain for the
+      # outreach email loop, the run planner and the research extractor, and all
+      # three run in THIS container. The scrub also silently broke the operator's
+      # model picker, because the catalog and the per-run `decision_model`
+      # refusal are both computed from the API's own settings — so Mercury, Groq
+      # and Cerebras could never be listed or pinned even though browser-worker
+      # was the container holding their keys and would have executed them.
+      #
+      # It was never a class boundary either: OPENROUTER_API_KEY and
+      # GOOGLE_GENAI_API_KEY — the same kind of vendor bearer token, the next two
+      # links in the same chain — arrive here unscrubbed through env_file, as
+      # does PERPLEXITY_API_KEY, and YDC_API_KEY is granted outright below. The
+      # scrub blanked three of five members of one class. The API already holds
+      # the vault Fernet key and the checkpoint AES key, both of which the deploy
+      # gate forbids browser-worker from seeing; the trust gradient runs the
+      # other way.
+      #
+      # So they are simply absent from this block now, and arrive through
+      # env_file exactly as the other two links do. Re-declaring them here as
+      # ${MERCURY_API_KEY:-} would read more explicitly but reintroduce the bug
+      # it is meant to fix: `environment:` outranks `env_file:`, and ${...}
+      # interpolates from whatever --env-file the invocation passed. A compose
+      # command run without --env-file .env.production would resolve them to the
+      # empty string and blank the primary provider all over again, silently.
+      # Model ids and the reasoning dial default in ops/core/config.py, so
+      # nothing here needs to restate them.
       # Owner-only credential submission / autonomous-login / reveal are gated by
       # this flag. It MUST be true for those operator actions to work; default
       # false keeps them disabled until explicitly enabled.

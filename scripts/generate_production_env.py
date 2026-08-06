@@ -46,6 +46,14 @@ COPY_FROM_LOCAL = frozenset(
         "CEREBRAS_MODEL",
         "GROQ_API_KEY",
         "GROQ_MODEL",
+        # Mercury leads every inference chain in this system, and it was the one
+        # provider this set left out — so a key added to .env was dropped on the
+        # next regeneration and reported as "left at template defaults" rather
+        # than as missing. The deployment then ran its primary provider blank and
+        # silently started at the second one.
+        "MERCURY_API_KEY",
+        "MERCURY_MODEL",
+        "MERCURY_REASONING_EFFORT",
         "COMPOSIO_API_KEY",
         "COMPOSIO_USER_ID",
         "COMPOSIO_GMAIL_API_KEY",
