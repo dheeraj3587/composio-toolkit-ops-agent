@@ -431,23 +431,30 @@ class PerplexitySearchDiscovery:
 class StructuredExtractor:
     """Turns an evidence pack into an :class:`OperationalResearch` record.
 
-    Gemini first, when a key is configured: the current public async client
-    (``client.aio.models.generate_content``) with a strict JSON schema and a
-    pinned production model. Then ``fallback`` — the deployment's ordinary
-    inference chain, which leads with Mercury — over a compacted copy of the same
-    evidence.
+    The deployment's own inference chain first — ``ops.core.inference`` ordered
+    Mercury, Groq, Cerebras, OpenRouter, Gemini — over a compacted copy of the
+    evidence, with the JSON schema rendered into the prompt. Then Gemini
+    directly, when a key is configured: the current public async client
+    (``client.aio.models.generate_content``) with a strict ``response_json_schema``
+    and a pinned production model, over the uncompacted evidence.
 
-    Either source may be absent. With no Gemini key the Gemini loop is skipped
-    entirely and the chain does the extraction, which is what lets a
-    Mercury-only deployment research at all; with no ``fallback`` a Gemini outage
-    is terminal, as it always was. Both absent is a construction error, because
-    nothing would be left to ask.
+    That order used to be the other way round, from when Gemini was the only
+    thing this class could use and the chain was added underneath it. Keeping
+    it meant every deployment with a Gemini key researched on Gemini no matter
+    what its primary model was — the one model-answered task in the system that
+    Mercury led on paper and never actually answered. Gemini is now what the
+    chain falls back to rather than what it defers to, and it remains the
+    stricter of the two on schema adherence, which is a better use for a second
+    attempt than a first one.
 
-    This class was called ``GeminiStructuredExtractor`` while Gemini was the only
-    thing it could use. The returned JSON is validated by Pydantic whichever
-    source produced it, and the enricher separately rejects any evidence/scope URL
-    outside the fetched pack, so no model here can inject a fabricated URL, scope,
-    or identity.
+    Either source may be absent. With no provider keys there is no chain and
+    Gemini does the extraction alone, exactly as it always did; with no Gemini
+    key a chain failure is terminal. Both absent is a construction error,
+    because nothing would be left to ask.
+
+    The returned JSON is validated by Pydantic whichever source produced it, and
+    the enricher separately rejects any evidence/scope URL outside the fetched
+    pack, so no model here can inject a fabricated URL, scope, or identity.
     """
 
     def __init__(
@@ -455,7 +462,7 @@ class StructuredExtractor:
         api_key: SecretStr | str | None,
         *,
         model: str | Sequence[str] = "gemini-3.6-flash",
-        fallback: JsonInference | None = None,
+        inference: JsonInference | None = None,
     ) -> None:
         if api_key is None:
             self._api_key: SecretStr | None = None
@@ -466,9 +473,9 @@ class StructuredExtractor:
             self._models = tuple(dict.fromkeys(name for name in models if name))
             if not self._models:
                 raise ValueError("at least one Gemini model id is required")
-        if not self._models and fallback is None:
-            raise ValueError("a Gemini key or a fallback inference chain is required")
-        self._fallback = fallback
+        if not self._models and inference is None:
+            raise ValueError("a Gemini key or an inference chain is required")
+        self._inference = inference
         # The model that actually produced the last successful response.
         self.model_used: str | None = None
 
@@ -479,8 +486,41 @@ class StructuredExtractor:
         p1_record: Mapping[str, object],
         documents: tuple[EvidenceDocument, ...],
     ) -> OperationalResearch:
-        prompt = _render_extraction_prompt(app_name, p1_record, documents)
         last_error: Exception | None = None
+
+        if self._inference is not None:
+            schema = OperationalResearch.model_json_schema()
+            compact_documents = tuple(
+                document.model_copy(
+                    update={"relevant_text": _compact_extraction_evidence(document.relevant_text)}
+                )
+                for document in documents
+            )
+            compact_prompt = _render_extraction_prompt(
+                app_name,
+                p1_record,
+                compact_documents,
+            )
+            chain_prompt = (
+                f"{compact_prompt}\n\nJSON SCHEMA\n"
+                f"{json.dumps(schema, separators=(',', ':'), sort_keys=True)}"
+            )
+            try:
+                result = await asyncio.to_thread(
+                    self._inference.generate,
+                    chain_prompt,
+                    schema=None,
+                    validate=OperationalResearch.model_validate,
+                )
+            except (TypeError, AttributeError, NameError, ImportError):
+                raise
+            except Exception as exc:
+                last_error = exc
+            else:
+                self.model_used = result.provider
+                return OperationalResearch.model_validate(result.payload)
+
+        prompt = _render_extraction_prompt(app_name, p1_record, documents)
         client: Any = None
         config: Any = None
         if self._models and self._api_key is not None:
@@ -525,48 +565,17 @@ class StructuredExtractor:
                 continue
             self.model_used = model
             return parsed
-        if self._fallback is not None:
-            schema = OperationalResearch.model_json_schema()
-            compact_documents = tuple(
-                document.model_copy(
-                    update={"relevant_text": _compact_extraction_evidence(document.relevant_text)}
-                )
-                for document in documents
-            )
-            compact_prompt = _render_extraction_prompt(
-                app_name,
-                p1_record,
-                compact_documents,
-            )
-            fallback_prompt = (
-                f"{compact_prompt}\n\nJSON SCHEMA\n"
-                f"{json.dumps(schema, separators=(',', ':'), sort_keys=True)}"
-            )
-            try:
-                result = await asyncio.to_thread(
-                    self._fallback.generate,
-                    fallback_prompt,
-                    schema=None,
-                    validate=OperationalResearch.model_validate,
-                )
-            except (TypeError, AttributeError, NameError, ImportError):
-                raise
-            except Exception as exc:
-                last_error = exc
-            else:
-                self.model_used = result.provider
-                return OperationalResearch.model_validate(result.payload)
-        # Name what was actually tried. With no Gemini key ``_models`` is empty,
-        # and the old message read "all structured extractors failed ()" — which
-        # says nothing about the chain that did the work and failed.
-        tried = [*self._models]
-        if self._fallback is not None:
-            tried.append("inference chain")
+        # Name what was actually tried, in the order it was tried. With no
+        # Gemini key ``_models`` is empty, and the old message read "all
+        # structured extractors failed ()" — which says nothing about the chain
+        # that did the work and failed.
+        tried = ["inference chain"] if self._inference is not None else []
+        tried.extend(self._models)
         raise RuntimeError(f"all structured extractors failed ({', '.join(tried)})") from last_error
 
 
 def _compact_extraction_evidence(text: str, *, limit: int = 6_000) -> str:
-    """Keep URL/auth/onboarding evidence windows for bounded fallback inference."""
+    """Keep URL/auth/onboarding evidence windows for bounded chain inference."""
 
     if len(text) <= limit:
         return text

@@ -1000,31 +1000,30 @@ class RunService:
         optional, disabled by default, and only ever supplies MORE candidate
         pages for the SAME canonical extraction below.
 
-        Two things about the extraction model changed together.
-        ``build_json_inference`` — the Mercury-first chain the browser decider
-        runs on — is now passed as the extractor's ``fallback``. That parameter
-        has existed since the extractor was written and nothing ever supplied it,
-        so a Gemini outage ended research outright even with four other providers
-        configured. And the gate below is no longer "Gemini or nothing": a
-        deployment with a Mercury key and no Gemini key used to get no enricher at
-        all, which is the only reason research could not run on Mercury.
+        The extraction model is the deployment's own chain. ``build_json_inference``
+        — the Mercury-first chain the browser decider runs on — is what the
+        extractor asks first, and the Gemini key it also takes is the fallback
+        behind it. Research was the last model-answered task in this system still
+        answered by a different provider than every other one, and it was answered
+        that way in every deployment with a Gemini key regardless of what the
+        deployment's primary model was. The gate is correspondingly no longer
+        "Gemini or nothing": a Mercury key alone builds an enricher.
 
-        Still backward-compatible: with ``GOOGLE_GENAI_API_KEY`` set and
-        ``YDC_API_KEY`` absent this builds the EXACT pre-existing Perplexity +
-        guarded-HTTP wiring, Gemini still extracts first, and
+        Still backward-compatible in wiring: with ``YDC_API_KEY`` absent this
+        builds the EXACT pre-existing Perplexity + guarded-HTTP pipeline and
         ``OperationalResearchEnricher`` runs its original code path unchanged.
         """
 
         # Same chain, same order, as the browser decision loop: Mercury, Groq,
         # Cerebras, OpenRouter, Gemini. ``None`` when no provider key is set.
-        fallback = build_json_inference(settings)
-        if settings.google_genai_api_key is None and fallback is None:
+        inference = build_json_inference(settings)
+        if settings.google_genai_api_key is None and inference is None:
             return None
 
         extractor = StructuredExtractor(
             settings.google_genai_api_key,
             model=settings.gemini_model_chain,
-            fallback=fallback,
+            inference=inference,
         )
         self._http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(20.0, connect=10.0),

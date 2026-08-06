@@ -176,8 +176,11 @@ class Settings(BaseModel):
         ordered = [self.gemini_model, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"]
         return tuple(dict.fromkeys(model for model in ordered if model))
 
-    # OpenRouter is the primary LLM for the email loop (compose/classify/reply);
-    # Gemini is the fallback. The model is a free OpenRouter model by default.
+    # OpenRouter is the email loop's (compose/classify/reply) second choice, not
+    # its first: ``ops.email.ai.build_email_assistant`` puts Mercury in front of
+    # it and Gemini behind it, the same order ``build_json_inference`` uses. This
+    # comment still said "primary" from when the chain was OpenRouter then Gemini.
+    # The model is a free OpenRouter model by default.
     openrouter_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
     # Free-tier browser-decision models. Both providers are OpenAI-compatible but

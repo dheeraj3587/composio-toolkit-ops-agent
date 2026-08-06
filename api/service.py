@@ -2906,9 +2906,19 @@ class LocalRunService:
                 ),
             )
         requirements = {
-            "research": bool(
-                self._settings.perplexity_api_key and self._settings.google_genai_api_key
-            ),
+            # A research retry needs an evidence source and a model to read it
+            # with, which is the pair ``RunService._build_research_enricher``
+            # actually builds from. It used to name two specific vendors —
+            # Perplexity AND Gemini — and both halves have since stopped being
+            # the only option: You.com Search discovers evidence when it is
+            # enabled, and extraction runs on the deployment's own Mercury-first
+            # chain with Gemini behind it. A Mercury-and-You.com deployment
+            # researches perfectly well and was still told its retry needed
+            # configuration. ``available_models`` is empty under exactly the
+            # condition that makes ``build_json_inference`` return ``None``, so
+            # it is the same test without constructing any provider client here.
+            "research": bool(available_models(self._settings))
+            and bool(self._settings.perplexity_api_key or self._settings.you_search_configured),
             # Provider-aware retry eligibility (no Browser Use key for Playwright).
             "browser": browser_configuration_state(
                 self._settings,

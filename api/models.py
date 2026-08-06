@@ -306,7 +306,7 @@ class CreateRunRequest(StrictApiModel):
     # search phrase, so a hint cannot smuggle prose into the research prompt.
     provider_hint_url: BoundedHttpUrl | None = None
     # The decision model this run is pinned to, as a catalog id from
-    # ``GET /ops/models`` (``"<provider>:<model>"``), and the reasoning effort it
+    # ``GET /api/models`` (``"<provider>:<model>"``), and the reasoning effort it
     # runs at. Shape is checked here; whether the id names a provider THIS
     # deployment has a key for is checked at the route, where the settings the
     # catalog is derived from are in hand. Both absent is the ordinary case and
