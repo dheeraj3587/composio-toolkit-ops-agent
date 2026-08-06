@@ -63,6 +63,19 @@ _PUBLIC_RUN_FIELDS = (
     "phase",
     "reason_code",
     "state_engine",
+    # The pinned model and reasoning effort, which the run really does execute
+    # on: ops/workflow/canonical_runtime.py reads the raw storage row and hands
+    # the pin to the worker. They were missing here, so the projection that
+    # feeds GET /api/runs/{id}/timeline returned None for both and the console
+    # rendered the literal "Deployment default" for every run — including one
+    # pinned to mercury:mercury-2 at effort high. An operator could not tell a
+    # pinned run from an unpinned one, which is the exact confusion the
+    # refuse-do-not-substitute design in api/service.py exists to prevent.
+    # Both are _safe_text-bounded on write in ops/core/storage.py and are
+    # validated against the model catalog before they are stored, so neither
+    # can carry secret or free-form material.
+    "decision_model",
+    "decision_effort",
 )
 
 

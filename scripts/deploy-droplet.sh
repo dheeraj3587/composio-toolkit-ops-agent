@@ -1243,8 +1243,24 @@ for name in (
 for name in ("BROWSER_STORAGE_STATE_KEY",):
     if api.get(name):
         raise SystemExit(f"{name} must not be available to the API container")
-if not services["browser-worker"]["environment"].get("MERCURY_MODEL"):
-    raise SystemExit("MERCURY_MODEL must be available to browser-worker")
+# Mercury leads every inference chain in this deployment, so a release that
+# cannot reach it is a release running on its second choice. This used to assert
+# MERCURY_MODEL, which can never be missing: compose declares it as
+# ${MERCURY_MODEL:-mercury-2}, and ${VAR:-default} substitutes for unset AND
+# empty, so the rendered value is never falsy and the gate could never fire. The
+# variable that actually decides whether Mercury is in the chain is the key, and
+# it was unchecked. browser-worker has no env_file at all - its only source is
+# the ${MERCURY_API_KEY:-} interpolation - so a rotated, renamed or mistyped key
+# renders as an empty string, Settings drops it for not being a SecretStr, and
+# the browser action loop silently answers on Groq with nothing in the deploy
+# log. Assert the key in BOTH containers: four of the five model-answered tasks
+# (run planner, onboarding decider, research extractor, outreach email loop) run
+# in the API, and only the action loop runs in browser-worker.
+for service_name in ("api", "browser-worker"):
+    if not services[service_name]["environment"].get("MERCURY_API_KEY"):
+        raise SystemExit(f"MERCURY_API_KEY must be available to {service_name}")
+    if not services[service_name]["environment"].get("MERCURY_MODEL"):
+        raise SystemExit(f"MERCURY_MODEL must be available to {service_name}")
 # The Browser Use cloud adapter is gone, so its key is no longer a supported
 # input. Refuse it outright rather than ignoring it: a key still present in
 # .env.production means the operator believes a remote backend is in play, and

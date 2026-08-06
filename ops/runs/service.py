@@ -27,7 +27,7 @@ from pydantic import SecretStr
 from ops.browser.provider import BrowserProvider as BrowserWorker
 from ops.core.config import Settings
 from ops.core.effect_ledger import SQLiteEffectStore
-from ops.core.inference import build_json_inference
+from ops.core.inference import DecisionBudget, build_json_inference
 from ops.core.model_catalog import ModelSelection
 from ops.core.models import (
     CapabilityAvailability,
@@ -1016,7 +1016,25 @@ class RunService:
 
         # Same chain, same order, as the browser decision loop: Mercury, Groq,
         # Cerebras, OpenRouter, Gemini. ``None`` when no provider key is set.
-        inference = build_json_inference(settings)
+        #
+        # Sized for extraction, not for a page decision. The defaults exist to
+        # stop ONE browser-loop decision eating the loop's budget: 1,024 output
+        # tokens and 15 seconds across at most 3 providers. An
+        # ``OperationalResearch`` record is a different shape of answer — a
+        # multi-scope OAuth app with the per-URL claims the enricher requires
+        # measures well past 1,024 tokens once the model pretty-prints it. On
+        # the old caps Mercury answered first and correctly and was then cut
+        # mid-JSON, Groq and Cerebras truncated identically, ``max_providers=3``
+        # ended the chain before the in-chain Gemini, and the extractor fell
+        # through to its own uncapped direct Gemini call — handing research back
+        # to Gemini, which is precisely what putting the chain first was meant
+        # to stop. Gemini's own extraction path already runs uncapped with a 45s
+        # timeout, so this only gives the chain the same room it has.
+        inference = build_json_inference(
+            settings,
+            budget=DecisionBudget(total_seconds=90.0, provider_seconds=45.0, max_providers=3),
+            max_completion_tokens=8192,
+        )
         if settings.google_genai_api_key is None and inference is None:
             return None
 
