@@ -1937,8 +1937,22 @@ class OperationsStorage:
             connection.executescript(_DECISION_ATTEMPTS_DDL)
             connection.executescript(_STEP_DECISIONS_DDL)
             for column_name, declaration in migration_columns.items():
-                if column_name not in existing_columns:
+                if column_name in existing_columns:
+                    continue
+                try:
                     connection.execute(f"ALTER TABLE runs ADD COLUMN {column_name} {declaration}")
+                except sqlite3.OperationalError:
+                    # ``existing_columns`` was read before this statement, so another
+                    # process opening the same database can add the column in between
+                    # and leave our snapshot stale. That is the migration succeeding,
+                    # not failing -- but only if the column is genuinely there now, so
+                    # re-read rather than swallow every OperationalError.
+                    current = {
+                        str(row[1])
+                        for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+                    }
+                    if column_name not in current:
+                        raise
             # After the ALTER migrations, so the rebuilt table carries the columns the
             # database ended up with, and before the index below, which the rebuild
             # drops along with the table it belongs to.
