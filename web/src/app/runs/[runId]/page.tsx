@@ -128,6 +128,14 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
     !isPlanOnly &&
     ["outreach_sent", "waiting_for_reply"].includes(detail.run.status)
   const canPoll = canPollOutreach
+  // The controlled-sink send. The backend is the only authority for it: it is
+  // offered when, and only when, the projected primary action is the gated
+  // outreach review AND that projection is enabled (contact route reviewed and
+  // controlled outreach configured). Nothing here fires it -- the operator does.
+  const canSendOutreach =
+    !isPlanOnly &&
+    primaryAction?.kind === "review_outreach" &&
+    primaryAction.enabled
   const missingFields = Array.from(new Set([
     ...(detail.missing_fields ?? []),
     ...(detail.research?.missing_fields ?? []),
@@ -291,6 +299,17 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
                 <p className="text-xs leading-5 text-muted-foreground">
                   The connected inbox is being checked automatically. Use the verification action beside the live browser to check immediately.
                 </p>
+              ) : canSendOutreach ? (
+                <div className="space-y-3">
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    The reviewed contact route is authorized. Sending delivers one real message through the controlled sink; it is not sent until you submit.
+                  </p>
+                  <PhaseActionForm
+                    runId={runId}
+                    action="outreach"
+                    label="Send reviewed outreach"
+                  />
+                </div>
               ) : canPoll ? (
                 <PhaseActionForm
                   runId={runId}

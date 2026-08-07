@@ -198,6 +198,9 @@ configuration load rather than silently replaced with defaults.
 | `ONBOARDING_TAKEOVER_ENABLED` | `true` | boolean | Enables observation-only autonomous continuation after a human clears a gate. This is not a live-capability flag and remains gated by startup automation and deployment acceptance. |
 | `ONBOARDING_TAKEOVER_INTERVAL_SECONDS` | `5` | 1–30 seconds | Maximum interval between clearance polls for an attached paused run. |
 | `ONBOARDING_TAKEOVER_PROBE_TIMEOUT_SECONDS` | `5.0` | 1.0–15.0 seconds | Bounds one clearance probe; a timeout keeps the run waiting rather than treating the gate as cleared. |
+| `ONBOARDING_WORKER_ENABLED` | `true` | boolean | Enables the queue pump that claims and drives runs created with `onboarding: true`. It never touches a run nobody enqueued, and stays gated by startup automation and deployment acceptance. |
+| `ONBOARDING_WORKER_INTERVAL_SECONDS` | `5` | 1–60 seconds | How long the pump waits after it finds the onboarding queue empty. Claim jitter is added on top. |
+| `ONBOARDING_WORKER_MAX_CONCURRENT_RUNS` | `3` | 1–10 runs | How many onboarding runs one worker process drives at once. Each holds one browser container for the length of a phase. |
 | `ONBOARDING_PROGRESS_STALE_SECONDS` | `180` | 30–1800 seconds | Marks a non-terminal, non-waiting run stale after this long without progress. |
 | `ONBOARDING_PROGRESS_WINDOW` | `50` | 1–200 events | Caps the newest-first progress events returned with a run timeline. |
 | `ONBOARDING_STEP_OBSERVE_TIMEOUT_SECONDS` | `20` | 5–60 seconds | Deadline for the observation step of one browser operation. |

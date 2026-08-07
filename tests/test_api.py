@@ -186,6 +186,7 @@ def test_exact_requested_routes_are_registered(harness: ApiHarness) -> None:
     assert routes == {
         ("/api/runs", "POST"),
         ("/api/runs", "GET"),
+        ("/api/runs/batch", "POST"),
         ("/api/runs/{run_id}", "GET"),
         ("/api/runs/{run_id}/timeline", "GET"),
         ("/api/runs/{run_id}/resume", "POST"),
@@ -203,7 +204,11 @@ def test_exact_requested_routes_are_registered(harness: ApiHarness) -> None:
         ("/api/runs/{run_id}/retry", "POST"),
         ("/api/runs/{run_id}/output", "GET"),
         # The onboarding operator surface (design LL-6.3). Every one requires the
-        # internal token and the owner gate.
+        # internal token and the trusted-caller (agent) gate; none of them carries
+        # credential material. They were moved off the OWNER gate deliberately:
+        # that gate additionally demands ALLOW_LOCAL_CREDENTIAL_SUBMISSION, which
+        # authorizes handing the deployment a raw secret -- a different question
+        # from whether an operator may press "Connect account" (api/app.py:689).
         ("/api/runs/{run_id}/decision", "POST"),
         ("/api/runs/{run_id}/pause", "POST"),
         ("/api/runs/{run_id}/reset", "POST"),
@@ -743,4 +748,8 @@ def test_app_catalog_lists_every_reviewed_runnable_app(harness: ApiHarness) -> N
         "buildability",
         "verification_status",
         "confidence",
+        # The reviewed recipe's own readiness claim. Non-secret and already public
+        # on RunSummary; the catalog needs it so a batch can be picked by how far
+        # the agent gets unattended.
+        "readiness_tier",
     }

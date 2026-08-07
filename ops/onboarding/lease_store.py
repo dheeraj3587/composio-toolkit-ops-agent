@@ -325,6 +325,17 @@ class SQLiteRunQueue(_LedgerDatabase):
             ).fetchall()
         return tuple(str(row[0]) for row in rows)
 
+    def remove(self, *, run_id: str) -> bool:
+        """Drop the run from the queue; ``False`` when it was not queued."""
+
+        run = _identifier(run_id, field="run id")
+        with self._write() as connection:
+            cursor = connection.execute("DELETE FROM onboarding_queue WHERE run_id = ?", (run,))
+            # Reported rather than only logged, for the same reason
+            # ``release`` reports its no-op: a caller that believes it settled a
+            # run it never had should be able to see that it did not.
+            return cursor.rowcount > 0
+
     def defer(self, *, run_id: str, not_before: str) -> None:
         """Move the run's ready time to ``not_before``; the phase is untouched."""
 

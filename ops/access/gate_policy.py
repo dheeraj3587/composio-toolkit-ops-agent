@@ -104,6 +104,11 @@ HUMAN_ONLY_GATES: frozenset[str] = frozenset(
         "device_approval",
         "billing",
         "provider_verification",
+        # Granting one application access to an account is a scope decision about
+        # someone else's data, not a terms acceptance, so it does not inherit
+        # legal_acceptance's recipe-declared resolution. Phase 7B revisits this
+        # for the managed-auth OAuth routes; until then it stays human-only.
+        "oauth_grant",
         # Autonomous account choice needs a reviewed, unambiguous recipe selector.
         # No recipe declares one yet, so choosing would be a guess about which
         # tenant to onboard.

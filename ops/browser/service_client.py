@@ -20,7 +20,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, get_args
@@ -41,7 +41,13 @@ from ops.browser.session_capability import (
 from ops.browser.setup_values import normalize_browser_setup_fields
 from ops.browser.signup import normalize_signup_fields
 from ops.browser.takeover import ClearanceObservation, ClearanceProbeReason
-from ops.browser.worker import BrowserObservation, BrowserSessionContext, HumanActionType
+from ops.browser.worker import (
+    MAX_OBSERVATION_STEPS,
+    BrowserObservation,
+    BrowserSessionContext,
+    BrowserStepRecord,
+    HumanActionType,
+)
 from ops.core.models import validate_vault_reference
 from ops.core.secret_store import parse_vault_reference
 from ops.providers.errors import ConfigurationRequiredError, ProviderOperationError
@@ -109,6 +115,76 @@ class BrowserServiceHealth:
     capacity_total: int = 0
     capacity_in_use: int = 0
     janitor_running: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteObservation:
+    """One reading of a remote page, in the shape the action loop consumes.
+
+    ``raw_elements`` deliberately arrives as per-element MAPPINGS rather than as
+    ``SnapshotElement`` objects, because the loop owns the projection: passing
+    them through ``build_snapshot`` is what strips values and marks secret-ish
+    fields, and a session implementation must not be able to skip that step.
+
+    A qualification worth stating, because it is the one place this differs from
+    an in-process observation: the mappings are rebuilt from elements the SERVICE
+    already projected. The browser container is the DLP boundary — page-derived
+    text is sanitized there, at the single source, and genuinely raw element data
+    is never put on the wire. Re-projecting here is therefore idempotent rather
+    than protective, and it is done anyway so the loop's guarantee holds for a
+    remote session exactly as it does for a local one.
+    """
+
+    url: str
+    title: str
+    visible_text: str
+    generation: int
+    fingerprint: str = ""
+    raw_elements: tuple[Mapping[str, object], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteActionOutcome:
+    """The typed result of one remote action, plus whether it was even attempted.
+
+    ``reached_service`` is separate from ``status`` because "the action was
+    refused" and "the request never arrived" call for opposite responses: the
+    first is information the planner should act on, the second means the planner
+    knows nothing and must not record an attempt. Collapsing an unreachable
+    service into ``failed`` would have the loop count a denial that never
+    happened and move on from a page it never touched.
+    """
+
+    status: Literal["executed", "stale", "blocked", "failed"]
+    candidate_id: str
+    before_url: str = ""
+    after_url: str = ""
+    before_generation: int = 0
+    after_generation: int = 0
+    reason_code: str | None = None
+    expected_selected_label: str | None = None
+    reached_service: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteCredentialSurface:
+    """Whether capture may run, and whether a human may still watch.
+
+    Two facts rather than one because they are not the same question and they
+    move in opposite directions: arming the surface is what REVOKES live pixels,
+    and a proven release is what gives them back. A caller deciding whether to
+    hand the run to a person reads ``live_view_allowed``; a caller deciding
+    whether to attempt capture reads ``armed``.
+
+    ``reached_service`` carries the same meaning it does on
+    :class:`RemoteActionOutcome`: false means nothing was read, so neither flag
+    describes the session and the caller must not act on them.
+    """
+
+    armed: bool
+    live_view_allowed: bool
+    reason_code: str = ""
+    reached_service: bool = True
 
 
 class BrowserServiceClient:
@@ -263,11 +339,20 @@ class BrowserServiceClient:
         run_id: str | None = None,
         decision_model: str | None = None,
         decision_effort: str | None = None,
+        setup_fields: Mapping[str, str] | None = None,
+        allowed_host_patterns: Sequence[str] | None = None,
     ) -> BrowserSessionContext:
         resolved_slug = app_slug or "unknown"
         # The run's allow-list travels as the flat pattern list plus the app slug,
         # and the service rebuilds it on the other side. Nothing ad-hoc crosses.
         patterns: tuple[str, ...] = ()
+        if allowed_hosts is None and allowed_host_patterns:
+            # The already-flat form, for a caller holding patterns rather than a
+            # built ``BrowserAllowedHosts`` — a route derived from a committed
+            # profile rather than a checked-in recipe. The service re-validates
+            # them exactly as it does the built form, so this is a second way to
+            # SAY the allow-list, not a way to skip it.
+            patterns = tuple(allowed_host_patterns)
         if allowed_hosts is not None:
             if allowed_hosts.app_slug != resolved_slug:
                 raise ProviderOperationError(
@@ -300,6 +385,12 @@ class BrowserServiceClient:
             body["recipe_snapshot"] = (
                 recipe.model_dump(mode="json") if hasattr(recipe, "model_dump") else recipe
             )
+        # The run's approved non-secret value map, seeded onto the session so it is
+        # drivable through observe/act without a ``navigate`` first. Sent only when
+        # non-empty, so a service that predates the field sees exactly the body it
+        # always saw rather than an unknown key its strict models would reject.
+        if setup_fields:
+            body["setup_fields"] = dict(setup_fields)
         try:
             response = await self._request(
                 "POST",
@@ -535,6 +626,7 @@ class BrowserServiceClient:
             non_secret_notes=tuple(payload.get("non_secret_notes") or ()),
             reason_code=payload.get("reason_code"),
             hitl_generation=hitl_generation,
+            steps=_parse_steps(payload.get("steps")),
         )
 
     async def auto_capture_credentials(
@@ -645,6 +737,293 @@ class BrowserServiceClient:
         payload = response.json()
         lifecycle = str(payload.get("lifecycle") or "")
         return lifecycle == "ACTIVE", lifecycle.casefold() or "unknown"
+
+    async def retain_session(
+        self, session_id: str, *, event: str, capability_scope: str
+    ) -> tuple[bool, str]:
+        """Tell the service a parked session is still wanted. ``(retained, reason)``.
+
+        Never raises into the caller. Retention is something a run does WHILE it
+        waits — for an email, for a human to clear a gate, for the API to come
+        back — so a failure to say "still here" must not itself end the wait. The
+        worst outcome of a false return is the session ageing out on the idle
+        clock, which is exactly what happened on every one of these waits before
+        the route existed.
+        """
+
+        try:
+            response = await self._request(
+                "POST",
+                f"/internal/browser/sessions/{session_id}/retain",
+                json_body={"event": event},
+                timeout=15.0,
+                capability_scope=capability_scope,
+            )
+        except (TypeError, AttributeError, AssertionError, NameError):
+            raise  # a programming error must surface, never look like a service answer
+        except Exception:
+            return False, "browser_service_unreachable"
+        if response.status_code == 404:
+            return False, "session_not_found"
+        if response.status_code >= 400:
+            return False, self._reason(response)
+        return True, event
+
+    async def observe_session(self, session_id: str, *, capability_scope: str) -> RemoteObservation:
+        """Read the remote page once, taking no action and making no decision.
+
+        The observe half of the pair that lets a planner in THIS process drive a
+        browser in another one a single step at a time. Before it existed the
+        client had ``navigate`` and ``resume``, each of which started a closed loop
+        inside the container — inspect, call a model, act, repeat — so there was no
+        way to look at a page, think, and then do one thing.
+
+        Raises rather than returning a sentinel: an observation that did not happen
+        is not an observation, and a caller that continued on an empty one would be
+        planning against a page it has never seen.
+        """
+
+        try:
+            response = await self._request(
+                "POST",
+                f"/internal/browser/sessions/{session_id}/observe",
+                timeout=self._timeout,
+                capability_scope=capability_scope,
+            )
+        except httpx.RequestError:
+            raise ProviderOperationError(
+                capability="browser observation",
+                reason_code="browser_service_unreachable",
+            ) from None
+        if response.status_code >= 400:
+            raise ProviderOperationError(
+                capability="browser observation",
+                reason_code=self._reason(response),
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            raise ProviderOperationError(
+                capability="browser observation",
+                reason_code="browser_service_invalid_response",
+            ) from None
+        if not isinstance(payload, Mapping):
+            raise ProviderOperationError(
+                capability="browser observation",
+                reason_code="browser_service_invalid_response",
+            )
+        return RemoteObservation(
+            url=str(payload.get("url") or ""),
+            title=str(payload.get("title") or ""),
+            visible_text=str(payload.get("visible_text") or ""),
+            generation=int(payload.get("generation") or 0),
+            fingerprint=str(payload.get("fingerprint") or ""),
+            raw_elements=_raw_elements(payload.get("elements")),
+        )
+
+    async def act_on_session(
+        self,
+        session_id: str,
+        *,
+        candidate: Mapping[str, object],
+        observed_url: str,
+        observed_generation: int,
+        capability_scope: str,
+    ) -> RemoteActionOutcome:
+        """Execute ONE candidate against the observation that planned it.
+
+        ``observed_url`` and ``observed_generation`` are the caller's statement of
+        what it planned against, and the service holds it to them: if the page has
+        moved the answer is ``stale`` and the plan must be remade. Omitting them
+        would leave the service comparing a fresh reading against itself, which
+        passes every time and would make the check decorative.
+
+        Every service answer — including a refusal — comes back as a typed outcome
+        rather than an exception, because a planner corrects itself differently for
+        each: re-observe on ``stale``, choose another action on ``blocked``, try a
+        sibling target on ``failed``. Only an unreachable service is reported as
+        ``reached_service=False``, and that one is not an outcome at all.
+        """
+
+        try:
+            response = await self._request(
+                "POST",
+                f"/internal/browser/sessions/{session_id}/act",
+                json_body={
+                    "candidate": dict(candidate),
+                    "observed_url": observed_url,
+                    "observed_generation": int(observed_generation),
+                },
+                timeout=self._timeout,
+                capability_scope=capability_scope,
+            )
+        except (TypeError, AttributeError, AssertionError, NameError):
+            raise  # a programming error must surface, never look like a page outcome
+        except Exception:
+            return RemoteActionOutcome(
+                status="failed",
+                candidate_id=str(candidate.get("candidate_id") or ""),
+                reason_code="browser_service_unreachable",
+                before_url=observed_url,
+                before_generation=observed_generation,
+                reached_service=False,
+            )
+        if response.status_code >= 400:
+            # A 4xx/5xx here is the boundary refusing the request — a malformed
+            # candidate, a host outside the run's allow-list, an expired session.
+            # None of those touched the page, so the outcome is ``blocked`` with
+            # the service's own reason rather than an invented failure.
+            return RemoteActionOutcome(
+                status="blocked",
+                candidate_id=str(candidate.get("candidate_id") or ""),
+                reason_code=self._reason(response),
+                before_url=observed_url,
+                before_generation=observed_generation,
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, Mapping):
+            payload = {}
+        raw_status = str(payload.get("status") or "")
+        outcome_status: Literal["executed", "stale", "blocked", "failed"] = (
+            raw_status  # type: ignore[assignment]
+            if raw_status in {"executed", "stale", "blocked", "failed"}
+            else "failed"
+        )
+        return RemoteActionOutcome(
+            status=outcome_status,
+            candidate_id=str(payload.get("candidate_id") or candidate.get("candidate_id") or ""),
+            before_url=str(payload.get("before_url") or observed_url),
+            after_url=str(payload.get("after_url") or ""),
+            before_generation=int(payload.get("before_generation") or observed_generation),
+            after_generation=int(payload.get("after_generation") or 0),
+            reason_code=(
+                str(payload["reason_code"])
+                if isinstance(payload.get("reason_code"), str)
+                else ("browser_service_invalid_response" if not raw_status else None)
+            ),
+            expected_selected_label=(
+                str(payload["expected_selected_label"])
+                if isinstance(payload.get("expected_selected_label"), str)
+                else None
+            ),
+        )
+
+    async def arm_credential_surface(
+        self,
+        session_id: str,
+        *,
+        recipe: Mapping[str, object] | None,
+        capability_scope: str,
+    ) -> RemoteCredentialSurface:
+        """Ask the service to PROVE the current page is the credential surface.
+
+        Nothing here asserts it. The recipe travels so the service can evaluate
+        the reviewed success predicate against a page it inspects itself, which is
+        the same proof ``navigate`` makes at the end of its loop — the difference
+        is only that a caller driving one action at a time can now reach it. Until
+        it could, such a session would land on the credential page and still be
+        refused at capture with ``credential_surface_not_ready``.
+
+        "Not yet" is an ordinary answer (``armed=False`` with a reason), because
+        while the agent is still working that is the expected state and the caller
+        simply keeps driving. Only an unreachable service is ``reached_service``
+        false, and a caller must treat that as knowing nothing: arming is what
+        revokes live pixels, so guessing either flag would either strand a human
+        or invite a capture the boundary never covered.
+        """
+
+        try:
+            response = await self._request(
+                "POST",
+                f"/internal/browser/sessions/{session_id}/credential-surface/arm",
+                json_body={"recipe_snapshot": dict(recipe) if recipe is not None else None},
+                timeout=self._timeout,
+                capability_scope=capability_scope,
+            )
+        except (TypeError, AttributeError, AssertionError, NameError):
+            raise  # a programming error must surface, never look like a page verdict
+        except Exception:
+            return RemoteCredentialSurface(
+                armed=False,
+                live_view_allowed=False,
+                reason_code="browser_service_unreachable",
+                reached_service=False,
+            )
+        return self._credential_surface(response, unarmed_reason="credential_surface_not_ready")
+
+    async def release_credential_surface(
+        self, session_id: str, *, capability_scope: str
+    ) -> RemoteCredentialSurface:
+        """Ask the service to give live pixels back, if the page proves it may.
+
+        The way out of what used to be a one-way door: reaching a credential
+        surface revoked live view for the rest of the session, so a run that then
+        stalled on something the agent could not finish could never be handed to a
+        person — nobody could see the screen again. The service re-inspects and
+        only releases a page that positively proves it bears no credential
+        content, so a refusal is a normal ``live_view_allowed=False`` answer
+        rather than an error.
+
+        A released session reports ``armed=False`` and must arm again before it
+        can capture, which is deliberate: an arming describes the page it was
+        proven against, not the session.
+        """
+
+        try:
+            response = await self._request(
+                "POST",
+                f"/internal/browser/sessions/{session_id}/credential-surface/release",
+                timeout=self._timeout,
+                capability_scope=capability_scope,
+            )
+        except (TypeError, AttributeError, AssertionError, NameError):
+            raise
+        except Exception:
+            return RemoteCredentialSurface(
+                armed=False,
+                live_view_allowed=False,
+                reason_code="browser_service_unreachable",
+                reached_service=False,
+            )
+        return self._credential_surface(response, unarmed_reason="credential_content_present")
+
+    def _credential_surface(
+        self, response: httpx.Response, *, unarmed_reason: str
+    ) -> RemoteCredentialSurface:
+        """Read a credential-surface answer, defaulting every unknown to CLOSED.
+
+        A refusal, an unparseable body, or a missing field all resolve to "not
+        armed, no live view". Both flags are dangerous to guess in the permissive
+        direction — one gates capture, the other gates whether a human may watch —
+        so nothing is inferred from absence.
+        """
+
+        if response.status_code >= 400:
+            return RemoteCredentialSurface(
+                armed=False,
+                live_view_allowed=False,
+                reason_code=self._reason(response),
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, Mapping):
+            payload = {}
+        armed = payload.get("armed") is True
+        raw_reason = payload.get("reason_code")
+        return RemoteCredentialSurface(
+            armed=armed,
+            live_view_allowed=payload.get("live_view_allowed") is True,
+            reason_code=(
+                str(raw_reason)
+                if isinstance(raw_reason, str) and raw_reason
+                else ("" if armed else unarmed_reason)
+            ),
+        )
 
     async def probe_gate_clearance(
         self, session_id: str, *, capability_scope: str
@@ -1121,6 +1500,47 @@ _ALLOWED_BROWSER_SECRET_FIELDS: frozenset[str] = frozenset(
 _BROKER_GRANT = re.compile(r"^bsg_[A-Za-z0-9_-]{43}$")
 
 
+def _raw_elements(raw: object) -> tuple[Mapping[str, object], ...]:
+    """Turn the wire's projected elements back into the mappings the loop projects.
+
+    The key names are the RAW vocabulary, not the projected one — ``type`` rather
+    than ``element_type``, ``value_present`` rather than ``has_value`` — because
+    ``build_snapshot`` reads those names and the loop is the thing that must run
+    it. Anything the caller sends that is not a mapping is dropped rather than
+    coerced: a malformed element is one the loop should never have been able to
+    plan against, and a half-built one would look like a real target.
+
+    ``secretish`` is deliberately NOT carried across. ``build_snapshot`` recomputes
+    it from the name and type, so re-deriving costs nothing and means a sender
+    cannot clear the flag on a password field by simply saying it is false.
+    """
+
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    elements: list[Mapping[str, object]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        mapping: dict[str, object] = {
+            "role": item.get("role") or "",
+            "name": item.get("name") or "",
+            "type": item.get("element_type") or "",
+            "value_present": bool(item.get("has_value")),
+            "visible": bool(item.get("visible", True)),
+            "enabled": bool(item.get("enabled", True)),
+            "checked": item.get("checked"),
+            "selected": item.get("selected"),
+            "expanded": item.get("expanded"),
+            "frame_path": tuple(item.get("frame_path") or ()),
+            "href_path": item.get("href_path") or "",
+            "test_id": item.get("test_id") or "",
+            "nearby_heading": item.get("nearby_heading") or "",
+            "selected_label": item.get("selected_label") or "",
+        }
+        elements.append(mapping)
+    return tuple(elements)
+
+
 def _validate_broker_grant(value: str) -> str:
     if not isinstance(value, str) or _BROKER_GRANT.fullmatch(value) is None:
         raise ProviderOperationError(
@@ -1179,6 +1599,45 @@ def _vault_references_only(values: Mapping[str, str] | None) -> dict[str, str]:
     return refs
 
 
+def _parse_steps(raw: object) -> tuple[BrowserStepRecord, ...]:
+    """Rebuild the action-loop trail, dropping anything that fails its own bounds.
+
+    The trail is telemetry: it is what the operator console renders as the
+    agent's chain of thought, and nothing downstream branches on it. So a
+    malformed entry must not cost the run the observation that carries it — a
+    step that fails ``BrowserStepRecord``'s validation is discarded and the rest
+    of the trail is kept, rather than raising out of the response parser and
+    turning a completed browser operation into a provider error.
+
+    The cap is applied here as well as on both sides of the wire, because this
+    is the last place a trail can be bounded before it becomes database rows.
+    """
+
+    if not isinstance(raw, list):
+        return ()
+    steps: list[BrowserStepRecord] = []
+    for entry in raw[:MAX_OBSERVATION_STEPS]:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            steps.append(
+                BrowserStepRecord(
+                    step_index=entry.get("step_index"),  # type: ignore[arg-type]
+                    stage=entry.get("stage"),  # type: ignore[arg-type]
+                    elapsed_ms=entry.get("elapsed_ms"),  # type: ignore[arg-type]
+                    decision=entry.get("decision"),  # type: ignore[arg-type]
+                    reason_code=entry.get("reason_code"),
+                    candidate_label=entry.get("candidate_label"),
+                    action=entry.get("action"),
+                    target_host=entry.get("target_host"),
+                    reason=entry.get("reason"),
+                )
+            )
+        except (ValueError, TypeError):
+            continue
+    return tuple(steps)
+
+
 __all__ = [
     "ALLOWED_BROWSER_SECRET_FIELDS",
     "CAPABILITY_HEADER",
@@ -1189,6 +1648,9 @@ __all__ = [
     "BrowserServiceHealth",
     "ProviderHealthState",
     "ReconcileOutcome",
+    "RemoteActionOutcome",
+    "RemoteCredentialSurface",
+    "RemoteObservation",
 ]
 
 # Public alias for tests and callers that need to know the permitted field set.

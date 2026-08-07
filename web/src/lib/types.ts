@@ -636,6 +636,68 @@ export interface OperationsRequestInput {
   // Absent means the deployment's own inference chain, unchanged.
   decision_model?: string | null
   decision_effort?: string | null
+  // Opt this run into the autonomous onboarding driver. The accepted run is put
+  // on the durable onboarding queue and a worker walks the phase machine
+  // (research -> vault check -> admission -> signup/login -> credentials).
+  // Absent or false keeps the canonical runtime, which is what every run in this
+  // console did before the driver was wired. It was missing from this contract
+  // entirely, which is why the console could not ask for it even after the API
+  // stopped refusing it.
+  onboarding?: boolean
+  // An operator's optional pointer at the provider's own docs, corroborated by
+  // research rather than trusted. HTTPS only, and never a search phrase: it goes
+  // onto the run's timeline, not into a prompt.
+  provider_hint_url?: string | null
+  // Immutable, non-secret setup values the browser may type into a provider's
+  // console (an app name, a redirect URL). Keys and values are both bounded, and
+  // nothing here is ever a credential.
+  provider_setup?: Record<string, string>
+}
+
+/**
+ * One reviewed configuration applied to many apps (api/models.py::CreateRunBatchRequest).
+ *
+ * Deliberately NOT `OperationsRequestInput & { app_names }`: the batch contract
+ * accepts no `browser_login` (a per-app secret, and one vendor's password must
+ * never be applied to fifty vendors) and no `provider_hint_url` (a pointer at one
+ * specific provider). Both stay single-run-only, so this is a separate shape
+ * rather than an extension that could silently grow either field.
+ */
+export interface OperationsBatchRequestInput {
+  app_names: string[]
+  account_mode: AccountMode
+  company: CompanyProfileInput
+  requested_scope_policy: "minimum" | "recommended" | "maximum"
+  execution_mode: ExecutionMode
+  browser_provider: "playwright"
+  credential_creation_policy: CredentialCreationPolicy
+  decision_model?: string | null
+  decision_effort?: string | null
+  onboarding?: boolean
+  provider_setup?: Record<string, string>
+}
+
+/** One app's outcome within a batch. `run_id` is set exactly when created. */
+export interface BatchRunResult {
+  app_name: string
+  status: "created" | "rejected"
+  run_id: string | null
+  reason_code: string | null
+  detail: string | null
+}
+
+/**
+ * Per-app outcomes for a batch create.
+ *
+ * Returned with 201 whenever the request itself was well formed, even if every
+ * app was rejected. A partial success is therefore the normal case and must be
+ * rendered as such: `created` and `rejected` always sum to `requested`.
+ */
+export interface CreateRunBatchResponse {
+  requested: number
+  created: number
+  rejected: number
+  results: BatchRunResult[]
 }
 
 export interface IntegratorOutput {
@@ -713,7 +775,7 @@ export interface LiveViewResponse {
   reason_code?: string | null
 }
 
-export type RunPhaseAction = "resume" | "poll-email" | "retry"
+export type RunPhaseAction = "resume" | "poll-email" | "retry" | "outreach"
 export type RetryCapability = "research" | "browser" | "email" | "validation"
 export type BrowserVerificationInput =
   | { code: string; url?: never }
@@ -753,6 +815,13 @@ export interface AppSearchItem {
   confidence: number | null
   buildability: string
   verification_status: string
+  /**
+   * How far the agent gets unattended, from the app's reviewed recipe.
+   *
+   * Optional as well as nullable: it defaults to `None` server-side and an older
+   * API omits it, so nothing may treat its absence as an error.
+   */
+  readiness_tier?: ReadinessTier | null
 }
 
 export interface AppSearchResponse {

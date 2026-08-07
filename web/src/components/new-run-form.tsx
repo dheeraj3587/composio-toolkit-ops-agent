@@ -7,11 +7,13 @@ import { toast } from "sonner"
 import { z } from "zod"
 import {
   ArrowRight,
+  Bot,
   Check,
   ChevronDown,
   KeyRound,
   LockKeyhole,
   MailCheck,
+  ShieldCheck,
   UserPlus,
 } from "lucide-react"
 
@@ -54,6 +56,22 @@ const runFormSchema = z
       const urls = value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean)
       return urls.length <= 10 && urls.every((url) => safeUrl.safeParse(url).success)
     }, "Use one valid HTTPS URL per line."),
+    // Hand the run to the autonomous onboarding driver instead of the canonical
+    // runtime. False is the answer for almost every run, and the three fields
+    // below mean nothing without it — they are only submitted when it is true.
+    onboarding: z.boolean(),
+    // Validated in the superRefine below rather than here: an HTTPS check that
+    // fires while the checkbox is off would block a submission that never sends
+    // the value at all.
+    provider_hint_url: z.string().trim().max(2_000),
+    provider_setup_organization_name: z.string().trim().max(200),
+    provider_setup_account_name: z.string().trim().max(200),
+    provider_setup_team_name: z.string().trim().max(200),
+    provider_setup_application_name: z.string().trim().max(200),
+    provider_setup_credential_name: z.string().trim().max(200),
+    provider_setup_permission_profile: z.string().trim().max(100),
+    provider_setup_expiration: z.string().trim().max(100),
+    provider_setup_region: z.string().trim().max(100),
   })
   .superRefine((values, context) => {
     if (
@@ -64,6 +82,17 @@ const runFormSchema = z
         code: "custom",
         path: ["app_login_password"],
         message: "Enter both the account email and password, or leave both empty.",
+      })
+    }
+    if (
+      values.onboarding &&
+      values.provider_hint_url &&
+      !safeUrl.safeParse(values.provider_hint_url).success
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["provider_hint_url"],
+        message: "Use one https:// documentation URL, or leave this empty.",
       })
     }
   })
@@ -84,6 +113,83 @@ const advancedFieldNames = [
   "callback_urls",
 ] as const satisfies readonly (keyof RunFormValues)[]
 
+/**
+ * The non-secret setup values this form offers the autonomous driver.
+ *
+ * PRE: every `key` is an approved provider setup field and every `maxLength`
+ * matches that field's server-side limit (ops/browser/setup_values.py::
+ * _PROVIDER_LIMITS); the backend refuses the whole request on an unapproved
+ * key, so this list is a contract and not a suggestion. Each entry posts as
+ * `provider_setup.<key>`, which is the name the server action parses.
+ * POST: nothing here is ever a credential. A password, API key or one-time code
+ * reaches the agent through the encrypted owner boundary, never through run
+ * creation, and the backend rejects a value that looks like secret material.
+ */
+const providerSetupFields = [
+  {
+    name: "provider_setup_organization_name",
+    key: "organization_name",
+    label: "Organization name",
+    placeholder: "Example Labs",
+    maxLength: 200,
+  },
+  {
+    name: "provider_setup_account_name",
+    key: "account_name",
+    label: "Account name",
+    placeholder: "Example Labs production",
+    maxLength: 200,
+  },
+  {
+    name: "provider_setup_team_name",
+    key: "team_name",
+    label: "Team or workspace name",
+    placeholder: "Platform integrations",
+    maxLength: 200,
+  },
+  {
+    name: "provider_setup_application_name",
+    key: "application_name",
+    label: "Developer app name",
+    placeholder: "composio-integration",
+    maxLength: 200,
+  },
+  {
+    name: "provider_setup_credential_name",
+    key: "credential_name",
+    label: "Credential name",
+    placeholder: "composio-credential",
+    maxLength: 200,
+  },
+  {
+    name: "provider_setup_permission_profile",
+    key: "permission_profile",
+    label: "Permission profile",
+    placeholder: "Read and write",
+    maxLength: 100,
+  },
+  {
+    name: "provider_setup_expiration",
+    key: "expiration",
+    label: "Credential expiry",
+    placeholder: "No expiry",
+    maxLength: 100,
+  },
+  {
+    name: "provider_setup_region",
+    key: "region",
+    label: "Region",
+    placeholder: "EU",
+    maxLength: 100,
+  },
+] as const satisfies readonly {
+  name: keyof RunFormValues
+  key: string
+  label: string
+  placeholder: string
+  maxLength: number
+}[]
+
 export function NewRunForm({
   defaultAppName = "",
   providerStates,
@@ -94,6 +200,7 @@ export function NewRunForm({
   const [state, formAction] = useActionState(createRunAction, initialCreateRunState)
   const [pending, startTransition] = useTransition()
   const advancedDetailsRef = useRef<HTMLDetailsElement>(null)
+  const onboardingDetailsRef = useRef<HTMLDetailsElement>(null)
   const {
     register,
     control,
@@ -122,6 +229,19 @@ export function NewRunForm({
       decision_model: "",
       decision_effort: "",
       callback_urls: "",
+      // Off by default, and declared rather than left undefined: the schema
+      // types this as a boolean, so an unmounted-until-opened checkbox with no
+      // default would fail validation instead of meaning "no".
+      onboarding: false,
+      provider_hint_url: "",
+      provider_setup_organization_name: "",
+      provider_setup_account_name: "",
+      provider_setup_team_name: "",
+      provider_setup_application_name: "",
+      provider_setup_credential_name: "",
+      provider_setup_permission_profile: "",
+      provider_setup_expiration: "",
+      provider_setup_region: "",
     },
   })
   const serverInvalid = new Set(state.fields)
@@ -132,6 +252,7 @@ export function NewRunForm({
   const executionMode = watch("execution_mode")
   const appName = watch("app_name")
   const decisionEffort = watch("decision_effort")
+  const onboarding = watch("onboarding")
   const catalog = useAppCatalog()
   const selectedApp = catalog.data?.items.find((app) => app.app_name === appName)
   const appCapabilities = useAppCapabilities(selectedApp?.app_slug)
@@ -199,6 +320,16 @@ export function NewRunForm({
     queueMicrotask(() => document.getElementById(firstAdvancedError)?.focus())
   }, [firstAdvancedError])
 
+  // Same reason as the panel above: the hint lives in a collapsed section, so a
+  // rejected URL would block the submit button with nothing on screen to fix.
+  const hintError = errors.provider_hint_url?.message
+  useEffect(() => {
+    if (!hintError) return
+    const details = onboardingDetailsRef.current
+    if (details) details.open = true
+    queueMicrotask(() => document.getElementById("provider_hint_url")?.focus())
+  }, [hintError])
+
   const submit = (values: RunFormValues) => {
     if (!selectedApp) {
       setError("app_name", {
@@ -208,12 +339,30 @@ export function NewRunForm({
       return
     }
     const data = new FormData()
+    const onboardingOnly = new Set<string>([
+      "provider_hint_url",
+      ...providerSetupFields.map((field) => field.name),
+    ])
     for (const [key, value] of Object.entries(values)) {
       if (key === "app_login_password") continue
+      // Posted below instead, under the names the server action actually parses
+      // (`provider_setup.<key>`), and only when the driver is asked for.
+      if (onboardingOnly.has(key)) continue
       data.set(key, String(value ?? ""))
     }
     // Preserve password whitespace exactly; it is never trimmed client-side.
     data.set("app_login_password", values.app_login_password)
+    // The hint and the setup values mean nothing without the driver, so leaving
+    // the checkbox off posts exactly the request this form posted before these
+    // controls existed — an empty `provider_setup` and no hint.
+    if (values.onboarding) {
+      const hint = values.provider_hint_url.trim()
+      if (hint) data.set("provider_hint_url", hint)
+      for (const field of providerSetupFields) {
+        const setupValue = String(values[field.name] ?? "").trim()
+        if (setupValue) data.set(`provider_setup.${field.key}`, setupValue)
+      }
+    }
     startTransition(() => formAction(data))
     // FormData owns an independent copy at this point. Remove the raw password
     // from React Hook Form and the DOM even when the server rejects the request.
@@ -563,6 +712,107 @@ export function NewRunForm({
               <Textarea id="callback_urls" rows={3} placeholder="https://app.example.com/oauth/callback" aria-invalid={invalid("callback_urls")} {...a11y} {...register("callback_urls")} />
             )}
           </Field>
+        </div>
+      </details>
+
+      <details ref={onboardingDetailsRef} className="panel group overflow-hidden rounded-2xl">
+        <summary className="flex cursor-pointer list-none items-center justify-between gap-4 px-5 py-5 sm:px-7">
+          <div>
+            <p className="eyebrow">Optional</p>
+            <h2 className="mt-1 text-base font-medium">Autonomous onboarding</h2>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Hand the whole signup to the agent. Off for almost every run.
+            </p>
+            {hintError ? (
+              <p className="mt-2 text-xs font-medium text-destructive" role="alert">
+                Review the highlighted onboarding setting.
+              </p>
+            ) : null}
+          </div>
+          <ChevronDown className="size-5 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" />
+        </summary>
+        <div className="space-y-6 border-t border-border px-5 py-7 sm:px-7">
+          <label
+            htmlFor="onboarding"
+            className="flex cursor-pointer items-start gap-3 rounded-xl border border-border bg-card p-4 transition hover:border-brand-300"
+          >
+            {/* No `value` attribute: react-hook-form returns the attribute's
+                string when one is present, and the schema types this field as a
+                boolean. Left off, it yields true/false. */}
+            <input
+              id="onboarding"
+              type="checkbox"
+              className="mt-0.5 size-4 shrink-0 accent-brand-600"
+              {...register("onboarding")}
+            />
+            <span>
+              <span className="flex items-center gap-2 text-sm font-medium">
+                <Bot className="size-4 text-brand-600" aria-hidden="true" />
+                Let the agent complete onboarding unattended
+              </span>
+              <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                The agent signs up, creates the developer app, and generates the credential on its own,
+                pausing only for CAPTCHA, MFA, billing, or legal consent. Leave this off to use the
+                standard runtime, which is what every run here does today.
+              </span>
+            </span>
+          </label>
+
+          {onboarding ? (
+            <div className="space-y-6 border-l-2 border-brand-200 pl-4 sm:pl-5">
+              <Field
+                label="Provider documentation URL"
+                htmlFor="provider_hint_url"
+                hint="Optional · seeds research for an app with no reviewed recipe"
+                error={hintError}
+              >
+                {(a11y) => (
+                  <Input
+                    id="provider_hint_url"
+                    type="url"
+                    inputMode="url"
+                    maxLength={2_000}
+                    spellCheck={false}
+                    placeholder="https://docs.example.com/api/authentication"
+                    aria-invalid={invalid("provider_hint_url")}
+                    {...a11y}
+                    {...register("provider_hint_url")}
+                  />
+                )}
+              </Field>
+
+              <fieldset className="space-y-4">
+                <legend className="text-sm font-medium">Setup values the agent may type</legend>
+                <p className="flex items-start gap-2 text-xs leading-5 text-muted-foreground">
+                  <ShieldCheck className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-300" aria-hidden="true" />
+                  Optional, non-secret names the provider&apos;s console asks for. Never enter a password,
+                  API key, or one-time code here — those reach the agent only through the encrypted owner
+                  vault, never through a run request.
+                </p>
+                <div className="grid gap-5 sm:grid-cols-2">
+                  {providerSetupFields.map((field) => (
+                    <Field
+                      key={field.name}
+                      label={field.label}
+                      htmlFor={field.name}
+                      error={errors[field.name]?.message}
+                    >
+                      {(a11y) => (
+                        <Input
+                          id={field.name}
+                          maxLength={field.maxLength}
+                          placeholder={field.placeholder}
+                          aria-invalid={invalid(field.name)}
+                          {...a11y}
+                          {...register(field.name)}
+                        />
+                      )}
+                    </Field>
+                  ))}
+                </div>
+              </fieldset>
+            </div>
+          ) : null}
         </div>
       </details>
 

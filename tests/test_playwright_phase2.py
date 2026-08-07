@@ -42,7 +42,7 @@ from ops.browser.pages import (
     install_dialog_handler,
     install_download_guard,
 )
-from ops.browser.risk import BrowserActionRiskPolicy
+from ops.browser.risk import ActionAuthorization, BrowserActionRiskPolicy
 from ops.browser.snapshot import build_ranked_snapshot, rank_raw_elements
 from ops.core.inference import DecisionBudget, DecisionFailed, JsonInference
 from ops.playwright.worker import (
@@ -736,7 +736,9 @@ def _checkpoint(**kw: object) -> BrowserApiTraceStep:
 )
 def test_risk_policy_requires_hitl_for_consequential_verbs(label: str) -> None:
     decision = BrowserActionRiskPolicy().classify(
-        candidate=_candidate("click", label), checkpoint=_checkpoint(), element=None
+        candidate=_candidate("click", label),
+        authorization=ActionAuthorization.from_checkpoint(_checkpoint()),
+        element=None,
     )
     assert decision.autonomous_allowed is False
     assert decision.level == "irreversible"
@@ -745,13 +747,17 @@ def test_risk_policy_requires_hitl_for_consequential_verbs(label: str) -> None:
 def test_risk_policy_allows_ordinary_navigation_and_read_only() -> None:
     policy = BrowserActionRiskPolicy()
     nav = policy.classify(
-        candidate=_candidate("click", "API keys"), checkpoint=_checkpoint(), element=None
+        candidate=_candidate("click", "API keys"),
+        authorization=ActionAuthorization.from_checkpoint(_checkpoint()),
+        element=None,
     )
     assert nav.autonomous_allowed is True
     assert nav.level == "state_changing"
 
     read = policy.classify(
-        candidate=_candidate("focus", "Create API key"), checkpoint=_checkpoint(), element=None
+        candidate=_candidate("focus", "Create API key"),
+        authorization=ActionAuthorization.from_checkpoint(_checkpoint()),
+        element=None,
     )
     assert read.autonomous_allowed is True  # focusing changes nothing
     assert read.level == "read_only"
@@ -760,7 +766,7 @@ def test_risk_policy_allows_ordinary_navigation_and_read_only() -> None:
 def test_risk_policy_refuses_a_value_ref_the_checkpoint_did_not_authorize() -> None:
     decision = BrowserActionRiskPolicy().classify(
         candidate=_candidate("fill", "Company", value_ref="company_name"),
-        checkpoint=_checkpoint(allowed_value_refs=()),
+        authorization=ActionAuthorization.from_checkpoint(_checkpoint(allowed_value_refs=())),
         element=None,
     )
     assert decision.autonomous_allowed is False
@@ -773,7 +779,9 @@ def test_risk_policy_never_lets_the_agent_type_into_a_credential_field() -> None
     )
     decision = BrowserActionRiskPolicy().classify(
         candidate=_candidate("fill", "API token", value_ref="company_name"),
-        checkpoint=_checkpoint(allowed_value_refs=("company_name",)),
+        authorization=ActionAuthorization.from_checkpoint(
+            _checkpoint(allowed_value_refs=("company_name",))
+        ),
         element=secret,
     )
     assert decision.autonomous_allowed is False

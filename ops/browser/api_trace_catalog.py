@@ -120,6 +120,21 @@ class BrowserApiTraceStep:
     allowed_value_refs: tuple[str, ...] = ()
     credential_creation_controls: tuple[str, ...] = ()
     requires_hitl: bool = False
+    # The reviewed page this checkpoint is trying to reach, when the recipe names
+    # one. It is the checkpoint's own ``goto`` target: without it the agent's only
+    # reviewed navigation option is the trace's start URL, so after signing in its
+    # single offered destination was the login page it had just left, and the API
+    # settings page every three-step recipe already names in its step 2 had to be
+    # rediscovered by clicking links. Defaulted to ``None`` because the JSON
+    # catalog does not carry it and a checkpoint without one is unchanged.
+    target_url: str | None = None
+    # ``True`` when the reviewed step's verb is a navigation. ``False`` marks an
+    # in-page step (click_control / fill_field / await_control), which is offered
+    # NO reviewed goto candidate: the recipe has said the next move happens on the
+    # page that is already loaded, so leaving it cannot be one of the choices.
+    # Defaults to ``True`` so the JSON catalog and every existing caller keep the
+    # behaviour they had.
+    navigates: bool = True
 
 
 @dataclass(frozen=True, slots=True)

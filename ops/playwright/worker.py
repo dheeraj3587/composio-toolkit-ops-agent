@@ -28,7 +28,7 @@ import importlib
 import re
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -39,6 +39,7 @@ from ops.browser.api_trace_catalog import (
     BrowserApiTraceStep,
 )
 from ops.browser.candidates import (
+    VALUE_ACTIONS,
     ActionCandidate,
     executable_candidates,
     generate_candidates,
@@ -53,7 +54,6 @@ from ops.browser.decider import (
     build_snapshot,
     candidate_choice_schema,
     match_checkpoint,
-    render_snapshot,
     validate_choice,
 )
 from ops.browser.egress import (
@@ -61,7 +61,11 @@ from ops.browser.egress import (
     build_egress_policy,
     reviewed_egress_extensions,
 )
-from ops.browser.host_policy import BrowserPolicyInactiveError, build_browser_allowed_hosts
+from ops.browser.host_policy import (
+    BrowserPolicyInactiveError,
+    allowed_hosts_from_recipe,
+    build_browser_allowed_hosts,
+)
 from ops.browser.login import (
     LoginInspection,
     apply_resume_secrets,
@@ -83,7 +87,7 @@ from ops.browser.process_hardening import (
     chromium_launch_environment,
     harden_playwright_parent_process,
 )
-from ops.browser.risk import BrowserActionRiskPolicy
+from ops.browser.risk import ActionAuthorization, BrowserActionRiskPolicy
 from ops.browser.setup_values import normalize_browser_setup_fields
 from ops.browser.signup import (
     SignupResult,
@@ -95,13 +99,19 @@ from ops.browser.signup import (
 from ops.browser.snapshot import build_ranked_snapshot
 from ops.browser.target_selection import derive_account_state
 from ops.browser.worker import (
+    MAX_OBSERVATION_STEPS,
     BrowserObservation,
     BrowserSessionContext,
+    BrowserStepRecord,
     HumanActionType,
     sanitize_browser_url,
     validate_allowed_domains,
 )
-from ops.core.config import Settings
+from ops.core.config import (
+    BROWSER_NAVIGATION_BUDGET_SECONDS,
+    Settings,
+    agent_loop_budget_seconds,
+)
 from ops.core.inference import JsonInference, build_json_inference
 from ops.core.model_catalog import selection_from_record
 from ops.core.model_input_dlp import (
@@ -225,7 +235,13 @@ def chromium_launch_args(*, headless: bool, sandbox_disabled: bool) -> list[str]
     return args
 
 
-_NAV_TIMEOUT_MS = 45_000
+# Derived from the same constant the budget validator reasons about, so the
+# navigation the loop is charged for and the navigation it actually performs
+# cannot drift apart.
+_NAV_TIMEOUT_MS = int(BROWSER_NAVIGATION_BUDGET_SECONDS * 1_000)
+# Only reached when a test double stands in for Settings; the real field carries
+# this default and the validator floors it.
+_DEFAULT_CLIENT_TIMEOUT_SECONDS = 315.0
 # Per-action Playwright timeout. Playwright auto-waits for actionability, so this
 # is a ceiling on that wait rather than a substitute for it.
 _ACTION_TIMEOUT_MS = 10_000
@@ -233,15 +249,25 @@ _JANITOR_INTERVAL_SECONDS = 60.0
 _OP_TIMEOUT_SECONDS = 120.0
 
 # Bounds for the agent action loop: it must always terminate.
-_MAX_AGENT_STEPS = 20
-# Keep the autonomous loop below the browser-service 300 second outer deadline,
-# leaving time for serialization, encrypted-state persistence and the RPC reply.
-_MAX_AGENT_SECONDS = 270.0
+#
+# The step cap is the deployment's ``BROWSER_AGENT_MAX_STEPS`` (see
+# ``self._agent_max_steps``); this literal is only reached when a test double
+# stands in for Settings, exactly like ``_DEFAULT_CLIENT_TIMEOUT_SECONDS`` above.
+# It used to be the only value there was, which meant the loop's two bounds — the
+# step count here and the wall clock, which is now derived from the client budget
+# — were tuned in different files by different rules and could not be reasoned
+# about together.
+_DEFAULT_MAX_AGENT_STEPS = 20
 _MAX_REPEATED_STATE = 3
 _MAX_MODEL_FAILURES = 2
 _MAX_ACTION_FAILURES = 3
 # Trace schema version carried on every candidate (item 4 groundwork).
 _TRACE_VERSION = "2.0"
+
+# The URL of the blank page Chromium opens a fresh context on. It is matched
+# EXACTLY, and never treated as an allowed host: it has no host at all. See
+# ``_execute_candidate`` for the single, narrow thing this permits.
+_BLANK_PAGE_URL = "about:blank"
 
 # Only these keyboard keys may be pressed by a model decision.
 _ALLOWED_PRESS_KEYS = frozenset(
@@ -360,6 +386,30 @@ class PlaywrightBrowserWorker:
         self._signup_states: dict[str, SignupSessionState] = {}
         # Concurrency cap: sized for a small VPS (each session is a Chromium process).
         self._max_sessions = max(1, int(getattr(self._settings, "playwright_max_sessions", 2)))
+        # The loop's wall clock, derived from the budget the CLIENT will actually
+        # wait rather than hardcoded beside it. The previous constant was 270 s,
+        # which plus the 45 s navigation came to exactly the 315 s client timeout:
+        # a loop that used its budget was aborted client-side with no observation
+        # and no named step, and the staleness sweep fenced the run a second
+        # later. Settings now floors the client timeout so this always leaves room
+        # for the navigation before it and the reply after it.
+        self._agent_loop_seconds = agent_loop_budget_seconds(
+            float(
+                getattr(
+                    self._settings,
+                    "browser_service_client_timeout_seconds",
+                    _DEFAULT_CLIENT_TIMEOUT_SECONDS,
+                )
+            )
+        )
+        # The loop's OTHER bound, from the same place. Wall clock alone does not
+        # terminate a loop whose steps are all cheap: a page that alternates
+        # between two states never repeats a fingerprint often enough to trip
+        # ``_MAX_REPEATED_STATE`` and can spend the whole budget making moves.
+        self._agent_max_steps = max(
+            1,
+            int(getattr(self._settings, "browser_agent_max_steps", _DEFAULT_MAX_AGENT_STEPS)),
+        )
         # Registry mutation happens from several application threads.
         self._registry_lock = threading.Lock()
         # Admission is a race-free semaphore, not a len() check outside the lock:
@@ -508,6 +558,8 @@ class PlaywrightBrowserWorker:
         display: str | None = None,
         decision_model: str | None = None,
         decision_effort: str | None = None,
+        setup_fields: Mapping[str, str] | None = None,
+        allowed_host_patterns: Sequence[str] | None = None,
     ) -> BrowserSessionContext:
         # ``display`` is the PRIVATE X display leased to this session by the browser
         # service (e.g. ":100"). Headful Chromium renders to exactly that display,
@@ -522,9 +574,52 @@ class PlaywrightBrowserWorker:
         # supplied directly via ``storage_state``, and the live view is always the
         # screenshot mode. The browser SERVICE (BrowserServiceClient) is where these
         # values actually matter.
-        # ``app_slug`` is re-recorded on the session at navigation time.
-        del recipe, app_slug, account_ref, secret_scope, use_storage_state, live_view_mode
+        del account_ref, secret_scope, use_storage_state, live_view_mode
         self._require_configuration()
+        # The reviewed app identity and its navigation allow-list are settled HERE,
+        # not at the first navigate. They used to be: ``recipe`` and ``app_slug``
+        # were discarded and ``navigate_onboarding`` was the sole writer of
+        # ``session.patterns``. That was harmless while ``navigate``/``resume`` were
+        # the only two ways to drive a session, because both seed it on the way in.
+        # It stopped being harmless the moment a caller could drive one action at a
+        # time through observe/act: ``is_allowed_browser_url`` is FAIL-CLOSED, so an
+        # empty pattern tuple denies every URL, and a session created but not yet
+        # navigated would refuse every action for hosts its own recipe reviews.
+        #
+        # A recipe alone is enough to answer this — no research, no discovery, no
+        # runtime input — which is why this reads ``allowed_hosts_from_recipe``
+        # rather than the research-taking ``build_browser_allowed_hosts``. A recipe
+        # for an app with no active browser policy still yields nothing, and the
+        # session stays fail-closed exactly as before.
+        #
+        # ``allowed_host_patterns`` is the fallback for a session that has no
+        # recipe at all — an app whose route was derived from a committed provider
+        # profile rather than a checked-in recipe. It is not a widening: these are
+        # the RUN's own allow-list patterns, already validated by the caller and
+        # re-validated here, and they are consulted only when the recipe path
+        # produced nothing. Requiring a recipe to have any allow-list at all was
+        # what made a profile-derived route impossible to drive rather than merely
+        # unreviewed — the session would be created and then refuse every URL.
+        resolved_slug = app_slug or (recipe.app_slug if recipe is not None else "")
+        seeded_patterns: tuple[str, ...] = ()
+        if recipe is not None and (not app_slug or recipe.app_slug == app_slug):
+            allowed = allowed_hosts_from_recipe(recipe)
+            if allowed is not None:
+                seeded_patterns = validate_allowed_domains(allowed.patterns())
+        if not seeded_patterns and allowed_host_patterns:
+            # A malformed pattern is refused outright rather than dropped: a
+            # partially understood allow-list is not confinement, and silently
+            # seeding the half that parsed would be worse than seeding none.
+            seeded_patterns = validate_allowed_domains(tuple(allowed_host_patterns))
+        # Reject an unusable value-reference map before Chromium is launched, so a
+        # bad field costs a 4xx rather than a browser process. These are the same
+        # non-secret, closed-vocabulary values ``navigate_onboarding`` accepts;
+        # seeding them at creation is what lets an observe/act session fill a form
+        # at all. Without it ``_approved_value`` could resolve exactly one
+        # reference — ``application_name``, from the slug — and every other field
+        # raised, so the agent could not type a company name or a callback URL.
+        seeded_values = normalize_browser_setup_fields(setup_fields)
+        del recipe, app_slug
         try:
             module = importlib.import_module("playwright.async_api")
         except ImportError:
@@ -610,6 +705,12 @@ class PlaywrightBrowserWorker:
         session.created_at = now
         session.last_active_at = now
         session.handle = handle
+        # The reviewed identity, allow-list and value map resolved above. Recorded
+        # before the session is published to the registry, so no caller can ever
+        # observe a registered session with an empty allow-list it should not have.
+        session.app_slug = resolved_slug
+        session.patterns = seeded_patterns
+        session.approved_values = seeded_values
         # Only a worker-owned slot is later released by the worker; in service mode
         # the manager releases its own slot.
         session.worker_capacity_owned = capacity_owned
@@ -671,7 +772,15 @@ class PlaywrightBrowserWorker:
         patterns = self._resolve_patterns(research, recipe=bound_recipe)
         session.patterns = patterns
         session.app_slug = research.app_slug
-        session.approved_values = normalize_browser_setup_fields(setup_fields)
+        # MERGE, not replace. The creation-time map is the baseline and this
+        # operation's fields override it key by key. An unconditional assignment
+        # here would erase everything seeded at ``start``, which would quietly undo
+        # the seeding for any run that creates a session with setup fields and then
+        # navigates without repeating them — the ordinary canonical sequence.
+        session.approved_values = {
+            **session.approved_values,
+            **normalize_browser_setup_fields(setup_fields),
+        }
         approved_signup_fields = (
             normalize_signup_fields(signup_fields) if account_creation_requested else {}
         )
@@ -794,7 +903,12 @@ class PlaywrightBrowserWorker:
         # A "cancelled" resume ends the run at a human gate rather than re-driving.
         if normalized_signal == "cancelled":
             return self._human_required(session, "The human cancelled the browser step.")
-        session.approved_values = normalize_browser_setup_fields(setup_fields)
+        # Merge for the same reason ``navigate_onboarding`` does: a resume that
+        # repeats only the field it changed must not drop the rest of the map.
+        session.approved_values = {
+            **session.approved_values,
+            **normalize_browser_setup_fields(setup_fields),
+        }
         return await self._run_action_loop(
             session,
             resolved,
@@ -853,6 +967,45 @@ class PlaywrightBrowserWorker:
         return session.live_pixel_mask_installed
 
     async def _run_action_loop(
+        self,
+        session: _PwSession,
+        research: OperationalResearch,
+        *,
+        recipe: AppRecipe,
+        sensitive_data: Mapping[str, str] | None,
+        account_creation_requested: bool = False,
+        signup_fields: Mapping[str, str] | None = None,
+        credential_creation_policy: str = "reuse_only",
+        resume_signal: str | None = None,
+    ) -> BrowserObservation:
+        """Drive the loop, then attach what it did to the observation it returns.
+
+        The loop proper has more than a dozen exits -- human required, blocked,
+        failed, each success predicate -- and threading a trail through all of
+        them would mean every future exit silently forgets to carry it. So the
+        trail accumulates on the session and is attached HERE, at the one place
+        every exit funnels through. It is reset first, so a trail describes this
+        operation rather than everything the session has ever done.
+        """
+
+        session.step_trail = []
+        observation = await self._drive_action_loop(
+            session,
+            research,
+            recipe=recipe,
+            sensitive_data=sensitive_data,
+            account_creation_requested=account_creation_requested,
+            signup_fields=signup_fields,
+            credential_creation_policy=credential_creation_policy,
+            resume_signal=resume_signal,
+        )
+        steps = tuple(session.step_trail)
+        session.step_trail = []
+        if not steps:
+            return observation
+        return replace(observation, steps=steps)
+
+    async def _drive_action_loop(
         self,
         session: _PwSession,
         research: OperationalResearch,
@@ -963,12 +1116,12 @@ class PlaywrightBrowserWorker:
                     if disposition is not None:
                         return disposition
 
-        deadline = asyncio.get_running_loop().time() + _MAX_AGENT_SECONDS
+        deadline = asyncio.get_running_loop().time() + self._agent_loop_seconds
         repeated: dict[str, int] = {}
         model_failures = 0
         action_failures = 0
 
-        for _step in range(_MAX_AGENT_STEPS):
+        for _step in range(self._agent_max_steps):
             if asyncio.get_running_loop().time() >= deadline:
                 return self._failed_observation(session, "navigation_timeout")
 
@@ -1130,7 +1283,27 @@ class PlaywrightBrowserWorker:
                 checkpoint_order=checkpoint.order,
                 trace_version=_TRACE_VERSION,
                 expected_postcondition=f"checkpoint_{checkpoint.order}_complete",
-                reviewed_goto_urls=(trace.start_url,),
+                # This checkpoint's own reviewed destination FIRST, then the
+                # trace's start URL as the way back. Previously only the start
+                # URL was offered, which meant that once a run had signed in, the
+                # single navigation the policy allowed it was a return to the
+                # login page — the API-settings page named in the recipe's own
+                # step was not a place it could go. Both are reviewed recipe
+                # URLs; the model still only picks a candidate id and never
+                # supplies a URL, and ``navigation_allowed`` re-checks the result.
+                #
+                # An in-page checkpoint gets none of them: its reviewed verb says
+                # the next move happens here, so offering a way off the page would
+                # let the loop satisfy itself by leaving.
+                reviewed_goto_urls=(
+                    tuple(
+                        dict.fromkeys(
+                            url for url in (checkpoint.target_url, trace.start_url) if url
+                        )
+                    )
+                    if checkpoint.navigates
+                    else ()
+                ),
                 allow_value_refs=checkpoint.allowed_value_refs,
             )
             if not executable_candidates(candidates):
@@ -1173,6 +1346,20 @@ class PlaywrightBrowserWorker:
                     raise  # a programming error must surface, never be swallowed
                 except Exception:
                     model_failures += 1
+                    # Report the failed decision as its own progress step before
+                    # replanning. This branch is the loop's longest silent path:
+                    # a decision may now spend ONBOARDING_ACTION_DECISION_TOTAL_SECONDS
+                    # before it raises, and it may do so twice, so a run could
+                    # burn two minutes and end at a human gate having recorded
+                    # nothing at all — the trail only ever gained a row after an
+                    # action executed. The run's progress heartbeat is built from
+                    # these rows, so a step nobody recorded is a step that never
+                    # happened as far as the operator console is concerned.
+                    self._append_decision_step(
+                        session=session,
+                        inspection=inspection,
+                        latency_ms=(asyncio.get_running_loop().time() - decision_started) * 1000.0,
+                    )
                     if model_failures >= _MAX_MODEL_FAILURES:
                         return self._human_required(
                             session,
@@ -1191,19 +1378,26 @@ class PlaywrightBrowserWorker:
                 del status  # execution re-resolves; this is only for risk context
             risk = self._risk_policy.classify(
                 candidate=chosen,
-                checkpoint=checkpoint,
-                element=target_element,
-                credential_creation_authorized=(
-                    credential_creation_policy == "create_if_missing"
-                    and bool(checkpoint.credential_creation_controls)
+                # The derivation of ``credential_creation_authorized`` moved into
+                # the value object. It used to be spelled out here, and the other
+                # loop that drives a browser (``ops/onboarding/action_loop.py``)
+                # simply never spelled it out at all — it never called this policy.
+                authorization=ActionAuthorization.from_checkpoint(
+                    checkpoint, credential_creation_policy=credential_creation_policy
                 ),
+                element=target_element,
             )
             if not risk.autonomous_allowed:
                 return self._human_required(
                     session, f"Action requires human authorization ({risk.reason_code})."
                 )
 
-            execution = await self._execute_candidate(session, chosen, inspection)
+            execution = await self._execute_candidate(
+                session,
+                chosen,
+                observed_url=inspection.url,
+                observed_generation=inspection.generation,
+            )
             # Emit the sanitized decision event from the REAL loop, so metrics and
             # replay fixtures describe actual runs rather than reconstructed ones.
             self._emit_decision(
@@ -1518,6 +1712,155 @@ class PlaywrightBrowserWorker:
             # must keep the run waiting rather than continue it on no evidence.
             return _GateProbe(gate=None, reason="probe_failed")
 
+    async def observe_session(self, context: BrowserSessionContext) -> PageInspection:
+        """One bounded, secret-free reading of the page — and nothing else.
+
+        The public half of :meth:`_inspect_page`, for a caller that owns its own
+        loop. Until this existed the service offered two verbs, ``navigate`` and
+        ``resume``, and each ran a whole closed loop server-side — inspect, decide
+        with its own model call, act, repeat — so an external planner could not
+        take one step: it could only hand over the wheel and read the outcome.
+
+        What it does NOT do is as load-bearing as what it does: it never enters
+        ``_run_action_loop``, never calls a model, never navigates, never clicks,
+        never touches the checkpoint index or the HITL counters. It does increment
+        ``dom_generation`` (unlike :meth:`probe_human_gate`, which is a watcher and
+        must stay invisible), because a generation is exactly the token the
+        matching :meth:`act_on_session` call has to quote back — an observation
+        that did not advance it could not be told apart from the one before it.
+
+        ``PageInspection.locators`` come back live and stay in this process; the
+        service projects the serializable fields and drops them.
+        """
+
+        session = self._session_for_context(context)
+        return await self._inspect_page(session)
+
+    async def act_on_session(
+        self,
+        context: BrowserSessionContext,
+        candidate: ActionCandidate,
+        *,
+        observed_url: str,
+        observed_generation: int,
+    ) -> ActionExecutionResult:
+        """Execute exactly ONE candidate against the observation that planned it.
+
+        The public half of :meth:`_execute_candidate`. The caller sends back the
+        ``url`` and ``generation`` its plan was made against and the executor holds
+        it to them: re-inspect, refuse a page that moved (``stale``), re-resolve
+        the target by stable identity requiring exactly one match, and only then
+        act. Nothing about the candidate is taken on trust — a ``goto`` URL is
+        re-checked against the reviewed patterns, a value action still resolves
+        through the approved-reference map and can never carry literal text, and a
+        credential-bearing target is refused outright.
+        """
+
+        session = self._session_for_context(context)
+        return await self._execute_candidate(
+            session,
+            candidate,
+            observed_url=observed_url,
+            observed_generation=observed_generation,
+        )
+
+    async def arm_credential_surface(
+        self,
+        context: BrowserSessionContext,
+        recipe: AppRecipe,
+    ) -> BrowserObservation | None:
+        """Prove the page in front of us IS the reviewed credential surface.
+
+        The public, loop-free half of :meth:`verify_credential_page`, and the same
+        proof: the recipe's structured success predicate, evaluated against a
+        freshly inspected page. No caller assertion is accepted and no model output
+        is consulted — this method exists precisely so that "the credential surface
+        is ready" keeps being a claim the RECIPE makes about the DOM, rather than
+        one an RPC caller makes about itself.
+
+        Until it existed, the only producer of ``credential_page_ready`` was buried
+        at the end of ``navigate_onboarding``'s closed loop. A session driven one
+        action at a time through observe/act could therefore land on the credential
+        page and still be refused at ``capture-credentials`` with
+        ``credential_surface_not_ready``, because nothing along that path was
+        allowed to say so.
+
+        THREE distinct answers, and a caller must tell them apart — arming is what
+        revokes live pixels, so treating any of them as the others either strands a
+        human or opens the boundary on a page that never earned it:
+
+        * ``None`` — the predicate does not hold. Not an error: "not there yet" is
+          the ordinary state while the agent is still working, and the caller
+          simply keeps driving.
+        * a ``blocked`` observation — the page is outside the reviewed allow-list,
+          so nothing was proven and nothing could be. It carries its own
+          ``reason_code``; do NOT read a non-``None`` return as success.
+        * a ``credential_page_ready`` observation — proven. Only this one arms.
+        """
+
+        session = self._session_for_context(context)
+        if recipe.app_slug != session.app_slug:
+            raise ProviderOperationError(
+                capability="Playwright browser", reason_code="immutable_recipe_app_mismatch"
+            )
+        trace = recipe_to_browser_trace(recipe)
+        if trace is None:
+            # No reviewed browser block: there is no predicate to satisfy, so there
+            # is no evidence this could ever be armed with. Refused, not answered
+            # ``None`` — "the recipe cannot prove this" is a different fact from
+            # "the page does not satisfy the proof yet".
+            raise ProviderOperationError(
+                capability="Playwright browser", reason_code="immutable_recipe_required"
+            )
+        return await self.verify_credential_page(session, trace)
+
+    async def release_credential_surface(self, context: BrowserSessionContext) -> bool:
+        """Re-permit live pixels once the page is proven to bear no credential.
+
+        The counterpart to the capture boundary, and the reason it is safe to have
+        one. Reaching a credential surface disables screenshots for the rest of the
+        session, and the service separately revokes live view. Both were WRITE-ONCE:
+        a run that reached ``credential_page_ready`` and then hit a CAPTCHA, an
+        expired session, or a form the agent could not finish could never be handed
+        back to a human — nobody could see the screen again, so the only remaining
+        outcome was to abandon the run. That is a worse failure than the one the
+        boundary defends against.
+
+        Reversal is evidence-based and fails CLOSED. ``_has_credential_content`` is
+        a structural check — password inputs, secret-ish field names, ``code``/
+        ``pre``/``textarea``/``contenteditable`` regions, ``data-secret`` markers —
+        plus a secret-material scan of the page text, and every failure to inspect
+        counts as "sensitive". Only a page that positively proves it holds nothing
+        credential-bearing gets pixels back, and the answer describes THIS page: a
+        later navigation to a credential surface re-disables them exactly as before.
+
+        What stays revoked: the egress stage. That tracker is monotonic by design
+        (``advance_to`` ignores a request to loosen) and this deliberately does not
+        fight it. Network confinement tightening after a credential is in hand is
+        unrelated to whether a human may look at the screen, and re-widening egress
+        would give back something no page inspection can vouch for.
+        """
+
+        session = self._session_for_context(context)
+
+        async def _safe() -> bool:
+            async with session.operation_lock:
+                return not await _has_credential_content(_active_page(session))
+
+        try:
+            proven_safe = bool(await self._loop.run(_safe(), timeout=_OP_TIMEOUT_SECONDS))
+        except Exception:
+            return False
+        if not proven_safe:
+            return False
+        session.screenshots_disabled = False
+        # Any frame captured before the boundary is still dropped. Re-arming permits
+        # FUTURE captures; it does not resurrect a stale one whose page state nobody
+        # can vouch for now.
+        session.screenshot = None
+        session.screenshot_at = None
+        return True
+
     def _chain_for(self, session: _PwSession) -> JsonInference | None:
         """The chain that decides for THIS session.
 
@@ -1564,7 +1907,14 @@ class PlaywrightBrowserWorker:
             current_url=inspection.url,  # already sanitized by _inspect_page
             page_title=inspection.title,
             rendered_candidates=render_candidates(options),
-            rendered_page=render_snapshot(inspection.elements),
+            # The PAGE block carries the page's PROSE, not a second copy of the
+            # element list: CANDIDATES above already renders every actionable
+            # control, so re-rendering the snapshot here spent the whole block
+            # saying what the model had just read. Visible text is what tells a
+            # "Create API Key" page apart from a "Your key was created" page, and
+            # it is already DLP-sanitized and bounded at the single source in
+            # _inspect_page.
+            rendered_page=inspection.visible_text,
         )
         # Last-line DLP assertion: refuse to send anything that still looks like it
         # carries credential material, rather than trusting upstream sanitization.
@@ -1578,7 +1928,16 @@ class PlaywrightBrowserWorker:
             schema=candidate_choice_schema(ids),
             validate=lambda payload: validate_choice(payload, candidate_ids=ids),
         )
+        session.last_inference_provider = (
+            result.provider if isinstance(result.provider, str) and result.provider else None
+        )
         choice = validate_choice(result.payload, candidate_ids=ids)
+        # The model's stated why. It used to be read on the report_hitl branch only
+        # and dropped on the floor for every ordinary choice, which is the branch
+        # that happens on nearly every step -- so the one sentence explaining what
+        # the agent thought it was doing was discarded precisely when a run went
+        # well. Sanitized here and screened again by the storage writer.
+        session.last_choice_reason = sanitize_reason(choice.reason) or None
         if choice.decision == "report_hitl":
             return self._human_required(session, sanitize_reason(choice.reason) or "Human action.")
         if choice.decision == "report_blocked":
@@ -1587,6 +1946,99 @@ class PlaywrightBrowserWorker:
             return self._human_required(session, "The agent reported a block it cannot prove.")
         assert choice.candidate_id is not None  # guaranteed by validate_choice
         return select_candidate(options, choice.candidate_id)
+
+    def _append_step(
+        self,
+        *,
+        session: _PwSession,
+        inspection: PageInspection,
+        chosen: ActionCandidate | None,
+        selection_source: SelectionSource,
+        execution: ActionExecutionResult,
+        latency_ms: float,
+    ) -> None:
+        """Append one bounded, value-free record of this iteration to the trail.
+
+        ``step_index`` is the position in THIS drive, so it restarts at 1 for each
+        navigate call; the API side offsets it onto the run's own sequence, which
+        is the only place that knows how many iterations the run has already
+        recorded.
+
+        The candidate label is the semantic target -- an accessible name -- not a
+        selector, and the host is taken from the URL the loop had ALREADY
+        sanitized in ``_inspect_page``. Failure is swallowed for the same reason a
+        sink failure is: a run must not die because its narration would not fit
+        its own bounds.
+        """
+
+        if len(session.step_trail) >= MAX_OBSERVATION_STEPS:
+            return
+        with contextlib.suppress(Exception):
+            host = urlsplit(execution.after_url or inspection.url).hostname or None
+            session.step_trail.append(
+                BrowserStepRecord(
+                    step_index=len(session.step_trail) + 1,
+                    stage="act",
+                    elapsed_ms=max(0, min(int(latency_ms), 3_600_000)),
+                    decision="select_candidate" if chosen is not None else "rejected",
+                    reason_code=(execution.reason_code or execution.status or None),
+                    candidate_label=(
+                        ((chosen.semantic_target or "")[:120] or None)
+                        if chosen is not None
+                        else None
+                    ),
+                    action=(chosen.action if chosen is not None else None),
+                    target_host=(host[:253] if host else None),
+                    # Present only when the model chose; a deterministic match has
+                    # no prose and must not borrow the previous step's.
+                    reason=(session.last_choice_reason if selection_source == "llm" else None),
+                )
+            )
+        session.last_choice_reason = None
+
+    def _append_decision_step(
+        self,
+        *,
+        session: _PwSession,
+        inspection: PageInspection,
+        latency_ms: float,
+    ) -> None:
+        """Append one ``decide``-stage record for a decision that produced nothing.
+
+        Separate from :meth:`_append_step` because that one describes an
+        EXECUTION and takes an ``ActionExecutionResult``; there is no execution
+        here, and synthesising a fake one to reuse it would put an invented action
+        outcome into the operator's chain of thought. ``decide`` and ``rejected``
+        are both members of the vocabularies ``ops.core.storage`` enforces, so this
+        row survives the API-side write instead of being dropped on arrival.
+
+        Failure is swallowed for the same reason it is there: a run must not die
+        because its narration would not fit its own bounds.
+        """
+
+        if len(session.step_trail) >= MAX_OBSERVATION_STEPS:
+            return
+        with contextlib.suppress(Exception):
+            host = urlsplit(inspection.url).hostname or None
+            session.step_trail.append(
+                BrowserStepRecord(
+                    step_index=len(session.step_trail) + 1,
+                    stage="decide",
+                    elapsed_ms=max(0, min(int(latency_ms), 3_600_000)),
+                    decision="rejected",
+                    # A member of ``ops.onboarding.phase``'s reason-code
+                    # vocabulary, which is what the API-side writer checks
+                    # against before it will keep the code: an unknown one is
+                    # silently dropped and the row loses the only fact that
+                    # explains it.
+                    reason_code="decision_provider_failed",
+                    target_host=(host[:253] if host else None),
+                )
+            )
+        # The chain answered with nothing usable, so whatever prose the PREVIOUS
+        # step left behind is not this step's reason and must not be inherited by
+        # the next one either.
+        session.last_choice_reason = None
 
     def _emit_decision(
         self,
@@ -1605,15 +2057,32 @@ class PlaywrightBrowserWorker:
         The URL is fingerprinted inside ``build_decision_event``, candidate ids are
         opaque by construction, and a sink failure is swallowed: observability must
         never break a run.
+
+        Two independent recorders, because they answer to different owners. The
+        step trail is appended FIRST and unconditionally: it travels back on the
+        observation and becomes the operator console's chain of thought, and the
+        metrics sink -- which production has never wired -- must not be able to
+        withhold it. That ordering is the whole point; when the trail lived behind
+        the ``sink is None`` return below, every fact this method computes was
+        discarded on every iteration of every live run.
         """
 
+        self._append_step(
+            session=session,
+            inspection=inspection,
+            chosen=chosen,
+            selection_source=selection_source,
+            execution=execution,
+            latency_ms=latency_ms,
+        )
         sink = self._event_sink
         if sink is None:
             return
-        provider = None
-        chain = self._chain_for(session)
-        if selection_source == "llm" and chain is not None:
-            provider = getattr(chain, "last_provider", None)
+        # Recorded by _choose_candidate off the InferenceResult that answered.
+        # This used to read a `last_provider` attribute that no chain has ever
+        # defined, so the getattr default won every time and inference_provider
+        # was NULL on every decision event ever emitted.
+        provider = session.last_inference_provider if selection_source == "llm" else None
         event = build_decision_event(
             session_id=session.handle,
             checkpoint_order=checkpoint_order,
@@ -1633,7 +2102,9 @@ class PlaywrightBrowserWorker:
         self,
         session: _PwSession,
         candidate: ActionCandidate,
-        inspection: PageInspection,
+        *,
+        observed_url: str,
+        observed_generation: int,
     ) -> ActionExecutionResult:
         """Re-validate immediately before acting, then execute the candidate.
 
@@ -1643,10 +2114,18 @@ class PlaywrightBrowserWorker:
         positional locator from the planning inspection is never executed. Returns
         a typed :class:`ActionExecutionResult` for every outcome — never an
         untyped None.
+
+        The two observation facts are passed as SCALARS rather than as the
+        ``PageInspection`` they came from, because they are the only two fields
+        this method ever read from it and because the observe/act RPC has no such
+        object to hand: a caller across the wire sends back the ``url`` and
+        ``generation`` it planned against, and holding it to exactly those is what
+        makes the staleness check mean anything. Taking a fresh inspection here
+        instead would compare a reading against itself and always pass.
         """
 
-        before_url = inspection.url
-        before_gen = inspection.generation
+        before_url = observed_url
+        before_gen = observed_generation
 
         # Set by the select_option branch so the caller can verify the option that
         # was actually requested (never the approved-value reference name).
@@ -1670,10 +2149,32 @@ class PlaywrightBrowserWorker:
             )
 
         fresh = await self._inspect_page(session)
-        if not navigation_allowed(fresh.url, session.patterns):
-            return _result("blocked", fresh.url, fresh.generation, "policy_blocked")
-        if fresh.url != inspection.url:
+        # Acting on a page outside the reviewed allow-list is refused, with exactly
+        # one narrow exemption: navigating AWAY from the browser's own blank start
+        # page. ``about:blank`` has no host, so it matches no allow-list and never
+        # will — and it is the state every session begins in. The loop path never
+        # met this because ``navigate_onboarding`` performs the first ``goto``
+        # itself, outside this method; a session driven one action at a time through
+        # observe/act starts here and, without the exemption, could not reach its
+        # first reviewed URL at all. The exemption gives up nothing: a blank page
+        # holds no element to click, no field to fill and no secret to leak, and the
+        # goto's own target is checked against the same patterns immediately below.
+        if not (fresh.url == _BLANK_PAGE_URL and candidate.action == "goto"):
+            if not navigation_allowed(fresh.url, session.patterns):
+                return _result("blocked", fresh.url, fresh.generation, "policy_blocked")
+        if fresh.url != observed_url:
             return _result("stale", fresh.url, fresh.generation, "target_stale")
+        # A ``goto`` target is re-checked against the SAME reviewed patterns the
+        # current page was just checked against, before the navigation is made
+        # rather than after it. The loop path only ever supplies a URL that came
+        # from the recipe, so this changes nothing there; the observe/act RPC
+        # accepts a candidate from outside this process, and without this check
+        # the one place a caller-supplied string reached Playwright unfiltered was
+        # ``page.goto``. Refusing here — not on the next iteration's inspection —
+        # means the request is never issued at all.
+        if candidate.action == "goto" and candidate.url is not None:
+            if not navigation_allowed(candidate.url, session.patterns):
+                return _result("blocked", fresh.url, fresh.generation, "policy_blocked")
 
         target_index: int | None = None
         if candidate.identity is not None:
@@ -1682,6 +2183,27 @@ class PlaywrightBrowserWorker:
                 return _result("stale", fresh.url, fresh.generation, "target_not_found")
             if len(matches) > 1:
                 return _result("stale", fresh.url, fresh.generation, "target_ambiguous")
+            # Credential-bearing fields are WRITTEN by code-owned injection and by
+            # nothing else. The candidate generator already refuses to emit a value
+            # action against a ``secretish`` element, so on the loop path this is
+            # unreachable; it is restated here because the observe/act RPC does not
+            # go through the generator, and "the agent never types into a password
+            # box" has to be true of the executor itself rather than only of the
+            # one caller that happens to be careful.
+            #
+            # Scoped to VALUE actions on purpose, and the reason matters.
+            # ``secretish`` is a substring test on the accessible NAME
+            # (``decider.py`` matches pass|secret|token|otp|code|...), so on a
+            # credentials page it is true of nearly every control — "Create new
+            # token" and "Copy API key" included. Refusing every non-read-only
+            # action on such an element would make the credential surface entirely
+            # unclickable and would veto the one click the risk policy explicitly
+            # authorizes under ``create_if_missing``. Whether a CLICK on a
+            # consequential control may run is the risk policy's question, asked in
+            # front of the loop; what belongs here is only the narrow, unconditional
+            # rule about writing.
+            if matches[0].secretish and candidate.action in VALUE_ACTIONS:
+                return _result("blocked", fresh.url, fresh.generation, "policy_blocked")
             target_index = matches[0].index
 
         def _approved_or_raise() -> str:

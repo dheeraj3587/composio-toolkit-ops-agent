@@ -488,7 +488,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--credential-creation-policy",
         choices=("reuse_only", "create_if_missing"),
-        default="reuse_only",
+        default="create_if_missing",
         help="Reuse an existing developer credential or explicitly allow create-if-missing.",
     )
 

@@ -147,6 +147,19 @@ class FlowSpec:
     requires_approval: bool = False
     requires_billing: bool = False
     evidence: tuple[FieldEvidence, ...] = ()
+    # The exact accessible names of the controls this flow's own reviewed
+    # description says CREATE the thing — "Create app", "Generate new token".
+    # ``steps`` is prose for the prompt and grounds nothing; these are matched
+    # against a live control's accessible name by
+    # ``ops.browser.risk.BrowserActionRiskPolicy``, which refuses every
+    # create/generate/save click that is not one of them. The recipe layer has
+    # carried the same field (``BrowserStep.credential_creation_controls``) all
+    # along; the profile layer had no equivalent, which is why the driver's own
+    # loop had no reviewed creation authority to consult and clicked anyway.
+    #
+    # Empty is the closed answer: an unreviewed flow gates to a human rather than
+    # creating something nobody signed off on.
+    control_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.supported and not self.entry_url:
@@ -155,6 +168,12 @@ class FlowSpec:
             len(step) > MAX_FLOW_STEP_CHARACTERS for step in self.steps
         ):
             raise ValueError("flow steps exceed their bound")
+        # Bounded on the same terms as the prose, for the same reason: these
+        # travel into a prompt-adjacent policy and a control label is short.
+        if len(self.control_names) > MAX_FLOW_STEPS or any(
+            not name.strip() or len(name) > MAX_FLOW_STEP_CHARACTERS for name in self.control_names
+        ):
+            raise ValueError("flow control names exceed their bound")
 
 
 @dataclass(frozen=True, slots=True)

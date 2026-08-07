@@ -30,6 +30,20 @@ from ops.research.p1_adapter import (
 from ops.runs.projections import _app_projection, _public_run, _sanitized_app_list
 
 
+def _runnable_readiness_tiers() -> dict[str, str]:
+    """Every runnable slug mapped to its reviewed readiness tier.
+
+    Both catalog reads already loaded this catalog to build the runnable-slug
+    filter and then threw the recipes away. Keeping the tier costs nothing and is
+    what the operator picking a batch actually needs: it is the recipe's own claim
+    about how far the agent gets unattended, which is a different question from
+    ``access_route`` (how the credential is obtained). Membership still decides
+    what is runnable, so a slug absent here is filtered out exactly as before.
+    """
+
+    return {recipe.app_slug: recipe.readiness_tier for recipe in load_app_recipe_catalog().apps}
+
+
 class RunQueryContext(Protocol):
     """The run-service state these read-only queries need.
 
@@ -101,15 +115,15 @@ class RunQueryService:
             raise ValueError("limit must be between 1 and 100")
         normalized = " ".join(query.casefold().split())
         snapshot = load_verified_snapshot(self._context.p1_adapter.snapshot_root)
-        runnable_slugs = {recipe.app_slug for recipe in load_app_recipe_catalog().apps}
+        runnable_tiers = _runnable_readiness_tiers()
         matches: list[dict[str, Any]] = []
         for record in snapshot.records:
-            if record.slug not in runnable_slugs:
+            if record.slug not in runnable_tiers:
                 continue
             haystack = " ".join((record.app, record.slug, record.category)).casefold()
             if normalized and normalized not in haystack:
                 continue
-            matches.append(_app_projection(record))
+            matches.append(_app_projection(record, readiness_tier=runnable_tiers[record.slug]))
             if len(matches) >= limit:
                 break
         return _sanitized_app_list(matches, capability="app search")
@@ -128,13 +142,17 @@ class RunQueryService:
         """
 
         snapshot = load_verified_snapshot(self._context.p1_adapter.snapshot_root)
-        runnable_slugs = {recipe.app_slug for recipe in load_app_recipe_catalog().apps}
+        runnable_tiers = _runnable_readiness_tiers()
         ordered = sorted(
-            (record for record in snapshot.records if record.slug in runnable_slugs),
+            (record for record in snapshot.records if record.slug in runnable_tiers),
             key=lambda record: record.app.casefold(),
         )
         return _sanitized_app_list(
-            [_app_projection(record) for record in ordered], capability="app catalog"
+            [
+                _app_projection(record, readiness_tier=runnable_tiers[record.slug])
+                for record in ordered
+            ],
+            capability="app catalog",
         )
 
     def get_app_research(self, app_slug: str) -> tuple[dict[str, Any], OperationalResearch] | None:

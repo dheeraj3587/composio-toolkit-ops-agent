@@ -28,6 +28,7 @@ from ops.browser.egress import BrowserEgressPolicy, EgressStage
 from ops.browser.link_log import log_event
 from ops.browser.target_selection import AccountState, select_browser_target
 from ops.browser.worker import (
+    HOST_POLICY_REASON_CODE,
     BrowserObservation,
     is_allowed_browser_url,
     sanitize_browser_url,
@@ -184,12 +185,34 @@ def make_route_handler(
     return _handler
 
 
-def _blocked(url: str) -> BrowserObservation:
+def _blocked(url: str, *, reason_code: str = HOST_POLICY_REASON_CODE) -> BrowserObservation:
+    """Refuse a navigation that left the reviewed hosts, and say which host.
+
+    Every refusal this function produces has the same cause: the page the run is
+    on, or the page it was about to be on, is not in the recipe's reviewed host
+    list. That is a fact about the RECIPE, not about the run — the vendor moved a
+    page, redirected through an identity provider, or the reviewed list was never
+    complete. An operator fixes it by widening the list and pressing Retry, so
+    the observation now NAMES that cause and ``canonical_runtime`` projects it as
+    ``configuration_required`` instead of the terminal ``blocked`` that
+    ``ops/core/state.py`` gives no outgoing transition.
+
+    The default reason code is the host-policy one because every current caller
+    is guarding the same predicate — ``navigation_allowed`` returned ``False``,
+    or the request-level guard aborted the load for the same reason. A caller
+    with a genuinely different cause passes its own code and keeps the terminal
+    projection.
+    """
+
     parsed = urlsplit(url)
     host = parsed.hostname or "unknown"
     return BrowserObservation(
         status="blocked",
         current_url=sanitize_browser_url(url),
         page_title=f"Navigation blocked by host policy ({host})"[:500],
-        non_secret_notes=("Target was outside the reviewed host allowlist.",),
+        non_secret_notes=(
+            "Target was outside the reviewed host allowlist.",
+            f"Add {host} to the recipe's reviewed hosts and retry the run.",
+        ),
+        reason_code=reason_code,
     )

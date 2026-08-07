@@ -98,6 +98,7 @@ from ops.planner.validator import (
     PLAN_REFUSAL_REASON_CODE,
     PlanRefusal,
 )
+from ops.playwright.actions import ActionExecutionResult
 from ops.providers.profile import ProfileField, ProviderProfile
 from ops.providers.profile_builder import ProfileClaim, build_profile, discovery_adapter
 from ops.providers.profile_store import ProviderProfileStore
@@ -224,12 +225,34 @@ class _ProviderSite:
             controls=("Developer settings",),
         )
 
-    async def act(self, candidate: ActionCandidate) -> None:
+    async def act(self, candidate: ActionCandidate) -> ActionExecutionResult:
+        before = self._url()
         self.acted.append(candidate.semantic_target)
         if self.state == "verified":
             self.state = "console"
         elif self.state == "console":
             self.state = "app_created"
+        # The site answers the way the executor does: a typed result, so the loop
+        # can tell an action that ran from one that was refused, went stale, or
+        # failed. Returning ``None`` — what this double did while ``act`` was
+        # declared ``-> None`` — is now refused outright.
+        return ActionExecutionResult(
+            status="executed",
+            candidate_id=candidate.candidate_id,
+            before_url=before,
+            after_url=self._url(),
+            before_generation=1,
+            after_generation=2,
+        )
+
+    def _url(self) -> str:
+        """Where this site currently is, in the same order ``observe`` reports."""
+
+        if self.state == "app_created":
+            return APP_CREATED_URL
+        if self.state == "console":
+            return PORTAL_URL
+        return WELCOME_URL
 
     # --- the signup submitter -----------------------------------------------
 

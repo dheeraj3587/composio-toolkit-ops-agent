@@ -233,7 +233,12 @@ export const providerStatusSchema = z.strictObject({
   // render truthfully instead of being rejected as invalid responses.
   provider: safeToken,
   status: safeToken,
-  detail: boundedText(500),
+  // Mirrors `api/models.py::ProviderState.detail`, which is a plain `str` and so
+  // permits "". boundedText adds a min(1) the backend does not have: a provider
+  // reporting an empty detail — which `not_configured` routinely does — failed
+  // this field, and because the whole health response is a strictObject, one
+  // empty string turned every provider's status into an unreadable response.
+  detail: z.string().max(500),
   reason_code: safeToken.nullish().default(null),
   checked_at: isoTimestamp.nullish().default(null),
   expires_at: isoTimestamp.nullish().default(null),
@@ -543,6 +548,27 @@ export const runDetailResponseSchema = z.strictObject({
   autonomy: autonomyOutcomeSchema.nullish().default(null),
 })
 
+// One app's outcome inside a batch create. `run_id` is present exactly when the
+// status is "created"; `reason_code` is a closed backend token and `detail` a
+// short operator-facing string, so neither is rendered raw as a sentence.
+export const batchRunResultSchema = z.strictObject({
+  app_name: boundedText(200),
+  status: z.enum(["created", "rejected"]),
+  run_id: runId.nullish().default(null),
+  reason_code: safeToken.nullish().default(null),
+  detail: nullableText(400),
+})
+
+// POST /api/runs/batch answers 201 even when every app was rejected: the batch
+// was processed and each app's outcome is data, not a transport error. Parsed
+// whole so a partial success can never be read as a failure.
+export const createRunBatchResponseSchema = z.strictObject({
+  requested: z.number().int().nonnegative(),
+  created: z.number().int().nonnegative(),
+  rejected: z.number().int().nonnegative(),
+  results: z.array(batchRunResultSchema).max(50),
+})
+
 const managedRedirectUrl = z.string().min(8).max(MAX_URL_LENGTH).refine((value) => {
   if (/[\u0000-\u0020\u007f]/.test(value)) return false
   try {
@@ -647,7 +673,14 @@ const runDecisionSchema = z.strictObject({
 })
 
 const runCitationSchema = z.strictObject({
-  kind: safeToken,
+  // Mirrors `api/models.py::RunCitationView.kind`, which is `str(max_length=60)`
+  // — deliberately free text, because the backend derives it from a research
+  // claim's FIELD NAME (`api/service.py::_run_citations`). safeToken forbids the
+  // slash and space those field names carry, and one such citation rejected the
+  // entire timeline response, which is the only source AgentTrace has. Rendered
+  // through `humanize()` into a span in agent-trace.tsx: inert text, never a
+  // link, a control, or markdown. Same treatment as the `reason` prose above.
+  kind: z.string().max(60),
   url: httpUrl,
   source_url: httpUrl.nullish().default(null),
 })
@@ -788,6 +821,52 @@ const relativeViewerPath = (endpoint: "screenshot" | "interactive") =>
     .max(300)
     .regex(new RegExp(`^/api/runs/[A-Za-z0-9_-]{1,180}/live-view/${endpoint}$`))
 
+// The address of our own browser service is a deployment choice, not a
+// constant: Compose sets BROWSER_SERVICE_URL and ops/core/config.py lets an
+// operator override it. This check used to pin the literal "browser-worker" and
+// "8081", so moving that one env var turned every live-view grant into a 502
+// INVALID_INTERACTIVE_GRANT with nothing in the UI to explain why. Only the
+// deployed origin is configurable; the property being defended -- the grant
+// points at us and not at some other host -- is unchanged.
+const DEFAULT_BROWSER_SERVICE_ORIGIN = "http://browser-worker:8081"
+
+// Fail closed in both directions. A missing, unparseable, or non-http(s)
+// BROWSER_SERVICE_URL falls back to the Compose default rather than widening
+// the comparison, so a typo in the env var can never degrade this to "any
+// host". `host` (not `hostname`) is compared so the port stays part of the
+// identity, and URL normalizes an explicit default port away on both sides.
+function expectedBrowserServiceOrigin(): { protocol: string; host: string } {
+  const configured = process.env.BROWSER_SERVICE_URL?.trim()
+
+  if (configured) {
+    try {
+      const parsed = new URL(configured)
+      if ((parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.host) {
+        return { protocol: parsed.protocol, host: parsed.host }
+      }
+    } catch {
+      // fall through to the default below
+    }
+  }
+
+  const fallback = new URL(DEFAULT_BROWSER_SERVICE_ORIGIN)
+  return { protocol: fallback.protocol, host: fallback.host }
+}
+
+/** True only for a URL whose shape and origin match our own browser service. */
+export function isOwnBrowserServiceEndpoint(parsed: URL, pathname: string): boolean {
+  const expected = expectedBrowserServiceOrigin()
+
+  return (
+    parsed.protocol === expected.protocol &&
+    parsed.host === expected.host &&
+    parsed.pathname === pathname &&
+    parsed.username === "" &&
+    parsed.password === "" &&
+    parsed.hash === ""
+  )
+}
+
 // The API-to-Next hop may carry one private, short-lived noVNC grant. This
 // schema lives in a server-only module and accepts only the reviewed browser
 // service endpoint with exactly one bounded session and token parameter. The
@@ -805,14 +884,7 @@ const privateInteractiveGrant = z.string().min(1).max(4_096).superRefine((value,
   const queryKeys = [...parsed.searchParams.keys()]
   const session = parsed.searchParams.get("session")
   const token = parsed.searchParams.get("token")
-  const validEndpoint =
-    parsed.protocol === "http:" &&
-    parsed.hostname === "browser-worker" &&
-    parsed.port === "8081" &&
-    parsed.pathname === "/internal/browser/live-view/novnc" &&
-    parsed.username === "" &&
-    parsed.password === "" &&
-    parsed.hash === ""
+  const validEndpoint = isOwnBrowserServiceEndpoint(parsed, "/internal/browser/live-view/novnc")
   const validQuery =
     queryKeys.length === 2 &&
     new Set(queryKeys).size === 2 &&
@@ -925,6 +997,11 @@ export const appSearchItemSchema = z.strictObject({
   confidence: z.number().min(0).max(1).nullable().default(null),
   buildability: safeToken,
   verification_status: safeToken,
+  // How far the agent gets unattended, from the app's reviewed recipe. Nullish
+  // with a null default rather than required: the field defaults to None
+  // server-side and an older API omits it entirely, and a strictObject failure
+  // here is a 502 that would cost the whole catalog over one grouping key.
+  readiness_tier: readinessTierSchema.nullish().default(null),
 })
 
 export const appSearchResponseSchema = z.strictObject({

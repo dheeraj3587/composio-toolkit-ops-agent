@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import secrets
 import threading
 from collections.abc import Mapping
@@ -31,6 +32,8 @@ from ops.browser.readiness import browser_configuration_state
 from ops.browser.setup_values import browser_setup_values
 from ops.browser.signup import normalize_signup_fields
 from ops.browser.worker import (
+    HOST_POLICY_REASON_CODE,
+    MAX_OBSERVATION_STEPS,
     BrowserObservation,
     BrowserSessionContext,
     HumanActionType,
@@ -40,9 +43,21 @@ from ops.core.model_catalog import ModelSelection
 from ops.core.models import OperationalResearch, OperationsRequest
 from ops.core.secret_store import AccountLoginStateError, SQLiteSecretStore, parse_vault_reference
 from ops.core.state import BrowserProvider, RunStatus
-from ops.core.storage import OperationsStorage
+from ops.core.storage import (
+    CANDIDATE_ACTION_VALUES,
+    MAX_PROGRESS_STEP_INDEX,
+    OperationsStorage,
+    OperationsUnitOfWork,
+)
 from ops.onboarding.composition import OnboardingPorts, build_onboarding_ports
-from ops.onboarding.driver import RunPlanningPorts, plan_admission
+from ops.onboarding.driver import RunPlanningPorts, SQLitePhaseHistoryStore, plan_admission
+from ops.onboarding.phase import (
+    INITIAL_PHASE,
+    ONBOARDING_REASON_CODES,
+    OnboardingPhase,
+    OnboardingReasonCode,
+    is_legal_phase_transition,
+)
 from ops.planner.adherence import AdherenceOutcome
 from ops.planner.plan import RunPlan, canonical_surface
 from ops.providers.composio_managed_auth import (
@@ -69,6 +84,7 @@ from ops.runs.idempotency import (
     _request_fingerprint,
     validate_idempotency_key,
 )
+from ops.runs.liveness import AWAITING_OWNER_PHASES
 from ops.runs.projections import _PERSISTED_EXECUTION_MODE, _public_run, _slugify
 from ops.runs.recipe_snapshot import (
     RecipeSnapshotError,
@@ -83,6 +99,295 @@ ExecutionMode = Literal["plan_only", "execute_when_configured"]
 # of being downgraded to ``provider_verification`` by the resume path below.
 _HUMAN_ACTION_TYPES: frozenset[str] = frozenset(get_args(HumanActionType))
 _STALE_ROUTE_OBSERVATION: Final = object()
+
+# The one onboarding phase every canonical browser step is filed under, and the
+# one correlation id that joins a progress event to its decision.
+#
+# Both are constants on purpose. The canonical runtime's phase strings are a
+# different vocabulary from ONBOARDING_PHASES, so any per-step mapping would be
+# invented rather than observed; and because ``step_index`` is made unique across
+# a run's drives before it is written, the correlation id carries no further
+# distinguishing work. ``developer_app`` is the phase every canonical browser
+# drive is actually working toward: reaching the vendor's own application or API
+# settings surface.
+_CANONICAL_TELEMETRY_PHASE: Final = "developer_app"
+_CANONICAL_TELEMETRY_CORRELATION_ID: Final = "canonical-browser-loop"
+
+# The correlation id every canonical phase boundary is filed under.
+#
+# One constant, and that is what makes the boundary writes idempotent for free:
+# ``onboarding_phase_history`` is unique on
+# ``(run_id, COALESCE(from_phase, ''), to_phase, attempt, correlation_id)``, so a
+# boundary this runtime re-derives after a restart, a duplicated observation, or
+# a re-entered code path collides with the row already there and comes back as
+# ``False`` — the store's own replay no-op — instead of appending a second copy.
+_CANONICAL_PHASE_CORRELATION_ID: Final = "canonical-phase-boundary"
+
+# The onboarding-vocabulary spine a canonical run walks, in order.
+#
+# Why a spine rather than a table keyed by the runtime's own phase strings: the
+# canonical runtime has ~28 phase strings and ``ops.onboarding.phase`` has 17,
+# and the legal-transition table refuses all but a handful of pairs. Naming the
+# ordered sequence instead means every consecutive pair here is legal by
+# construction, so advancing along it can never raise ``IllegalPhaseTransition``
+# and can never need a transition the state machine does not already declare.
+#
+# Nothing here is invented: each of these is a fact the canonical runtime proves
+# before the boundary is written — the run was created from reviewed research,
+# the vault was consulted for a stored login, a browser session was created on
+# the recipe's login entry, the vendor's own in-policy surface answered, the
+# credential surface was reached, a credential was captured, vaulted, and
+# validated.
+_CANONICAL_PHASE_SPINE: Final[tuple[OnboardingPhase, ...]] = (
+    "research",
+    "vault_check",
+    "route_selected_login",
+    "authenticated",
+    "developer_app",
+    "credential_generation",
+    "vault_storage",
+    "credential_validation",
+    "completed",
+)
+_CANONICAL_SPINE_INDEX: Final[dict[OnboardingPhase, int]] = {
+    phase: index for index, phase in enumerate(_CANONICAL_PHASE_SPINE)
+}
+
+# The reason code an intermediate spine boundary carries when it is crossed on
+# the way to a later one. Every member is in ``OnboardingReasonCode`` and names
+# what that phase established, so the console never renders a code invented here.
+_CANONICAL_SPINE_REASON: Final[dict[OnboardingPhase, OnboardingReasonCode]] = {
+    "research": "profile_corroborated",
+    "vault_check": "credentials_present",
+    "route_selected_login": "session_recreated",
+    "authenticated": "host_in_app_policy",
+    "developer_app": "developer_app_created",
+    "credential_generation": "credential_generated",
+    "vault_storage": "credential_stored",
+    "credential_validation": "credential_valid",
+    "completed": "credential_valid",
+}
+
+# Which projected browser outcome crosses which onboarding boundary.
+#
+# Deliberately partial. ``target_probe_pending`` crosses nothing — the run is
+# still inside the phase it was already in. ``failed``, ``blocked``,
+# ``effect_reconciliation``, ``host_policy_review_required`` and
+# ``credential_validation_failed`` are canonical-only recovery states with no
+# onboarding counterpart: ``blocked`` in particular is reachable in the
+# transition table only from ``research`` and ``vault_check``, so claiming it for
+# a run that already opened a browser would be a boundary the state machine does
+# not admit. Those outcomes leave the history at the last boundary that was
+# actually proven, which is the honest reading.
+_CANONICAL_OUTCOME_BOUNDARY: Final[dict[str, tuple[OnboardingPhase, OnboardingReasonCode]]] = {
+    "challenge_pending": ("captcha_paused", "captcha_detected"),
+    "entry_reached": ("developer_app", "developer_app_created"),
+    "credential_ready": ("developer_app", "developer_app_created"),
+    "completed": ("completed", "credential_valid"),
+}
+
+# Phases :meth:`CanonicalRuntime.retry_browser_run` refuses to restart from.
+#
+# This was an ALLOW-list of four phases — browser_unavailable, browser_start_failed,
+# failed, session_lost — which are the four ways Chromium itself dies. Nine other
+# phases also write ``configuration_required``: effect_reconciliation,
+# login_credential_staging, signup_identity_required, login_account_selection,
+# signup_login_promotion, login_credential_promotion, plan_refused,
+# outreach_send_failed and credential_validation_failed. Every one of them named a
+# state the operator was explicitly told to recover from, and every one of them
+# answered Retry with ``browser_retry_requires_reconciliation`` — the run was
+# recoverable by design and unrecoverable in practice.
+#
+# Inverting it makes the default *recoverable*, which is the right default for a
+# status whose whole meaning is "an operator can fix this". A retry is safe by
+# construction for these nine: the docstring invariant below holds regardless of
+# phase — each attempt takes a fresh effect identity while capture reconciliation
+# stays bound to the run, so a restart cannot duplicate a credential-generation
+# side effect. ``effect_reconciliation`` is the one phase that names an ambiguous
+# external outcome rather than a local failure, so it gets its own check.
+#
+# What stays denied, and why each is not merely an omission:
+#   blocked           - terminal by policy; ops/core/state.py gives it no outgoing
+#                       status transition, so a restart would be refused downstream
+#                       anyway, with a worse error.
+#   completed         - there is nothing to retry, and re-running a finished trace
+#                       would act on the vendor a second time.
+#   credential_ready  - the run is parked on the page a human was asked to visit.
+#   entry_reached       Restarting throws away exactly the submission window
+#                       AWAITING_OWNER_PHASES in ops/runs/liveness.py exists to
+#                       protect. Same invariant, enforced against the operator's
+#                       own button instead of against a sweep.
+RETRY_DENIED_PHASES: Final[frozenset[str]] = frozenset(
+    {"blocked", "completed", "credential_ready", "entry_reached"}
+)
+
+
+def _projection_discard_reason(
+    record: Mapping[str, Any] | None,
+    *,
+    session_id: str,
+    projection_effect_identity: str | None,
+    expected_state_revision: int | None,
+) -> str | None:
+    """Which compare-and-set guard refuses this projection, or ``None`` to write it.
+
+    Extracted from the boolean chain it replaces so that a lost race can SAY which
+    guard it lost on. The conditions and their order are unchanged; only the return
+    type is, from "may I write" to "why may I not". Every code is a fixed internal
+    token and carries no run data, so it is safe to persist in an audit payload.
+    """
+
+    if record is None:
+        return "run_row_absent"
+    if record.get("state_engine") != "canonical_v1":
+        return "run_is_not_canonical"
+    if record.get("browser_provider") != "playwright":
+        return "run_is_not_playwright"
+    if record.get("browser_session_id") != session_id:
+        # A different browser session is bound to the run than the one that
+        # produced this observation.
+        return "session_rebound"
+    if str(record.get("status") or "") not in {"browser_running", "waiting_for_hitl"}:
+        return "run_left_browser_statuses"
+    if (
+        projection_effect_identity is not None
+        and record.get("effect_identity") != projection_effect_identity
+    ):
+        # Typically a retry: ``retry_browser_run`` mints a fresh effect identity, so
+        # the previous attempt's projection must not land on the new attempt.
+        return "effect_identity_superseded"
+    if (
+        expected_state_revision is not None
+        and int(record.get("state_revision", 0) or 0) != expected_state_revision
+    ):
+        return "state_revision_superseded"
+    return None
+
+
+# The statuses a discarded projection may durably annotate.
+#
+# Both mean the same thing: whatever took this row away from the browser has
+# already STOPPED it, so no writer is stepping it any more and a phase written
+# here fights nobody. Every other discard reason leaves the run inside a browser
+# status with a live writer that won the race, and the loser must not overwrite
+# the winner — which is why the annotation below is conditional rather than
+# unconditional. ``completed`` and ``blocked`` are excluded by the same rule:
+# they are terminal, and re-phasing a terminal run would resurrect it.
+_RECONCILABLE_DISCARD_STATUSES: Final[frozenset[str]] = frozenset(
+    {"failed", "configuration_required"}
+)
+
+
+def _record_discarded_credential_custody(
+    transaction: OperationsUnitOfWork,
+    run_id: str,
+    *,
+    record: Mapping[str, Any],
+    outcome: _AppliedBrowserOutcome,
+    discard_reason: str,
+) -> None:
+    """Keep custody of a credential whose projection lost its compare-and-set.
+
+    The dangerous discard is the one that happens AFTER automatic capture: the
+    vendor has issued a key, the worker has written it to the vault, and the
+    side-effect ledger says ``completed``/``credential_vaulted`` — and then the
+    projection carrying the references loses the race and is dropped. The ledger
+    row alone is not enough to recover from: it proves a credential exists but
+    not where, because the id inside a ``vault://`` reference is minted per write
+    and cannot be re-derived. Losing the references orphans a live secret — one
+    nobody can hand to the integrator and nobody can revoke.
+
+    Two durable facts are written, and the second one deliberately only
+    sometimes:
+
+    * **The custody event, always.** ``credential_refs`` is a mapping of
+      ``vault://`` pointers, which is exactly what ``credentials_stored``
+      already persists on the happy path and what the redactor keeps rather
+      than masks (``ops/core/redaction.py`` ``_is_reference_payload``). No value
+      is written here, only the address of one.
+    * **The phase, only on a run that has already stopped.** A run still inside
+      a browser status has a live writer that won this race, and annotating it
+      would be the loser overwriting the winner one level up. A run the sweeps
+      or a failure already parked at ``failed``/``configuration_required`` has
+      no such writer, and there ``effect_reconciliation`` is the phase that says
+      what is true — a credential exists and the run has not accounted for it.
+      That phase is also the one ``retry_browser_run`` reconciles rather than
+      blindly restarts, so the annotation is what makes the run recoverable from
+      the operator's Retry instead of merely explicable in the audit log.
+    """
+
+    refs = dict(outcome.vaulted_credential_refs or {})
+    if not refs:
+        return
+    transaction.append_audit_event(
+        run_id=run_id,
+        event_type="credential_reconciliation_required",
+        payload={
+            "reason_code": "credential_vaulted_projection_discarded",
+            "discard_reason_code": discard_reason,
+            "kinds": sorted(refs),
+            "credential_refs": dict(sorted(refs.items())),
+            "effect_identity": outcome.effect_identity,
+            "external_actions": True,
+        },
+    )
+    if str(record.get("status") or "") not in _RECONCILABLE_DISCARD_STATUSES:
+        return
+    revision = int(record.get("state_revision", 0) or 0) + 1
+    transaction.update_run(
+        run_id,
+        phase="effect_reconciliation",
+        reason_code="credential_vaulted_projection_discarded",
+        external_actions=True,
+        state_revision=revision,
+        last_projected_revision=revision,
+    )
+
+
+def _canonical_profile_digest(app_slug: str) -> str:
+    """The profile digest every canonical row for one app is filed under.
+
+    Derived rather than looked up, for the reason ``_record_step_telemetry``
+    already states: the digest is never projected to the API, it exists to
+    satisfy the storage validator and to join a run's rows to each other, so
+    deriving it from the recipe slug keeps it stable across drives without
+    pretending a research profile was involved. Shared with the telemetry writer
+    so a run's progress events and its phase history carry the same value.
+    """
+
+    return hashlib.sha256(f"canonical_v1:{app_slug}".encode()).hexdigest()
+
+
+def _next_phase_boundary(phase: OnboardingPhase, target: OnboardingPhase) -> OnboardingPhase | None:
+    """The one boundary to commit next on the way from ``phase`` to ``target``.
+
+    ``None`` means there is no legal way forward, and the caller then records
+    nothing rather than forcing a transition the state machine refuses.
+
+    Three cases, in the order they are tried:
+
+    * the direct boundary is already legal — take it;
+    * both phases sit on the spine and the target is ahead — take one step
+      along the spine, which is legal by the spine's construction;
+    * ``phase`` is off the spine (a CAPTCHA pause is the only way that happens
+      today) — rejoin at the furthest spine phase the pause may legally reach
+      without overshooting the target.
+    """
+
+    if is_legal_phase_transition(phase, target):
+        return target
+    there = _CANONICAL_SPINE_INDEX.get(target)
+    if there is None:
+        return None
+    here = _CANONICAL_SPINE_INDEX.get(phase)
+    if here is not None:
+        return _CANONICAL_PHASE_SPINE[here + 1] if there > here else None
+    rejoin = [
+        candidate
+        for candidate in _CANONICAL_PHASE_SPINE[:there]
+        if is_legal_phase_transition(phase, candidate)
+    ]
+    return rejoin[-1] if rejoin else None
 
 
 class CanonicalRuntimeContext(Protocol):
@@ -177,6 +482,7 @@ class CanonicalRuntimeContext(Protocol):
         recipe: AppRecipe,
         expected_state_revision: int,
         expected_effect_identity: str | None,
+        evidence: str = "",
     ) -> bool | None: ...
 
 
@@ -195,6 +501,15 @@ class _AppliedBrowserOutcome:
     hitl: dict[str, object] | None = None
     changes: Mapping[str, object] | None = None
     events: tuple[tuple[str, Mapping[str, object]], ...] = ()
+    # The ``vault://`` pointers to material that is ALREADY in the vault by the
+    # time this outcome exists. Automatic capture writes the secret inside the
+    # browser worker, so from the moment it returns references the vault holds a
+    # value whose only address is this mapping: the id in a reference is minted
+    # per put() and cannot be re-derived from the app slug or the account.
+    # Carrying it here is what lets the projection's discard branch record the
+    # custody fact instead of dropping the last copy of the address (item 1.6).
+    # References, never values — the same boundary every audit payload uses.
+    vaulted_credential_refs: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +596,8 @@ class CanonicalRuntime:
         self._context = context
         self._planning = planning
         self._onboarding_ports: OnboardingPorts | None = None
+        self._phases: SQLitePhaseHistoryStore | None = None
+        self._phases_lock = threading.Lock()
 
     def onboarding_ports(self) -> OnboardingPorts:
         """Bind the onboarding ports from this runtime's own settings and vault.
@@ -306,6 +623,109 @@ class CanonicalRuntime:
                 secret_store=self._context._secret_store,
             )
         return self._onboarding_ports
+
+    def _phase_store(self) -> SQLitePhaseHistoryStore | None:
+        """The run ledger's phase history, opened once per runtime.
+
+        The SAME store the API reads through ``_ApiOnboardingProjection`` and the
+        same one the phase driver writes through — opened against this runtime's
+        own ledger path so there is exactly one ``onboarding_phase_history`` for a
+        deployment. Opened lazily rather than in ``__init__`` because it runs the
+        ledger DDL, and returned as ``None`` if that fails: phase history is a
+        console projection, and a run must not fail because its projection could
+        not be opened.
+        """
+
+        with self._phases_lock:
+            if self._phases is None:
+                try:
+                    self._phases = SQLitePhaseHistoryStore(self._context.storage.db_path)
+                except Exception:  # pragma: no cover - a ledger that cannot be opened
+                    return None
+            return self._phases
+
+    def _commit_phase_boundary(
+        self,
+        run_id: str,
+        *,
+        target: OnboardingPhase,
+        reason_code: OnboardingReasonCode,
+        app_slug: str,
+        attempt: int = 0,
+    ) -> None:
+        """Record the onboarding boundaries this run has now provably crossed.
+
+        Why this exists at all: ``api.service`` decides a run is an onboarding run
+        exactly when ``SQLitePhaseHistoryStore.history`` is non-empty for it, and
+        the only writer of that table was the phase driver, which
+        ``api/app.py`` refuses. Every live run therefore had empty history, which
+        made reset, pause, decision and retry-step answer ``phase_unavailable``
+        and left the console's agent panel blank. Committing the boundaries the
+        canonical runtime already proves closes that without any driver work.
+
+        Three properties, each of which is a constraint rather than a preference:
+
+        * **It is called only after a compare-and-set has already won.** Every
+          call site sits after its unit of work has committed. A projection that
+          loses its CAS returns before reaching here, so a lost race can never
+          leave a history row describing work the run never recorded — the same
+          ordering, and the same reason, as ``_record_step_telemetry``.
+        * **It opens its own transaction, never a nested one.** The store takes
+          its own ``BEGIN IMMEDIATE`` on its own connection; calling it inside an
+          open ``unit_of_work`` would have two writers of ``ops.db`` in one
+          thread. Because it is outside the run's transaction it also cannot
+          abort, delay, or roll back a projection: the worst a failure here does
+          is leave the console a boundary short.
+        * **It never raises and never forces a transition.** Illegal boundaries
+          are declined by :func:`_next_phase_boundary` rather than pushed at the
+          store, a replay stops the walk (the row is already durable), and every
+          remaining failure is swallowed into a log line.
+        """
+
+        store = self._phase_store()
+        if store is None:
+            return
+        digest = _canonical_profile_digest(app_slug)
+        try:
+            current = store.current_phase(run_id=run_id)
+            phase = None if current is None else current[0]
+            if phase is None:
+                # A run's history necessarily opens at INITIAL_PHASE: it is the
+                # only phase the transition table admits from no phase at all.
+                if not store.commit_phase(
+                    run_id=run_id,
+                    from_phase=None,
+                    to_phase=INITIAL_PHASE,
+                    reason_code=_CANONICAL_SPINE_REASON[INITIAL_PHASE],
+                    profile_digest=digest,
+                    attempt=attempt,
+                    correlation_id=_CANONICAL_PHASE_CORRELATION_ID,
+                ):
+                    return
+                phase = INITIAL_PHASE
+            # Bounded by the spine's length: the walk advances by one boundary per
+            # iteration and stops on a replay, so it cannot spin.
+            for _ in range(len(_CANONICAL_PHASE_SPINE)):
+                if phase == target:
+                    return
+                step = _next_phase_boundary(phase, target)
+                if step is None:
+                    return
+                if not store.commit_phase(
+                    run_id=run_id,
+                    from_phase=phase,
+                    to_phase=step,
+                    reason_code=(reason_code if step == target else _CANONICAL_SPINE_REASON[step]),
+                    profile_digest=digest,
+                    attempt=attempt,
+                    correlation_id=_CANONICAL_PHASE_CORRELATION_ID,
+                ):
+                    # The store rolled its own unit of work back and the boundary
+                    # is already durable, so there is nothing left to add here.
+                    return
+                phase = step
+        except Exception:  # pragma: no cover - a projection must not fail a run
+            log_event("canonical.phase_history.not_recorded", run_id=run_id)
 
     @staticmethod
     def _requires_broker_grants(worker: object) -> bool:
@@ -988,6 +1408,17 @@ class CanonicalRuntime:
             if created is None:  # pragma: no cover - SQLite invariant
                 raise RuntimeError("created run could not be read")
 
+        # The run's opening phase boundary, written once the run row is durable
+        # (the history table has a foreign key onto it) and outside the unit of
+        # work that made it so. Every route kind gets it, not just Playwright:
+        # reset, pause and the decision endpoint are gated on this history for
+        # managed-auth and gated runs too.
+        self._commit_phase_boundary(
+            run_id,
+            target=INITIAL_PHASE,
+            reason_code=_CANONICAL_SPINE_REASON[INITIAL_PHASE],
+            app_slug=recipe.app_slug,
+        )
         persisted_recipe = self._recipe_for_run(created)
         if not plan_only and persisted_recipe.route_kind == "playwright":
             if stored_login_selection_error is not None:
@@ -1208,6 +1639,16 @@ class CanonicalRuntime:
                 transient=transient_secrets,
             )
             raise
+        # The reservation above committed, which is the run's own proof that the
+        # vault question has been answered: ``sensitive`` is exactly "a stored
+        # login was found and is being submitted".
+        self._commit_phase_boundary(
+            run_id,
+            target="vault_check",
+            reason_code="credentials_present" if sensitive else "credentials_missing",
+            app_slug=recipe.app_slug,
+            attempt=next_attempt,
+        )
         if not reserved:
             self._discard_pre_dispatch_browser_secrets(
                 sensitive=sensitive,
@@ -1347,6 +1788,16 @@ class CanonicalRuntime:
                 transient=transient_secrets,
             )
             raise
+        # A browser session exists and is bound to the run: the login route was
+        # taken, which is the boundary the transition table reaches from
+        # ``vault_check``.
+        self._commit_phase_boundary(
+            run_id,
+            target="route_selected_login",
+            reason_code="session_recreated",
+            app_slug=recipe.app_slug,
+            attempt=next_attempt,
+        )
 
         thread: threading.Thread | None = None
         try:
@@ -1418,6 +1869,142 @@ class CanonicalRuntime:
             raise
         return _public_run(updated)
 
+    def _reconcile_capture_effect(
+        self,
+        run_id: str,
+        current: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Resolve the capture effect BEFORE a restart re-runs it.
+
+        ``effect_reconciliation`` is the only ``configuration_required`` phase that
+        names an ambiguous EXTERNAL outcome rather than a local failure: the run
+        reserved the credential-generation effect and then lost the answer. The
+        recorded intent is the only durable evidence of what the vendor actually
+        did, so it is read here rather than guessed at.
+
+        Three answers, and which one is returned is decided entirely by the ledger:
+
+        * ``None`` — restart the trace. An absent row means the effect was never
+          reserved; ``failed`` means it definitively did not take; and
+          ``completed`` carrying ``no_credential_found`` means the capture ran to
+          the end and the reviewed page held no credential, so nothing was minted
+          and re-running mints nothing twice. That last case used to be refused
+          along with the rest of ``completed``, which dead-ended precisely the
+          runs where automatic capture came back empty — the ones an operator
+          most wants to retry.
+        * a run record — reconciled, do not restart. The vendor issued a key and
+          the worker vaulted it; re-running the trace would press Create again
+          and leave an orphaned key nothing in this system knows about. Instead
+          the run is handed to its owner-submission window, which is a recovery
+          that touches the vendor not at all.
+        * a raised ``CredentialSubmissionError`` — ``outcome_unknown`` and
+          ``pending`` are the two states where the ledger cannot say whether a
+          key exists, so neither a restart nor a reconciliation is honest. This
+          is the one genuinely human question in this method, and it stays fenced
+          rather than guessed.
+        """
+
+        effect = self._context.storage.get_side_effect(
+            run_id,
+            f"{run_id}:credential-capture:v1",
+        )
+        if effect is None:
+            return None
+        status = str(effect.get("status") or "")
+        if status == "completed":
+            if str(effect.get("external_id") or "") == "no_credential_found":
+                return None
+            return self._reconcile_vaulted_capture(run_id, current)
+        if status in {"outcome_unknown", "pending"}:
+            # Reserved, then the answer was lost — ``pending`` for the same reason
+            # as ``outcome_unknown``, because a process that died between reserving
+            # and completing left exactly as little evidence. Neither is a state a
+            # blind restart may resolve.
+            raise CredentialSubmissionError("credential_effect_outcome_unknown")
+        return None
+
+    def _reconcile_vaulted_capture(
+        self,
+        run_id: str,
+        current: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Hand a run whose credential already exists back to its owner window.
+
+        The state this recovers from is real and was a dead end: capture succeeds
+        and vaults, and before the projection commits a sweep or a stop moves the
+        run — so the compare-and-set loses, the run sits at
+        ``effect_reconciliation``, and Retry refuses forever because the ledger
+        correctly says a key was already minted. The credential existed, the run
+        could not reach it, and no button changed that.
+
+        Reopening the owner-submission window is the recovery that costs the
+        vendor nothing: ``browser_running`` plus ``credential_ready`` is exactly
+        the pair ``RunCredentialService.submit_owner_credentials`` accepts, and
+        every automatic-capture recipe in the catalog also declares the
+        ``credential_fields`` that submission needs, so the owner can hand over
+        the key the vendor already issued. ``failed -> browser_running`` and
+        ``configuration_required -> browser_running`` are both legal in
+        ``ops/core/state.py``, so this widens no transition table.
+
+        The stale browser session id is cleared rather than kept. It named a
+        session that was released when the run stopped, and leaving it would
+        both advertise a dead live view and let a late projection from that
+        session match the compare-and-set again.
+
+        A human is genuinely required here — only a person can read a key off the
+        vendor's page — so this is a pause that was always going to exist. What
+        it replaces is not autonomy, it is a permanently unrecoverable run.
+        """
+
+        recipe = self._recipe_for_run(current)
+        if not recipe.credential_fields:
+            # Nothing for the owner to submit, so the window would be a second
+            # dead end. Keep the honest refusal instead of inventing a state.
+            raise CredentialSubmissionError("credential_effect_already_completed")
+        with self._context.storage.unit_of_work() as transaction:
+            record = transaction.get_run(run_id)
+            if record is None:
+                raise KeyError("run was not found")
+            if (
+                str(record.get("status") or "") not in _RECONCILABLE_DISCARD_STATUSES
+                or str(record.get("phase") or "") != "effect_reconciliation"
+            ):
+                # Re-read under the transaction: something moved the run between
+                # the caller's read and this write, and that writer owns it.
+                raise CredentialSubmissionError("credential_effect_already_completed")
+            revision = int(record.get("state_revision", 0) or 0) + 1
+            updated = transaction.update_run(
+                run_id,
+                status="browser_running",
+                phase="credential_ready",
+                reason_code="owner_credential_submission_required",
+                route_reason_code="owner_credential_submission_required",
+                browser_session_id=None,
+                hitl_request=None,
+                provider_status={
+                    "recipe": record.get("readiness_tier"),
+                    "composio": "not_started",
+                    "browser": "credential_page_ready",
+                    "email": "not_started",
+                    "validation": "not_started",
+                },
+                external_actions=True,
+                state_revision=revision,
+                last_projected_revision=revision,
+            )
+            transaction.append_audit_event(
+                run_id=run_id,
+                event_type="credential_effect_reconciled",
+                payload={
+                    "reason_code": "owner_credential_submission_required",
+                    "effect_status": "completed",
+                    # The vendor was not touched to get here; the effect that did
+                    # touch it is the one being reconciled, not repeated.
+                    "external_actions": False,
+                },
+            )
+        return _public_run(updated)
+
     def retry_browser_run(self, run_id: str) -> dict[str, Any]:
         """Start a fresh Playwright attempt after a recoverable browser failure.
 
@@ -1432,6 +2019,13 @@ class CanonicalRuntime:
         if not lock.acquire(blocking=False):
             raise RunConflictError(run_id, "retry_browser")
         try:
+            # An operator retry refunds the autonomous sweeps' gate budgets for
+            # this run. Those budgets are durable now, so without this a run that
+            # exhausted them once would be retried into the same gate with no
+            # attempts left to resolve it — the retry would start a browser and
+            # then wait for a human who was never told to come.
+            with contextlib.suppress(Exception):
+                self._context.storage.clear_gate_attempts(run_id)
             current = self._context.storage.get_run(run_id)
             if current is None:
                 raise KeyError("run was not found")
@@ -1452,13 +2046,17 @@ class CanonicalRuntime:
                     return continued
             if current.get("status") not in {"failed", "configuration_required"}:
                 raise CredentialSubmissionError("browser_retry_not_available")
-            if current.get("phase") not in {
-                "browser_unavailable",
-                "browser_start_failed",
-                "failed",
-                "session_lost",
-            }:
+            current_phase = str(current.get("phase") or "")
+            if current_phase in RETRY_DENIED_PHASES:
                 raise CredentialSubmissionError("browser_retry_requires_reconciliation")
+            if current_phase == "effect_reconciliation":
+                # Read the ledger before restarting anything: this phase exists
+                # precisely because a restart that has not read it may re-run a
+                # committed effect. A reconciliation that resolved the run
+                # returns it here, and no browser is started.
+                reconciled = self._reconcile_capture_effect(run_id, current)
+                if reconciled is not None:
+                    return reconciled
             recipe = self._recipe_for_run(current)
             if recipe.route_kind != "playwright":
                 raise CredentialSubmissionError("run_is_not_playwright")
@@ -1591,6 +2189,11 @@ class CanonicalRuntime:
                     recipe=recipe,
                     expected_state_revision=expected_state_revision,
                     expected_effect_identity=expected_effect_identity,
+                    # The divergence the observer just measured, as sanitized prose.
+                    # ``getattr`` because the context is duck-typed here: an older
+                    # outcome without the field degrades to the evidence-free
+                    # re-plan rather than raising.
+                    evidence=getattr(outcome, "evidence", ""),
                 )
             if replanned is None:
                 return _STALE_ROUTE_OBSERVATION
@@ -1787,6 +2390,22 @@ class CanonicalRuntime:
                 events=(("browser_hitl_required", hitl),),
             )
         if observation.status == "blocked":
+            # A host-policy refusal is not a policy STOP, it is an incomplete
+            # reviewed host list — the vendor redirected through an identity
+            # provider, moved a settings page, or the list never covered the
+            # whole flow. Every one of those is fixed by editing the recipe and
+            # pressing Retry, so it projects as ``configuration_required``: a
+            # status ``ops/core/state.py`` lets a run leave, on a phase that is
+            # not in ``RETRY_DENIED_PHASES``. Terminal ``blocked`` is reserved
+            # for the refusals nothing an operator types can undo — the model's
+            # own unproven ``report_blocked``, and route divergence.
+            if observation.reason_code == HOST_POLICY_REASON_CODE:
+                return _AppliedBrowserOutcome(
+                    status="configuration_required",
+                    phase="host_policy_review_required",
+                    reason_code=HOST_POLICY_REASON_CODE,
+                    provider_browser="blocked",
+                )
             return _AppliedBrowserOutcome(
                 status="blocked",
                 phase="blocked",
@@ -2042,6 +2661,7 @@ class CanonicalRuntime:
                 provider_browser="credential_page_ready",
                 effect_identity=effect_identity,
                 events=(ready_event,),
+                vaulted_credential_refs=dict(refs),
             )
         self._context.storage.update_side_effect(
             run_id=run_id,
@@ -2060,7 +2680,98 @@ class CanonicalRuntime:
             effect_identity=effect_identity,
             changes=changes,
             events=(ready_event, *tuple(final.events)),
+            # Both post-capture outcomes carry the references, not just the happy
+            # one: the vault write is the worker's, and it has already happened in
+            # either branch. The ledger row above says a credential exists; this
+            # says where it is, so the two together survive a lost projection.
+            vaulted_credential_refs=dict(refs),
         )
+
+    def _record_step_telemetry(
+        self,
+        run_id: str,
+        *,
+        observation: BrowserObservation,
+        recipe: AppRecipe,
+    ) -> None:
+        """Write the action loop's trail as the two telemetry rows the console reads.
+
+        The operator console's *Chain of thought* renders
+        ``onboarding_progress_events`` and ``onboarding_step_decisions``, and the
+        only writer of either was ``DurableLoopTelemetry``, which is wired solely
+        to the driver the API still refuses. So on the live canonical path the
+        panel had nothing to render — not because the agent was silent, but
+        because every fact it produced was computed inside the browser container
+        and discarded there. This is the bridge: the worker now carries a
+        bounded, value-free trail back on the observation, and this writes it.
+
+        Four choices worth stating, because each of them is a constraint rather
+        than a preference:
+
+        * ``phase`` is the constant ``developer_app`` for every canonical browser
+          step. The canonical runtime's own ~40 phase strings are a different
+          vocabulary from :data:`ONBOARDING_PHASES`, and inventing a per-step
+          mapping would make the console claim the run crossed phase boundaries
+          the runtime never crossed. One honest phase beats seventeen invented
+          ones.
+        * ``profile_digest`` is derived, not looked up. It is never projected to
+          the API — it exists to satisfy the storage validator and to join rows —
+          so deriving it from the recipe slug keeps it stable across drives
+          without pretending a research profile was involved.
+        * ``step_index`` is offset past whatever the run already recorded. The
+          worker numbers steps from 1 within a single drive; a run that drives
+          twice would otherwise write two rows numbered 1, and the console's
+          one-to-one join of a progress event to its decision would become
+          ambiguous.
+        * ``reason_code`` and ``action`` are dropped unless they are members of
+          the vocabularies storage enforces. ``record_step_decision`` RAISES on an
+          unknown reason code, and the browser's execution reason codes are a
+          different, wider set — so a code from that set must not cost the run
+          its telemetry row.
+
+        The whole method is best-effort. Telemetry that failed to write must
+        never fail the run that produced it: the observation has already been
+        projected by the time this is called, and the vendor-side work it
+        describes has already happened.
+        """
+
+        steps = getattr(observation, "steps", ())
+        if not steps:
+            return
+        try:
+            storage = self._context.storage
+            digest = _canonical_profile_digest(recipe.app_slug)
+            recorded = storage.list_progress_events(run_id)
+            offset = max((int(row.get("step_index") or 0) for row in recorded), default=0)
+            for step in steps[:MAX_OBSERVATION_STEPS]:
+                index = offset + step.step_index
+                if index > MAX_PROGRESS_STEP_INDEX:
+                    break
+                storage.record_progress_event(
+                    run_id=run_id,
+                    phase=_CANONICAL_TELEMETRY_PHASE,
+                    profile_digest=digest,
+                    correlation_id=_CANONICAL_TELEMETRY_CORRELATION_ID,
+                    step_index=index,
+                    stage=step.stage,
+                    elapsed_ms=step.elapsed_ms,
+                )
+                storage.record_step_decision(
+                    run_id=run_id,
+                    phase=_CANONICAL_TELEMETRY_PHASE,
+                    correlation_id=_CANONICAL_TELEMETRY_CORRELATION_ID,
+                    step_index=index,
+                    decision=step.decision,
+                    reason_code=(
+                        step.reason_code if step.reason_code in ONBOARDING_REASON_CODES else None
+                    ),
+                    candidate_label=step.candidate_label,
+                    action=(step.action if step.action in CANDIDATE_ACTION_VALUES else None),
+                    target_host=step.target_host,
+                    reason=step.reason,
+                )
+        except Exception:  # pragma: no cover - telemetry must never fail a run
+            log_event("canonical.browser.telemetry_not_recorded", run_id=run_id)
 
     def _apply_browser_observation(
         self,
@@ -2257,23 +2968,52 @@ class CanonicalRuntime:
                         )
             with self._context.storage.unit_of_work() as transaction:
                 record = transaction.get_run(run_id)
-                if (
-                    record is None
-                    or record.get("state_engine") != "canonical_v1"
-                    or record.get("browser_provider") != "playwright"
-                    or record.get("browser_session_id") != context.session_id
-                    or str(record.get("status") or "")
-                    not in {"browser_running", "waiting_for_hitl"}
-                    or (
-                        projection_effect_identity is not None
-                        and record.get("effect_identity") != projection_effect_identity
-                    )
-                    or (
-                        outcome.expected_state_revision is not None
-                        and int(record.get("state_revision", 0) or 0)
-                        != outcome.expected_state_revision
-                    )
-                ):
+                discarded = _projection_discard_reason(
+                    record,
+                    session_id=context.session_id,
+                    projection_effect_identity=projection_effect_identity,
+                    expected_state_revision=outcome.expected_state_revision,
+                )
+                if discarded is not None:
+                    # The compare-and-set lost: another writer owns this row now.
+                    # Returning silently was the bug — by this point
+                    # ``_finalize_captured_credentials`` may already have vaulted a
+                    # secret and the vendor may already have issued it, and the only
+                    # record of that work was a projection about to be thrown away.
+                    #
+                    # What is written here is an AUDIT EVENT and nothing else. It is
+                    # deliberately not a status or phase write: every branch of
+                    # ``_projection_discard_reason`` means some other authority is
+                    # already responsible for this run — a retry took a fresh effect
+                    # identity, an operator paused it, a newer projection landed —
+                    # so forcing a phase would be this loser overwriting the winner,
+                    # which is the same race one level up. An append-only fact
+                    # conflicts with nobody and still leaves the evidence.
+                    #
+                    # Committed on the same transaction: appending it is what this
+                    # unit of work now exists to do. ``record is None`` is the one
+                    # case with nothing to attach the event to.
+                    if record is not None:
+                        transaction.append_audit_event(
+                            run_id=run_id,
+                            event_type="browser_projection_discarded",
+                            payload={
+                                "reason_code": discarded,
+                                "discarded_status": outcome.status,
+                                "discarded_phase": outcome.phase,
+                                "discarded_reason_code": outcome.reason_code,
+                                # The projection is dropped, but the work it
+                                # describes may already have reached the vendor.
+                                "external_actions": True,
+                            },
+                        )
+                        _record_discarded_credential_custody(
+                            transaction,
+                            run_id,
+                            record=record,
+                            outcome=outcome,
+                            discard_reason=discarded,
+                        )
                     return None
                 revision = int(record.get("state_revision", 0) or 0) + 1
                 changes: dict[str, object] = {
@@ -2316,6 +3056,22 @@ class CanonicalRuntime:
                 context,
                 "playwright",
                 reason=f"canonical_{outcome.status}",
+            )
+        # After the projection commits, not before: a trail written for a
+        # projection that then lost its CAS race would describe work the run
+        # never recorded, and the console would show steps belonging to a
+        # different writer's version of the run. The phase boundary below is
+        # written here for the same reason and under the same rule — the
+        # discard branch returns above, so a loser writes no history.
+        self._record_step_telemetry(run_id, observation=observation, recipe=recipe)
+        boundary = _CANONICAL_OUTCOME_BOUNDARY.get(outcome.phase)
+        if boundary is not None:
+            self._commit_phase_boundary(
+                run_id,
+                target=boundary[0],
+                reason_code=boundary[1],
+                app_slug=recipe.app_slug,
+                attempt=int(updated.get("attempt", 0) or 0),
             )
         log_event("canonical.browser.applied", run_id=run_id, status=outcome.status)
         return _public_run(updated)
@@ -2430,7 +3186,18 @@ class CanonicalRuntime:
         expected_updated_at: str,
         stale_seconds: int,
     ) -> bool:
-        """Atomically fence a canonical browser RPC that is still stale."""
+        """Atomically fence a canonical browser RPC that is still stale.
+
+        Never a run parked for a person. ``RunLivenessService`` already excludes
+        the awaiting-owner phases from its own staleness clock, but this method is
+        the authority that actually writes ``failed`` — and an invariant enforced
+        only in the caller is one sweep away from being lost again. The bug it
+        prevents is worth restating: ``browser_running`` plus ``credential_ready``
+        or ``entry_reached`` is the exact pair
+        ``RunCredentialService.submit_owner_credentials`` requires, so failing such
+        a run five minutes after it reached the page a human was asked to visit
+        made the run refuse the very submission it had just invited.
+        """
 
         try:
             last_updated = datetime.fromisoformat(expected_updated_at.replace("Z", "+00:00"))
@@ -2447,6 +3214,7 @@ class CanonicalRuntime:
             current = self._context.storage.get_run(run_id)
             if (
                 current is None
+                or str(current.get("phase") or "") in AWAITING_OWNER_PHASES
                 or current.get("state_engine") != "canonical_v1"
                 or current.get("status") != "browser_running"
                 or str(current.get("updated_at") or "") != expected_updated_at
@@ -2457,6 +3225,7 @@ class CanonicalRuntime:
                 record = transaction.get_run(run_id)
                 if (
                     record is None
+                    or str(record.get("phase") or "") in AWAITING_OWNER_PHASES
                     or record.get("state_engine") != "canonical_v1"
                     or record.get("status") != "browser_running"
                     or str(record.get("updated_at") or "") != expected_updated_at

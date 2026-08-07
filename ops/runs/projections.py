@@ -79,11 +79,20 @@ _PUBLIC_RUN_FIELDS = (
 )
 
 
-def _app_projection(record: P1AppRecord) -> dict[str, Any]:
+def _app_projection(record: P1AppRecord, *, readiness_tier: str | None = None) -> dict[str, Any]:
     """The ONE minimal, non-secret projection of a verified P1 record.
 
     Shared by catalog search and the full listing so the two can never drift into
     exposing different fields for the same record.
+
+    ``readiness_tier`` is passed in rather than read here because it is the
+    *recipe's* claim about how far the agent can get unattended, and this record
+    is the P1 evidence — the two are different sources and only the caller holds
+    both. It is what an operator picking apps to onboard actually sorts on, and
+    the catalog published every other axis but this one. ``None`` when the caller
+    has no recipe for the slug; both callers filter to runnable slugs first, so
+    in practice it is always set, and the default keeps the older single-argument
+    call shape valid rather than making a non-catalog caller invent a tier.
     """
 
     return {
@@ -96,6 +105,7 @@ def _app_projection(record: P1AppRecord) -> dict[str, Any]:
         "buildability": record.buildability,
         "verification_status": record.verification_status,
         "confidence": record.confidence,
+        "readiness_tier": readiness_tier,
     }
 
 

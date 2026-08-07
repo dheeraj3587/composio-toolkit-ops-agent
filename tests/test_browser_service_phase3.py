@@ -115,6 +115,8 @@ class _FakeWorker:
         # Every DISPLAY the service launched a session with, in order.
         self.received_displays: list[str | None] = []
         self.received_decision: tuple[str | None, str | None] = (None, None)
+        self.received_setup_fields: dict[str, str] = {}
+        self.received_app_slug: str = ""
         self.storage_state = {"cookies": [{"name": "session", "value": "SUPERSECRETCOOKIEVALUE"}]}
         self.capture_calls: list[tuple[str, str]] = []
         self.boundary_events: list[str] = []
@@ -160,12 +162,18 @@ class _FakeWorker:
         display: str | None = None,
         decision_model: str | None = None,
         decision_effort: str | None = None,
+        app_slug: str = "",
+        setup_fields: Any = None,
+        allowed_host_patterns: Any = None,
     ) -> BrowserSessionContext:
         # Mirrors the real worker: the service may hand over previously saved,
         # already-decrypted authenticated state (never a filesystem path), the
-        # PRIVATE X display leased to this session, and the run's pinned decision
-        # model.
+        # PRIVATE X display leased to this session, the run's pinned decision
+        # model, and the reviewed slug plus approved value map the real worker
+        # seeds the session's allow-list and value references from.
         assert recipe is not None and recipe.app_slug == "pipedrive"
+        self.received_setup_fields = dict(setup_fields or {})
+        self.received_app_slug = app_slug
         self.received_decision = (decision_model, decision_effort)
         self.received_storage_state = storage_state
         self.received_displays.append(display)

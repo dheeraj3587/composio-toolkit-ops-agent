@@ -14,6 +14,7 @@ from ops.providers.composio_capability import (
     ToolkitInfo,
     classify_capability,
     normalize_app_slug,
+    resolve_toolkit_slug,
 )
 
 
@@ -38,9 +39,21 @@ def _preflight(catalog: _FakeCatalog) -> ComposioCapabilityPreflight:
 
 
 def test_normalize_app_slug_collapses_name_variants() -> None:
+    # The normalizer only ever produces the canonical hyphenated app slug. It is
+    # the last-resort guess at the catalog key, never the authority: Composio
+    # knows Help Scout as "help_scout" and Google Ads as "googleads", which no
+    # hyphen-only normalization can spell.
     assert normalize_app_slug("Help Scout") == "help-scout"
     assert normalize_app_slug("WhatsApp_Business") == "whatsapp-business"
     assert normalize_app_slug("salesforce") == "salesforce"
+    assert resolve_toolkit_slug("help-scout") == "help_scout"
+    assert resolve_toolkit_slug("google-ads") == "googleads"
+    assert resolve_toolkit_slug("meta-ads") == "metaads"
+    assert resolve_toolkit_slug("linkedin-ads") == "linkedin_ads"
+    assert resolve_toolkit_slug("bright-data") == "brightdata"
+    # An explicit toolkit slug wins, and an unreviewed app keeps the guess.
+    assert resolve_toolkit_slug("help-scout", toolkit_slug="Help_Scout") == "help_scout"
+    assert resolve_toolkit_slug("obscure-vendor") == "obscure-vendor"
 
 
 async def test_case_a_active_connection_is_composio_ready() -> None:
@@ -80,17 +93,22 @@ async def test_case_b_managed_auth_without_connection_requires_connection() -> N
 async def test_case_c_custom_auth_preserves_gated_outreach() -> None:
     catalog = _FakeCatalog(
         ToolkitInfo(
-            slug="zendesk",
+            slug="help_scout",
             available=True,
             managed_auth=False,
             auth_schemes=("oauth2_custom",),
-            tools=("ZENDESK_CREATE_TICKET",),
+            tools=("HELP_SCOUT_CREATE_CONVERSATION",),
         ),
         active=False,
     )
-    report = await _preflight(catalog).evaluate(app_name="Zendesk", app_slug="zendesk")
+    report = await _preflight(catalog).evaluate(app_name="Help Scout", app_slug="help-scout")
 
-    # Zendesk is a real Composio toolkit; it is never "toolkit_unavailable".
+    # The catalog is queried with the reviewed toolkit slug, never the hyphenated
+    # guess Composio does not know. Looking "help-scout" up returns no toolkit,
+    # which would unlock a real gated outreach for an app Composio already covers.
+    assert catalog.toolkit_queries == ["help_scout"]
+    assert report.app_slug == "help-scout"
+    # Help Scout is a real Composio toolkit; it is never "toolkit_unavailable".
     assert report.toolkit_available is True
     assert report.capability_state == "custom_auth_or_approval_required"
     assert report.outreach_allowed is True

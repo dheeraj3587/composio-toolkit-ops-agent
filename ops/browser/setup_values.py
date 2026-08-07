@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Mapping, Sequence
 from urllib.parse import urlsplit
 
 from ops.core.model_input_dlp import contains_secret_material
+
+# No ``ops.core.config`` import, not even under TYPE_CHECKING: this module is
+# pulled in by ``api/models.py`` and ``ops/core/models.py`` at import time, and
+# a field-shape validator has no business dragging the pydantic-settings chain
+# behind it. Everything here works off literal field names and limits.
+LOGGER = logging.getLogger(__name__)
 
 _PROVIDER_LIMITS: dict[str, int] = {
     "application_name": 200,

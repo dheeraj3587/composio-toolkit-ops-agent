@@ -4,8 +4,12 @@ import { createHash, randomBytes } from "node:crypto"
 
 import { redirect } from "next/navigation"
 
-import { ApiError, PhaseConflictError, createRun } from "@/lib/api"
-import type { OperationsRequestInput } from "@/lib/types"
+import { ApiError, PhaseConflictError, createRun, createRunBatch } from "@/lib/api"
+import type {
+  CreateRunBatchResponse,
+  OperationsBatchRequestInput,
+  OperationsRequestInput,
+} from "@/lib/types"
 
 /**
  * Why a run was refused, in the operator's words.
@@ -32,8 +36,12 @@ const REFUSAL_REASONS: Record<string, string> = {
     "The work inbox did not answer its readiness check, so the confirmation email could not be received. Check the inbox on the system health page and try again.",
   reviewed_recipe_required:
     "This app has no reviewed recipe, so the agent cannot run against it. It can still be researched in plan-only mode.",
+  // No longer emitted by this deployment's API: `onboarding: true` is served,
+  // not refused. Kept because this console is deployed independently of the API
+  // and may be pointed at an older one, and a raw code would otherwise fall
+  // through to the generic sentence.
   onboarding_driver_not_wired:
-    "The autonomous onboarding driver is not wired to a browser in this deployment.",
+    "The autonomous onboarding driver is not wired to a browser on this server.",
   // Signing in with a submitted password is a browser route, and only a
   // browser route stages one. Every code above described creating an account;
   // an operator handing the agent their own credentials got none of them.
@@ -75,6 +83,32 @@ function value(formData: FormData, name: string, maxLength = 500): string {
 function rawSecret(formData: FormData, name: string): string {
   const entry = formData.get(name)
   return typeof entry === "string" ? entry : ""
+}
+
+// A checkbox posts its value only when checked, so anything truthy means "on"
+// and an absent field means off. Read this way rather than as a string compare
+// so the control can be a checkbox, a switch, or a hidden input without the
+// server action caring which.
+function checked(formData: FormData, name: string): boolean {
+  const entry = formData.get(name)
+  return typeof entry === "string" && ["on", "true", "1", "yes"].includes(entry.trim().toLowerCase())
+}
+
+// Bounded non-secret setup values, posted as `provider_setup.<key>` fields. The
+// backend caps the map at 20 entries and validates every value against the
+// reviewed recipe's declared setup fields; this only shapes what is sent, so a
+// malformed key is dropped rather than failing a run the operator can still get.
+function providerSetup(formData: FormData): Record<string, string> {
+  const values: Record<string, string> = {}
+  for (const [name, entry] of formData.entries()) {
+    if (!name.startsWith("provider_setup.") || typeof entry !== "string") continue
+    const key = name.slice("provider_setup.".length)
+    if (!/^[a-z0-9_]{1,60}$/i.test(key)) continue
+    const value = entry.trim().slice(0, 500)
+    if (value) values[key] = value
+    if (Object.keys(values).length >= 20) break
+  }
+  return values
 }
 
 function validWebUrl(candidate: string): boolean {
@@ -142,6 +176,15 @@ export async function createRunAction(
       ? requestedEffort
       : null
 
+  // The autonomous driver, and the two fields that only mean anything with it.
+  // The hint is dropped rather than rejected when it is not an HTTPS URL: it is
+  // one more candidate for research to corroborate, never an admitted claim, so
+  // a mistyped pointer must not cost the operator the run.
+  const onboarding = checked(formData, "onboarding")
+  const requestedHint = value(formData, "provider_hint_url", 2_000)
+  const providerHintUrl = validWebUrl(requestedHint) ? requestedHint : null
+  const setupValues = providerSetup(formData)
+
   const requestedCreationPolicy = value(formData, "credential_creation_policy", 40)
   const creationPolicy = ["reuse_only", "create_if_missing"].includes(
     requestedCreationPolicy,
@@ -200,6 +243,9 @@ export async function createRunAction(
         : null,
     decision_model: decisionModel,
     decision_effort: decisionEffort,
+    onboarding,
+    provider_hint_url: providerHintUrl,
+    provider_setup: setupValues,
   }
 
   // This value is returned to client-side action state so it must not be
@@ -238,4 +284,168 @@ export async function createRunAction(
   }
 
   redirect(`/runs/${encodeURIComponent(runId)}`)
+}
+
+// The batch route's own bound (api/models.py::CreateRunBatchRequest.app_names).
+// Selecting more is refused here rather than truncated: silently dropping the
+// tail would report success for a batch the operator did not ask for.
+const MAX_BATCH_APPS = 50
+
+export interface CreateRunBatchFormState {
+  error: string | null
+  fields: string[]
+  /**
+   * The per-app outcomes, when the batch itself was accepted.
+   *
+   * Present alongside a null `error` even when every app was rejected: the API
+   * answers 201 with per-app results, and collapsing that into one error message
+   * is exactly what makes a partial success unreadable.
+   */
+  batch: CreateRunBatchResponse | null
+  idempotencyKey: string | null
+  requestFingerprint: string | null
+}
+
+/**
+ * The names selected in the catalog, in selection order, without duplicates.
+ *
+ * The backend REFUSES a duplicate rather than folding it (asking for two runs of
+ * one app and receiving one would be a lie), so a repeat here — which the UI can
+ * only produce as a bug — is dropped before it can fail the whole batch.
+ */
+function selectedAppNames(formData: FormData): string[] {
+  const names: string[] = []
+  const seen = new Set<string>()
+  for (const entry of formData.getAll("app_names")) {
+    if (typeof entry !== "string") continue
+    const candidate = entry.trim().slice(0, 200)
+    if (!candidate) continue
+    const key = candidate.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    names.push(candidate)
+  }
+  return names
+}
+
+/**
+ * Start one run per selected app, under a single reviewed configuration.
+ *
+ * Deliberately does not redirect. A batch's answer is per-app, and sending the
+ * operator to one run id would discard the outcome of the other forty-nine —
+ * including every rejection, which is the half they need to act on.
+ *
+ * `browser_login` and `provider_hint_url` are absent on purpose: the batch model
+ * rejects both (a per-app secret and a per-app pointer), so the form does not
+ * collect them and this action never sends them.
+ */
+export async function createRunBatchAction(
+  previousState: CreateRunBatchFormState,
+  formData: FormData,
+): Promise<CreateRunBatchFormState> {
+  const appNames = selectedAppNames(formData)
+  const requestedAccountMode = value(formData, "account_mode", 40)
+  const accountMode = ["existing_account", "create_account"].includes(requestedAccountMode)
+    ? (requestedAccountMode as OperationsRequestInput["account_mode"])
+    : null
+  const legalName = value(formData, "legal_name", 180)
+  const website = value(formData, "website", 500)
+  const useCase = value(formData, "use_case", 2_000)
+  const expectedVolume = value(formData, "expected_volume", 180)
+  const callbacks = callbackUrls(value(formData, "callback_urls", 2_000))
+  const requestedPolicy = value(formData, "requested_scope_policy", 20)
+  const policy = ["minimum", "recommended", "maximum"].includes(requestedPolicy)
+    ? (requestedPolicy as OperationsRequestInput["requested_scope_policy"])
+    : null
+  const requestedExecutionMode = value(formData, "execution_mode", 40)
+  // Fail CLOSED, exactly as the single-run path does: a missing or unrecognized
+  // mode is plan_only, never live execution — and here it would be live
+  // execution multiplied by the size of the selection.
+  const executionMode = ["plan_only", "execute_when_configured"].includes(requestedExecutionMode)
+    ? (requestedExecutionMode as OperationsRequestInput["execution_mode"])
+    : "plan_only"
+  const requestedBrowserProvider = value(formData, "browser_provider", 40)
+  const browserProvider = requestedBrowserProvider === "playwright" ? "playwright" : null
+  const requestedCreationPolicy = value(formData, "credential_creation_policy", 40)
+  const creationPolicy = ["reuse_only", "create_if_missing"].includes(requestedCreationPolicy)
+    ? (requestedCreationPolicy as OperationsRequestInput["credential_creation_policy"])
+    : null
+  const onboarding = checked(formData, "onboarding")
+  const setupValues = providerSetup(formData)
+
+  const invalid: string[] = []
+  // An empty selection is not a request. Guarded here as well as in the control
+  // that is disabled with none selected, so no path can post an empty batch.
+  if (appNames.length === 0) invalid.push("app_names")
+  if (appNames.length > MAX_BATCH_APPS) invalid.push("app_names")
+  if (accountMode === null) invalid.push("account_mode")
+  if (legalName.length < 2) invalid.push("legal_name")
+  if (!validWebUrl(website)) invalid.push("website")
+  if (useCase.length < 12) invalid.push("use_case")
+  if (callbacks === null) invalid.push("callback_urls")
+  if (policy === null) invalid.push("requested_scope_policy")
+  if (browserProvider === null) invalid.push("browser_provider")
+  if (creationPolicy === null) invalid.push("credential_creation_policy")
+
+  if (invalid.length > 0) {
+    return {
+      error:
+        appNames.length === 0
+          ? "Select at least one app in the catalog. No runs were created."
+          : appNames.length > MAX_BATCH_APPS
+            ? `Select at most ${MAX_BATCH_APPS} apps. No runs were created.`
+            : "Review the marked fields. No runs were created.",
+      fields: invalid,
+      batch: null,
+      idempotencyKey: null,
+      requestFingerprint: null,
+    }
+  }
+
+  const request: OperationsBatchRequestInput = {
+    app_names: appNames,
+    account_mode: accountMode ?? "existing_account",
+    company: {
+      legal_name: legalName,
+      website,
+      use_case: useCase,
+      expected_volume: expectedVolume || null,
+      callback_urls: callbacks ?? [],
+    },
+    requested_scope_policy: policy ?? "minimum",
+    execution_mode: executionMode,
+    browser_provider: browserProvider ?? "playwright",
+    credential_creation_policy: creationPolicy ?? "reuse_only",
+    onboarding,
+    provider_setup: setupValues,
+  }
+
+  // No secret is ever part of a batch, so the request is its own idempotency
+  // shape. Resubmitting an unchanged selection reuses the key, and the API
+  // derives a stable per-app key from it, so a retry returns the same runs
+  // rather than a second set.
+  const requestFingerprint = createHash("sha256")
+    .update(JSON.stringify(request))
+    .digest("hex")
+  const idempotencyKey =
+    previousState.requestFingerprint === requestFingerprint && previousState.idempotencyKey
+      ? previousState.idempotencyKey
+      : `idem_${randomBytes(16).toString("hex")}`
+
+  try {
+    const batch = await createRunBatch(request, idempotencyKey)
+    return { error: null, fields: [], batch, idempotencyKey, requestFingerprint }
+  } catch (error) {
+    const unavailable = error instanceof ApiError && error.status >= 500
+    return {
+      error: unavailable
+        ? "The operations API is unavailable. We could not confirm whether any of these runs were persisted. Check the ledger before retrying."
+        : (refusalMessage(error) ??
+          "The backend rejected this batch request. Review the shared settings and try again."),
+      fields: [],
+      batch: null,
+      idempotencyKey,
+      requestFingerprint,
+    }
+  }
 }

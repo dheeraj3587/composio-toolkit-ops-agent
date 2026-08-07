@@ -84,6 +84,7 @@ from ops.onboarding.phase import (
     OnboardingReasonCode,
     is_legal_phase_transition,
 )
+from ops.runs.liveness import AWAITING_OWNER_PHASES
 from ops.runs.projections import _parse_timestamp
 from ops.runs.resume import (
     PAUSED_PHASE,
@@ -94,6 +95,21 @@ from ops.runs.resume import (
 )
 
 LOGGER = logging.getLogger("composio_ops.run_service")
+
+# The most run rows either sweep here will page through in one pass. Both sweeps
+# below page instead of reading only the newest 100 rows, but "paged" must not
+# mean "unbounded":
+#
+#   * the periodic sweep shares one thread with autonomous advancement and the
+#     staleness mark, so a ``list_runs`` that ever stopped honouring ``offset``
+#     would spin forever here and silently stop all three; and
+#   * the startup sweep runs before the service accepts traffic, so an unbounded
+#     scan of a large ledger is an unbounded delay to boot.
+#
+# 10,000 rows is roughly two orders of magnitude past a 50-app catalog with
+# retries, so the ceiling cannot re-create the newest-100 blindness that paging
+# removed, and reaching it is reported rather than swallowed.
+_MAX_SWEEP_ROWS: Final = 10_000
 
 
 class RunReconciliationContext(Protocol):
@@ -154,9 +170,17 @@ class RunReconciliationService:
         # service (see _browser_session_is_live); only a session the service still
         # reports ACTIVE is left resumable.
         try:
+            # Same paging shape as the periodic sweep below and as the staleness
+            # sweep in ops/runs/liveness.py: advance on ``len(batch)`` and bound on
+            # rows actually seen, never on a repeated literal page size. The page
+            # size appeared three times here (the query, the short-page test, and
+            # the offset step), so changing it in one place and not the others
+            # would have silently skipped or re-read rows on every pass.
+            page = 100
             offset = 0
+            scanned = 0
             while True:
-                batch = self.storage.list_runs(limit=100, offset=offset)
+                batch = self.storage.list_runs(limit=page, offset=offset)
                 if not batch:
                     break
                 for record in batch:
@@ -219,9 +243,16 @@ class RunReconciliationService:
                             stranded_statuses=("waiting_for_hitl",),
                             reason="browser_service_session_lost",
                         )
-                if len(batch) < 100:
+                offset += len(batch)
+                scanned += len(batch)
+                if len(batch) < page:
                     break
-                offset += 100
+                if scanned >= _MAX_SWEEP_ROWS:
+                    LOGGER.warning(
+                        "startup run reconciliation stopped at the %d-row scan bound",
+                        _MAX_SWEEP_ROWS,
+                    )
+                    break
         except Exception:  # pragma: no cover - reconciliation must never crash boot
             LOGGER.warning("startup run reconciliation was skipped after an error")
 
@@ -364,34 +395,65 @@ class RunReconciliationService:
         idle_seconds = max(600, int(settings.browser_service_client_timeout_seconds) * 4)
         cutoff = datetime.now(UTC) - timedelta(seconds=idle_seconds)
         reconciled = 0
-        for record in self.storage.list_runs(limit=limit, offset=0):
-            if record.get("status") != "browser_running":
-                continue
-            run_id = str(record.get("run_id") or "")
-            if not run_id:
-                continue
-            updated_at = _parse_timestamp(record.get("updated_at"))
-            if updated_at is None or updated_at > cutoff:
-                continue
-            before = self.storage.get_run(run_id)
-            self.reconcile_one_stranded(
-                run_id,
-                stranded_statuses=("browser_running",),
-                reason="idle_browser_run_reconciled",
-            )
-            after = self.storage.get_run(run_id)
-            if (
-                isinstance(before, Mapping)
-                and isinstance(after, Mapping)
-                and before.get("status") != after.get("status")
-            ):
-                reconciled += 1
-                log_event(
-                    "browser.idle_run.reconciled",
-                    run_id=run_id,
-                    app_slug=record.get("app_slug"),
-                    idle_seconds=idle_seconds,
+        offset = 0
+        scanned = 0
+        while True:
+            # Paged rather than a single newest-100 window. 50 apps with retries
+            # exceed one page immediately, and this sweep is the only thing that
+            # recovers a stranded browser_running row — a run pushed off page one
+            # by newer runs would have held its browser slot forever.
+            records = self.storage.list_runs(limit=limit, offset=offset)
+            if not records:
+                break
+            for record in records:
+                if record.get("status") != "browser_running":
+                    continue
+                # A run parked on the page a human was asked to visit is idle on
+                # purpose. Same exemption, and same reason, as the staleness sweep:
+                # reconciling it to configuration_required would revoke exactly the
+                # browser_running/credential_ready pair that makes the owner's
+                # submission acceptable, just 21 minutes later instead of 5.
+                if str(record.get("phase") or "") in AWAITING_OWNER_PHASES:
+                    continue
+                run_id = str(record.get("run_id") or "")
+                if not run_id:
+                    continue
+                updated_at = _parse_timestamp(record.get("updated_at"))
+                if updated_at is None or updated_at > cutoff:
+                    continue
+                before = self.storage.get_run(run_id)
+                self.reconcile_one_stranded(
+                    run_id,
+                    stranded_statuses=("browser_running",),
+                    reason="idle_browser_run_reconciled",
                 )
+                after = self.storage.get_run(run_id)
+                if (
+                    isinstance(before, Mapping)
+                    and isinstance(after, Mapping)
+                    and before.get("status") != after.get("status")
+                ):
+                    reconciled += 1
+                    log_event(
+                        "browser.idle_run.reconciled",
+                        run_id=run_id,
+                        app_slug=record.get("app_slug"),
+                        idle_seconds=idle_seconds,
+                    )
+            offset += len(records)
+            scanned += len(records)
+            if len(records) < limit:
+                break
+            if scanned >= _MAX_SWEEP_ROWS:
+                # Everything past the bound stays unswept until the next pass,
+                # which is the same silent stall paging was added to remove, so
+                # it is stated rather than left to be inferred from a count.
+                log_event(
+                    "browser.idle_run.scan_truncated",
+                    level=30,
+                    scanned=scanned,
+                )
+                break
         return reconciled
 
 
@@ -583,6 +645,13 @@ class OnboardingRunRecoveryService(OnboardingRunControlService):
         if self._release_session is not None:
             released = bool(self._release_session(run_id=run_id, reason=RESET_RELEASE_REASON))
         cleared = self._clear_workflow_state(run_id)
+        # The phases' working memory goes with the workflow state. Without this an
+        # operator-requested restart from ``research`` inherits the hypotheses of
+        # the walk that failed — notes about pages the new walk may never see,
+        # which is precisely how a fresh attempt re-enters the previous attempt's
+        # dead end. The vault references are the thing reset preserves; a notebook
+        # about a route that did not work is not.
+        self._storage.clear_phase_scratchpads(run_id)
         committed = self._commit_reset_path(run_id, boundary=boundary, path=path)
         # Read again *after* the reset, so the count reports what survived rather
         # than what was there before — the only reading that proves Property 13.

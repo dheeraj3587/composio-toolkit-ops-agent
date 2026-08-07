@@ -13,8 +13,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ops.browser.decider import MAX_ELEMENTS
 from ops.browser.host_policy import MAX_ALLOWED_HOST_PATTERNS
-from ops.browser.worker import HumanActionType
+from ops.browser.worker import MAX_OBSERVATION_STEPS, HumanActionType
 from ops.core.models import validate_vault_reference
 
 SessionLifecycle = Literal["ACTIVE", "CLOSING", "CLOSED"]
@@ -95,6 +96,23 @@ class CreateSessionRequest(_Strict):
     # value is refused here rather than reaching the chain builder.
     decision_model: str | None = Field(default=None, max_length=120, pattern=r"^[A-Za-z0-9_.:/-]*$")
     decision_effort: str | None = Field(default=None, max_length=20, pattern=r"^[a-z]*$")
+    # The run's approved, NON-SECRET value-reference map, in the same closed
+    # vocabulary and with the same validator ``NavigateRequest`` uses. Seeded onto
+    # the session at creation so a caller driving it one action at a time through
+    # observe/act can fill a form at all: outside ``navigate``/``resume`` the map
+    # was empty, and ``_approved_value`` could then resolve exactly one reference
+    # (``application_name``, derived from the slug) and raised for every other.
+    # A value action never carries literal text from a caller — the model emits a
+    # reference and the executor resolves it HERE — so this map is the only way
+    # text a human approved can reach a page.
+    setup_fields: dict[str, str] = Field(default_factory=dict, max_length=20)
+
+    @field_validator("setup_fields")
+    @classmethod
+    def _approved_setup_fields(cls, values: dict[str, str]) -> dict[str, str]:
+        from ops.browser.setup_values import normalize_browser_setup_fields
+
+        return normalize_browser_setup_fields(values)
 
     @model_validator(mode="after")
     def _storage_state_requires_account_binding(self) -> CreateSessionRequest:
@@ -201,7 +219,15 @@ class NavigateRequest(_Strict):
     """Drive the reviewed onboarding trace toward the credential page."""
 
     # The verified OperationalResearch payload (non-secret, strict upstream).
-    research: dict[str, object]
+    #
+    # Optional since the recipe became able to answer the same question. It used
+    # to be required, which forced every caller to carry a full research payload
+    # even when it held a reviewed recipe stating the same URLs — the recipe IS
+    # the reviewed statement of them, and ``recipe_to_operational_research``
+    # already projects one onto this contract. Omitting both is still refused
+    # below: the operation has to navigate somewhere, and neither present means
+    # no reviewed destination exists.
+    research: dict[str, object] | None = None
     # Creation-time AppRecipe snapshot supplied by the canonical API. Legacy
     # callers may omit it, but canonical operations always bind it explicitly.
     recipe_snapshot: dict[str, object] | None = None
@@ -232,6 +258,19 @@ class NavigateRequest(_Strict):
         from ops.browser.signup import normalize_signup_fields
 
         return normalize_signup_fields(values)
+
+    @model_validator(mode="after")
+    def _reviewed_destination(self) -> NavigateRequest:
+        """One of the two reviewed statements of where this run may go.
+
+        Refused at the wire rather than deep in the drive, because "no research
+        and no recipe" is not a policy denial about a page — it is a request that
+        never named a destination, and the caller should hear that as a 422.
+        """
+
+        if self.research is None and self.recipe_snapshot is None:
+            raise ValueError("navigate requires research or a recipe snapshot")
+        return self
 
     @model_validator(mode="after")
     def _exact_secret_grants(self) -> NavigateRequest:
@@ -282,6 +321,52 @@ class ResumeRequest(_Strict):
         return self
 
 
+class RetainSessionRequest(_Strict):
+    """Keep a bound session ACTIVE across a wait the caller owns.
+
+    The counterpart to closing it. ``SessionManager.retain`` has enforced the
+    continuity-event vocabulary since it was written but had no route, so the only
+    way to keep a session alive was to keep driving it: a run parked for an email,
+    a CAPTCHA, or an API restart had no way to SAY it was still there, and the
+    janitor reaped it on the idle clock. The event is validated here against the
+    same closed set the manager checks, so a typo is a 422 rather than a silently
+    unretained session.
+    """
+
+    event: Literal[
+        "email_verification",
+        "captcha_paused",
+        "navigation_retry",
+        "worker_restart",
+        "api_restart",
+        "live_view_client_disconnect",
+    ]
+
+
+class StepRecordModel(_Strict):
+    """One action-loop iteration on the wire (mirrors ``BrowserStepRecord``).
+
+    Every bound here is the same bound the dataclass enforces, restated as a
+    field constraint so a malformed trail is rejected at the boundary rather
+    than raising a ``ValueError`` out of a dataclass constructor on the API
+    side. Nothing here is a URL, a selector, or markup: ``target_host`` is a
+    hostname with no path or query, ``candidate_label`` is an accessible name
+    the snapshot already sanitized, and ``reason`` is the model's own one line
+    of prose, which the storage layer re-screens for secret material before it
+    is ever written.
+    """
+
+    step_index: int = Field(ge=1, le=100_000)
+    stage: str = Field(min_length=1, max_length=40)
+    elapsed_ms: int = Field(ge=0, le=3_600_000)
+    decision: str = Field(min_length=1, max_length=40)
+    reason_code: str | None = Field(default=None, min_length=1, max_length=100)
+    candidate_label: str | None = Field(default=None, min_length=1, max_length=120)
+    action: str | None = Field(default=None, min_length=1, max_length=40)
+    target_host: str | None = Field(default=None, min_length=1, max_length=253)
+    reason: str | None = Field(default=None, min_length=1, max_length=400)
+
+
 class ObservationResponse(_Strict):
     """The bounded observation the API consumes (mirrors BrowserObservation)."""
 
@@ -295,6 +380,184 @@ class ObservationResponse(_Strict):
     non_secret_notes: tuple[str, ...] = ()
     # Bounded, value-free reason code mirrored from BrowserObservation.
     reason_code: str | None = None
+    # What the action loop did on the way here, oldest first. Additive with an
+    # empty default, so a worker that reports no trail is exactly unchanged. The
+    # cap is the same one the worker enforces when it appends, restated here so
+    # the boundary refuses an oversized trail rather than trusting the sender.
+    steps: tuple[StepRecordModel, ...] = Field(default=(), max_length=MAX_OBSERVATION_STEPS)
+    session: SessionSummary | None = None
+
+
+class SnapshotElementModel(_Strict):
+    """One interactive element on the wire (mirrors ``SnapshotElement``).
+
+    Every field here is already sanitized at its source: ``build_ranked_snapshot``
+    collects accessible names through the DLP projection, ``href_path`` is a PATH
+    with no query or fragment so a token in a link cannot ride out on it, and no
+    field can hold an input's value — ``has_value`` says only WHETHER a non-secret
+    field is filled. What deliberately does not appear is the Playwright locator:
+    it is a live handle bound to this process's browser loop and has no meaning
+    anywhere else, which is why the caller re-identifies its target by
+    role/name/type instead of by position.
+    """
+
+    index: int = Field(ge=0, le=10_000)
+    role: str = Field(max_length=60)
+    name: str = Field(max_length=300)
+    element_type: str = Field(default="", max_length=60)
+    has_value: bool = False
+    secretish: bool = False
+    visible: bool = True
+    enabled: bool = True
+    checked: bool | None = None
+    selected: bool | None = None
+    expanded: bool | None = None
+    frame_path: tuple[str, ...] = Field(default=(), max_length=16)
+    href_path: str | None = Field(default=None, max_length=500)
+    test_id: str | None = Field(default=None, max_length=200)
+    nearby_heading: str | None = Field(default=None, max_length=300)
+    selected_label: str | None = Field(default=None, max_length=300)
+
+
+class ObserveResponse(_Strict):
+    """One reading of the page, and the generation a matching act must quote.
+
+    The service used to offer only ``navigate`` and ``resume``, each of which ran
+    a whole closed loop inside this container — inspect, call a model, act, repeat
+    — so a planner outside the process could not take a single step; it could only
+    hand over the wheel and read the outcome. This is the observe half of the pair
+    that makes one step possible.
+
+    ``generation`` and ``url`` are the load-bearing fields, not decoration: the
+    caller sends them back on the act request, and the executor refuses to act if
+    the page has moved since. Without them the staleness check would compare a
+    fresh reading against itself and pass every time.
+    """
+
+    url: str = Field(max_length=2000)
+    title: str = Field(default="", max_length=500)
+    visible_text: str = Field(default="", max_length=20_000)
+    fingerprint: str = Field(default="", max_length=128)
+    generation: int = Field(ge=0)
+    elements: tuple[SnapshotElementModel, ...] = Field(default=(), max_length=MAX_ELEMENTS)
+    session: SessionSummary | None = None
+
+
+class ElementIdentityModel(_Strict):
+    """The stable identity an act request re-resolves its target by."""
+
+    role: str = Field(max_length=60)
+    name: str = Field(max_length=300)
+    element_type: str = Field(default="", max_length=60)
+    frame_path: tuple[str, ...] = Field(default=(), max_length=16)
+    test_id: str | None = Field(default=None, max_length=200)
+    href_path: str | None = Field(default=None, max_length=500)
+    nearby_heading: str | None = Field(default=None, max_length=300)
+
+
+class ActionCandidateModel(_Strict):
+    """One action to execute, described only in terms the executor can verify.
+
+    Note what a caller CANNOT say here. There is no selector and no positional
+    index: the target is named by role/name/type and must resolve to exactly one
+    element or the request comes back ``stale``. There is no literal text: a value
+    action carries a ``value_ref`` that is resolved against the session's reviewed
+    approved-value map, so a caller cannot type a string of its own choosing and
+    cannot reach a credential. A ``url`` is re-checked against the session's
+    reviewed navigation patterns before the request is issued.
+
+    There is also no ``risk``. The executor never read it, and accepting one would
+    imply the sender's own verdict about its own action is authoritative — which
+    is exactly the thing the risk policy exists to not do.
+    """
+
+    candidate_id: str = Field(min_length=1, max_length=64)
+    action: Literal[
+        "click",
+        "fill",
+        "type",
+        "press",
+        "goto",
+        "select_option",
+        "check",
+        "uncheck",
+        "scroll_into_view",
+        "focus",
+    ]
+    semantic_target: str = Field(default="", max_length=300)
+    identity: ElementIdentityModel | None = None
+    value_ref: str | None = Field(default=None, max_length=100)
+    press_key: str | None = Field(default=None, max_length=40)
+    url: str | None = Field(default=None, max_length=2000)
+    hint_index: int | None = Field(default=None, ge=0, le=10_000)
+
+    @model_validator(mode="after")
+    def _target_is_addressable(self) -> ActionCandidateModel:
+        # ``goto`` is the one action that names a destination instead of an
+        # element; every other action must resolve one, and an act request with
+        # neither would reach the executor only to fail there with a less specific
+        # reason than the boundary can give.
+        if self.action == "goto":
+            if not self.url:
+                raise ValueError("a goto candidate needs a url")
+        elif self.identity is None:
+            raise ValueError("a non-goto candidate needs an element identity")
+        return self
+
+
+class ActRequest(_Strict):
+    """Execute one candidate against the observation that planned it.
+
+    ``observed_url`` and ``observed_generation`` are required and unfaked: they
+    are the caller's statement of what it planned against, and the executor
+    re-inspects and holds it to them.
+    """
+
+    candidate: ActionCandidateModel
+    observed_url: str = Field(min_length=1, max_length=2000)
+    observed_generation: int = Field(ge=0)
+
+
+class ActionExecutionResultModel(_Strict):
+    """The typed outcome of one action (mirrors ``ActionExecutionResult``).
+
+    Four statuses, each meaning something the caller must respond to differently
+    — which is the whole point of returning them separately. ``executed`` ran;
+    ``stale`` means the page moved and the plan must be remade against a fresh
+    observation; ``blocked`` means policy refused it and a different action is
+    needed; ``failed`` means the action itself did not complete.
+    """
+
+    status: Literal["executed", "stale", "blocked", "failed"]
+    candidate_id: str = Field(max_length=64)
+    before_url: str = Field(default="", max_length=2000)
+    after_url: str = Field(default="", max_length=2000)
+    before_generation: int = Field(ge=0)
+    after_generation: int = Field(ge=0)
+    reason_code: str | None = Field(default=None, max_length=100)
+    expected_selected_label: str | None = Field(default=None, max_length=300)
+    session: SessionSummary | None = None
+
+
+class ArmCredentialSurfaceRequest(_Strict):
+    """The reviewed recipe whose success predicate must hold to arm the surface."""
+
+    recipe_snapshot: dict[str, object] | None = None
+
+
+class CredentialSurfaceResponse(_Strict):
+    """Whether the credential surface is armed, and whether pixels are permitted.
+
+    Both facts are reported because they answer different questions and can differ:
+    ``armed`` says capture may run, ``live_view_allowed`` says a human may still
+    see the screen. Arming turns the second off; a proven release turns it back on.
+    """
+
+    armed: bool
+    live_view_allowed: bool
+    # A closed, non-secret code. Empty on success; on refusal it says which proof
+    # failed — never what was on the page.
+    reason_code: str = Field(default="", max_length=100)
     session: SessionSummary | None = None
 
 
@@ -397,10 +660,16 @@ class ErrorResponse(_Strict):
 
 
 __all__ = [
+    "ActRequest",
+    "ActionCandidateModel",
+    "ActionExecutionResultModel",
+    "ArmCredentialSurfaceRequest",
     "CaptureCredentialsResponse",
     "ClearanceProbeReason",
     "CreateSessionRequest",
+    "CredentialSurfaceResponse",
     "DrainStatus",
+    "ElementIdentityModel",
     "ErrorResponse",
     "GateClearanceReport",
     "HealthResponse",
@@ -408,10 +677,13 @@ __all__ = [
     "LiveViewMode",
     "NavigateRequest",
     "ObservationResponse",
+    "ObserveResponse",
     "ProviderHealthState",
     "ReconcileSessionsRequest",
     "ReconcileSessionsResponse",
     "ResumeRequest",
+    "RetainSessionRequest",
     "SessionLifecycle",
     "SessionSummary",
+    "SnapshotElementModel",
 ]

@@ -89,10 +89,12 @@ SESSION_BEARING_PHASES: frozenset[OnboardingPhase] = frozenset(
     }
 )
 
-# Phases that may be resumed into after a crash. A phase absent here is a
-# transient computation and is recomputed from the prior durable phase, which
-# today means the three terminal phases: nothing resumes into them.
-RESUMABLE_PHASES: frozenset[OnboardingPhase] = SESSION_BEARING_PHASES | frozenset(
+# The resumable phases that hold no browser session. Annotated separately rather
+# than written inline below because a bare set literal infers as ``frozenset[str]``,
+# and unioning it with a ``frozenset[OnboardingPhase]`` widens the RESULT to
+# ``frozenset[str]`` — which silently costs the exhaustiveness checking every
+# other phase constant here relies on.
+_SESSIONLESS_RESUMABLE_PHASES: frozenset[OnboardingPhase] = frozenset(
     {
         "research",
         "vault_check",
@@ -102,6 +104,13 @@ RESUMABLE_PHASES: frozenset[OnboardingPhase] = SESSION_BEARING_PHASES | frozense
         "credential_validation",
         "paused",
     }
+)
+
+# Phases that may be resumed into after a crash. A phase absent here is a
+# transient computation and is recomputed from the prior durable phase, which
+# today means the three terminal phases: nothing resumes into them.
+RESUMABLE_PHASES: frozenset[OnboardingPhase] = (
+    SESSION_BEARING_PHASES | _SESSIONLESS_RESUMABLE_PHASES
 )
 
 # Total phase → coarse status mapping. ``vault_storage`` and
@@ -229,6 +238,14 @@ OnboardingReasonCode = Literal[
     "research_domain_disagreement",
     "research_no_evidence",
     "research_adapters_unavailable",
+    # Research was attempted and *raised* — the binding that names the provider
+    # rejected the run's ledger row, or an evidence fetcher or claim extractor
+    # threw instead of answering. Distinct from the two codes above on purpose:
+    # ``research_adapters_unavailable`` means nothing was called, and the
+    # inconclusive codes mean everything was called and the web did not
+    # corroborate. This one means the attempt itself broke, so the thing to read
+    # is the logged traceback, not the provider (reliability R5.9).
+    "research_attempt_failed",
     "profile_url_unreachable",
     # --- admission ----------------------------------------------------------
     "credentials_present",
@@ -250,6 +267,7 @@ OnboardingReasonCode = Literal[
     # --- route adherence ----------------------------------------------------
     "route_replanned",  # the one authorized re-plan (reliability R6.2, R6.4)
     "route_divergence_unresolved",  # divergence after that re-plan (reliability R6.5)
+    "route_divergence_same_host",  # recorded, not escalated: the host still matches
     # --- action loop / navigation ------------------------------------------
     "host_in_app_policy",  # from BrowserHostDecision
     "browser_host_not_in_app_policy",  # from BrowserHostDecision

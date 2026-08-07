@@ -284,7 +284,15 @@ class CreateRunRequest(StrictApiModel):
     # not be created on a backend that no longer exists: the value is frozen onto
     # the run and decides which backend a retry or resume is allowed to use.
     browser_provider: Literal["playwright"] = "playwright"
-    credential_creation_policy: CredentialCreationPolicy = "reuse_only"
+    # Defaults to create_if_missing because that is what an unattended run needs:
+    # ``worker.py`` only authorizes a Create/Generate click when this is
+    # create_if_missing AND the checkpoint declares reviewed
+    # ``credential_creation_controls``, so reuse_only makes every reviewed
+    # creation control unclickable and ends the run at _human_required. The
+    # reviewed-controls half is still the real gate; this only stops the policy
+    # from vetoing it by default. The operator console has always posted
+    # create_if_missing explicitly, so no stored request fingerprint changes.
+    credential_creation_policy: CredentialCreationPolicy = "create_if_missing"
     provider_setup: dict[str, str] = Field(default_factory=dict, max_length=20)
     # Deprecated compatibility alias for execution_mode="plan_only". Only an
     # explicitly supplied dry_run=true carries intent; execution_mode is the single
@@ -297,10 +305,13 @@ class CreateRunRequest(StrictApiModel):
     browser_login: BrowserLoginInput | None = None
     # Opt into the autonomous onboarding driver (design LL-6.3). Additive and
     # default-false, so an existing client's request keeps its current meaning.
-    # NOT SERVABLE YET: the driver has no browser binding in this deployment, so
-    # ``true`` is refused at the route with ``onboarding_driver_not_wired``. The
-    # field stays in the contract because the refusal is the honest answer and a
-    # removed field would 422 as an unknown key, which says nothing useful.
+    # It is SERVED, not refused: the accepted run is written to the durable
+    # onboarding queue and ``ops.onboarding.worker`` claims it and drives the
+    # phase machine. This route was refused with ``onboarding_driver_not_wired``
+    # for as long as no ``LoopSessionFactory`` existed outside the test fakes;
+    # ``ops.onboarding.browser_session`` is that binding and the refusal went with
+    # it. A deployment with no browser service still enqueues, and the run simply
+    # waits in the queue rather than being told a lie at create time.
     onboarding: bool = False
     # Optional operator hint for provider research. A bounded HTTPS URL, never a
     # search phrase, so a hint cannot smuggle prose into the research prompt.
@@ -370,6 +381,143 @@ class CreateRunRequest(StrictApiModel):
             # model would record a preference on the run that nothing applied.
             raise ValueError("decision_effort requires decision_model")
         return self
+
+
+class CreateRunBatchRequest(StrictApiModel):
+    """One reviewed configuration, applied to many apps in the catalog.
+
+    **Why a separate model rather than ``app_names`` on ``CreateRunRequest``.**
+    The stored idempotency fingerprint is computed over the accepted request, so
+    adding a field to ``CreateRunRequest`` would change the fingerprint of every
+    request shape and turn stored keys into false replay conflicts. This model is
+    purely additive: the batch route fans out to the SAME single-run creation
+    path, one call per app, and each resulting run is indistinguishable from one
+    created directly. Nothing downstream learns it was part of a batch.
+
+    **What is deliberately absent.** ``browser_login`` is a per-app secret and an
+    owner action gated separately at the single-run route; accepting one here
+    would apply one vendor's password to fifty vendors. ``provider_hint_url`` is
+    a pointer at one specific provider and is meaningless shared across a batch.
+    Both stay single-run-only, so a caller that needs them uses ``POST /api/runs``.
+
+    **Partial success is the contract.** One unknown app name must not discard
+    forty-nine accepted runs, so the route reports per-app outcomes rather than
+    failing whole. See :class:`CreateRunBatchResponse`.
+    """
+
+    # Bounded at the reviewed catalog's size: a batch is "some or all of the
+    # catalog", never an unbounded fan-out, and each entry costs a durable row.
+    app_names: list[str] = Field(min_length=1, max_length=50)
+    company: CompanyInput
+    account_mode: AccountMode
+    requested_scope_policy: Literal["minimum", "recommended", "maximum"] = "maximum"
+    execution_mode: Literal["plan_only", "execute_when_configured"] = "plan_only"
+    browser_provider: Literal["playwright"] = "playwright"
+    credential_creation_policy: CredentialCreationPolicy = "create_if_missing"
+    provider_setup: dict[str, str] = Field(default_factory=dict, max_length=20)
+    dry_run: bool = True
+    onboarding: bool = False
+    decision_model: str | None = Field(default=None, max_length=120)
+    decision_effort: str | None = Field(default=None, max_length=20)
+
+    @field_validator("app_names")
+    @classmethod
+    def app_names_are_unique_and_named(cls, value: list[str]) -> list[str]:
+        """Reject blanks and duplicates rather than silently folding them.
+
+        A duplicate is refused, not de-duplicated: the caller asked for two runs
+        of one app and would otherwise be told it got what it asked for while
+        receiving one. Order is preserved so the response reads in request order.
+        """
+
+        seen: set[str] = set()
+        for name in value:
+            candidate = name.strip()
+            if not candidate:
+                raise ValueError("app_names must not contain a blank entry")
+            if len(candidate) > 200:
+                raise ValueError("an app name must be at most 200 characters")
+            key = candidate.casefold()
+            if key in seen:
+                raise ValueError(f"app_names contains {candidate!r} more than once")
+            seen.add(key)
+        return [name.strip() for name in value]
+
+    @field_validator("provider_setup")
+    @classmethod
+    def provider_setup_is_reviewed(cls, value: dict[str, str]) -> dict[str, str]:
+        return normalize_provider_setup_fields(value)
+
+    @field_validator("decision_model")
+    @classmethod
+    def decision_model_is_catalog_shaped(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        candidate = value.strip()
+        if not candidate:
+            return None
+        provider, separator, model = candidate.partition(":")
+        if not separator or not provider or not model:
+            raise ValueError("decision_model must be '<provider>:<model>'")
+        return candidate
+
+    @field_validator("decision_effort")
+    @classmethod
+    def decision_effort_is_known(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        candidate = value.strip()
+        if not candidate:
+            return None
+        if candidate not in EFFORT_VALUES:
+            raise ValueError("decision_effort is not a recognized reasoning effort")
+        return candidate
+
+    @model_validator(mode="after")
+    def _reject_conflicting_dry_run_alias(self) -> CreateRunBatchRequest:
+        # Same two rules the single-run model enforces, restated rather than
+        # inherited: these models are separate contracts on purpose, and a shared
+        # base would let a later field added for one silently appear on the other.
+        dry_run_explicitly_true = "dry_run" in self.model_fields_set and self.dry_run is True
+        if dry_run_explicitly_true and self.execution_mode == "execute_when_configured":
+            raise ValueError(
+                "dry_run=true is a deprecated alias for execution_mode='plan_only' "
+                "and cannot be combined with execution_mode='execute_when_configured'"
+            )
+        if self.decision_effort is not None and self.decision_model is None:
+            raise ValueError("decision_effort requires decision_model")
+        return self
+
+
+class BatchRunResult(StrictApiModel):
+    """One app's outcome within a batch.
+
+    ``run_id`` is present exactly when ``status == "created"``. ``reason_code`` is
+    a stable token for the machine and ``detail`` a short operator-facing string;
+    neither ever carries provider page text or a secret, because both are derived
+    from the API's own error vocabulary rather than from anything a provider said.
+    """
+
+    app_name: str
+    status: Literal["created", "rejected"]
+    run_id: str | None = None
+    reason_code: str | None = None
+    detail: str | None = None
+
+
+class CreateRunBatchResponse(StrictApiModel):
+    """Per-app outcomes for a batch create.
+
+    Returned with 201 whenever the request itself was well formed, even if every
+    app was rejected: the batch was accepted and processed, and per-app failures
+    are data, not a transport error. A caller decides what to do by reading
+    ``created`` and the per-item ``status``.
+    """
+
+    requested: int
+    created: int
+    rejected: int
+    results: list[BatchRunResult]
 
 
 class CredentialSubmissionRequest(StrictApiModel):
@@ -1231,6 +1379,12 @@ class AppSummary(StrictApiModel):
     buildability: str
     verification_status: str
     confidence: float = Field(ge=0.0, le=1.0)
+    # How far the agent gets unattended, which is the axis an operator sorts on
+    # when choosing a batch to onboard — and a different question from
+    # ``access_route``, which says how the credential is obtained. Optional so an
+    # older client and any caller projecting a record with no reviewed recipe stay
+    # valid; the catalog reads filter to runnable slugs, so they always set it.
+    readiness_tier: ReadinessTier | None = None
 
 
 class AppSearchResponse(StrictApiModel):

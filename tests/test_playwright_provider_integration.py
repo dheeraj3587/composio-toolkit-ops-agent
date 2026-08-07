@@ -400,10 +400,10 @@ def test_idle_live_view_reports_the_configured_provider_without_a_viewer() -> No
 def test_screenshot_route_is_registered_and_owner_gated() -> None:
     source = (_REPO / "api" / "app.py").read_text(encoding="utf-8")
     assert '"/api/runs/{run_id}/live-view/screenshot"' in source
-    # Same owner gate as the live-view endpoint, plus no-store caching.
+    # Same gate as the live-view endpoint, plus no-store caching.
     marker = source.index("live_view_screenshot")
     body = source[marker : marker + 1_200]
-    assert "_require_owner_action(request)" in body
+    assert "_require_agent_action(request)" in body
     assert "no-store" in body and "image/png" in body
 
 

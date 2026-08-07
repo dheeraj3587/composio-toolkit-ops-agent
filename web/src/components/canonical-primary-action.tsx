@@ -2,7 +2,7 @@
 
 import { useActionState } from "react"
 import { useFormStatus } from "react-dom"
-import { ArrowDown, Cable, CircleOff, ExternalLink, RefreshCcw } from "lucide-react"
+import { ArrowDown, Cable, CircleOff, RefreshCcw } from "lucide-react"
 
 import {
   runManagedConnectionAction,
@@ -115,12 +115,11 @@ function PrimaryActionControl({ runId, action }: { runId: string; action: Primar
   if (target) {
     return action.enabled ? (
       <Button asChild size="sm" className="w-full rounded-none md:w-auto">
+        {/* Every target here is an in-page anchor, including gated outreach:
+            it scrolls to the panel that now carries the real send control, so
+            review stays a deliberate step ahead of the send. */}
         <a href={target}>
-          {action.kind === "review_outreach" ? (
-            <ExternalLink aria-hidden="true" />
-          ) : (
-            <ArrowDown aria-hidden="true" />
-          )}
+          <ArrowDown aria-hidden="true" />
           {actionCopy[action.kind].title}
         </a>
       </Button>

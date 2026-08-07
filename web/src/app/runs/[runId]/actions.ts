@@ -126,7 +126,7 @@ export async function runPhaseAction(
 ): Promise<PhaseActionState> {
   const runId = String(formData.get("run_id") ?? "").slice(0, 180)
   const actionValue = String(formData.get("action") ?? "")
-  const action: RunPhaseAction | null = ["resume", "poll-email", "retry"].includes(actionValue)
+  const action: RunPhaseAction | null = ["resume", "poll-email", "retry", "outreach"].includes(actionValue)
     ? (actionValue as RunPhaseAction)
     : null
 

@@ -16,7 +16,7 @@ This module is typing/documentation only — it holds no runtime behavior.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
 from ops.browser.worker import BrowserObservation, BrowserSessionContext
@@ -57,6 +57,8 @@ class BrowserProvider(Protocol):
         display: str | None = ...,
         decision_model: str | None = ...,
         decision_effort: str | None = ...,
+        setup_fields: Mapping[str, str] | None = ...,
+        allowed_host_patterns: Sequence[str] | None = ...,
     ) -> BrowserSessionContext: ...
 
     async def navigate_onboarding(

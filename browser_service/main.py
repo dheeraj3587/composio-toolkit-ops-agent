@@ -24,7 +24,7 @@ import socket
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal, cast
+from typing import Any, Literal, cast, get_args
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, status
 from fastapi.responses import JSONResponse
@@ -40,24 +40,38 @@ from browser_service.auth import (
 from browser_service.clearance import observe_gate_clearance
 from browser_service.display_pool import DisplayPool, DisplayUnavailable
 from browser_service.models import (
+    ActionCandidateModel,
+    ActionExecutionResultModel,
+    ActRequest,
+    ArmCredentialSurfaceRequest,
     CaptureCredentialsRequest,
     CaptureCredentialsResponse,
     CreateSessionRequest,
+    CredentialSurfaceResponse,
     DrainStatus,
     GateClearanceReport,
     HealthResponse,
     LiveViewGrant,
     NavigateRequest,
     ObservationResponse,
+    ObserveResponse,
     ProviderHealthState,
     ReconcileSessionsRequest,
     ReconcileSessionsResponse,
     ResumeRequest,
+    RetainSessionRequest,
     SessionSummary,
+    SnapshotElementModel,
+    StepRecordModel,
 )
 from browser_service.novnc import LiveViewDenied, VncTarget, authorize_live_view
 from browser_service.secret_broker import BrokerCaptureStore, BrowserSecretBrokerClient
-from browser_service.session_manager import ManagedSession, SessionManager, SessionUnavailable
+from browser_service.session_manager import (
+    SESSION_CONTINUITY_EVENTS,
+    ManagedSession,
+    SessionManager,
+    SessionUnavailable,
+)
 from browser_service.settings import BrowserServiceSettings
 from ops.browser.host_policy import (
     allowed_hosts_from_patterns,
@@ -65,11 +79,22 @@ from ops.browser.host_policy import (
     navigation_target_urls,
 )
 from ops.browser.process_hardening import harden_browser_service_process
+from ops.browser.worker import MAX_OBSERVATION_STEPS
 from ops.core.logging_setup import configure_logging
 from ops.core.redaction import install_redacting_filter
 from ops.providers.errors import ProviderOperationError
 
 LOGGER = logging.getLogger("browser_service")
+
+# The retain route's wire vocabulary and the manager's enforcement set are two
+# copies of one list, in modules that cannot import each other: session_manager
+# imports models, so models cannot import back. Checked at import so a member
+# added to one and forgotten in the other fails the container's startup instead of
+# becoming a 422 the first time a run actually needs to park.
+if set(get_args(RetainSessionRequest.model_fields["event"].annotation)) != set(
+    SESSION_CONTINUITY_EVENTS
+):  # pragma: no cover - a wiring assertion, not a branch
+    raise RuntimeError("retain event vocabulary drifted from SESSION_CONTINUITY_EVENTS")
 
 _LIVE_VIEW_QUERY = re.compile(
     r"(?P<path>/internal/browser/live-view/novnc)\?[^\s\"']*",
@@ -429,7 +454,7 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         """
 
         # Revoke FIRST. A socket racing the drain now fails authorization, and the
-        # screenshot endpoint also consults this monotonic flag.
+        # screenshot endpoint consults the same flag.
         session.live_view_allowed = False
         _set_hitl_pending(session, False)
         session.screenshot_available = False
@@ -539,10 +564,24 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             payload.recipe_snapshot,
             expected_app_slug=payload.app_slug,
         )
-        if recipe is None:
+        if recipe is None and not payload.allowed_host_patterns:
+            # A checked-in recipe is no longer the ONLY way to bound a session —
+            # the run's own allow-list is the other, and it is the same
+            # confinement expressed directly rather than derived. Requiring the
+            # recipe made a route derived from a committed provider profile
+            # impossible to create at all, which is a harder refusal than
+            # "unreviewed": the apps that most need to be driven this way are
+            # exactly the ones no recipe covers.
+            #
+            # What is NOT relaxed: a session must still be bounded by one of the
+            # two. Neither present means no allow-list exists, and a session with
+            # an empty pattern tuple is refused every URL by
+            # ``is_allowed_browser_url`` anyway — so this refuses it here, where
+            # the reason can be said plainly, rather than at a navigation that
+            # would look like a policy denial.
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="recipe_snapshot_required",
+                detail="session_confinement_required",
             )
         # Rebuild the run's allow-list from its serialized patterns rather than
         # trusting loose strings later. A malformed list is refused outright: a
@@ -596,6 +635,15 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 display=session.display_slot.display if session.display_slot else None,
                 decision_model=payload.decision_model,
                 decision_effort=payload.decision_effort,
+                # Seeds the session's app slug, reviewed navigation patterns and
+                # approved value map from the recipe validated above, so a session
+                # is drivable through observe/act without a ``navigate`` first.
+                app_slug=payload.app_slug,
+                setup_fields=payload.setup_fields,
+                # The fallback the worker uses when there is no recipe to derive an
+                # allow-list from. Validated above into ``allowed_hosts``; the flat
+                # patterns are what the worker's own navigation check reads.
+                allowed_host_patterns=payload.allowed_host_patterns,
             )
             # EXPLICIT ownership: the manager can now close the real session, and
             # nothing reaches into the worker's private session dictionary.
@@ -727,6 +775,178 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             raise _clearance_absent(session_id) from None
 
     @app.post(
+        "/internal/browser/sessions/{session_id}/retain",
+        response_model=SessionSummary,
+    )
+    async def retain_session(
+        session_id: str,
+        payload: RetainSessionRequest,
+        auth: AuthContext = _AUTH,
+    ) -> SessionSummary:
+        """Keep a bound session ACTIVE across a wait, and say why.
+
+        No lease and no browser work: this is the explicit "I am still here" a
+        caller makes while a run is parked. Only the run-progress events refresh
+        the idle clock — a live-view client disconnecting keeps the session but
+        buys it no further idle budget — and neither kind moves the absolute
+        maximum-age ceiling, so the janitor's expiry policy is unchanged.
+        """
+
+        caller_capability_digest = require_session_capability(auth)
+        session = manager.get_if_present(session_id)
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
+        assert_session_access(
+            session_owner=session.owner,
+            caller_owner=auth.owner,
+            session_capability_digest=session.session_capability_digest,
+            caller_capability_digest=caller_capability_digest,
+        )
+        try:
+            return manager.retain(session_id, event=payload.event).summary()
+        except SessionUnavailable as exc:
+            raise _sanitized_error(exc) from None
+
+    @app.post(
+        "/internal/browser/sessions/{session_id}/observe",
+        response_model=ObserveResponse,
+    )
+    async def observe(session_id: str, auth: AuthContext = _AUTH) -> ObserveResponse:
+        """Read the page once and return it, deciding and doing nothing.
+
+        With ``act`` below, this is the pair that makes a single agent step
+        possible from outside this container. Until they existed the service
+        offered ``navigate`` and ``resume``, and each ran a whole closed loop in
+        here — inspect, call a model, execute, repeat until done or paused — so an
+        external planner had no way to observe a page, think, and take one action.
+        It could only hand over the wheel and read what came back.
+
+        It is a POST because it is not free: it drives the browser, takes a lease,
+        and advances ``dom_generation``. The generation is the point — it is the
+        token ``act`` must quote back, and an observation that did not advance it
+        could not be distinguished from the one before.
+
+        The Playwright locators the inspection carries are live handles bound to
+        this process's browser loop; they stay here, and the caller re-identifies
+        its target by role/name/type instead.
+        """
+
+        caller_capability_digest = require_session_capability(auth)
+        session = manager.get_if_present(session_id)
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
+        assert_session_access(
+            session_owner=session.owner,
+            caller_owner=auth.owner,
+            session_capability_digest=session.session_capability_digest,
+            caller_capability_digest=caller_capability_digest,
+        )
+        try:
+            with manager.lease(session_id) as leased:
+                inspection = await asyncio.wait_for(
+                    _worker().observe_session(_worker_context(leased)),
+                    timeout=resolved.operation_timeout_seconds,
+                )
+                leased.touch()
+                return ObserveResponse(
+                    url=inspection.url,
+                    title=inspection.title,
+                    visible_text=inspection.visible_text,
+                    fingerprint=inspection.fingerprint,
+                    generation=inspection.generation,
+                    elements=tuple(
+                        SnapshotElementModel.model_validate(element, from_attributes=True)
+                        for element in inspection.elements
+                    ),
+                    session=leased.summary(),
+                )
+        except TimeoutError:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="operation_timeout"
+            ) from None
+        except SessionUnavailable as exc:
+            raise _sanitized_error(exc) from None
+        except ProviderOperationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.reason_code
+            ) from None
+
+    @app.post(
+        "/internal/browser/sessions/{session_id}/act",
+        response_model=ActionExecutionResultModel,
+    )
+    async def act(
+        session_id: str,
+        payload: ActRequest,
+        auth: AuthContext = _AUTH,
+    ) -> ActionExecutionResultModel:
+        """Execute exactly one candidate against the observation that planned it.
+
+        Every outcome is a typed 200, never an exception: ``stale`` when the page
+        moved under the plan, ``blocked`` when policy refused, ``failed`` when the
+        action did not complete, ``executed`` when it ran. A planner has to be able
+        to tell those apart to correct itself, which is precisely what collapsing
+        them into an HTTP error would take away.
+
+        Confinement is enforced twice for a ``goto``, on two different lists and
+        for two different reasons. Here, against the RUN's allow-list, because a
+        session bound to one run must not be steered to another provider's domain
+        — the same check ``navigate`` makes on its research payload. Then again in
+        the executor, against the recipe's reviewed navigation patterns, before the
+        request is issued.
+        """
+
+        caller_capability_digest = require_session_capability(auth)
+        session = manager.get_if_present(session_id)
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
+        assert_session_access(
+            session_owner=session.owner,
+            caller_owner=auth.owner,
+            session_capability_digest=session.session_capability_digest,
+            caller_capability_digest=caller_capability_digest,
+        )
+        target_url = payload.candidate.url
+        if target_url and session.allowed_hosts is not None:
+            denial = first_denied_navigation((target_url,), session.allowed_hosts)
+            if denial is not None:
+                session.reason_code = denial.reason_code
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=denial.reason_code)
+        try:
+            with manager.lease(session_id) as leased:
+                result = await asyncio.wait_for(
+                    _worker().act_on_session(
+                        _worker_context(leased),
+                        _action_candidate(payload.candidate),
+                        observed_url=payload.observed_url,
+                        observed_generation=payload.observed_generation,
+                    ),
+                    timeout=resolved.operation_timeout_seconds,
+                )
+                leased.touch()
+                return ActionExecutionResultModel(
+                    status=result.status,
+                    candidate_id=result.candidate_id,
+                    before_url=result.before_url,
+                    after_url=result.after_url,
+                    before_generation=result.before_generation,
+                    after_generation=result.after_generation,
+                    reason_code=result.reason_code,
+                    expected_selected_label=result.expected_selected_label,
+                    session=leased.summary(),
+                )
+        except TimeoutError:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="operation_timeout"
+            ) from None
+        except SessionUnavailable as exc:
+            raise _sanitized_error(exc) from None
+        except ProviderOperationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.reason_code
+            ) from None
+
+    @app.post(
         "/internal/browser/sessions/{session_id}/navigate", response_model=ObservationResponse
     )
     async def navigate(
@@ -815,7 +1035,10 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 observation = await _drive(
                     _worker(),
                     leased,
-                    payload.research or {},
+                    # Passed through as ``None`` rather than coerced to ``{}``: an
+                    # empty mapping is not a research payload, and ``_drive`` can
+                    # now derive one from the recipe a resume already carries.
+                    payload.research,
                     payload.recipe_snapshot,
                     payload.credential_refs,
                     payload.secret_grants,
@@ -947,6 +1170,173 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 detail="credential_capture_failed",
             ) from None
         return CaptureCredentialsResponse(credential_refs=captured or {})
+
+    @app.post(
+        "/internal/browser/sessions/{session_id}/credential-surface/arm",
+        response_model=CredentialSurfaceResponse,
+    )
+    async def arm_credential_surface(
+        session_id: str,
+        payload: ArmCredentialSurfaceRequest,
+        auth: AuthContext = _AUTH,
+    ) -> CredentialSurfaceResponse:
+        """Let a session reach the capture boundary without running a closed loop.
+
+        ``credential_surface_ready`` had exactly two producers, both inside
+        ``navigate`` and ``resume``, and both only as the terminal verdict of a
+        server-side loop. A caller driving one action at a time through
+        observe/act could therefore park ON the credential page and still be
+        refused at ``capture-credentials`` with ``credential_surface_not_ready``,
+        because no route along its path was allowed to say the page had been
+        reached. This is that route, and it is the same proof: the reviewed
+        recipe's structured success predicate, evaluated by the worker against a
+        freshly inspected page. The caller asserts nothing.
+
+        Not being there yet is an ordinary 200 with ``armed=false`` — the agent is
+        expected to keep working — while a recipe that could never prove it is a
+        502 carrying the worker's reason code. Once armed, the capture boundary is
+        entered here exactly as navigation enters it, so live pixels are revoked
+        before any reveal can run rather than after.
+        """
+
+        caller_capability_digest = require_session_capability(auth)
+        session = manager.get_if_present(session_id)
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
+        assert_session_access(
+            session_owner=session.owner,
+            caller_owner=auth.owner,
+            session_capability_digest=session.session_capability_digest,
+            caller_capability_digest=caller_capability_digest,
+        )
+        recipe = _validated_recipe_snapshot(
+            payload.recipe_snapshot,
+            expected_app_slug=session.app_slug,
+        )
+        if recipe is None:
+            # The predicate lives in the recipe; there is nothing to evaluate
+            # without one. Refused before a lease is taken.
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="recipe_snapshot_required",
+            )
+        try:
+            with manager.lease(session_id) as leased:
+                observation = await asyncio.wait_for(
+                    _worker().arm_credential_surface(_worker_context(leased), recipe),
+                    timeout=resolved.operation_timeout_seconds,
+                )
+                # A non-``None`` return is NOT success. The worker also answers with
+                # a ``blocked`` observation when the page is outside the reviewed
+                # allow-list, and arming on that would revoke live view for a page
+                # that never proved anything — the exact failure the boundary
+                # exists to prevent. Only the proven status arms; everything else
+                # reports the worker's own reason so the agent can tell "not there
+                # yet" from "this host was never reviewed".
+                if observation is None or observation.status != "credential_page_ready":
+                    leased.touch()
+                    return CredentialSurfaceResponse(
+                        armed=False,
+                        live_view_allowed=leased.live_view_allowed,
+                        reason_code=(
+                            observation.reason_code
+                            if observation is not None and observation.reason_code
+                            else "credential_surface_not_ready"
+                        ),
+                        session=leased.summary(),
+                    )
+                leased.credential_surface_ready = True
+                await _enter_secret_capture_boundary(leased)
+                leased.touch()
+                return CredentialSurfaceResponse(
+                    armed=True,
+                    live_view_allowed=leased.live_view_allowed,
+                    session=leased.summary(),
+                )
+        except TimeoutError:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="operation_timeout"
+            ) from None
+        except SessionUnavailable as exc:
+            raise _sanitized_error(exc) from None
+        except HTTPException:
+            raise
+        except ProviderOperationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.reason_code
+            ) from None
+
+    @app.post(
+        "/internal/browser/sessions/{session_id}/credential-surface/release",
+        response_model=CredentialSurfaceResponse,
+    )
+    async def release_credential_surface(
+        session_id: str,
+        auth: AuthContext = _AUTH,
+    ) -> CredentialSurfaceResponse:
+        """Hand a post-credential session back to a human, if the page permits it.
+
+        Revocation used to be write-once: a run that reached the credential
+        surface and then stalled — a CAPTCHA on the next page, an expired form,
+        anything the agent could not finish — could never be shown to anyone
+        again, so the only remaining outcome was to abandon it. That is a worse
+        failure than the one the boundary defends against, and this is the
+        deliberate way back.
+
+        The worker decides, not the caller: it re-inspects the live page with the
+        same fail-closed structural check the capture path uses, and only a page
+        that positively proves it holds no credential content gets pixels back. A
+        refusal is a 200 with ``live_view_allowed`` unchanged, because "still
+        sensitive" is a legitimate state and not an error. Clearing
+        ``credential_surface_ready`` alongside it is the point of the pairing: a
+        released session must re-arm — and re-enter the boundary — before it can
+        capture again, rather than inheriting an arming that described an older
+        page. The egress stage stays where it is; it is monotonic by design and
+        network confinement is not what a human looking at a screen affects.
+        """
+
+        caller_capability_digest = require_session_capability(auth)
+        session = manager.get_if_present(session_id)
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found")
+        assert_session_access(
+            session_owner=session.owner,
+            caller_owner=auth.owner,
+            session_capability_digest=session.session_capability_digest,
+            caller_capability_digest=caller_capability_digest,
+        )
+        try:
+            with manager.lease(session_id) as leased:
+                released = await asyncio.wait_for(
+                    _worker().release_credential_surface(_worker_context(leased)),
+                    timeout=resolved.operation_timeout_seconds,
+                )
+                leased.touch()
+                if not released:
+                    return CredentialSurfaceResponse(
+                        armed=leased.credential_surface_ready,
+                        live_view_allowed=leased.live_view_allowed,
+                        reason_code="credential_content_present",
+                        session=leased.summary(),
+                    )
+                leased.live_view_allowed = True
+                leased.credential_surface_ready = False
+                leased.secret_capture_boundary_entered = False
+                return CredentialSurfaceResponse(
+                    armed=False,
+                    live_view_allowed=True,
+                    session=leased.summary(),
+                )
+        except TimeoutError:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="operation_timeout"
+            ) from None
+        except SessionUnavailable as exc:
+            raise _sanitized_error(exc) from None
+        except ProviderOperationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.reason_code
+            ) from None
 
     @app.get("/internal/browser/sessions/{session_id}/screenshot")
     async def screenshot(session_id: str, auth: AuthContext = _AUTH) -> Response:
@@ -1363,10 +1753,77 @@ def _validated_recipe_snapshot(
     return recipe
 
 
+def _worker_context(session: ManagedSession) -> Any:
+    """The worker-side handle for a managed session.
+
+    Built from ``current_page_id`` rather than read from ``session.worker_context``
+    because the page id is what the worker keys its registry on, and a session that
+    was reattached after a restart has the id long before it has the recorded
+    context object. The lifetime fields are carried across so the worker reports
+    the same bounds the manager is enforcing.
+    """
+
+    from ops.browser.worker import BrowserSessionContext
+
+    handle = session.current_page_id
+    return BrowserSessionContext(
+        profile_id=handle,
+        session_id=handle,
+        live_view_available=True,
+        allowed_domains=(),
+        created_at=session.created_at.isoformat(),
+        inactivity_expires_at=session.maximum_expires_at.isoformat(),
+        maximum_expires_at=session.maximum_expires_at.isoformat(),
+    )
+
+
+def _action_candidate(model: ActionCandidateModel) -> Any:
+    """Rebuild the executor's candidate from the wire model.
+
+    ``risk`` is set to ``requires_hitl`` and is not accepted from the caller. The
+    executor never reads it, so the value is inert on this path — but a candidate
+    that arrived over the wire did not come from ``generate_candidates`` and has no
+    policy verdict attached to it, and if one ever reaches ``executable_candidates``
+    it must fail closed rather than present itself as pre-approved. The three
+    trace-provenance fields are empty for the same reason: this candidate belongs to
+    no reviewed checkpoint, and claiming one would be a lie the metrics would repeat.
+    """
+
+    from ops.browser.candidates import ActionCandidate, ElementIdentity
+
+    identity = (
+        ElementIdentity(
+            role=model.identity.role,
+            name=model.identity.name,
+            element_type=model.identity.element_type,
+            frame_path=tuple(model.identity.frame_path),
+            test_id=model.identity.test_id,
+            href_path=model.identity.href_path,
+            nearby_heading=model.identity.nearby_heading,
+        )
+        if model.identity is not None
+        else None
+    )
+    return ActionCandidate(
+        candidate_id=model.candidate_id,
+        action=model.action,
+        semantic_target=model.semantic_target,
+        identity=identity,
+        risk="requires_hitl",
+        expected_postcondition="",
+        trace_version="",
+        checkpoint_order=0,
+        value_ref=model.value_ref,
+        press_key=model.press_key,
+        url=model.url,
+        hint_index=model.hint_index,
+    )
+
+
 async def _drive(
     worker: Any,
     session: ManagedSession,
-    research_payload: dict[str, object],
+    research_payload: dict[str, object] | None,
     recipe_payload: dict[str, object] | None,
     credential_refs: dict[str, str],
     secret_grants: dict[str, str],
@@ -1391,16 +1848,37 @@ async def _drive(
     from ops.browser.worker import BrowserSessionContext
     from ops.core.models import OperationalResearch
 
-    try:
-        research = OperationalResearch.model_validate(research_payload)
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="invalid_research_payload"
-        ) from None
     recipe = _validated_recipe_snapshot(
         recipe_payload,
         expected_app_slug=session.app_slug,
     )
+    if research_payload is None:
+        # Derived, not assumed. ``recipe_to_operational_research`` projects the
+        # recipe's OWN reviewed URLs onto this contract, so the destinations below
+        # are the ones a human already signed off on — the caller simply did not
+        # have to restate them. A recipe the catalog cannot project is a 422 here
+        # rather than a partially-populated research object nobody reviewed.
+        if recipe is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="invalid_research_payload",
+            )
+        from ops.recipes.app_recipes import recipe_to_operational_research
+
+        try:
+            research = recipe_to_operational_research(recipe)
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="research_not_derivable_from_recipe",
+            ) from None
+    else:
+        try:
+            research = OperationalResearch.model_validate(research_payload)
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="invalid_research_payload"
+            ) from None
     if research.app_slug != session.app_slug:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -1540,6 +2018,24 @@ async def _drive(
         credential_field_labels=tuple(observation.credential_field_labels),
         non_secret_notes=tuple(observation.non_secret_notes),
         reason_code=observation.reason_code,
+        # Restated field by field rather than validated off the dataclass: the
+        # response model forbids extra fields, so an explicit projection is what
+        # keeps a future field on the worker's record from leaving this container
+        # before anyone has decided it is safe to.
+        steps=tuple(
+            StepRecordModel(
+                step_index=step.step_index,
+                stage=step.stage,
+                elapsed_ms=step.elapsed_ms,
+                decision=step.decision,
+                reason_code=step.reason_code,
+                candidate_label=step.candidate_label,
+                action=step.action,
+                target_host=step.target_host,
+                reason=step.reason,
+            )
+            for step in observation.steps[:MAX_OBSERVATION_STEPS]
+        ),
         session=session.summary(),
     )
 

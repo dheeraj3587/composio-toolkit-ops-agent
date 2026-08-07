@@ -13,7 +13,7 @@ import ipaddress
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Literal, Protocol, TypeVar
+from typing import Final, Literal, Protocol, TypeVar
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ops.browser.host_policy import BrowserHostDecision
@@ -59,7 +59,17 @@ BrowserReasonCode = Literal[
     "navigation_timeout",
     "postcondition_failed",
     "session_lost",
+    "navigation_host_not_reviewed",
 ]
+
+# The one reason code whose projection is not terminal, named here rather than in
+# the module that emits it because both ends of the wire need the same literal:
+# ``ops/playwright/routing.py`` writes it onto the observation and
+# ``ops/workflow/canonical_runtime.py`` branches on it when it decides the run's
+# status. It means "the page is outside the recipe's REVIEWED hosts" — a fact
+# about the recipe, fixable by widening the list and retrying — as opposed to
+# ``policy_blocked``, which is a refusal that stands however the recipe is edited.
+HOST_POLICY_REASON_CODE: Final = "navigation_host_not_reviewed"
 
 HumanActionType = Literal[
     "login_required",
@@ -71,6 +81,11 @@ HumanActionType = Literal[
     "device_approval",
     "provider_verification",
     "legal_acceptance",
+    # An OAuth/OIDC access grant ("Allow", "Authorize", "Grant access"). Distinct
+    # from legal_acceptance: accepting a provider's terms is not the same act as
+    # granting one application access to an account, and only the former is
+    # recipe-declarable.
+    "oauth_grant",
     "billing",
     "account_selection",
     # Pre-execution business decision: may the system create an account with this
@@ -102,6 +117,69 @@ class SelectorHint:
             raise ValueError("selector is invalid")
 
 
+MAX_OBSERVATION_STEPS = 40
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserStepRecord:
+    """One action-loop iteration, bounded and value-free, carried back to the API.
+
+    The loop computes every fact here already — which control it chose, whether a
+    deterministic match or the model chose it, which verb ran, what came back —
+    and until now it handed them to an event sink that production never wires, so
+    the richest telemetry in the system was recomputed and discarded on every
+    iteration. The operator console's "Chain of thought" panel reads
+    ``onboarding_progress_events`` and ``onboarding_step_decisions``, and only the
+    unwired driver ever wrote to those, so the panel was structurally empty for
+    every live run. This record is the wire format that closes that gap.
+
+    Nothing here is a URL, a selector, or page markup. ``candidate_label`` is a
+    sanitized accessible name, ``target_host`` is a bare host, and ``reason`` is
+    the model's own short justification — the one model-authored string on the
+    path. It is bounded here and quarantined again by
+    ``OperationsStorage.record_step_decision`` before it is ever stored, which is
+    where a secret-shaped explanation is dropped in favour of a "withheld" marker.
+    """
+
+    step_index: int
+    stage: str
+    elapsed_ms: int
+    decision: str
+    reason_code: str | None = None
+    candidate_label: str | None = None
+    action: str | None = None
+    target_host: str | None = None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.step_index, bool)
+            or not isinstance(self.step_index, int)
+            or not 1 <= self.step_index <= 100_000
+        ):
+            raise ValueError("browser step index is invalid")
+        if (
+            isinstance(self.elapsed_ms, bool)
+            or not isinstance(self.elapsed_ms, int)
+            or not 0 <= self.elapsed_ms <= 3_600_000
+        ):
+            raise ValueError("browser step elapsed time is invalid")
+        for field, limit in (
+            ("stage", 40),
+            ("decision", 40),
+            ("reason_code", 100),
+            ("candidate_label", 120),
+            ("action", 40),
+            ("target_host", 253),
+            ("reason", 400),
+        ):
+            value = getattr(self, field)
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value or len(value) > limit:
+                raise ValueError(f"browser step {field} is invalid")
+
+
 @dataclass(frozen=True, slots=True)
 class BrowserObservation:
     """Bounded agent output with no generic credential-value container."""
@@ -122,6 +200,9 @@ class BrowserObservation:
     # Browser-service HITL generation. Zero means the provider does not expose a
     # generation and therefore cannot participate in autonomous takeover.
     hitl_generation: int = 0
+    # What the loop did on the way to this observation, oldest first. Additive and
+    # defaulting to empty, so a backend that reports no trail is unchanged.
+    steps: tuple[BrowserStepRecord, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "current_url", sanitize_browser_url(self.current_url))

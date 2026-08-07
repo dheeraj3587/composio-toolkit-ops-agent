@@ -115,11 +115,50 @@ class ComposioToolkitCatalog(Protocol):
 
 
 def normalize_app_slug(value: str) -> str:
-    """Normalize an app name/slug to the catalog lookup key."""
+    """Normalize an app name/slug to the canonical hyphenated app slug.
+
+    This is a *guess* at the Composio catalog key, not an authority: it can only
+    ever emit hyphens, so a toolkit registered as ``help_scout`` or ``googleads``
+    is unreachable through it. Use :func:`resolve_toolkit_slug` for the lookup.
+    """
 
     normalized = unicodedata.normalize("NFKC", value).strip().casefold()
     collapsed = "-".join(part for part in normalized.replace("_", "-").split() if part)
     return collapsed or normalized
+
+
+def _recipe_toolkit_slug(app_slug: str) -> str | None:
+    """Return the reviewed recipe's Composio toolkit slug for a canonical app slug.
+
+    The import is local so this read-only boundary keeps its lazy, dependency-free
+    import graph and an absent/unreadable catalog simply yields no override.
+    """
+
+    if not app_slug:
+        return None
+    from ops.recipes.app_recipes import get_app_recipe
+
+    recipe = get_app_recipe(app_slug)
+    slug = getattr(recipe, "toolkit_slug", None)
+    return slug if isinstance(slug, str) and slug else None
+
+
+def resolve_toolkit_slug(app_slug: str, *, toolkit_slug: str | None = None) -> str:
+    """Resolve the slug Composio actually knows this app by.
+
+    Precedence: an explicitly supplied ``toolkit_slug`` (the caller already holds
+    the reviewed value), then the reviewed recipe catalog, then the normalized
+    guess. Five reviewed apps -- help-scout, google-ads, meta-ads, linkedin-ads
+    and bright-data -- are registered under a slug the guess cannot spell, so
+    looking them up by ``normalize_app_slug`` reports them as absent and lets the
+    P1 fallback (including real gated outreach) run for a toolkit that exists.
+    """
+
+    explicit = (toolkit_slug or "").strip().casefold()
+    if explicit:
+        return explicit
+    normalized = normalize_app_slug(app_slug)
+    return _recipe_toolkit_slug(normalized) or normalized
 
 
 def classify_capability(
@@ -173,10 +212,14 @@ class ComposioCapabilityPreflight:
         *,
         app_name: str,
         app_slug: str | None = None,
+        toolkit_slug: str | None = None,
         required_tools: Sequence[str] = (),
     ) -> ComposioCapabilityReport:
         del app_name  # normalization uses the slug; the name is accepted for parity
         slug = normalize_app_slug(app_slug or "")
+        # The reported app_slug stays the canonical app identity; the catalog is
+        # queried with the reviewed toolkit slug when one exists.
+        lookup_slug = resolve_toolkit_slug(slug, toolkit_slug=toolkit_slug)
         catalog = self._catalog or self._build_catalog()
         if catalog is None:
             return ComposioCapabilityReport(
@@ -193,7 +236,7 @@ class ComposioCapabilityPreflight:
             )
 
         try:
-            toolkit = await catalog.get_toolkit(slug)
+            toolkit = await catalog.get_toolkit(lookup_slug)
             active = False
             if toolkit is not None and toolkit.available:
                 active = await catalog.has_active_connection(toolkit.slug)
@@ -361,4 +404,5 @@ __all__ = [
     "ToolkitInfo",
     "classify_capability",
     "normalize_app_slug",
+    "resolve_toolkit_slug",
 ]

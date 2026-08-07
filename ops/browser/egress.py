@@ -67,7 +67,17 @@ class BrowserEgressPolicy:
 
         vendor = self.vendor_navigation_hosts
         if stage is EgressStage.CREDENTIAL_SURFACE:
-            # Nothing but the vendor itself, for any kind.
+            # Nothing but the vendor itself, for any kind — post-auth hosts drop
+            # here too, and that is deliberate now that a recipe can actually
+            # populate them. ``post_auth_hosts`` is for the origins a sign-in
+            # BOUNCES through (an ``*.auth0.com`` tenant, ``clerk.<vendor>``),
+            # which are third-party-operated: granting one image/CSS/beacon
+            # access while a credential is on screen would reopen the exact
+            # channel this stage exists to close. A vendor-owned console the
+            # credential is actually RENDERED on is a host the vendor publicly
+            # owns, so it belongs in the recipe's ``exact_hosts`` (as
+            # ``console.apify.com`` and ``app.datadoghq.com`` already are) and
+            # stays reachable here through ``vendor``.
             return vendor
 
         if stage is EgressStage.AUTHENTICATED:
@@ -182,6 +192,14 @@ def reviewed_egress_extensions(
             active_api_hosts=browser.static_resource_hosts,
             active_script_hosts=browser.static_resource_hosts,
             passive_asset_hosts=browser.static_resource_hosts,
+            # The console the vendor hands the tab to after sign-in. It belongs to
+            # the AUTHENTICATED stage by definition, which is the one stage this
+            # field feeds, so it neither loosens PRE_AUTH nor survives
+            # CREDENTIAL_SURFACE. Until this line the recipe could declare the
+            # host and the network still refused it: ``post_auth_hosts`` existed
+            # on both dataclasses below and nothing ever populated it from a
+            # recipe, so the field read as configured and was dead.
+            post_auth_hosts=browser.post_auth_hosts,
         )
 
     return _REVIEWED_EGRESS_EXTENSIONS.get(app_slug, ReviewedEgressExtensions())
@@ -218,10 +236,31 @@ def build_egress_policy(
     passive_asset_hosts: tuple[str, ...] = (),
     post_auth_hosts: tuple[str, ...] = (),
 ) -> BrowserEgressPolicy:
-    """Build a policy from the app's REVIEWED vendor patterns plus reviewed extras."""
+    """Build a policy from the app's REVIEWED vendor patterns plus reviewed extras.
 
+    ``vendor_patterns`` is the run's NAVIGATION allow-list, and that allow-list is
+    now a union: ``ops/browser/host_policy.py`` folds the recipe's reviewed
+    identity-provider and post-auth hosts into it so a federated sign-in is not
+    refused as an off-policy destination. Egress must not inherit that union
+    verbatim, because its whole point is that the same host is trusted at
+    different stages for different things: ``allowed_patterns`` deliberately DROPS
+    the IdP once a session exists, and drops everything but the vendor once a
+    credential may be on screen. Passing the union straight through would have
+    kept accounts.google.com — a host already trusted to run script during
+    sign-in — reachable for any resource kind on the credential surface, which is
+    exactly the pixel/CSS/beacon channel that stage exists to close.
+
+    So the reviewed non-vendor hosts are subtracted back out of the vendor set and
+    re-enter only through the stage that reviewed them. The subtraction is by
+    exact pattern string: it can only ever REMOVE a host from the widest set, so
+    the worst case is over-restriction, and it restores egress to precisely the
+    behaviour it had before navigation widened.
+    """
+
+    staged_elsewhere = frozenset(identity_provider_hosts) | frozenset(post_auth_hosts)
+    vendor_only = tuple(pattern for pattern in vendor_patterns if pattern not in staged_elsewhere)
     return BrowserEgressPolicy(
-        vendor_navigation_hosts=tuple(vendor_patterns),
+        vendor_navigation_hosts=vendor_only,
         identity_provider_hosts=tuple(identity_provider_hosts),
         active_api_hosts=tuple(active_api_hosts),
         active_script_hosts=tuple(active_script_hosts),

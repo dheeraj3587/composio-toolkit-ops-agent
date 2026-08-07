@@ -65,6 +65,7 @@ from ops.browser.candidates import (
     select_candidate,
 )
 from ops.browser.decider import (
+    MAX_ELEMENTS,
     SnapshotElement,
     build_choice_prompt,
     build_snapshot,
@@ -73,7 +74,10 @@ from ops.browser.decider import (
     validate_choice,
 )
 from ops.browser.host_policy import BrowserAllowedHosts, evaluate_navigation
+from ops.browser.risk import ActionAuthorization, BrowserActionRiskPolicy, RiskDecision
+from ops.browser.snapshot import rank_raw_elements
 from ops.browser.worker import BrowserObservation, HumanActionType
+from ops.core.inference import DecisionFailed
 from ops.core.model_input_dlp import (
     sanitize_element_name,
     sanitize_page_text,
@@ -87,11 +91,24 @@ from ops.onboarding.phase import (
     OnboardingPhase,
     OnboardingReasonCode,
 )
+from ops.onboarding.scratchpad import (
+    ScratchpadStore,
+    load_scratchpad,
+    render_scratchpad,
+    save_scratchpad,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - imported for typing only
     # Typing-only so this vocabulary module stays free of the settings/pydantic
     # import chain at runtime; ``from_settings`` needs only attribute access.
     from ops.core.config import Settings
+
+    # Typing-only for the same reason: ``ops.playwright.actions`` imports
+    # ``Settings`` at module scope, and the loop only ever READS ``.status`` and
+    # ``.reason_code`` off the value a session hands back — it never constructs
+    # one and never isinstance-checks one, so the runtime import would buy
+    # nothing and cost the whole settings chain.
+    from ops.playwright.actions import ActionExecutionResult
 
 
 # --- budgets ---------------------------------------------------------------
@@ -107,6 +124,18 @@ MAX_NAVIGATION_DENIALS: Final = 10
 # than imported because ``ops.browser.candidates.generate_candidates`` carries it
 # as a parameter default; the happy-path test pins the two equal.
 MAX_CANDIDATES: Final = 8
+
+# Parity with the OTHER loop that drives a browser, ``ops/playwright/worker.py``'s
+# trace loop: ``_MAX_MODEL_FAILURES`` and ``_MAX_ACTION_FAILURES``. Restated here
+# rather than imported because importing them would pull the entire Playwright
+# worker — Playwright, the session manager, the recipe catalog — into what is
+# otherwise a vocabulary module. Before this existed the two loops disagreed by a
+# factor of two and one: the worker retried a failed decision twice and a failed
+# action three times, while this loop gave up on the FIRST of either, so the same
+# provider outage read as "the agent is trying" on one path and "the agent is
+# blocked" on the other.
+MAX_DECISION_FAILURES: Final = 2
+MAX_ACTION_FAILURES: Final = 3
 
 LoopOutcome = Literal["done", "gate", "exhausted", "denied_fatal"]
 LOOP_OUTCOMES: Final[tuple[LoopOutcome, ...]] = get_args(LoopOutcome)
@@ -327,6 +356,36 @@ class PhaseGoal:
     reviewed_goto_urls: tuple[str, ...] = ()
     allow_value_refs: tuple[str, ...] = ()
     max_candidates: int = MAX_CANDIDATES
+    # The exact accessible names a human reviewed as the controls that may create
+    # a credential on this phase's pages, and the run's immutable policy on doing
+    # so. Both default to the closed answer: with no reviewed control the risk
+    # policy refuses every "Create"/"Generate"/"Save" click outright, which is the
+    # correct behaviour for a phase whose goal nobody reviewed for that.
+    credential_creation_controls: tuple[str, ...] = ()
+    credential_creation_policy: str = "reuse_only"
+    # The phase itself declares that a human must act on it. Kept here rather than
+    # inferred, so a handler can mark a phase HITL without the loop having to
+    # discover it from the page.
+    requires_hitl: bool = False
+
+    def authorization(self) -> ActionAuthorization:
+        """What this goal authorizes, in the risk policy's own vocabulary.
+
+        The loop asks the SAME :class:`~ops.browser.risk.BrowserActionRiskPolicy`
+        the worker's trace loop asks. Before this existed the loop's only risk
+        signal was ``ActionCandidate.executable``, derived from the substring list
+        in ``ops/browser/candidates.py`` — which names neither ``create`` nor
+        ``save``, so "Create API key" and "Save" arrived marked low-risk and the
+        loop clicked them without ever consulting the credential-creation
+        authority.
+        """
+
+        return ActionAuthorization.for_phase(
+            allowed_value_refs=self.allow_value_refs,
+            credential_creation_controls=self.credential_creation_controls,
+            requires_hitl=self.requires_hitl,
+            credential_creation_policy=self.credential_creation_policy,
+        )
 
     def __post_init__(self) -> None:
         if self.phase not in SESSION_BEARING_PHASES:
@@ -353,6 +412,9 @@ class PhaseGoal:
         signals: Sequence[str] = (),
         reviewed_goto_urls: Sequence[str] = (),
         allow_value_refs: Sequence[str] = (),
+        credential_creation_controls: Sequence[str] = (),
+        credential_creation_policy: str = "reuse_only",
+        requires_hitl: bool = False,
     ) -> PhaseGoal:
         """A goal whose postconditions come from :data:`PHASE_POSTCONDITIONS`.
 
@@ -372,6 +434,9 @@ class PhaseGoal:
             success_reason_code=success_reason_code,
             reviewed_goto_urls=tuple(reviewed_goto_urls),
             allow_value_refs=tuple(allow_value_refs),
+            credential_creation_controls=tuple(credential_creation_controls),
+            credential_creation_policy=credential_creation_policy,
+            requires_hitl=requires_hitl,
         )
 
 
@@ -500,7 +565,105 @@ _POSTCONDITION_PREDICATES: Final[dict[str, Callable[[BrowserObservation], bool]]
 _HITL_CATEGORY_ACTIONS: Final[dict[str, HumanActionType]] = {
     "billing": "billing",
     "legal_acceptance": "legal_acceptance",
+    # ``ops/browser/risk.py``'s "authorization" family is authorize/approve/
+    # allow/grant — an access grant, which now has its own typed action. Mapped
+    # here so the operator is asked to grant access rather than to perform an
+    # unspecified "provider verification".
+    "authorization": "oauth_grant",
 }
+
+# The four statuses ``ActionExecutionResult`` declares. Restated as a runtime set
+# because the type itself is imported for typing only (see the TYPE_CHECKING block
+# at the top): the loop has to be able to REFUSE an unrecognised status, and a
+# type annotation cannot do that at runtime.
+_ACT_STATUSES: Final[frozenset[str]] = frozenset({"executed", "stale", "blocked", "failed"})
+
+# Exceptions that are always a bug in this repo rather than an outcome of a page.
+# The same tuple ``ops/playwright/worker.py`` and ``ops/browser/service_client.py``
+# re-raise before their own containment clauses; kept identical so the two loops
+# agree about what must never be swallowed.
+_PROGRAMMING_ERRORS: Final = (TypeError, AttributeError, AssertionError, NameError, ImportError)
+
+# One executor reason code onto the closed onboarding vocabulary. Only the codes
+# with an exact counterpart are mapped; everything else falls back to the caller's
+# default, because inventing a near-miss code is worse than a truthful generic one
+# — an operator acts on these. ``ops/onboarding/phase.py`` owns the closed list and
+# is not this task's to widen, so a transport-level refusal (the service being
+# unreachable, say) is reported as the boundary refusal it is.
+_ACTION_REASONS: Final[dict[str, OnboardingReasonCode]] = {
+    "target_not_found": "candidate_identity_not_found",
+    "target_ambiguous": "candidate_identity_ambiguous",
+    "policy_blocked": "browser_host_not_in_app_policy",
+    "postcondition_failed": "postcondition_failed",
+    # Nothing about the page was observed after these, so the action's effect is
+    # genuinely unknown rather than known-absent.
+    "action_timeout": "outcome_unknown",
+    "navigation_timeout": "outcome_unknown",
+    "browser_disconnected": "outcome_unknown",
+    "page_crashed": "outcome_unknown",
+}
+
+# One decision-chain failure onto the code the loop's telemetry records. The
+# authority for what the OPERATOR is shown is ``_DECISION_PAUSE_REASONS`` in
+# ``ops/onboarding/driver.py``, which reads the same exception after the retry
+# bound is spent; this is only the per-attempt reject fact, restated here because
+# importing the driver would close an import cycle.
+_DECISION_REJECT_REASONS: Final[dict[str, OnboardingReasonCode]] = {
+    "invalid_json": "decision_unusable",
+    "schema_invalid": "decision_unusable",
+}
+
+# What the loop returns when it could not read the page even once. A phase that
+# never observed anything still has to hand the driver an observation, and this
+# one is deliberately inert: no human action, no credential labels, no developer
+# app id, so nothing downstream can mistake it for a page that was seen. The URL
+# is ``about:blank`` because ``BrowserObservation`` refuses anything that is not
+# https-or-about, and it is the honest answer — no page was read.
+_UNOBSERVED: Final = BrowserObservation(
+    status="failed",
+    current_url="about:blank",
+    page_title="unobserved",
+    reason_code="outcome_unknown",
+)
+
+
+def _act_status(executed: object) -> str:
+    """The typed status of one executed candidate, refusing an untyped answer.
+
+    A ``LoopSession`` that returns ``None`` — which is what every implementation
+    did while ``act`` was declared ``-> None`` — is a programming error in the
+    adapter, not a page outcome, so it raises rather than defaulting to
+    ``executed``. Defaulting is precisely the bug this change exists to remove:
+    "the session said nothing" must never read as "the action worked".
+    """
+
+    status = getattr(executed, "status", None)
+    if status not in _ACT_STATUSES:
+        raise TypeError("LoopSession.act must return an ActionExecutionResult")
+    return str(status)
+
+
+def _action_reason(executed: object, *, default: OnboardingReasonCode) -> OnboardingReasonCode:
+    """One execution result's reason code, narrowed to the closed vocabulary."""
+
+    reason = getattr(executed, "reason_code", None)
+    if isinstance(reason, str):
+        return _ACTION_REASONS.get(reason, default)
+    return default
+
+
+def _resumable_intent(pending: str | None, options: Sequence[ActionCandidate]) -> str | None:
+    """The retained intent, but only if THIS snapshot still offers it.
+
+    A stale retry is not a replay: the control has to survive re-generation, the
+    risk filter, and the avoid list before it may be re-attempted. When it does
+    not, the retry is dropped silently and the model decides afresh — which is the
+    correct reading of "the element the plan named is gone".
+    """
+
+    if pending is None:
+        return None
+    return next((option.candidate_id for option in options if option.candidate_id == pending), None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,6 +678,12 @@ class LoopObservation:
 
     observation: BrowserObservation
     raw_elements: tuple[Mapping[str, object], ...] = ()
+    # The page's visible PROSE, when the session can report it. Optional because
+    # ``BrowserObservation`` has never carried page text and older sessions have
+    # none to give; when it is empty the prompt falls back to the element render.
+    # It is sanitized again here rather than trusted, on the same principle as
+    # raw_elements: the loop owns the projection.
+    page_text: str = ""
 
 
 class LoopSession(Protocol):
@@ -539,8 +708,27 @@ class LoopSession(Protocol):
         """Return the current page's bounded observation and raw elements."""
         ...
 
-    async def act(self, candidate: ActionCandidate) -> None:
-        """Execute one policy-generated candidate against the live page."""
+    async def act(self, candidate: ActionCandidate) -> ActionExecutionResult:
+        """Execute one policy-generated candidate and report what happened.
+
+        This used to be declared ``-> None``, and every consequence of that was
+        live. ``run_action_loop`` counted an executed action unconditionally, so a
+        server-side ``policy_blocked`` — which never touched the page — spent the
+        action budget as though it had worked and never reached the denials
+        counter. Worse, ``stale``, ``blocked`` and ``failed`` were all
+        indistinguishable from success, so the loop's only reaction to any of them
+        was to re-observe an unchanged page and conclude that nothing was
+        happening. That is the largest single reason the agent "looked like it does
+        nothing".
+
+        POST: a typed :class:`~ops.playwright.actions.ActionExecutionResult`. The
+              four statuses ask for four different corrections and the caller makes
+              all four: ``executed`` verifies the postcondition against a fresh
+              observation, ``stale`` re-observes and retries the SAME intent,
+              ``blocked`` counts a denial and picks a different candidate, and
+              ``failed`` avoids that target and tries a sibling. An implementation
+              reports a refusal as a status; it does not raise one.
+        """
         ...
 
 
@@ -585,6 +773,8 @@ async def run_action_loop(
     decider: CandidateDecider,
     telemetry: LoopTelemetry,
     deadlines: StepDeadlines = DEFAULT_STEP_DEADLINES,
+    run_id: str = "",
+    scratchpads: ScratchpadStore | None = None,
     clock: Callable[[], float] = monotonic,
 ) -> LoopResult:
     """Drive one phase to a classified outcome, or exhaust a bound and stop.
@@ -605,6 +795,15 @@ async def run_action_loop(
       Q4. every navigation executed passed ``evaluate_navigation``.
       Q5. no prompt that tripped the DLP screen was sent.
       Q6. no phase transition is committed here (Requirement 4.20).
+      Q7. ``actions_executed`` counts only actions the session reported as
+          ``executed``. A refused or stale action is NOT an action: counting it
+          spent the budget that buys the phase its remaining attempts.
+      Q8. the only exceptions that leave this function are programming errors and
+          a decision chain that failed ``MAX_DECISION_FAILURES`` times. Every
+          other failure — a disconnected browser, a crashed page, a session
+          adapter raising instead of reporting — becomes a classified outcome,
+          because an exception escaping here unwinds ``_drive_phase`` and kills
+          the whole run rather than the phase.
 
     INVARIANTS:
       I1. budgets are checked at the top of every iteration, before observing.
@@ -617,6 +816,10 @@ async def run_action_loop(
           that acted on nothing — those are what a stuck run consists of (R4.1).
       I6. every observe, decide, act and verify step is bounded by ``deadlines``,
           so no single step can freeze the phase (R4.7).
+      I7. a retried intent is re-validated from scratch — regenerated from the
+          fresh snapshot, re-risk-classified, re-resolved by identity — so
+          "retry" never means "replay a decision made against a page that has
+          since moved".
     """
 
     if goal.phase != phase:  # P3
@@ -624,7 +827,66 @@ async def run_action_loop(
 
     started = clock()
     actions = model_calls = denials = no_progress = 0
+    # Consecutive-failure counters, at parity with the worker's trace loop. They
+    # are NOT budgets: a decision or an action that eventually succeeds must not
+    # leave the phase closer to giving up, so both reset on the first success.
+    decision_failures = action_failures = 0
+    # 5.3: the candidate this iteration should re-try without asking the model
+    # again, set when the page moved under an intent that was otherwise fine.
+    # Candidate ids are stable across iterations (the checkpoint order is pinned
+    # and the id is hashed from the element's identity), so the same control on a
+    # re-rendered page produces the same id and the retry is exact.
+    pending_intent: str | None = None
+    # Candidate ids that the executor has already refused or failed on. Excluded
+    # from later iterations so "pick a different candidate" is enforced rather
+    # than hoped for — otherwise the model, shown the same page and the same
+    # option list, re-picks the control that just bounced until a budget runs out.
+    avoid: set[str] = set()
     satisfied_before: tuple[str, ...] = ()
+    # 5.1: this phase's durable working memory. An unwired store or an empty
+    # run id leaves it None and the loop drives exactly as it did before.
+    memory = (
+        load_scratchpad(
+            scratchpads,
+            run_id=run_id,
+            phase=phase,
+            goal=goal.instruction,
+            postconditions=goal.postconditions,
+        )
+        if scratchpads is not None and run_id
+        else None
+    )
+
+    def remember(
+        candidate: ActionCandidate,
+        status: str,
+        *,
+        reason_code: str | None = None,
+        at: BrowserObservation | None = None,
+    ) -> None:
+        """Record one step and persist it; a no-op when memory is inert.
+
+        ``at`` is the post-action observation for an executed step and defaults
+        to this iteration's observation for the ones that never touched the page.
+        Only the candidate's id, action and accessible name travel - never its
+        selector - and ``scratchpad`` re-sanitizes all of them anyway.
+        """
+
+        nonlocal memory
+        if memory is None or scratchpads is None:
+            return
+        where = observation if at is None else at
+        memory = memory.with_step(
+            candidate_id=candidate.candidate_id,
+            label=candidate.semantic_target,
+            action=candidate.action,
+            status=status,
+            reason_code=reason_code,
+            url=where.current_url,
+            title=where.page_title,
+        )
+        save_scratchpad(scratchpads, memory)
+
     iteration = 0
     step_started = started
     stage: LoopStage = "observe"
@@ -673,7 +935,31 @@ async def run_action_loop(
     async def observe(seconds: float) -> LoopObservation:
         return await asyncio.wait_for(session.observe(), seconds)
 
-    seen = await observe(deadlines.observe_seconds)
+    # Derived once: it is a property of the reviewed goal, not of the page, and
+    # nothing inside the loop may widen it mid-phase.
+    authorization = goal.authorization()
+
+    # The FIRST observation sits outside the loop and therefore outside the
+    # iteration's containment, so a session that cannot be read at all — a browser
+    # that died between the phase boundary and here — used to raise straight
+    # through ``_drive_phase`` and end ``drive_run``, losing the lease release and
+    # the phase's counters with it. Contained on the same terms as every later
+    # observation: an unreadable page is a phase that cannot run, not a run that
+    # cannot continue (Q8).
+    try:
+        seen = await observe(deadlines.observe_seconds)
+    except _PROGRAMMING_ERRORS:
+        raise
+    except Exception:
+        report("observe")
+        return _result(
+            "exhausted",
+            _UNOBSERVED,
+            "outcome_unknown",
+            actions=actions,
+            model_calls=model_calls,
+            denials=denials,
+        )
 
     while True:
         observation = seen.observation
@@ -718,11 +1004,34 @@ async def run_action_loop(
 
             # --- candidates from policy, never from the model ----------------
             stage = "candidates"
-            elements = build_snapshot(seen.raw_elements)
+            # RANK, then project. ``build_snapshot`` truncates at ``MAX_ELEMENTS``
+            # in collection order, so projecting the raw list directly kept the
+            # first 40 elements the DOM happened to yield and discarded the rest
+            # unseen. On a settings page whose "Create API token" button sits at
+            # position 60, the agent was never shown the one control the whole
+            # phase exists to click, and every iteration then legitimately reported
+            # no useful candidate. The worker path never had this problem because
+            # it collects through ``build_ranked_snapshot``; this is the same
+            # ranking applied to already-collected elements, which is all the loop
+            # has — the locators live in the browser process.
+            elements = build_snapshot(
+                rank_raw_elements(
+                    [dict(raw) for raw in seen.raw_elements],
+                    checkpoint_signals=goal.signals,
+                    limit=MAX_ELEMENTS,
+                )
+            )
             candidates = generate_candidates(
                 elements=elements,
                 checkpoint_signals=goal.signals,
-                checkpoint_order=iteration,
+                # A candidate id is hashed from (trace_version, checkpoint_order,
+                # action, name). Feeding the iteration counter here gave the SAME
+                # control a different id on every turn, so nothing downstream can
+                # recognise an option it has already tried or already been denied.
+                # The phase is the checkpoint on this path — it is already in
+                # trace_version — so the order is pinned and ids stay stable for
+                # as long as the page does.
+                checkpoint_order=0,
                 trace_version=f"phase:{goal.phase}",
                 expected_postcondition=goal.postconditions[0],
                 reviewed_goto_urls=goal.reviewed_goto_urls,
@@ -734,79 +1043,169 @@ async def run_action_loop(
                 report("candidates")
                 seen = await observe(deadlines.observe_seconds)
                 continue
-            options = executable_candidates(candidates)
+            # TWO filters, not one, and the second is the authoritative one.
+            # ``executable_candidates`` reads ``ActionCandidate.executable``, which
+            # the generator derives from a substring list that names neither
+            # ``create``/``generate`` nor ``save``/``apply`` — so on this path
+            # "Create API key" and "Save" arrived marked low-risk and were clicked
+            # autonomously, bypassing the credential-creation authority entirely.
+            # The worker's trace loop has always consulted the real policy; this is
+            # that same policy, on the same terms, in front of this loop.
+            options, first_denied = _autonomous_options(
+                executable_candidates(candidates), elements, authorization
+            )
+            # 5.3, the "pick a DIFFERENT candidate" half: a control the executor
+            # already refused or already failed on is withheld from the model.
+            # Dropped wholesale when it would leave nothing to choose from — an
+            # avoid set that covers the whole page is stale relative to a page
+            # that has since re-rendered, and manufacturing a human gate out of it
+            # would be exactly the unnecessary HITL this loop exists to avoid. The
+            # budgets, not this filter, are what stop a genuinely stuck phase.
+            options = [option for option in options if option.candidate_id not in avoid] or options
             if not options:
                 # Every option on this page is an irreversible or privilege-changing
-                # control. Requirement 4.18: hand it to a human, unexecuted.
+                # control. Requirement 4.18: hand it to a human, unexecuted. The
+                # risk verdict names WHICH control and which verb family, so the
+                # operator is asked for the decision the page actually needs rather
+                # than a generic "provider action".
                 report("gate")
+                gated, verdict = first_denied if first_denied is not None else (candidates[0], None)
                 return _gate(
-                    candidates[0],
+                    gated,
                     observation,
                     actions=actions,
                     model_calls=model_calls,
                     denials=denials,
+                    category=verdict.category if verdict is not None else "",
                 )
 
-            # --- DLP: the ONLY path from page to model -----------------------
-            stage = "decide"
-            prompt = build_choice_prompt(
-                app_name=goal.provider_name,
-                credential_goal=goal.description,
-                checkpoint_instruction=goal.instruction,
-                checkpoint_signals=goal.signals,
-                current_url=sanitize_url(observation.current_url),
-                page_title=sanitize_page_text(observation.page_title, origin="title"),
-                rendered_candidates=render_candidates(options),
-                rendered_page=render_snapshot(_sanitized(elements)),
-            )
-            screened = screen_model_input(prompt)
-            if not screened.allowed:  # Requirement 4.19, Q5
-                telemetry.dlp_refusal()
-                no_progress += 1
-                report("decide")
-                seen = await observe(deadlines.observe_seconds)
-                continue
+            # --- 5.3, the "retry the SAME intent" half ------------------------
+            # A ``stale`` action means the DOM moved under us, not that the intent
+            # was wrong, so the correction is to re-plan the same control against
+            # the snapshot we just took — NOT to buy a second opinion. Re-deciding
+            # would spend a model call and, on a page that keeps re-rendering,
+            # could spend the whole model budget re-answering a question that was
+            # already answered correctly. The retry still passes every gate below
+            # (risk, identity, navigation): only the model call is skipped (I7).
+            chosen_id = _resumable_intent(pending_intent, options)
+            pending_intent = None
+            choice_reason: str | None = None
 
-            # --- I4: the model may only name an id generated right here -------
-            candidate_ids = [candidate.candidate_id for candidate in candidates]
-            payload = await asyncio.wait_for(
-                decider.choose(screened.prompt, schema=candidate_choice_schema(candidate_ids)),
-                deadlines.decide_seconds,
-            )
-            model_calls += 1
-            telemetry.model_call(model_calls=model_calls)
-            try:
-                choice = validate_choice(payload, candidate_ids=candidate_ids)
-            except ValueError:  # Requirement 4.5
-                telemetry.reject("action_not_in_candidate_set")
-                report_decision("rejected", reason_code="action_not_in_candidate_set")
-                no_progress += 1
-                report("decide")
-                seen = await observe(deadlines.observe_seconds)
-                continue
-
-            if choice.decision == "report_hitl":
-                report_decision("report_hitl", reason=choice.reason)
-                report("gate")
-                return _gate(
-                    None, observation, actions=actions, model_calls=model_calls, denials=denials
+            if chosen_id is None:
+                # --- DLP: the ONLY path from page to model -------------------
+                stage = "decide"
+                memory_block = "" if memory is None else render_scratchpad(memory)
+                prompt = build_choice_prompt(
+                    app_name=goal.provider_name,
+                    credential_goal=goal.description,
+                    checkpoint_instruction=(
+                        f"{memory_block}\n\n{goal.instruction}"
+                        if memory_block
+                        else goal.instruction
+                    ),
+                    checkpoint_signals=goal.signals,
+                    current_url=sanitize_url(observation.current_url),
+                    page_title=sanitize_page_text(observation.page_title, origin="title"),
+                    rendered_candidates=render_candidates(options),
+                    # Prose when the session reports it — visible text is what tells
+                    # "create a key" apart from "here is your key" — and the element
+                    # render only as a fallback, since CANDIDATES above already lists
+                    # every actionable control.
+                    rendered_page=(
+                        sanitize_page_text(seen.page_text)
+                        if seen.page_text
+                        else render_snapshot(_sanitized(elements))
+                    ),
                 )
-            if choice.decision == "report_blocked":
-                # The chain answered and named no candidate action: unusable, not a
-                # spent bound (reliability R4.6).
-                report_decision("report_blocked", reason=choice.reason)
-                report("decide")
-                return _result(
-                    "exhausted",
-                    observation,
-                    "decision_unusable",
-                    actions=actions,
-                    model_calls=model_calls,
-                    denials=denials,
-                )
+                screened = screen_model_input(prompt)
+                if not screened.allowed:  # Requirement 4.19, Q5
+                    telemetry.dlp_refusal()
+                    no_progress += 1
+                    report("decide")
+                    seen = await observe(deadlines.observe_seconds)
+                    continue
 
-            assert choice.candidate_id is not None  # guaranteed by validate_choice
-            selected = _by_id(candidates, choice.candidate_id)
+                # --- I4: the model may only name an id generated right here ---
+                # Over `options`, not `candidates`: the prompt renders only the
+                # executable ones, so building the schema enum from the full set
+                # offered ids for controls the model was never shown — it picked one,
+                # validate_choice accepted it (it IS in the generated set), and the
+                # gated candidate then went to a human. The enum and the rendered list
+                # have to be the same list.
+                candidate_ids = [candidate.candidate_id for candidate in options]
+                try:
+                    payload = await asyncio.wait_for(
+                        decider.choose(
+                            screened.prompt, schema=candidate_choice_schema(candidate_ids)
+                        ),
+                        deadlines.decide_seconds,
+                    )
+                except DecisionFailed as failure:
+                    # Parity with the worker's trace loop, which retries a failed
+                    # decision ``_MAX_MODEL_FAILURES`` times. This loop used to let
+                    # the FIRST failure propagate out to ``_drive_phase``, so a
+                    # single rate-limit on the first provider paused a run that the
+                    # very next call would have driven. The failure costs no model
+                    # call (none was answered) but does cost a no-progress rung, so
+                    # a chain that is down cannot spin here for free.
+                    decision_failures += 1
+                    unusable = _DECISION_REJECT_REASONS.get(
+                        failure.reason_code, "decision_provider_failed"
+                    )
+                    telemetry.reject(unusable)
+                    report_decision("rejected", reason_code=unusable)
+                    no_progress += 1
+                    report("decide")
+                    if decision_failures >= MAX_DECISION_FAILURES:
+                        # Re-raised rather than classified: ``step_for_decision_failure``
+                        # is the authority on which decision cause the operator is
+                        # shown, and it needs the typed exception to say so (R4.5,
+                        # R4.6).
+                        raise
+                    continue
+                decision_failures = 0
+                model_calls += 1
+                telemetry.model_call(model_calls=model_calls)
+                try:
+                    choice = validate_choice(payload, candidate_ids=candidate_ids)
+                except ValueError:  # Requirement 4.5
+                    telemetry.reject("action_not_in_candidate_set")
+                    report_decision("rejected", reason_code="action_not_in_candidate_set")
+                    no_progress += 1
+                    report("decide")
+                    seen = await observe(deadlines.observe_seconds)
+                    continue
+
+                if choice.decision == "report_hitl":
+                    report_decision("report_hitl", reason=choice.reason)
+                    report("gate")
+                    return _gate(
+                        None, observation, actions=actions, model_calls=model_calls, denials=denials
+                    )
+                if choice.decision == "report_blocked":
+                    # The chain answered and named no candidate action: unusable, not a
+                    # spent bound (reliability R4.6).
+                    report_decision("report_blocked", reason=choice.reason)
+                    report("decide")
+                    return _result(
+                        "exhausted",
+                        observation,
+                        "decision_unusable",
+                        actions=actions,
+                        model_calls=model_calls,
+                        denials=denials,
+                    )
+
+                assert choice.candidate_id is not None  # guaranteed by validate_choice
+                chosen_id = choice.candidate_id
+                choice_reason = choice.reason
+                if memory is not None and choice.reason:
+                    # The running hypothesis comes from the `reason` the choice
+                    # schema ALREADY requires - no new output channel, and the
+                    # model still emits only a candidate_id from the closed enum.
+                    memory = memory.with_hypothesis(choice.reason)
+
+            selected = _by_id(candidates, chosen_id)
             if selected is None:  # unreachable while validate_choice holds
                 telemetry.reject("action_not_in_candidate_set")
                 report_decision("rejected", reason_code="action_not_in_candidate_set")
@@ -814,7 +1213,7 @@ async def run_action_loop(
                 report("decide")
                 seen = await observe(deadlines.observe_seconds)
                 continue
-            report_decision("select_candidate", candidate=selected, reason=choice.reason)
+            report_decision("select_candidate", candidate=selected, reason=choice_reason)
             if not selected.executable:  # Requirement 4.18, left unexecuted
                 report("gate")
                 return _gate(
@@ -822,7 +1221,29 @@ async def run_action_loop(
                 )
             # Re-checks executability at the policy boundary rather than trusting the
             # branch above.
-            candidate = select_candidate(candidates, choice.candidate_id)
+            candidate = select_candidate(candidates, chosen_id)
+
+            # And re-checks RISK at the same boundary, for the same reason. The
+            # filter above decided what the model was allowed to see; this decides
+            # what is allowed to run. They are computed from the same authorization
+            # and the same snapshot, so they agree — but only this one stands
+            # between a model reply and a live click, so it is the one that must be
+            # unconditional.
+            verdict = _risk_of(candidate, elements, authorization)
+            if not verdict.autonomous_allowed:
+                telemetry.reject("candidate_risk_requires_human")
+                report_decision(
+                    "rejected", reason_code="candidate_risk_requires_human", candidate=candidate
+                )
+                report("gate")
+                return _gate(
+                    candidate,
+                    observation,
+                    actions=actions,
+                    model_calls=model_calls,
+                    denials=denials,
+                    category=verdict.category,
+                )
 
             # --- re-resolve against THIS iteration's snapshot ----------------
             if candidate.identity is not None:  # Requirement 4.6
@@ -834,6 +1255,7 @@ async def run_action_loop(
                         else "candidate_identity_ambiguous"
                     )
                     telemetry.reject(unresolved)
+                    remember(candidate, "not_attempted", reason_code=unresolved)
                     report_decision("rejected", reason_code=unresolved, candidate=candidate)
                     no_progress += 1
                     report("decide")
@@ -863,7 +1285,79 @@ async def run_action_loop(
                     continue
 
             # --- act, then classify against a FRESH observation ---------------
-            await asyncio.wait_for(session.act(candidate), deadlines.act_seconds)
+            executed = await asyncio.wait_for(session.act(candidate), deadlines.act_seconds)
+            status = _act_status(executed)
+
+            if status == "stale":
+                # The page moved between the snapshot the plan was made against
+                # and the moment it ran. The INTENT was fine — so it is kept, on
+                # ``pending_intent``, and re-validated against the next snapshot.
+                # Nothing executed, so nothing is charged to the action budget; a
+                # no-progress rung is charged, because a page that keeps moving
+                # under us is exactly the shape of a stuck phase.
+                remember(candidate, "stale")
+                pending_intent = candidate.candidate_id
+                no_progress += 1
+                report("act")
+                seen = await observe(deadlines.observe_seconds)
+                continue
+
+            if status == "blocked":
+                # The executor's own boundary refused this action, so the page was
+                # never touched. This is the counter it belongs in — before, it
+                # was counted as an executed action, which both spent the action
+                # budget and hid the denial from the run's denial facts entirely.
+                reason = _action_reason(executed, default="browser_host_not_in_app_policy")
+                remember(candidate, "blocked", reason_code=reason)
+                denials += 1
+                avoid.add(candidate.candidate_id)
+                telemetry.denial(reason)
+                if denials >= budget.max_navigation_denials:
+                    report("act")
+                    return _result(
+                        "denied_fatal",
+                        observation,
+                        reason,
+                        actions=actions,
+                        model_calls=model_calls,
+                        denials=denials,
+                    )
+                no_progress += 1
+                report("act")
+                seen = await observe(deadlines.observe_seconds)
+                continue
+
+            if status == "failed":
+                # A typed action failure: the target vanished, the click did
+                # nothing, the navigation errored. The intent is what is suspect
+                # here (unlike ``stale``), so the target is added to ``avoid`` and
+                # the next iteration picks a SIBLING identity. Bounded at parity
+                # with the worker's ``_MAX_ACTION_FAILURES``; past that the page is
+                # not one this phase can drive, and the reason code says which
+                # failure it was rather than a generic exhaustion.
+                action_failures += 1
+                avoid.add(candidate.candidate_id)
+                reason = _action_reason(executed, default="postcondition_failed")
+                remember(candidate, "failed", reason_code=reason)
+                telemetry.reject(reason)
+                report_decision("rejected", reason_code=reason, candidate=candidate)
+                no_progress += 1
+                report("act")
+                if action_failures >= MAX_ACTION_FAILURES:
+                    return _result(
+                        "exhausted",
+                        observation,
+                        reason,
+                        actions=actions,
+                        model_calls=model_calls,
+                        denials=denials,
+                    )
+                seen = await observe(deadlines.observe_seconds)
+                continue
+
+            # Q7: only here, where the session reported the action actually ran.
+            action_failures = 0
+            avoid.discard(candidate.candidate_id)
             actions += 1
             telemetry.action(candidate_id=candidate.candidate_id, actions_executed=actions)
 
@@ -872,6 +1366,9 @@ async def run_action_loop(
             check = check_postconditions(
                 goal, seen.observation, previously_satisfied=satisfied_before
             )
+            if memory is not None:
+                memory = memory.with_postconditions(check.satisfied)
+            remember(candidate, "executed", at=seen.observation)
             if check.all_met:  # Q1
                 report("verify")
                 return _result(
@@ -911,6 +1408,54 @@ async def run_action_loop(
                     denials=denials,
                 )
             no_progress += 1
+        except _PROGRAMMING_ERRORS:
+            # The same rule the worker's trace loop keeps: a programming error is
+            # never a page outcome. It propagates so tests and monitoring see it,
+            # and it is listed BEFORE the containment clause below so the
+            # containment cannot swallow it.
+            raise
+        except DecisionFailed:
+            # Re-raised from the decide branch once the retry bound is spent. It
+            # is a ``RuntimeError``, so without this clause the containment below
+            # would swallow the one exception the driver is written to catch and
+            # the operator would be shown "outcome unknown" instead of which
+            # decision cause stopped the phase.
+            raise
+        except Exception:
+            # Q8. Until this existed the loop's only handler was ``TimeoutError``,
+            # so a disconnected browser, a crashed renderer, a closed target, or a
+            # session adapter that raised instead of reporting unwound
+            # ``run_action_loop`` -> ``_drive_phase`` -> ``drive_run`` and ended
+            # the RUN. A phase that cannot be driven has to report that it cannot
+            # be driven; it does not get to take the walk down with it.
+            #
+            # ``act`` is the one stage whose side effect we cannot see, so it is
+            # terminal on the first occurrence and carries ``outcome_unknown`` —
+            # the same code its timeout carries, and the code the driver's effect
+            # bookkeeping already reads as "a second attempt must reconcile rather
+            # than repeat". Every other stage is retried at parity with a failed
+            # action, because a transient read is worth re-reading.
+            report(stage)
+            if stage == "act":
+                return _result(
+                    "exhausted",
+                    observation,
+                    "outcome_unknown",
+                    actions=actions,
+                    model_calls=model_calls,
+                    denials=denials,
+                )
+            action_failures += 1
+            no_progress += 1
+            if action_failures >= MAX_ACTION_FAILURES:
+                return _result(
+                    "exhausted",
+                    observation,
+                    "outcome_unknown",
+                    actions=actions,
+                    model_calls=model_calls,
+                    denials=denials,
+                )
 
 
 def _result(
@@ -932,6 +1477,54 @@ def _result(
     )
 
 
+_RISK_POLICY: Final = BrowserActionRiskPolicy()
+
+
+def _risk_of(
+    candidate: ActionCandidate,
+    elements: Sequence[SnapshotElement],
+    authorization: ActionAuthorization,
+) -> RiskDecision:
+    """The central risk verdict for one candidate against this snapshot.
+
+    The element is resolved for CONTEXT only — the policy reads its role, name and
+    ``secretish`` flag. A candidate whose identity does not resolve here still gets
+    a verdict (on its own semantic target), because "the element vanished" must not
+    read as "the action is safe"; the loop's own identity re-resolution, further
+    down, is what refuses to act on it.
+    """
+
+    element: SnapshotElement | None = None
+    if candidate.identity is not None:
+        _, element = resolve_identity(candidate.identity, elements)
+    return _RISK_POLICY.classify(candidate=candidate, authorization=authorization, element=element)
+
+
+def _autonomous_options(
+    candidates: Sequence[ActionCandidate],
+    elements: Sequence[SnapshotElement],
+    authorization: ActionAuthorization,
+) -> tuple[list[ActionCandidate], tuple[ActionCandidate, RiskDecision] | None]:
+    """Split candidates into what may run autonomously and why the rest may not.
+
+    Returns the allowed list plus the FIRST refusal with its verdict. The refusal
+    is kept rather than counted because when nothing is allowed it is the only
+    thing that can tell the operator what decision the page is asking for — a
+    billing wall and an unreviewed "Generate key" button both leave this list
+    empty, and they need different humans.
+    """
+
+    allowed: list[ActionCandidate] = []
+    first_denied: tuple[ActionCandidate, RiskDecision] | None = None
+    for candidate in candidates:
+        verdict = _risk_of(candidate, elements, authorization)
+        if verdict.autonomous_allowed:
+            allowed.append(candidate)
+        elif first_denied is None:
+            first_denied = (candidate, verdict)
+    return allowed, first_denied
+
+
 def _gate(
     candidate: ActionCandidate | None,
     observation: BrowserObservation,
@@ -939,12 +1532,13 @@ def _gate(
     actions: int,
     model_calls: int,
     denials: int,
+    category: str = "",
 ) -> LoopResult:
     """A gate outcome that always names the human action, candidate unexecuted."""
 
     return _result(
         "gate",
-        _gate_observation(observation, candidate),
+        _gate_observation(observation, candidate, category=category),
         "candidate_risk_requires_human",
         actions=actions,
         model_calls=model_calls,
@@ -953,20 +1547,26 @@ def _gate(
 
 
 def _gate_observation(
-    observation: BrowserObservation, candidate: ActionCandidate | None
+    observation: BrowserObservation,
+    candidate: ActionCandidate | None,
+    *,
+    category: str = "",
 ) -> BrowserObservation:
     """Project an observation into one that names the human action required.
 
     The page's own typed human action wins when it has one; otherwise the action
-    comes from the candidate's irreversible category, so the driver never has to
-    guess what to ask the operator for.
+    comes from the risk policy's verb family when a verdict supplied one, and
+    failing that from the candidate's own irreversible category — so the driver
+    never has to guess what to ask the operator for. The verdict is preferred
+    because its vocabulary is the wider of the two: the candidate generator's
+    category set omits the credential-creation and persistence families entirely.
     """
 
     if observation.human_action_type is not None:
         return observation
-    category = ""
-    if candidate is not None and candidate.expected_postcondition.startswith("human_decision:"):
-        category = candidate.expected_postcondition.split(":", 1)[1]
+    if not category and candidate is not None:
+        if candidate.expected_postcondition.startswith("human_decision:"):
+            category = candidate.expected_postcondition.split(":", 1)[1]
     human_action: HumanActionType = _HITL_CATEGORY_ACTIONS.get(category, "provider_verification")
     return BrowserObservation(
         status="human_action_required",

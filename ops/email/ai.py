@@ -1,28 +1,50 @@
 """LLM-backed outreach composition and reply analysis for the Gmail loop.
 
-Primary backend is Inception Mercury, then OpenRouter, then Gemini — all three
-OpenAI-shaped or structured-output JSON, tried in order. Callers keep a
-deterministic template fallback for when every LLM backend is unavailable. Inputs
-use only supplied company facts and the already sanitized (secret-free) reply
-text; no secret value is ever sent or emitted.
+Both calls run on the ONE governed inference stack, ``ops.core.inference``: the
+ordered provider chain (Mercury -> Groq -> Cerebras -> OpenRouter -> Gemini), a
+decision budget, a hard per-attempt wall-clock timeout, the per-provider circuit
+breaker, and the typed attempt sink.
+
+Until this module was merged onto that stack it carried its own second copy of
+the Mercury/OpenRouter/Gemini clients with NO budget, no timeout beyond httpx's
+own, no breaker, no attempt record, and a ``_generate`` that caught every
+exception and reported one flat ``RuntimeError`` — so an email-loop model failure
+was invisible in production while the identical failure on the browser loop was a
+typed, recorded reason code. Nothing about the prompts, the response schemas, or
+the call sites changed; only what governs the call. The chain also gained the two
+providers it never had (Groq, Cerebras), which is why a budget matters here now.
+
+Callers keep their deterministic fallback for when the budget is spent —
+``ops.workflow.graph_outreach`` falls back to the templated outreach and
+``ops.runs.email`` to the offline ``ReplyClassifier`` — so an exhausted chain
+degrades a run instead of stopping it or parking it on a human. Inputs use only
+supplied company facts and the already sanitized (secret-free) reply text; no
+secret value is ever sent or emitted.
 """
 
 from __future__ import annotations
 
-import importlib
-import json
-from typing import Literal, Protocol
+from collections.abc import Mapping
+from typing import Literal, TypeVar
 
-import httpx
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field
 
+from ops.core.inference import (
+    DecisionAttemptSink,
+    DecisionBudget,
+    JsonInference,
+    build_json_inference,
+)
 from ops.core.models import CompanyProfile, OperationalResearch
 
-_TIMEOUT_SECONDS = 45.0
-_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-_MERCURY_URL = "https://api.inceptionlabs.ai/v1/chat/completions"
 # Sized for the largest field either schema allows: a 6,000-character reply body.
+# This is passed PER CALL: ``ops.core.inference._MAX_COMPLETION_TOKENS`` (1,024)
+# is the per-page browser-decision default and must stay where it is — a browser
+# decision that needs four thousand tokens is a malformed decision, whereas a
+# vendor reply legitimately runs to a full page of prose.
 _MAX_TOKENS = 4_096
+
+_SchemaT = TypeVar("_SchemaT", bound=BaseModel)
 
 ReplyClass = Literal[
     "no_reply",
@@ -54,6 +76,11 @@ class ReplyAnalysisAI(BaseModel):
     questions: list[str] = Field(default_factory=list, max_length=20)
     setup_urls: list[str] = Field(default_factory=list, max_length=20)
     reason: str | None = Field(default=None, max_length=1_000)
+    # A HINT, not a gate. The field stays because it is part of this schema's
+    # published shape and the prompt still asks for it, but nothing may start a
+    # browser session because a model said so: ``ops.runs.email.poll_email``
+    # derives that from facts it extracted itself (see the predicate there) and
+    # records this boolean beside its own answer only so the two can be compared.
     start_browser_onboarding: bool = False
 
 
@@ -109,225 +136,161 @@ def _analyze_prompt(app_name: str, company: CompanyProfile, reply_text: str) -> 
     )
 
 
-class _Backend(Protocol):
-    def generate_json(self, prompt: str) -> dict[str, object]: ...
+def email_budget(settings: object) -> DecisionBudget:
+    """Bounds for one email model call.
 
+    Read through ``getattr`` for the same reason ``ops.core.inference`` does it:
+    ``build_email_assistant`` is handed a bare ``object`` by both of its callers
+    (``ops.workflow.graph_outreach`` builds ``Settings.from_env()`` inside a
+    ``try``), and every settings double in the suite would otherwise have to grow
+    three attributes. ``ops.core.config`` now declares all three
+    (``EMAIL_MODEL_TOTAL_SECONDS`` / ``_PROVIDER_SECONDS`` / ``_MAX_PROVIDERS``)
+    with exactly the fallback numbers below, so a real ``Settings`` always wins
+    and the fallbacks only serve the settings doubles. Note the ``or``: a field
+    left at 0 reads as absent and restores the fallback, which is why the
+    declared defaults are non-zero rather than 0.
 
-class MercuryBackend:
-    """Inception Mercury, OpenAI-shaped (``api.inceptionlabs.ai``).
+    An email decision is a different shape of purchase from a browser decision.
+    The browser loop pays one decision per page state and its budget exists to
+    stop a single page eating the run; this pays one decision per *inbound
+    vendor message*, on a run that is already waiting on a human at
+    hours-to-days scale, so deliberation is worth more here than latency. Hence
+    45s per provider — deliberately equal to ``ops.core.inference``'s own httpx
+    transport timeout, so the wall-clock guard fires only for a socket the
+    transport is still hanging on rather than pre-empting a slow-but-working
+    provider — and all five providers admitted.
 
-    Added so the email loop reaches the same primary model as every other model
-    task in this deployment. It was the one loop Mercury could not serve: the
-    browser decider and the research extractor both route through
-    ``ops.core.inference.build_json_inference``, which leads with Mercury, while
-    this chain started at OpenRouter and could never get there.
-
-    Plain ``json_object`` mode rather than a strict schema. The two response
-    shapes here are small but not flat — ``ReplyAnalysisAI`` carries three string
-    arrays — and :class:`EmailAssistant` validates every payload with Pydantic
-    afterwards regardless, so a strict schema would only add a vendor-specific way
-    to fail. ``max_tokens`` (not ``max_completion_tokens``) is what Inception
-    documents, and it is sized for a full 6,000-character reply body.
+    ``total_seconds`` is what actually matters, because this runs inside the
+    ``email-poller`` thread, which walks up to ``EMAIL_POLL_MAX_RUNS_PER_CYCLE``
+    runs per cycle. 120s is a *reduction*: the previous stack had no total at
+    all, and its worst case was three sequential httpx timeouts of 45s plus a
+    Gemini backend that looped over its whole model chain at 45s each.
     """
 
-    def __init__(self, api_key: SecretStr, *, model: str, reasoning_effort: str) -> None:
-        self._api_key = api_key
-        self._model = model
-        self._reasoning_effort = reasoning_effort
-
-    def generate_json(self, prompt: str) -> dict[str, object]:
-        headers = {
-            "Authorization": f"Bearer {self._api_key.get_secret_value()}",
-            "Content-Type": "application/json",
-        }
-        payload: dict[str, object] = {
-            "model": self._model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You output only a single valid JSON object, no prose or markdown.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.3,
-            "response_format": {"type": "json_object"},
-            "max_tokens": _MAX_TOKENS,
-        }
-        if self._reasoning_effort:
-            payload["reasoning_effort"] = self._reasoning_effort
-        with httpx.Client(timeout=_TIMEOUT_SECONDS) as client:
-            response = client.post(_MERCURY_URL, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        return _loads_json_object(content)
+    return DecisionBudget(
+        total_seconds=float(getattr(settings, "email_model_total_seconds", 0.0) or 120.0),
+        provider_seconds=float(getattr(settings, "email_model_provider_seconds", 0.0) or 45.0),
+        max_providers=int(getattr(settings, "email_model_max_providers", 0) or 5),
+    )
 
 
-class OpenRouterBackend:
-    """OpenAI-compatible chat-completions backend (OpenRouter)."""
+def _response_schema(schema: type[BaseModel]) -> Mapping[str, object]:
+    """The JSON schema handed to the strict-decoding providers.
 
-    def __init__(self, api_key: SecretStr, *, model: str) -> None:
-        self._api_key = api_key
-        self._model = model
+    Passed positionally into ``JsonInference.generate(schema=...)``, which is the
+    existing parameter — ``JsonBackend.generate_json`` is NOT widened. Providers
+    that document strict constrained decoding for the configured model use it;
+    the rest fall back to plain ``json_object`` mode, and a vendor that rejects
+    this particular schema answers 400, which ``_OpenAICompatibleBackend`` already
+    retries unconstrained rather than burning the provider.
 
-    def generate_json(self, prompt: str) -> dict[str, object]:
-        headers = {
-            "Authorization": f"Bearer {self._api_key.get_secret_value()}",
-            "Content-Type": "application/json",
-            "X-Title": "Composio Toolkit Ops Agent",
-        }
-        payload = {
-            "model": self._model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You output only a single valid JSON object, no prose or markdown.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.3,
-            "response_format": {"type": "json_object"},
-        }
-        with httpx.Client(timeout=_TIMEOUT_SECONDS) as client:
-            response = client.post(_OPENROUTER_URL, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        return _loads_json_object(content)
+    Worth naming, because it is the one asymmetry the merge inherits:
+    ``GeminiJsonBackend.generate_json`` does ``del schema`` (ops/core/inference.py:314),
+    so on the Gemini leg ``ReplyAnalysisAI.classification`` loses its enum. It does
+    not matter here and was not made worse by the merge. The old Gemini backend in
+    this module never sent a schema either, ``_analyze_prompt`` spells out all
+    eleven classes in the prompt, and — the part that actually closes it — every
+    payload is validated by ``schema.model_validate``, which is passed to
+    ``generate`` as its ``validate`` callable: an off-enum classification raises,
+    is classified ``schema_invalid``, and advances the chain. Gemini is last, so
+    the only reachable consequence is ``DecisionFailed("schema_invalid")`` and the
+    caller's deterministic fallback — never an unvalidated class reaching a run.
+    """
 
-
-class GeminiBackend:
-    """Gemini structured-output backend (google.genai)."""
-
-    def __init__(self, api_key: SecretStr, *, models: tuple[str, ...]) -> None:
-        self._api_key = api_key
-        self._models = tuple(dict.fromkeys(name for name in models if name))
-
-    def generate_json(self, prompt: str) -> dict[str, object]:
-        genai = importlib.import_module("google.genai")
-        types = importlib.import_module("google.genai.types")
-        client = genai.Client(api_key=self._api_key.get_secret_value())
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.3,
-            http_options=types.HttpOptions(timeout=int(_TIMEOUT_SECONDS * 1000)),
-        )
-        last_error: Exception | None = None
-        for model in self._models:
-            try:
-                response = client.models.generate_content(
-                    model=model, contents=prompt, config=config
-                )
-            except Exception as exc:
-                last_error = exc
-                continue
-            text = getattr(response, "text", None)
-            if isinstance(text, str) and text:
-                return _loads_json_object(text)
-            last_error = RuntimeError("Gemini returned no content")
-        raise RuntimeError("all Gemini models failed") from last_error
+    return schema.model_json_schema()
 
 
 class EmailAssistant:
-    """Try each configured backend in order (Mercury, then OpenRouter, then Gemini)."""
+    """The two email model calls, on the governed chain.
 
-    def __init__(self, backends: tuple[_Backend, ...]) -> None:
-        if not backends:
-            raise ValueError("at least one LLM backend is required")
-        self._backends = backends
+    Holds a :class:`JsonInference` rather than a private list of backends. That
+    one substitution is the whole of this module's governance: the budget, the
+    per-attempt wall-clock timeout, the per-provider circuit breaker and the
+    attempt sink all live in the chain, and the failure a caller sees is
+    ``DecisionFailed`` carrying a typed reason code instead of the flat
+    ``RuntimeError("all email LLM backends failed")`` this class used to raise
+    with the cause squashed into ``__cause__`` and nothing recorded anywhere.
 
-    def _generate(self, prompt: str, schema: type[BaseModel]) -> BaseModel:
-        last_error: Exception | None = None
-        for backend in self._backends:
-            try:
-                payload = backend.generate_json(prompt)
-                return schema.model_validate(payload)
-            except Exception as exc:
-                last_error = exc
-                continue
-        raise RuntimeError("all email LLM backends failed") from last_error
+    ``DecisionFailed`` is a ``RuntimeError``, and both call sites already catch
+    broadly, so no caller had to change to keep working.
+    """
+
+    def __init__(self, inference: JsonInference) -> None:
+        self._inference = inference
+
+    @property
+    def provider_names(self) -> tuple[str, ...]:
+        """The chain this assistant will try, in order."""
+
+        return self._inference.provider_names
+
+    def _generate(self, prompt: str, schema: type[_SchemaT]) -> _SchemaT:
+        # ``validate`` runs inside the chain so a provider that answers the wrong
+        # shape advances to the next one instead of ending the decision; the
+        # re-validation below is what turns the accepted payload into the typed
+        # model the caller was promised.
+        result = self._inference.generate(
+            prompt,
+            schema=_response_schema(schema),
+            validate=schema.model_validate,
+        )
+        return schema.model_validate(result.payload)
 
     def compose_outreach(
         self, *, app_name: str, company: CompanyProfile, research: OperationalResearch
     ) -> OutreachDraftAI:
-        result = self._generate(_outreach_prompt(app_name, company, research), OutreachDraftAI)
-        assert isinstance(result, OutreachDraftAI)
-        return result
+        return self._generate(_outreach_prompt(app_name, company, research), OutreachDraftAI)
 
     def analyze_reply(
         self, *, app_name: str, company: CompanyProfile, reply_text: str
     ) -> ReplyAnalysisAI:
-        result = self._generate(_analyze_prompt(app_name, company, reply_text), ReplyAnalysisAI)
-        assert isinstance(result, ReplyAnalysisAI)
-        return result
+        return self._generate(_analyze_prompt(app_name, company, reply_text), ReplyAnalysisAI)
 
 
-def _loads_json_object(text: str) -> dict[str, object]:
-    """Parse a JSON object, tolerating code fences or surrounding prose."""
+def build_email_assistant(
+    settings: object,
+    *,
+    attempts: DecisionAttemptSink | None = None,
+) -> EmailAssistant | None:
+    """Build the email assistant on the deployment's one inference chain.
 
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = stripped.strip("`")
-        if stripped.lower().startswith("json"):
-            stripped = stripped[4:]
-    try:
-        parsed = json.loads(stripped)
-    except json.JSONDecodeError:
-        start = stripped.find("{")
-        end = stripped.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise
-        parsed = json.loads(stripped[start : end + 1])
-    if not isinstance(parsed, dict):
-        raise ValueError("LLM response was not a JSON object")
-    return parsed
+    Same contract as before — ``None`` when no provider key is configured, so
+    both callers keep their deterministic fallback — but the chain is now
+    whatever ``build_json_inference`` builds: Mercury, Groq, Cerebras,
+    OpenRouter, Gemini, in that order, minus the ones with no key. Groq and
+    Cerebras are new to the email loop purely by inheritance; they were already
+    the deployment's second and third choice everywhere else.
 
+    ``max_completion_tokens`` is passed PER CALL rather than by raising
+    ``ops.core.inference._MAX_COMPLETION_TOKENS``. That global is the per-page
+    browser-decision default and 1,024 is correct for it; a reply body may
+    legitimately be 6,000 characters, and a decision truncated mid-JSON is what
+    ``schema_invalid`` looks like from the outside.
 
-def build_email_assistant(settings: object) -> EmailAssistant | None:
-    """Build the chain: Mercury primary, then OpenRouter, then Gemini.
-
-    Mercury leads for the same reason it leads ``build_json_inference`` — it is
-    this deployment's primary model — and the two providers behind it are
-    untouched, so a deployment with no Mercury key gets exactly the previous
-    OpenRouter-then-Gemini chain and one that has a key keeps both as fallbacks.
+    ``attempts`` is optional because only one of the two callers has somewhere to
+    put the rows: ``ops.runs.email`` folds them into the ``reply_received`` audit
+    event of the run it is already writing. Outreach composition happens before a
+    run has an audit trail of its own, so it passes nothing and the chain simply
+    does not record — which is still strictly more than the previous stack, which
+    could not record from either site.
     """
 
-    backends: list[_Backend] = []
-    mercury_key = getattr(settings, "mercury_api_key", None)
-    if isinstance(mercury_key, SecretStr):
-        backends.append(
-            MercuryBackend(
-                mercury_key,
-                model=getattr(settings, "mercury_model", "") or "mercury-2",
-                # The same dial the decision chain runs at. Composing outreach and
-                # classifying a vendor's reply are judgement calls made once per
-                # message, where latency does not bound anything.
-                reasoning_effort=getattr(settings, "mercury_reasoning_effort", "") or "high",
-            )
-        )
-    openrouter_key = getattr(settings, "openrouter_api_key", None)
-    if isinstance(openrouter_key, SecretStr):
-        model = (
-            getattr(settings, "openrouter_model", "") or "nvidia/nemotron-3-ultra-550b-a55b:free"
-        )
-        backends.append(OpenRouterBackend(openrouter_key, model=model))
-    gemini_key = getattr(settings, "google_genai_api_key", None)
-    if isinstance(gemini_key, SecretStr):
-        models = tuple(getattr(settings, "gemini_model_chain", ()) or ())
-        if models:
-            backends.append(GeminiBackend(gemini_key, models=models))
-    if not backends:
+    inference = build_json_inference(
+        settings,
+        budget=email_budget(settings),
+        max_completion_tokens=_MAX_TOKENS,
+        attempts=attempts,
+    )
+    if inference is None:
         return None
-    return EmailAssistant(tuple(backends))
+    return EmailAssistant(inference)
 
 
 __all__ = [
     "EmailAssistant",
-    "GeminiBackend",
-    "MercuryBackend",
-    "OpenRouterBackend",
     "OutreachDraftAI",
     "ReplyAnalysisAI",
     "ReplyClass",
     "build_email_assistant",
+    "email_budget",
 ]

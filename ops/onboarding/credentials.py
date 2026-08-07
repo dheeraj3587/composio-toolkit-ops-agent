@@ -86,6 +86,7 @@ did we abandon" (design LL-5.3).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import Callable, Mapping
@@ -807,7 +808,17 @@ class CredentialSurfaceSession(Protocol):
 
 
 class ProviderConfigurationPublisher(Protocol):
-    """Where a proven credential becomes published provider configuration."""
+    """Where a proven credential becomes published provider configuration.
+
+    Synchronous and permitted to block: the single call site awaits it through
+    ``asyncio.to_thread``, so an implementation may make a provider call — or drive
+    an async provider boundary with ``asyncio.run`` — without stalling the driver's
+    loop, and without this port having to be async for the sake of one adapter.
+    :class:`~ops.onboarding.publishers.ComposioProviderConfigurationPublisher` is
+    the implementation; it wraps the managed-auth boundary that already owns the
+    reserve → act → complete walk for the two irreversible Composio calls, so
+    publication inherits that idempotency rather than adding a second scheme.
+    """
 
     def publish_provider_configuration(
         self,
@@ -940,7 +951,18 @@ async def capture_store_validate_publish(
 
     if result.status == "valid":
         completed_at = _completion_moment(result.checked_at, clock=deps.clock)
-        deps.publisher.publish_provider_configuration(
+        # OFF THE LOOP, DELIBERATELY. The port is synchronous — publishing is one
+        # provider call and the installed Composio SDK has no async surface — but
+        # the driver that awaits this walk also holds the run's lease and its
+        # deadlines, and a blocking HTTPS round trip on its loop would stall every
+        # timer the run depends on. ``to_thread`` keeps the port's simple shape and
+        # the loop's liveness at the same time, and it is also what lets an
+        # implementation drive an async provider boundary (``asyncio.run``) from
+        # inside the synchronous method, which is impossible on a loop that is
+        # already running. The publication is still strictly ordered before the
+        # ``completed`` step, because it is awaited.
+        await asyncio.to_thread(
+            deps.publisher.publish_provider_configuration,
             run_id=run_id,
             reference=reference,
             kind=kind,

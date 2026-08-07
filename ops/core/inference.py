@@ -343,11 +343,55 @@ class DecisionBudget:
     ``total_seconds`` caps the WHOLE decision across providers;
     ``provider_seconds`` caps each individual attempt; ``max_providers`` caps how
     many providers are tried at all.
+
+    The defaults are sized against the ordered fallback that is actually
+    configured — Mercury, Groq, Cerebras, OpenRouter, Gemini — not against the
+    three it used to admit. ``max_providers=3`` meant the last two were
+    unreachable by construction: a chain that lost its first three providers to a
+    rate limit reported ``all_providers_failed`` without ever asking the two that
+    were up. Raising it costs nothing in the common case, because a refused or
+    rate-limited provider fails in milliseconds and only a *timing out* provider
+    spends its full slice.
+    ``provider_seconds=6`` was the other half: this deployment runs Mercury at
+    ``reasoning_effort="high"``, which routinely needs longer than six seconds to
+    return its first token, so the budget cancelled the decision it was waiting
+    for and the loop fell through to a human gate.
+
+    These values are the FALLBACK, not the configuration. They were once the only
+    numbers there were — a frozen dataclass with no environment variable anywhere
+    behind it — which is exactly why the chain could not be widened without
+    editing this file. The live budget is built from settings by
+    :func:`action_decision_budget`, and ``Settings`` floors
+    ``ONBOARDING_STEP_DECIDE_TIMEOUT_SECONDS`` at the same
+    ``ONBOARDING_ACTION_DECISION_TOTAL_SECONDS`` so the deadline and the chain it
+    waits on can never be raised out of step. The defaults here are kept equal to
+    those field defaults so that a caller holding a settings double with neither
+    attribute gets the same behaviour as one holding real settings.
     """
 
-    total_seconds: float = 15.0
-    provider_seconds: float = 6.0
-    max_providers: int = 3
+    total_seconds: float = 60.0
+    provider_seconds: float = 25.0
+    max_providers: int = 5
+
+
+def action_decision_budget(settings: object) -> DecisionBudget:
+    """The per-page decision budget of the live browser action loop.
+
+    Read through ``getattr`` rather than off a typed ``Settings`` for the reason
+    the module docstring gives: ``ops.core.config`` imports this module, so this
+    module cannot import it back, and every browser test double that stands in for
+    settings would otherwise have to grow three more attributes. The fallbacks
+    below are the same numbers ``Settings`` declares as its field defaults; if the
+    two ever diverge, the settings value wins, which is the safe direction.
+    """
+
+    return DecisionBudget(
+        total_seconds=float(getattr(settings, "onboarding_action_decision_total_seconds", 60.0)),
+        provider_seconds=float(
+            getattr(settings, "onboarding_action_decision_provider_seconds", 25.0)
+        ),
+        max_providers=int(getattr(settings, "onboarding_action_max_providers", 5)),
+    )
 
 
 # Typed, sanitized decision reason codes (never provider payload text).
@@ -682,7 +726,17 @@ def build_json_inference(
     ordered = list(backends.values())
     if selected in backends:
         ordered = [backends[selected], *(b for name, b in backends.items() if name != selected)]
-    return JsonInference(ordered, budget=budget, attempts=attempts) if ordered else None
+    if not ordered:
+        return None
+    # A caller that names no budget gets the DEPLOYMENT's action-decision budget,
+    # not the dataclass defaults. Every live browser chain is built through this
+    # function without a budget (``ops/playwright/worker.py`` twice,
+    # ``ops/onboarding/composition.py`` twice), so before this line those four
+    # chains were the only ones in the system that no environment variable could
+    # reach. Callers with a different shape of answer to buy — planning
+    # (``plan_budget``) and research extraction — still pass their own.
+    resolved = budget if budget is not None else action_decision_budget(settings)
+    return JsonInference(ordered, budget=resolved, attempts=attempts)
 
 
 __all__ = [
@@ -701,5 +755,6 @@ __all__ = [
     "MercuryJsonBackend",
     "OpenRouterJsonBackend",
     "RateLimited",
+    "action_decision_budget",
     "build_json_inference",
 ]

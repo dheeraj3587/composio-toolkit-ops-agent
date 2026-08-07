@@ -297,6 +297,7 @@ class HitlRequest(StrictModel):
         "device_approval",
         "provider_verification",
         "legal_acceptance",
+        "oauth_grant",
         "billing",
         "account_selection",
         "signup_authorization",

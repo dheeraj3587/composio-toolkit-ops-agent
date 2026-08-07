@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -30,10 +31,13 @@ from api.models import (
     AppSummary,
     AutonomyOutcomeView,
     AuxiliaryHostView,
+    BatchRunResult,
     BrowserLoginInput,
     BrowserServiceHealthView,
     BrowserUiState,
     BrowserVerificationInput,
+    CreateRunBatchRequest,
+    CreateRunBatchResponse,
     CreateRunRequest,
     CredentialSubmissionRequest,
     FieldEvidenceView,
@@ -91,6 +95,7 @@ from ops.onboarding.driver import (
     EffectReservationRecord,
     SQLitePhaseHistoryStore,
 )
+from ops.onboarding.lease_store import SQLiteRunQueue
 from ops.onboarding.phase import (
     TERMINAL_PHASES,
     OnboardingPhase,
@@ -98,6 +103,7 @@ from ops.onboarding.phase import (
     is_legal_phase_transition,
     legal_phase_targets,
 )
+from ops.onboarding.publishers import ONBOARDING_REQUEST_EVENT
 from ops.providers.composio_managed_auth import managed_auth_configuration_is_valid
 from ops.providers.profile import FieldEvidence, FlowSpec, ProviderProfile
 from ops.providers.profile_store import SQLiteProviderProfileStore
@@ -117,12 +123,14 @@ from ops.research.signup_agent import (
     ProgressReporter,
     research_signup_route,
 )
+from ops.runs.advance import ESCALATED_EVENT
+from ops.runs.errors import ProviderReadinessError
 from ops.runs.projections import (
     ProjectedTimelineEvent,
     onboarding_timeline_event,
 )
 from ops.runs.reconciliation import OnboardingRunRecoveryService
-from ops.runs.service import CredentialSubmissionError
+from ops.runs.service import CredentialSubmissionError, IdempotencyConflictError
 from ops.runs.service import RunService as CoreRunService
 
 
@@ -194,12 +202,21 @@ class RunService(Protocol):
 
     def deployment_mutations_allowed(self) -> bool: ...
 
+    def owner_secret_actions_allowed(self) -> bool: ...
+
     async def create_run(
         self,
         request: CreateRunRequest,
         *,
         idempotency_key: str | None = None,
     ) -> RunDetailResponse: ...
+
+    async def create_run_batch(
+        self,
+        request: CreateRunBatchRequest,
+        *,
+        idempotency_key: str | None = None,
+    ) -> CreateRunBatchResponse: ...
 
     async def submit_credentials(
         self,
@@ -317,6 +334,11 @@ _FAILURE_EVENT_SUMMARIES: Final[dict[str, str]] = {
     "managed_connection_poll_failed": "Managed connection status could not be read.",
     "outreach_send_failed": "Provider outreach could not be sent.",
     "run_reconciled_on_startup": "Run reconciled after a service restart.",
+    # A browser outcome that lost its compare-and-set and was therefore never
+    # written to the run. It is a failure summary rather than a progress one
+    # because the work it describes may have reached the vendor even though the
+    # run never recorded it — which is precisely what an operator needs to see.
+    "browser_projection_discarded": "A browser outcome was superseded and not applied.",
 }
 
 # The 14 onboarding progress events of Requirement 17.2, with the LL-7 summaries.
@@ -384,6 +406,19 @@ _ONBOARDING_TAKEOVER_SUMMARIES: Final[dict[str, str]] = {
     "onboarding_takeover_withheld": "Takeover withheld; the run stays paused for an operator.",
 }
 
+# The autonomous advance sweep's decision to stop trying, written by
+# ``AutonomousAdvanceService._record_escalation`` (ops/runs/advance.py). The
+# durable row carries the gate name and a reason code outside the onboarding
+# vocabulary, which is exactly why it needs its own entry: without one, the sweep
+# wrote a row nobody could read, because ``_EVENT_SUMMARIES`` is a closed
+# allow-list and every unknown type degrades to the generic "run updated" line —
+# the one projection that cannot answer "why is this run still waiting?". The
+# summary is static like all the others; neither ``gate`` nor ``reason_code``
+# reaches it.
+_ONBOARDING_ADVANCE_SUMMARIES: Final[dict[str, str]] = {
+    ESCALATED_EVENT: "Autonomous advancement handed the gate back to an owner.",
+}
+
 # The live-view attachment fact that decides whether a paused session keeps its
 # idle budget, written by the browser session boundary. The row carries the run id,
 # the session id and the attachment outcome, and never a signed live-view URL
@@ -396,6 +431,18 @@ _ONBOARDING_ATTACHMENT_SUMMARIES: Final[dict[str, str]] = {
 # reported no progress inside the Staleness_Window (Requirement 4.9).
 _ONBOARDING_LIVENESS_SUMMARIES: Final[dict[str, str]] = {
     "onboarding_progress_stale": "No loop progress within the staleness window.",
+}
+
+# A handler exception that escaped ``drive_run``, written by ``OnboardingWorker``
+# (ops/onboarding/worker.py). It needs its own entry for the same reason the
+# advance sweep does, only worse: a crash commits no phase boundary, so it emits
+# no ``OnboardingReasonCode`` and moves no phase — without this line the run is
+# re-claimed on the waiting backoff forever behind a timeline that says nothing.
+# The durable row carries only the worker id, the exception's TYPE name and the
+# retry interval; the message and traceback stay in the redacted process log, so
+# no provider text can reach an operator's screen through here.
+_ONBOARDING_DRIVER_CRASH_SUMMARIES: Final[dict[str, str]] = {
+    "onboarding_driver_raised": "The run's driver raised; it will be retried automatically.",
 }
 
 # The pre-flight route plan and its adherence, written by the plan store and the
@@ -424,8 +471,10 @@ _EVENT_SUMMARIES: Final[dict[str, str]] = {
     **_ONBOARDING_ADMISSION_SUMMARIES,
     **_ONBOARDING_CONTINUATION_SUMMARIES,
     **_ONBOARDING_TAKEOVER_SUMMARIES,
+    **_ONBOARDING_ADVANCE_SUMMARIES,
     **_ONBOARDING_ATTACHMENT_SUMMARIES,
     **_ONBOARDING_LIVENESS_SUMMARIES,
+    **_ONBOARDING_DRIVER_CRASH_SUMMARIES,
     **_ONBOARDING_PLAN_SUMMARIES,
 }
 
@@ -670,6 +719,62 @@ def _work_email_ref_for_app(app_name: str, *, app_slug: str | None = None) -> st
     return f"vault://company/work_email/{resolved_slug or 'app'}"
 
 
+def _single_run_request(request: CreateRunBatchRequest, app_name: str) -> CreateRunRequest:
+    """Project one app out of a batch onto the ordinary single-run request.
+
+    POST: the result is a request the single-run path cannot distinguish from one
+          a client posted directly, so a batch member gets the same validation,
+          the same durable shape, and the same idempotency fingerprint rules.
+
+    ``dry_run`` is forwarded only when the batch request set it EXPLICITLY.
+    ``CreateRunRequest`` rejects an explicit ``dry_run=True`` alongside
+    ``execution_mode="execute_when_configured"``, and it detects "explicit" with
+    ``model_fields_set`` — so unconditionally passing the field's default would
+    manufacture that conflict for every batch that asked to execute.
+    """
+
+    payload: dict[str, object] = {
+        "app_name": app_name,
+        "company": request.company,
+        "account_mode": request.account_mode,
+        "requested_scope_policy": request.requested_scope_policy,
+        "execution_mode": request.execution_mode,
+        "browser_provider": request.browser_provider,
+        "credential_creation_policy": request.credential_creation_policy,
+        "provider_setup": dict(request.provider_setup),
+        "onboarding": request.onboarding,
+        "decision_model": request.decision_model,
+        "decision_effort": request.decision_effort,
+    }
+    if "dry_run" in request.model_fields_set:
+        payload["dry_run"] = request.dry_run
+    return CreateRunRequest.model_validate(payload)
+
+
+def _batch_member_idempotency_key(batch_key: str | None, app_name: str) -> str | None:
+    """Derive one app's idempotency key from the batch's key.
+
+    PRE:  ``batch_key`` is a validated batch key, or ``None`` when the caller
+          supplied none.
+    POST: ``None`` when ``batch_key`` is ``None``; otherwise a key matching the
+          same ``^idem_[0-9a-f]{32}$`` contract the header enforces, distinct per
+          app and STABLE across replays of the same batch.
+
+    Derivation rather than reuse: the batch's own key is one key for N durable
+    creates, and handing the identical key to each app would make the second app
+    look like a replay of the first with a different request — an idempotency
+    conflict on every app but one. Hashing per app keeps the caller's guarantee
+    (post the same batch twice, get the same runs back) while giving each create
+    the distinct reservation it needs. The app name is case-folded so a batch that
+    differs only in the casing of a name resolves to the same member key.
+    """
+
+    if batch_key is None:
+        return None
+    digest = hashlib.sha256(f"{batch_key}\x00{app_name.casefold()}".encode()).hexdigest()
+    return f"idem_{digest[:32]}"
+
+
 class LocalRunService:
     """Leak-resistant HTTP adapter over the canonical application service."""
 
@@ -695,6 +800,7 @@ class LocalRunService:
         self._onboarding_lock = threading.Lock()
         self._onboarding_phases: SQLitePhaseHistoryStore | None = None
         self._onboarding_profiles: SQLiteProviderProfileStore | None = None
+        self._onboarding_queue: SQLiteRunQueue | None = None
 
     async def startup(self) -> None:
         await run_in_threadpool(self._service.startup)
@@ -718,6 +824,26 @@ class LocalRunService:
         if not self._settings.ops_startup_automation_enabled:
             return True
         return deployment_is_accepted(self._settings)
+
+    def owner_secret_actions_allowed(self) -> bool:
+        """Whether this deployment accepts a RAW SECRET from its owner.
+
+        This is the single definition of that predicate, and both halves of the
+        contract read it here: :meth:`_primary_action` decides whether to render
+        the "Submit credentials" button enabled, and ``api.app`` asks the live
+        service this exact question before admitting a raw-secret route. They
+        used to be two restatements of one flag from two different sources --
+        ``Settings.allow_local_credential_submission`` here against a direct
+        ``os.environ`` read in the route gate -- and an injected ``Settings``
+        (every composition that does not go through ``load_settings``) makes the
+        two disagree, which renders an enabled button whose route answers 403.
+
+        Reading it per call rather than caching it is deliberate: the flag is
+        part of the run service's settings snapshot, so the answer the route
+        gets is by construction the answer the button was drawn from.
+        """
+
+        return self._settings.allow_local_credential_submission
 
     def _require_started(self) -> None:
         if not self._started:
@@ -794,6 +920,22 @@ class LocalRunService:
                 reason_code="credential_stored_validation_not_reviewed",
             )
         if summary.route_kind == "managed_auth":
+            # Connect and poll-connection are agent-actor routes: their gate in
+            # ``api.app`` (``_require_agent_action``) asks only who is calling,
+            # and the internal-token caller that renders this button always
+            # satisfies it. So the only thing left that can refuse the click is
+            # configuration, and it is refused by this same predicate: a false
+            # ``managed_auth_configuration_is_valid`` is exactly why the run
+            # service leaves ``_managed_auth_provider`` unbuilt
+            # (ops/runs/service.py, ``managed_auth_configured``), which is what
+            # makes ``connect_managed`` refuse with the reason_code repeated
+            # below (ops/workflow/canonical_runtime.py). The button's disabled
+            # reason and the route's 409 reason_code are therefore the same
+            # string arrived at from the same function, not two guesses.
+            #
+            # Before the split this button read a configuration predicate while
+            # the route additionally demanded ALLOW_LOCAL_CREDENTIAL_SUBMISSION,
+            # so all 25 managed-auth apps rendered an enabled control that 403'd.
             managed_enabled = managed_auth_configuration_is_valid(self._settings)
             if record.get("connection_request_id"):
                 return PrimaryAction(
@@ -816,7 +958,9 @@ class LocalRunService:
             )
         if summary.route_kind == "playwright":
             if summary.phase in {"credential_ready", "entry_reached"}:
-                owner_actions_enabled = self._settings.allow_local_credential_submission
+                # The one place the raw-secret gate is defined, so the button and
+                # the route that receives the secret cannot answer differently.
+                owner_actions_enabled = self.owner_secret_actions_allowed()
                 return PrimaryAction(
                     kind="submit_credentials",
                     enabled=owner_actions_enabled,
@@ -1398,6 +1542,49 @@ class LocalRunService:
                     owner=self._settings.browser_service_owner,
                 )
             return self._onboarding_profiles
+
+    def _queue_store(self) -> SQLiteRunQueue:
+        """The durable onboarding work queue, opened once per service instance."""
+
+        with self._onboarding_lock:
+            if self._onboarding_queue is None:
+                self._onboarding_queue = SQLiteRunQueue(self._service.storage.db_path)
+            return self._onboarding_queue
+
+    def _enqueue_onboarding(self, run_id: str, *, hint_url: str | None) -> None:
+        """Hand one accepted run to the autonomous driver, durably.
+
+        This is the whole of "``onboarding: true`` is served": one timeline row
+        and one queue row, both written after the run itself is durable. The
+        worker (``ops.onboarding.worker``) claims from that queue and drives the
+        phase machine; nothing about this request waits on a browser, which is why
+        creating an onboarding run is as fast as creating any other one.
+
+        The hint URL rides on the timeline event rather than on the request record
+        deliberately: the request record is what the idempotency fingerprint is
+        computed over, so a new field on it would turn every stored fingerprint
+        into a false replay conflict. ``LedgerRunProviderBinding`` reads it back
+        from exactly this event type.
+
+        Order matters. The audit row is written first, because a crash between
+        the two leaves a hint with no queued run — recoverable by re-creating —
+        while the reverse leaves the first thing research reads missing from a run
+        already being driven.
+
+        Failure is reported, never swallowed into a half-served promise: an
+        operator who asked for autonomous onboarding and got a 201 must not be
+        holding a run that no worker will ever claim.
+        """
+
+        self._service.storage.append_audit_event(
+            run_id=run_id,
+            event_type=ONBOARDING_REQUEST_EVENT,
+            # Only ever an https URL the request model already validated, and
+            # only when one was given. No company text, no credentials.
+            payload={"hint_url": hint_url} if hint_url else {},
+        )
+        self._queue_store().enqueue(run_id=run_id)
+        LOGGER.info("run %s enqueued for autonomous onboarding", run_id)
 
     def _release_onboarding_session(self, *, run_id: str, reason: str) -> bool:
         """Hand the run's bound browser session back, synchronously.
@@ -2366,7 +2553,114 @@ class LocalRunService:
                 # text through here, so the payload stays projectable.
                 payload={"detail": step_detail} if step_detail else {},
             )
+        if request.onboarding:
+            # Last, and only once the run is durable: the queue names a run id,
+            # so enqueueing before the row exists would hand the worker a run it
+            # cannot read. A replayed idempotent create re-enqueues the same run
+            # id, which the queue folds into the one row it already has.
+            await run_in_threadpool(
+                self._enqueue_onboarding,
+                detail.run.run_id,
+                hint_url=request.provider_hint_url,
+            )
         return detail
+
+    async def create_run_batch(
+        self,
+        request: CreateRunBatchRequest,
+        *,
+        idempotency_key: str | None = None,
+    ) -> CreateRunBatchResponse:
+        """Create one run per named app, reporting each app's outcome separately.
+
+        PRE:  the service is started; ``request.app_names`` is non-empty, unique
+              and bounded by the model.
+        POST: every named app has exactly one entry in the response, in request
+              order. An entry is ``created`` with a run id, or ``rejected`` with a
+              reason code. Runs created here are indistinguishable from runs
+              created through :meth:`create_run` — this is a fan-out over that
+              method, not a second creation path.
+
+        **Why per-app errors are caught rather than raised.** The alternative is
+        that one unknown app name in a fifty-app batch discards the other
+        forty-nine *after* they are already durable, which would leave the ledger
+        holding runs the caller was told nothing about. Only the four errors that
+        mean "this APP cannot be created" are caught; anything else propagates and
+        the route fails, because a storage or configuration failure is not an
+        outcome about one app.
+
+        **Sequential on purpose.** Creation is a durable write with an idempotency
+        reservation, and concurrent creates would contend on the same ledger
+        for no benefit — the route does not wait on a browser (the onboarding
+        queue is what the worker later drains), so the per-app cost is a database
+        write, not a network round trip.
+        """
+
+        self._require_started()
+        results: list[BatchRunResult] = []
+        for app_name in request.app_names:
+            member_key = _batch_member_idempotency_key(idempotency_key, app_name)
+            try:
+                detail = await self.create_run(
+                    _single_run_request(request, app_name),
+                    idempotency_key=member_key,
+                )
+            except AppNotFoundError:
+                results.append(
+                    BatchRunResult(
+                        app_name=app_name,
+                        status="rejected",
+                        reason_code="app_not_found",
+                        detail="the app is not in the reviewed catalog",
+                    )
+                )
+            except InvalidRequestError as exc:
+                results.append(
+                    BatchRunResult(
+                        app_name=app_name,
+                        status="rejected",
+                        reason_code="invalid_request",
+                        # The field paths only; never the rejected value.
+                        detail=", ".join(exc.fields) or None,
+                    )
+                )
+            except ProviderReadinessError as exc:
+                results.append(
+                    BatchRunResult(
+                        app_name=app_name,
+                        status="rejected",
+                        reason_code=exc.reason_code,
+                        detail=f"the {exc.provider} provider is not ready",
+                    )
+                )
+            except IdempotencyConflictError:
+                # Reached only when this batch key was already used with a
+                # DIFFERENT configuration for the same app. Replaying the same
+                # batch verbatim returns the original runs as ``created``,
+                # because the derived member key is stable.
+                results.append(
+                    BatchRunResult(
+                        app_name=app_name,
+                        status="rejected",
+                        reason_code="idempotency_conflict",
+                        detail="this key was already used for a different request",
+                    )
+                )
+            else:
+                results.append(
+                    BatchRunResult(
+                        app_name=app_name,
+                        status="created",
+                        run_id=detail.run.run_id,
+                    )
+                )
+        created = sum(1 for result in results if result.status == "created")
+        return CreateRunBatchResponse(
+            requested=len(results),
+            created=created,
+            rejected=len(results) - created,
+            results=results,
+        )
 
     @staticmethod
     def _buffer_step(

@@ -323,6 +323,24 @@ class RunQueue(Protocol):
               16.14).
         """
 
+    def remove(self, *, run_id: str) -> bool:
+        """Drop a run from the queue because it will never be driven again.
+
+        PRE:  none. Removing a run that is not queued is a no-op, so a worker
+              that crashed after driving and before removing may remove twice.
+        POST: the run is not queued. Nothing else about the run changes — this
+              is a scheduling fact, never a phase transition, and in particular
+              it neither writes nor implies an outcome.
+
+        The counterpart to :meth:`dequeue_candidates`' "a candidate stays queued
+        until the run is terminal". Without it a terminal run stays due forever
+        and every poll re-claims it, re-reads its history, and re-derives the
+        same terminal phase — work that is invisible in the run's record and
+        unbounded in the queue's. Only the caller that observed the terminal
+        phase may call this; a re-enqueue by an operator restart legitimately
+        undoes it (:meth:`enqueue` folds to the earlier ready time).
+        """
+
     def defer(self, *, run_id: str, not_before: str) -> None:
         """Re-queue a run with a delay — verification backoff and CAPTCHA waits.
 

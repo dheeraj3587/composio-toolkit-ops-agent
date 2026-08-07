@@ -465,6 +465,17 @@ MAX_CANDIDATE_LABEL_LENGTH: Final = 120
 # :meth:`OperationsStorage.record_step_decision` for the quarantine rules.
 MAX_DECISION_REASON_LENGTH: Final = 400
 
+# The cap on one phase's working-memory document. ``ops.onboarding.scratchpad``
+# imports this constant rather than restating it, and trims its own oldest steps
+# until the serialized document fits — so the CHECK below is a backstop against a
+# writer that bypasses that module, not the everyday bound.
+#
+# 8 KiB is roughly four times what the module's own per-field caps can produce
+# (six steps plus a goal, a postcondition list and a 240-character note). The
+# slack is deliberate: the document is JSON, and a schema that gains a field
+# should not start failing a CHECK on live runs before anyone notices.
+MAX_SCRATCHPAD_DOCUMENT_LENGTH: Final = 8_000
+
 
 # One row per plan revision (Requirements 5.7, 6.6). History, not current state:
 # a re-plan supersedes the active row and inserts its replacement in the same
@@ -770,6 +781,40 @@ CREATE TABLE IF NOT EXISTS onboarding_step_decisions (
 
 CREATE INDEX IF NOT EXISTS idx_step_decisions_run
 ON onboarding_step_decisions(run_id, id);
+"""
+
+
+# One row per ``(run_id, phase)``: that phase's durable working memory, as an
+# opaque bounded document owned by ``ops.onboarding.scratchpad``.
+#
+# CURRENT STATE, not history — unlike every table above it. The three tables above
+# are append-only ledgers of what happened, and they answer "what did this run
+# do". This one answers "what does this phase currently believe", which is a
+# single value that is rewritten in place. A restart reads it back and resumes the
+# phase's REASONING rather than only its position, which is the whole reason it is
+# durable instead of a field on the loop's stack frame.
+#
+# ``document`` is deliberately opaque to this module. Every field inside it has
+# already been through ``ops.core.model_input_dlp`` on the way in — the writer
+# sanitizes per field and re-screens per field, because the document's rendered
+# form is prompt INPUT — and this module screens the whole document once more
+# before the write. Parsing it here to re-validate the parts would duplicate that
+# boundary in a second place and give the two somewhere to disagree.
+#
+# The PRIMARY KEY is the pair, so a run's phases cannot overwrite each other's
+# memory, and the row cascades with the run rather than outliving it.
+_PHASE_SCRATCHPADS_DDL = f"""
+CREATE TABLE IF NOT EXISTS onboarding_phase_scratchpads (
+    run_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (
+        phase IN ({_vocabulary_clause(ONBOARDING_PHASES)})
+    ),
+    document TEXT NOT NULL CHECK (length(document) <= {MAX_SCRATCHPAD_DOCUMENT_LENGTH}),
+    revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, phase),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
 """
 
 
@@ -1881,6 +1926,28 @@ class OperationsStorage:
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
                 );
+
+                -- How many times each sweep has already spent an attempt on one
+                -- run's gate. This used to be two plain dicts on the run service
+                -- (``_autonomous_advances`` and ``_otp_attempts``), which meant
+                -- every deploy, restart and crash silently refunded every budget
+                -- a run had spent: a gate that could never be resolved was
+                -- retried forever, a few seconds apart, for the life of the
+                -- deployment. The budget is only a budget if it outlives the
+                -- process that enforces it.
+                --
+                -- The PRIMARY KEY is the pair, so the counters for a run's
+                -- different gates cannot overwrite each other, and the row
+                -- cascades with the run rather than accumulating for runs that
+                -- no longer exist.
+                CREATE TABLE IF NOT EXISTS run_gate_attempts (
+                    run_id TEXT NOT NULL,
+                    gate TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (run_id, gate),
+                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+                );
                 """
             )
             existing_columns = {
@@ -1940,6 +2007,10 @@ class OperationsStorage:
             connection.executescript(_PROGRESS_EVENTS_DDL)
             connection.executescript(_DECISION_ATTEMPTS_DDL)
             connection.executescript(_STEP_DECISIONS_DDL)
+            # Additive in the same sense: a new table with no data migration, so an
+            # existing database gains an empty scratchpad store on the next open and
+            # every in-flight run simply starts its next phase with no memory.
+            connection.executescript(_PHASE_SCRATCHPADS_DDL)
             for column_name, declaration in migration_columns.items():
                 if column_name in existing_columns:
                     continue
@@ -3363,6 +3434,59 @@ class OperationsStorage:
         ).fetchone()
         return int(row[0])
 
+    def gate_attempts(self, run_id: str, gate: str) -> int:
+        """How many attempts a sweep has already spent on this run's gate."""
+
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT attempts FROM run_gate_attempts WHERE run_id = ? AND gate = ?",
+                (_safe_text(run_id), _safe_text(gate)),
+            ).fetchone()
+        return 0 if row is None else int(row[0])
+
+    def spend_gate_attempt(self, run_id: str, gate: str) -> int:
+        """Charge one attempt against this run's gate and report the new total.
+
+        The increment is one statement, so two sweep threads racing on the same
+        gate spend two attempts rather than both reading the same total and
+        writing back the same number. Read-then-write from Python would let a
+        run overrun its budget by exactly the number of concurrent sweeps, which
+        is the failure this counter exists to prevent.
+        """
+
+        self.initialize()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO run_gate_attempts (run_id, gate, attempts, updated_at)
+                VALUES (?, ?, 1, ?)
+                ON CONFLICT(run_id, gate) DO UPDATE SET
+                    attempts = attempts + 1,
+                    updated_at = excluded.updated_at
+                RETURNING attempts
+                """,
+                (_safe_text(run_id), _safe_text(gate), _utc_now()),
+            )
+            row = cursor.fetchone()
+        return 0 if row is None else int(row[0])
+
+    def clear_gate_attempts(self, run_id: str) -> None:
+        """Refund every gate budget for one run.
+
+        Called when an operator restarts a run on purpose. A durable budget that
+        no deliberate action could reset would turn "this gate is unresolvable"
+        into "this run is unresolvable", which is a worse bug than the one the
+        durability fixes.
+        """
+
+        self.initialize()
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM run_gate_attempts WHERE run_id = ?",
+                (_safe_text(run_id),),
+            )
+
     def record_progress_event(
         self,
         *,
@@ -3545,6 +3669,90 @@ class OperationsStorage:
                 (_safe_text(run_id), _metric_row_limit(limit)),
             ).fetchall()
         return [dict(zip(_STEP_DECISION_COLUMNS, row, strict=True)) for row in rows]
+
+    def save_phase_scratchpad(self, *, run_id: str, phase: str, document: str) -> int:
+        """Replace one phase's working-memory document and return its new revision.
+
+        PRE:  ``document`` is the serialized form produced by
+              ``ops.onboarding.scratchpad.PhaseScratchpad.to_document``, which has
+              already sanitized and bounded every field inside it.
+        POST: exactly one row exists for ``(run_id, phase)`` and its revision is one
+              higher than the row it replaced. The revision is not read by anything
+              today; it exists so a resumed run can be told apart from one whose
+              memory was written once and never updated, which is precisely the
+              symptom a scratchpad that silently fails to persist would show.
+
+        Refuses rather than truncates on the two ways a document can be wrong. Over
+        the bound means the writer skipped the module's own trimming, and secret
+        material means it skipped the module's screening; storing a truncated or
+        partly redacted document would leave a memory that is read back into a
+        PROMPT in a state nobody screened. The caller (``save_scratchpad``) contains
+        the refusal so a failed write costs the phase its notebook, not its run.
+        """
+
+        self.initialize()
+        if not isinstance(document, str) or not document:
+            raise ValueError("a scratchpad document must be non-empty text")
+        if len(document) > MAX_SCRATCHPAD_DOCUMENT_LENGTH:
+            raise ValueError("scratchpad document exceeds the durable bound")
+        if contains_secret_material(document):
+            raise ValueError("scratchpad document still looks credential-bearing")
+        stored_phase = _audit_phase(phase)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO onboarding_phase_scratchpads (run_id, phase, document, revision,
+                                                          updated_at)
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(run_id, phase) DO UPDATE SET
+                    document = excluded.document,
+                    revision = revision + 1,
+                    updated_at = excluded.updated_at
+                RETURNING revision
+                """,
+                (_safe_text(run_id), stored_phase, document, _utc_now()),
+            )
+            row = cursor.fetchone()
+        return 1 if row is None else int(row[0])
+
+    def read_phase_scratchpad(self, run_id: str, phase: str) -> str | None:
+        """The stored working-memory document for one ``(run_id, phase)``, if any.
+
+        ``None`` for a pair that has never been written, which the caller reads as
+        "this phase starts with no memory" — the same state a phase that has never
+        run is in, and deliberately indistinguishable from it: a run resumed after
+        the row was garbage-collected must still be drivable.
+        """
+
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT document FROM onboarding_phase_scratchpads WHERE run_id = ? AND phase = ?",
+                (_safe_text(run_id), _audit_phase(phase)),
+            ).fetchone()
+        return None if row is None else str(row[0])
+
+    def clear_phase_scratchpads(self, run_id: str, *, phase: str | None = None) -> None:
+        """Forget one phase's memory, or the whole run's.
+
+        Called on a deliberate reset. A run that an operator restarted from
+        ``research`` must not carry the hypotheses of the walk that failed: they
+        describe pages the new walk may never see, and re-showing them to the model
+        is exactly the way a fresh attempt inherits the last one's dead end.
+        """
+
+        self.initialize()
+        with self._connect() as connection:
+            if phase is None:
+                connection.execute(
+                    "DELETE FROM onboarding_phase_scratchpads WHERE run_id = ?",
+                    (_safe_text(run_id),),
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM onboarding_phase_scratchpads WHERE run_id = ? AND phase = ?",
+                    (_safe_text(run_id), _audit_phase(phase)),
+                )
 
     def record_decision_attempt(
         self,

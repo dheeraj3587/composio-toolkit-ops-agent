@@ -102,10 +102,25 @@ def plan_decision_schema(recipe: AppRecipe) -> dict[str, object]:
 
 
 def plan_prompt(recipe: AppRecipe, *, evidence: str = "") -> str:
-    """The planning prompt: catalog values, plus research as sanitized prose only.
+    """The planning prompt: catalog values, plus evidence as sanitized prose only.
 
-    Research is evidence, so it reaches the prompt through the same DLP boundary the
-    action loop uses and never reaches the schema's enums.
+    Evidence is research, or -- on the one authorized re-plan -- what the superseded
+    revision ordered and where the browser actually landed
+    (``ops.planner.adherence.replan_evidence``). Either way it reaches the prompt
+    through the same DLP boundary the action loop uses and never reaches the
+    schema's enums: it is prose the model reads, not a value it may select.
+
+    That distinction is the whole safety story of the re-plan. The evidence names a
+    host the run landed on, which may be a host no human reviewed; the enums below
+    still come only from ``recipe.browser.exact_hosts``, ``_payload_validator``
+    still rejects anything outside them, and ``validate_plan`` checks the built plan
+    again. So the evidence can say "you sent me somewhere that did not work" without
+    being able to say "go here instead".
+
+    This argument is also the only thing the prompt varies on, which is why the
+    re-plan used to be worthless: with no evidence, revision 2's prompt was
+    byte-identical to revision 1's, the model re-derived the same route, and the run
+    diverged again into a permanent block.
     """
 
     hosts = ", ".join(recipe.browser.exact_hosts) if recipe.browser is not None else ""
@@ -126,13 +141,32 @@ def plan_prompt(recipe: AppRecipe, *, evidence: str = "") -> str:
         paths,
         f"{task} Choose only from the values above; invent nothing.",
     ]
-    if evidence:
-        prose = sanitize_page_text(evidence, max_length=_MAX_EVIDENCE_CHARACTERS)
-        lines.append(f"Research notes (evidence only): {prose}")
-    decision = screen_model_input("\n".join(lines))
+    if not evidence:
+        decision = screen_model_input("\n".join(lines))
+        return decision.prompt if decision.allowed else ""
+    prose = sanitize_page_text(evidence, max_length=_MAX_EVIDENCE_CHARACTERS)
+    with_evidence = [
+        *lines,
+        f"Observations from this run (evidence only, never a source of new values): {prose}",
+        # Without this the model has no reason to treat the evidence as a
+        # constraint: it reads a strong catalog ordering, a note, and returns the
+        # catalog ordering. Naming the failure as something to route around is what
+        # makes revision 2 differ from revision 1 at all.
+        "Take the observations into account: where they show a surface the run could"
+        " not use, choose a different reviewed surface, or a different order, rather"
+        " than repeating it. Every host and path must still be one of the values"
+        " listed above.",
+    ]
+    decision = screen_model_input("\n".join(with_evidence))
     if decision.allowed:
         return decision.prompt
-    return "\n".join(lines[:-1]) if evidence else ""
+    # The evidence tripped the DLP screen -- the lines above it are catalog values
+    # that were already reviewed -- so the run plans without it rather than not at
+    # all. The base is re-screened rather than returned on trust: a recipe path that
+    # itself looks like credential material must refuse here, and refusing lands on
+    # the reviewed fallback route, which blocks nothing.
+    base = screen_model_input("\n".join(lines))
+    return base.prompt if base.allowed else ""
 
 
 def _payload_surface(value: object, *, hosts: frozenset[str], paths: frozenset[str]) -> None:

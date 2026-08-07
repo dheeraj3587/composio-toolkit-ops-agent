@@ -9,6 +9,7 @@ import {
   appResearchResponseSchema,
   modelCatalogResponseSchema,
   appSearchResponseSchema,
+  createRunBatchResponseSchema,
   healthResponseSchema,
   liveViewResponseSchema,
   managedConnectionResponseSchema,
@@ -31,12 +32,14 @@ import type {
   AppSearchResponse,
   BrowserVerificationInput,
   CompanyProfileInput,
+  CreateRunBatchResponse,
   HealthResponse,
   IntegratorOutput,
   LiveViewResponse,
   ManagedConnectionResponse,
   ModelCatalogResponse,
   OnboardingPhase,
+  OperationsBatchRequestInput,
   OperationsRequestInput,
   PauseResponse,
   PhaseConflict,
@@ -314,12 +317,49 @@ export function createRun(
   )
 }
 
+/**
+ * One reviewed configuration, fanned out over many apps in a single call.
+ *
+ * Same token, timeout and idempotency contract as `createRun` — this is the
+ * create route repeated N times on the backend, not a second creation path. The
+ * batch key is derived per app by the API, so posting the same batch twice
+ * returns the same runs rather than duplicating them.
+ */
+export function createRunBatch(
+  request: OperationsBatchRequestInput,
+  idempotencyKey: string,
+): Promise<CreateRunBatchResponse> {
+  if (!IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
+    throw new ApiError(400, "INVALID_IDEMPOTENCY_KEY", "The batch request is invalid.")
+  }
+
+  return apiRequest(
+    "/api/runs/batch",
+    createRunBatchResponseSchema,
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify(request),
+    },
+    RUN_ACTION_TIMEOUT_MS,
+  )
+}
+
 export function performPhaseAction(
   runId: string,
   action: RunPhaseAction,
   capability?: RetryCapability,
 ): Promise<ActionReceipt> {
-  const suffix = action === "poll-email" ? "/poll-email" : action === "retry" ? "/retry" : "/resume"
+  const suffix =
+    action === "poll-email"
+      ? "/poll-email"
+      : action === "retry"
+        ? "/retry"
+        // The gated controlled-sink send. It carries no body: the backend route
+        // takes the run id alone and re-derives the reviewed contact route.
+        : action === "outreach"
+          ? "/outreach"
+          : "/resume"
   // Resume drives a same-session browser task synchronously. Inbox verification
   // also performs bounded exponential polling on the API, so both need the
   // production action timeout rather than the short metadata-request timeout.

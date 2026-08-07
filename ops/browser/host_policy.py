@@ -20,8 +20,15 @@ Discovery never widens an app that already has a reviewed recipe, and it never
 authorizes a domain the app's verified URLs do not support.
 
 Documentation URLs and runtime-supplied hosts still never expand this boundary.
-Resource and IdP hosts remain separately reviewed recipe fields and do not become
-top-level navigation destinations.
+
+Three reviewed recipe host lists reach navigation and one does not. ``exact_hosts``,
+``identity_provider_hosts`` and ``post_auth_hosts`` are all places the run's tab
+legitimately ends up — the vendor, the sign-in it hands off to, and the console it
+lands on afterwards — and :func:`_allowed_from_policy` unions exactly those three.
+``static_resource_hosts`` stays out: a CDN is fetched BY the page and is never
+navigated to, so admitting it would grant a destination nobody reviewed as one.
+The three stay separate fields everywhere else, because "the vendor owns this host"
+and "the run may end up here" are different claims with different readers.
 """
 
 from __future__ import annotations
@@ -110,6 +117,22 @@ class BrowserHostPolicy:
     # Retained in the serialized effect shape for legacy-read compatibility. New
     # recipes are exact-host only and always leave this empty.
     vendor_wildcard_domains: tuple[str, ...] = ()
+    # Reviewed federated sign-in hosts, kept SEPARATE from ``exact_hosts`` rather
+    # than folded into it. ``exact_hosts`` answers "which hosts does this vendor
+    # own", and three unrelated callers rely on that meaning: research result
+    # validation (ops/you/host_policy.py), email verification-link acceptance
+    # (ops/runs/verification.py) and signup-route scanning. accounts.google.com
+    # is not a firecrawl page, and a search result there must not be accepted as
+    # one. Only :func:`build_browser_allowed_hosts` unions the two, because only
+    # navigation needs to follow the sign-in.
+    identity_provider_hosts: tuple[str, ...] = ()
+    # Reviewed hosts that only appear AFTER a successful sign-in — the post-login
+    # console, or the hosted-auth callback the vendor bounces through. Separate
+    # from ``exact_hosts`` for the same reason the IdP hosts are: the callers
+    # listed above read ``exact_hosts`` as a claim about public vendor ownership,
+    # and a tenant host like ``vendor.eu.auth0.com`` is not that. Carried here so
+    # the same union that follows the sign-in also follows the landing.
+    post_auth_hosts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,10 +199,94 @@ def browser_policy_from_recipe(recipe: AppRecipe) -> BrowserHostPolicy | None:
         app_slug=recipe.app_slug,
         active=True,
         # Navigation authority is deliberately narrower than resource egress:
-        # IdP and static-resource hosts never become top-level destinations.
+        # static-resource hosts are fetched by the page and never visited.
         exact_hosts=browser.exact_hosts,
+        # Empty because no recipe field can currently supply a reviewed NAVIGATION
+        # wildcard, not because the plumbing is missing. ``BrowserRecipe`` has two
+        # wildcard-bearing fields and neither is a destination: ``static_resource_
+        # hosts`` belongs to the egress boundary (ops/browser/egress.py) and the
+        # ``verification_*`` hosts belong to the email boundary. Forwarding either
+        # here would turn a fetched-by-the-page CDN or a mail host into a top-level
+        # destination nobody reviewed as one. Admitting a per-tenant vendor host
+        # (``<store>.myshopify.com``) needs a NEW reviewed field on ``BrowserRecipe``
+        # — see the summary note; it must also join the ``navigation_hosts`` count
+        # in that model's validator so wildcards keep counting against
+        # ``MAX_ALLOWED_HOST_PATTERNS``. Once such a field exists this is the only
+        # line that changes: everything downstream (``_allowed_from_policy``,
+        # ``host_matches_patterns``, ``allowed_hosts_from_patterns``) already
+        # carries and enforces wildcards correctly.
         vendor_wildcard_domains=(),
+        # Carried, not merged. See BrowserHostPolicy.identity_provider_hosts.
+        identity_provider_hosts=browser.identity_provider_hosts,
+        post_auth_hosts=browser.post_auth_hosts,
     )
+
+
+def _allowed_from_policy(app_slug: str, policy: BrowserHostPolicy) -> BrowserAllowedHosts:
+    """Flatten one active policy into the allow-list navigation actually enforces.
+
+    The one place the reviewed identity-provider and post-auth hosts join the
+    navigation allow-list. Excluding them was a bug, not a boundary: a federated
+    sign-in is a top-level navigation by construction — clicking "Continue with
+    Google" moves the whole tab to accounts.google.com. Egress already loads that
+    document (it is a reviewed IdP host), so the network fetched the page and
+    ``navigation_allowed`` then refused the URL it had just fetched, landing the
+    run in ``blocked``, which ops/core/state.py gives no outgoing transitions at
+    all. Five of the seven browser-ready apps (apify, firecrawl, vercel, datadog,
+    coda) reach sign-in this way, so the asymmetry ended every one of their runs
+    irrecoverably. ``post_auth_hosts`` is the other half of the same round trip:
+    the IdP hands the tab BACK, and 13 of the 14 playwright recipes have a
+    single-element ``exact_hosts``, so a vendor that returns you to a different
+    origin than it sent you from hit the same dead end one navigation later.
+
+    No host arrives here that a checked-in recipe did not already review: this is
+    a union of three reviewed fields of the same recipe, each of which a human had
+    to type into the recipe by hand, with no discovery, no page content and no
+    runtime input. Every one of the three is validated as an EXACT host, so
+    nothing here can widen to a subdomain the reviewer did not name.
+    Static-resource hosts stay out — a CDN is fetched by the page, never visited.
+    """
+
+    return BrowserAllowedHosts(
+        app_slug=app_slug,
+        exact_hosts=tuple(
+            dict.fromkeys(
+                (
+                    *policy.exact_hosts,
+                    *policy.identity_provider_hosts,
+                    *policy.post_auth_hosts,
+                )
+            )
+        ),
+        vendor_wildcard_domains=policy.vendor_wildcard_domains,
+    )
+
+
+def allowed_hosts_from_recipe(recipe: AppRecipe) -> BrowserAllowedHosts | None:
+    """The navigation allow-list a reviewed recipe proves entirely on its own.
+
+    :func:`build_browser_allowed_hosts` takes an ``OperationalResearch`` because
+    it may fall back to deriving a domain from the app's own verified URLs. This
+    cannot and does not: a recipe is the only input, so there is nothing to
+    discover and nothing to fail closed against.
+
+    It exists for the caller that has a recipe and nothing else — browser-session
+    CREATION, which happens before any research is bound to the session. Until it
+    did, a session's ``patterns`` stayed empty until the first
+    ``navigate_onboarding``, and ``is_allowed_browser_url`` is fail-closed, so
+    every action on a session driven any other way (the observe/act RPC) was
+    refused for a host the recipe plainly reviewed.
+
+    Returns ``None`` rather than raising for an app with no active browser policy,
+    because at creation time "this app is not browser-drivable" is not yet an
+    error — the session may still be created for an operation that never
+    navigates. The refusal belongs at the navigation, where it already is.
+    """
+
+    policy = browser_policy_from_recipe(recipe)
+    if policy is None or not policy.active:
+        return None
+    return _allowed_from_policy(recipe.app_slug, policy)
 
 
 def navigation_target_urls(research: object) -> tuple[str, ...]:
@@ -292,11 +399,9 @@ def build_browser_allowed_hosts(
     if not policy.active:
         raise BrowserPolicyInactiveError(app_slug, "browser_policy_inactive_for_app")
 
-    return BrowserAllowedHosts(
-        app_slug=app_slug,
-        exact_hosts=tuple(dict.fromkeys(policy.exact_hosts)),
-        vendor_wildcard_domains=policy.vendor_wildcard_domains,
-    )
+    # See :func:`_allowed_from_policy` for why the reviewed identity-provider and
+    # post-auth hosts are unioned in here and nowhere else.
+    return _allowed_from_policy(app_slug, policy)
 
 
 def allowed_hosts_from_patterns(app_slug: str, patterns: Iterable[str]) -> BrowserAllowedHosts:
@@ -422,6 +527,7 @@ __all__ = [
     "BrowserHostPolicy",
     "BrowserPolicyInactiveError",
     "allowed_hosts_from_patterns",
+    "allowed_hosts_from_recipe",
     "build_browser_allowed_hosts",
     "evaluate_navigation",
     "first_denied_navigation",

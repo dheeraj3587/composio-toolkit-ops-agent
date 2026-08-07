@@ -112,6 +112,7 @@ from ops.core.inference import DecisionFailed, DecisionReasonCode
 from ops.core.model_input_dlp import sanitize_url
 from ops.core.models import HitlRequest
 from ops.core.private_files import finalize_private_database, prepare_private_database
+from ops.core.state import CredentialCreationPolicy
 from ops.core.storage import AUTONOMY_VERDICT_VALUES, OperationsStorage
 from ops.email.verification import (
     DEFAULT_CLOCK_SKEW_SECONDS,
@@ -181,6 +182,7 @@ from ops.onboarding.phase import (
     legal_phase_targets,
     validate_phase_transition,
 )
+from ops.onboarding.scratchpad import ScratchpadStore
 from ops.planner.decide import PlanOutcome
 from ops.planner.plan import RunPlan
 from ops.planner.store import RunPlanStore
@@ -1894,8 +1896,16 @@ class LoginReferenceBinder(Protocol):
 class RunPlanner(Protocol):
     """Produce a pre-flight plan for one reviewed recipe."""
 
-    def plan_for(self, *, recipe: AppRecipe, revision: int) -> PlanOutcome | PlanRefusal:
-        """Return a plan outcome or a typed refusal."""
+    def plan_for(
+        self, *, recipe: AppRecipe, revision: int, evidence: str = ""
+    ) -> PlanOutcome | PlanRefusal:
+        """Return a plan outcome or a typed refusal.
+
+        ``evidence`` is sanitized prose about this run; it is the only thing the
+        planning prompt varies on, so a re-plan that passes none re-derives the
+        route it is replacing. The first-pass call at line 2282 passes none, which
+        is correct: there is nothing yet to say.
+        """
 
 
 class RunPlanValidator(Protocol):
@@ -1970,6 +1980,10 @@ class OnboardingDeps:
     # and ambiguous-outcome counters on the autonomy outcome; nothing on this port
     # can reserve or complete an effect.
     effects: RecoveryEffectReader | None = None
+    # Where each phase's durable working memory lives (roadmap 5.1). Optional and
+    # inert when unwired: a deployment with no store drives phases with no memory,
+    # which is exactly how they were driven before.
+    scratchpads: ScratchpadStore | None = None
     budget: LoopBudget = field(default_factory=LoopBudget)
     # The per-step bound on one browser operation, so a hung step cannot freeze a
     # phase (reliability R4.7).
@@ -1981,6 +1995,15 @@ class OnboardingDeps:
     verification_budget: VerificationBudget | None = None
     timings: LeaseTimings = DEFAULT_LEASE_TIMINGS
     clock: Callable[[], datetime] = _utc_moment
+    # The RUN's own committed credential-creation policy, read from its immutable
+    # ledger column at the composition root. It lives here rather than on a port
+    # because it is a property of the RUN, and this bundle is already built once
+    # per run — the same reason ``ProfileGoals`` carries it for the loop-driven
+    # phases. It is one HALF of the creation gate; the other half is the reviewed
+    # control names the profile carries, and the AND lives in
+    # :meth:`~ops.browser.risk.ActionAuthorization.for_phase`. The default is the
+    # narrow answer so a bundle assembled without it can only authorize less.
+    credential_creation_policy: CredentialCreationPolicy = "reuse_only"
 
 
 @dataclass(slots=True)
@@ -2309,13 +2332,35 @@ def phase_correlation_id(*, run_id: str, phase: OnboardingPhase, attempt: int) -
     return sha256(seed).hexdigest()[:32]
 
 
-async def drive_run(*, run_id: str, worker_id: str, deps: OnboardingDeps) -> AutonomyOutcome | None:
+async def drive_run(
+    *,
+    run_id: str,
+    worker_id: str,
+    deps: OnboardingDeps,
+    lease: Lease | None = None,
+) -> AutonomyOutcome | None:
     """Advance one run under a lease until it blocks, pauses, or terminates.
+
+    ``lease`` is the one this worker ALREADY holds for the run, which is how a
+    queue-driven worker gets in: ``LeaseStore.claim_next`` selects a due run and
+    claims it in one statement, and there is no way to hand that lease back to a
+    ``claim`` — the claim SQL's ``holder IS NULL OR deadline < now`` predicate
+    (``ops/onboarding/lease_store.py``) refuses a live lease no matter who holds
+    it, so a worker that claimed through the queue and then called this without
+    the lease would fence ITSELF out and see ``None`` on every pass. Passing
+    ``None`` keeps the original behaviour of claiming here, which is what every
+    existing caller and every test does. Renewal and the exactly-once release are
+    the ``LeaseGuard``'s either way (Q3): ownership of the lease's lifetime
+    transfers to this call, so a caller must not release a lease it passed in.
 
     PRE:
       P1. ``run_id`` names an existing run; ``deps`` is fully wired.
       P2. no other worker holds a live lease for the run (the lease store's own
           guarantee, not an assumption this function makes).
+      P3. a supplied ``lease`` is live and names this ``run_id`` and
+          ``worker_id`` — a mismatch is a wiring fault and is raised, because
+          driving under someone else's fencing token is exactly what the token
+          exists to prevent.
 
     POST:
       Q1. the phase the run stopped at is terminal, is a waiting phase, or is the
@@ -2351,9 +2396,12 @@ async def drive_run(*, run_id: str, worker_id: str, deps: OnboardingDeps) -> Aut
           ``plan_surface_not_in_catalog`` and no session (Requirements 5.1, 5.6).
     """
 
-    lease = deps.leases.claim(
-        run_id=run_id, worker_id=worker_id, ttl_seconds=deps.timings.ttl_seconds
-    )
+    if lease is None:
+        lease = deps.leases.claim(
+            run_id=run_id, worker_id=worker_id, ttl_seconds=deps.timings.ttl_seconds
+        )
+    elif lease.run_id != run_id or lease.worker_id != worker_id:  # P3
+        raise ValueError("the supplied lease does not belong to this run and worker")
     if lease is None:  # Q4
         LOGGER.info("onboarding run %s is already leased by another worker", run_id)
         return None
@@ -3355,6 +3403,34 @@ class DeveloperAppFlows:
 
         return tuple(dict.fromkeys((*self.creation.steps, *self.credential.steps)))[:MAX_FLOW_STEPS]
 
+    def control_names(
+        self, *, credential_creation_policy: CredentialCreationPolicy
+    ) -> tuple[str, ...]:
+        """The reviewed controls this phase may create something with.
+
+        The CREATION flow always contributes: the driver only enters this phase
+        after reserving a create-dev-app effect, so creating the application is
+        the phase's definition rather than an assumption about it.
+
+        The CREDENTIAL flow contributes only when the RUN committed
+        ``create_if_missing``. Folding it in unconditionally — as this method used
+        to, on the argument that a provider minting the key from the same dialog
+        names its control under whichever flow a reviewer happened to write it —
+        made an actual minting control such as "Generate key" autonomously
+        clickable on a run started with ``reuse_only``, which is the one thing
+        that policy forbids. Under ``reuse_only`` this phase authorizes the
+        application-creation controls and nothing else; the credential phase,
+        which reads the same run column, is where a minting control is judged.
+
+        Anything other than the exact string ``"create_if_missing"`` narrows, so
+        an absent, unreadable, or mistyped policy fails closed.
+        """
+
+        names = tuple(self.creation.control_names)
+        if credential_creation_policy == "create_if_missing":
+            names = (*names, *self.credential.control_names)
+        return tuple(dict.fromkeys(names))
+
 
 class DeveloperAppBinding(Protocol):
     """Where the phase learns the run's owner and the credential it is after.
@@ -3439,7 +3515,11 @@ def developer_app_flows(
 
 
 def developer_app_goal(
-    *, profile: ProviderProfile, request: DeveloperAppRequest, flows: DeveloperAppFlows
+    *,
+    profile: ProviderProfile,
+    request: DeveloperAppRequest,
+    flows: DeveloperAppFlows,
+    credential_creation_policy: CredentialCreationPolicy = "reuse_only",
 ) -> PhaseGoal:
     """The goal this phase is driven toward, built from the declared flows (9.2).
 
@@ -3449,6 +3529,11 @@ def developer_app_goal(
     factory keyed by phase and profile cannot know. The postconditions still come
     from :data:`~ops.onboarding.action_loop.PHASE_POSTCONDITIONS`, so the bar for
     ``done`` is the phase's declared one and this function cannot lower it.
+
+    ``credential_creation_policy`` is the RUN's own committed column, carried on
+    :class:`OnboardingDeps` for this run. It selects which reviewed controls this
+    phase may click (see :meth:`DeveloperAppFlows.control_names`), and its default
+    is the narrow one so a caller that forgets it authorizes less, never more.
     """
 
     return PhaseGoal.for_phase(
@@ -3466,6 +3551,23 @@ def developer_app_goal(
         signals=flows.signals(),
         reviewed_goto_urls=flows.entry_urls(),
         allow_value_refs=(DEVELOPER_APP_NAME_REF,),
+        # The creation authority the risk policy requires, and the narrow rule it
+        # now states: ``create_if_missing`` is this phase's DEFINITION for the
+        # APPLICATION-creation controls only. The driver enters ``developer_app``
+        # only after reserving a create-dev-app effect, so a run that reached here
+        # has already decided it is creating an application — but it has decided
+        # nothing about minting a CREDENTIAL. So the controls below are the
+        # creation flow's always and the credential flow's only when the run's own
+        # committed policy says ``create_if_missing``; the effective policy stays
+        # ``create_if_missing`` because it is the application-creation controls it
+        # is being ANDed with. What is still not assumed is WHICH control creates
+        # the application — that comes from the reviewed flows, and when they name
+        # none, every "Create"/"Generate" click on the page gates to a human
+        # instead of running.
+        credential_creation_controls=flows.control_names(
+            credential_creation_policy=credential_creation_policy
+        ),
+        credential_creation_policy="create_if_missing",
     )
 
 
@@ -3549,7 +3651,16 @@ async def drive_developer_app(
         # have reached the provider; neither authorizes a second one.
         return PhaseStep.pause(plan.reason_code)
 
-    goal = developer_app_goal(profile=profile, request=request, flows=flows)
+    goal = developer_app_goal(
+        profile=profile,
+        request=request,
+        flows=flows,
+        # The RUN half of the creation gate, read from the run's own immutable
+        # ledger column at the composition root. A deps bundle that never carried
+        # it reads ``reuse_only``, so an unwired deployment narrows this phase
+        # rather than widening it.
+        credential_creation_policy=deps.credential_creation_policy,
+    )
     session = await deps.sessions.session_for(run_id=run_id, phase=DEVELOPER_APP_PHASE, lease=lease)
     try:
         result = await run_action_loop(
@@ -3561,6 +3672,8 @@ async def drive_developer_app(
             decider=deps.decider,
             telemetry=deps.telemetry,
             deadlines=deps.deadlines,
+            run_id=run_id,
+            scratchpads=deps.scratchpads,
         )
     except DecisionFailed as failure:
         # The reservation stays open for the same reason it does below: nothing was
@@ -5083,6 +5196,8 @@ async def _drive_phase(
             decider=deps.decider,
             telemetry=deps.telemetry,
             deadlines=deps.deadlines,
+            run_id=run_id,
+            scratchpads=deps.scratchpads,
         )
     except DecisionFailed as failure:
         # The chain was called and could not answer usably: pause naming which of

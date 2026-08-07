@@ -1617,11 +1617,17 @@ class _ManagedEndpointService:
         )
 
 
-def test_managed_api_endpoints_are_owner_gated_typed_and_no_store(
+def test_managed_api_endpoints_are_token_gated_typed_and_no_store(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Renamed from ``..._owner_gated_...``: /connect and /poll-connection sit
+    # behind ``_require_agent_action`` (api/app.py:689), not the owner gate, so
+    # the only authority they need is the internal token set below. The
+    # ALLOW_LOCAL_CREDENTIAL_SUBMISSION setenv that used to sit here was
+    # vestigial -- neither route reads that flag any more, and leaving it in
+    # place asserted an authority the endpoints do not actually require, which
+    # would have hidden a regression that re-coupled them to it.
     internal_token = "canonical-runtime-internal-token-" + ("i" * 32)
-    monkeypatch.setenv("ALLOW_LOCAL_CREDENTIAL_SUBMISSION", "true")
     monkeypatch.setenv("OPS_INTERNAL_API_TOKEN", internal_token)
     service = _ManagedEndpointService()
     application = create_app(service=cast(Any, service))
@@ -1679,10 +1685,19 @@ def test_composition_root_binds_every_onboarding_port(tmp_path: Path) -> None:
         assert ports.validator is not None
         assert ports.decider is not None
         assert ports.vault is not None
-        # Research is the one port with no implementation to bind in this tree, and
-        # it says so rather than pretending (Requirement 2.7 is a run outcome; this
-        # is a configuration one).
-        assert ports.unavailable == {"research": "research_adapters_unavailable"}
+        # The ports this deployment cannot bind say so rather than pretending
+        # (Requirement 2.7 is a run outcome; this is a configuration one). Research
+        # and the publisher are absent because THESE settings configure neither a
+        # discovery adapter nor Composio; the signup submitter and the login route
+        # are absent because no implementation of either exists anywhere in the
+        # tree yet. All four are reported, and every phase that needs one stops
+        # with the code named here instead of being driven by a faked port.
+        assert ports.unavailable == {
+            "research": "research_adapters_unavailable",
+            "publisher": "capture_spec_unavailable",
+            "signup_submitter": "signup_policy_absent",
+            "login_route": "credentials_missing",
+        }
         # The budgets and lease timings come from settings, not from literals.
         assert ports.captcha_budget.max_pauses == settings.onboarding_captcha_pause_budget
         assert ports.budget.max_actions == settings.onboarding_loop_max_actions

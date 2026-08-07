@@ -10,6 +10,17 @@ address, and remembers the message id it handled.
 Credentials that arrive by email are stored as vault references only and merged
 into the reference-only bundle; a rejection blocks the run. Both are recorded
 through the single transition authority, never by writing a status directly.
+
+The model here is an *input*, never an authority. Reply classification is asked
+of ``ops.email.ai`` on the one governed inference chain (budget, per-attempt
+timeout, circuit breaker, attempt sink), and every attempt it makes is recorded
+on the ``reply_received`` audit event; when the chain has nothing usable to say
+the deterministic ``ReplyClassifier`` answer stands, so an exhausted or
+unconfigured chain degrades the classification rather than stopping the run.
+Nothing consequential is left to the model alone: credentials only advance a run
+when the vault broker actually produced references, and whether browser
+onboarding may begin is decided by ``_browser_onboarding_ready`` from facts this
+module extracted, with the model's own boolean recorded beside it as a hint.
 """
 
 from __future__ import annotations
@@ -17,9 +28,11 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Mapping
-from typing import Any, Protocol, cast
+from dataclasses import dataclass, field
+from typing import Any, Final, Protocol, cast
 
 from ops.core.config import Settings
+from ops.core.inference import DecisionFailed, DecisionOutcome
 from ops.core.models import CompanyProfile, OperationalResearch, OperationsRequest
 from ops.core.state import RunStatus, validate_status_transition
 from ops.core.storage import OperationsStorage
@@ -33,6 +46,23 @@ from ops.runs.projections import _public_run, _strip_quoted_reply
 from ops.runs.recipe_snapshot import RecipeSnapshotError, recipe_from_run
 from ops.workflow.graph import DurableOperationsWorkflow
 from ops.workflow.integrator import build_integrator_bundle
+
+# The most run rows one reply-poll pass will page through while looking for runs
+# that are actually waiting. The poller used to read ``list_runs(limit, offset=0)``
+# and stop, which meant it only ever saw the NEWEST ``limit`` rows: once a
+# ``waiting_for_reply`` run was pushed off page one by newer runs, its provider
+# reply was never collected again and the run sat waiting forever with nothing in
+# the logs to say why. Paging fixes that, but "paged" must not mean "unbounded" —
+# this runs on the shared poller thread ahead of the reply intake, so a pass has
+# to finish inside ``email_poll_interval_seconds`` no matter how old the ledger
+# is. Same ceiling and same reasoning as ``ops/runs/advance.py``'s sweep bound.
+_MAX_SCAN_ROWS: Final = 10_000
+
+# How many rows one ``list_runs`` call fetches while scanning. Deliberately NOT
+# ``limit``: ``limit`` is the shared-mailbox work budget (how many runs may be
+# polled), and reusing it as the page size would have made a deployment with
+# ``EMAIL_POLL_MAX_RUNS_PER_CYCLE=1`` issue one query per run in the ledger.
+_SCAN_PAGE_SIZE: Final = 100
 
 
 class RunEmailContext(Protocol):
@@ -59,6 +89,83 @@ class RunEmailContext(Protocol):
         limit: int = 1_000,
         max_attempts_per_run: int | None = None,
     ) -> int: ...
+
+
+@dataclass(slots=True)
+class _EmailModelAttempts:
+    """One row per attempt of the email inference chain (reliability R4.3).
+
+    Implements ``ops.core.inference.DecisionAttemptSink``. Provider name, typed
+    outcome and latency only — never a prompt, a payload, or an answer — which is
+    the same contract the browser loop's sink holds itself to.
+
+    These rows ride in the ``reply_received`` audit event the intake transaction
+    already writes, rather than in ``onboarding_decision_attempts``, because that
+    table cannot hold them: its rows are keyed by an onboarding *phase* and its
+    ``purpose`` column is constrained to ``("action", "plan")``
+    (ops/core/storage.py:408), and a gated run waiting on a vendor reply has
+    neither. Putting them in the audit event needs no migration and is enough to
+    answer the question that was previously unanswerable in production — "why did
+    this reply get classified by the heuristic instead of the model?" — because
+    before the merge that failure raised one flat ``RuntimeError`` into a bare
+    ``except`` and left nothing behind at all.
+    """
+
+    rows: list[dict[str, object]] = field(default_factory=list)
+
+    def record_attempt(self, *, provider: str, outcome: DecisionOutcome, latency_ms: int) -> None:
+        # Bounded by the chain itself (``max_providers``), but capped again here:
+        # this list is serialized into a durable audit payload, and an audit row
+        # must not be able to grow without a bound of its own.
+        if len(self.rows) >= 10:
+            return
+        self.rows.append({"provider": provider, "outcome": outcome, "latency_ms": int(latency_ms)})
+
+
+def _browser_onboarding_ready(
+    *,
+    classification: str,
+    official_setup_urls: tuple[str, ...],
+    credential_refs: Mapping[str, str],
+) -> bool:
+    """Whether this reply is what starts browser onboarding — the code's call.
+
+    ``ReplyAnalysisAI.start_browser_onboarding`` is a boolean a *model* writes,
+    and no model may decide that a browser session gets driven against a live
+    third-party site. It is kept (the schema is published and another surface may
+    read it) but demoted to a hint recorded beside this answer; the predicate is:
+
+    * ``official_setup_urls`` is non-empty. These come from
+      ``ReplyClassifier``'s regex over the sanitized body of the ONE
+      Gmail-authenticated inbound message (ops/email/reply_classifier.py:91),
+      never from ``ReplyAnalysisAI.setup_urls``, which is model-authored and can
+      name a host the vendor never sent. "Approved" with nowhere to go is not a
+      thing to open a browser for, and a fabricated URL must not become one.
+    * no credential references arrived. If the vault broker already extracted a
+      credential from this very message there is nothing left for a browser to
+      obtain, and the run is on its way to ``completed``.
+    * the classification is ``approved_setup_required``. This is the one conjunct
+      the model can still influence, and only within the eleven-member enum, only
+      when it validated, and only when the deterministic classifier was not the
+      one that answered — the other two conjuncts are facts the code extracted.
+
+    Recomputed here rather than read off ``heuristic.start_browser_onboarding``
+    (ops/email/reply_classifier.py:207), which applies the same rule, because by
+    this point ``cls`` may be the *model's* classification: reporting the
+    heuristic's boolean beside a classification the heuristic did not make would
+    put two disagreeing facts on one audit event. The rule is deliberately the
+    classifier's own, so a deployment with no model configured behaves
+    identically to one whose chain agreed with it.
+
+    A true here is a *precondition*, not an authorization: whatever eventually
+    consumes it still passes the browser host policy and the run's own gates.
+    """
+
+    return (
+        classification == "approved_setup_required"
+        and bool(official_setup_urls)
+        and not credential_refs
+    )
 
 
 def _latest_exact_inbound(
@@ -159,28 +266,77 @@ class RunEmailService:
                 break
 
     def poll_waiting_runs(self, *, limit: int = 100) -> int:
-        """Poll every run awaiting a provider reply; returns how many were polled.
+        """Poll runs awaiting a provider reply; returns how many were polled.
 
         Idempotent: poll_email acts only on a genuinely new inbound reply, so
         repeated cycles over the same runs are safe no-ops.
+
+        ``limit`` is a *work* budget, not a scan window. It bounds how many runs
+        this pass reads the shared mailbox for (``EMAIL_POLL_MAX_RUNS_PER_CYCLE``,
+        "so one large backlog cannot starve the API or monopolize the connected
+        Gmail account"). It used to double as the ``list_runs`` page size with
+        ``offset=0``, which quietly made it a *visibility* window as well: only
+        the newest ``limit`` rows were ever considered, so the moment a
+        ``waiting_for_reply`` run was displaced off page one by newer runs its
+        reply stopped being collected — permanently, and silently, because a run
+        that is never polled also never reports a failure.
+
+        Two halves to the fix, and both are needed:
+
+        * the ledger is *scanned* in pages up to ``_MAX_SCAN_ROWS`` so a waiting
+          run is found wherever it sits; and
+        * the runs found are polled OLDEST first. ``list_runs`` orders newest
+          first, so taking the first ``limit`` of the scan would have re-created
+          the same starvation one level up — with more waiting runs than the
+          budget allows, the same newest few would be polled every cycle forever
+          while the oldest, the ones most likely to have a reply sitting unread,
+          were never reached. Oldest-first drains: whatever is served completes
+          and leaves the waiting set.
         """
 
         context = self._context
-        if context._gmail_worker is None:
+        if context._gmail_worker is None or limit <= 0:
             return 0
+        # Only run ids are retained from the scan, so bounding it at 10k rows
+        # costs a list of short strings even in the worst case where every row
+        # is waiting.
+        waiting: list[str] = []
+        offset = 0
+        while offset < _MAX_SCAN_ROWS:
+            records = context.storage.list_runs(
+                limit=min(_SCAN_PAGE_SIZE, _MAX_SCAN_ROWS - offset),
+                offset=offset,
+            )
+            if not records:
+                break
+            for record in records:
+                if record.get("state_engine") != "canonical_v1":
+                    continue
+                if record.get("status") not in {"waiting_for_reply", "outreach_sent"}:
+                    continue
+                run_id = str(record.get("run_id") or "")
+                if run_id:
+                    waiting.append(run_id)
+            offset += len(records)
+            if len(records) < _SCAN_PAGE_SIZE:
+                break
         polled = 0
-        for record in context.storage.list_runs(limit=limit, offset=0):
-            if record.get("state_engine") != "canonical_v1":
-                continue
-            if record.get("status") not in {"waiting_for_reply", "outreach_sent"}:
-                continue
-            run_id = str(record.get("run_id") or "")
-            if not run_id:
-                continue
+        attempted = 0
+        for run_id in reversed(waiting):
+            if attempted >= limit:
+                break
+            # The budget is spent on the ATTEMPT, not on the success. A failing
+            # ``poll_email`` may already have hit the mailbox before it raised, so
+            # counting only successes would let a backlog of failing runs make
+            # unbounded provider reads in a single pass — the exact thing
+            # ``EMAIL_POLL_MAX_RUNS_PER_CYCLE`` exists to prevent. The return value
+            # still reports successful polls only.
+            attempted += 1
             try:
                 context.poll_email(run_id)
                 polled += 1
             except Exception:
+                # One unreadable run must not end the pass for the others.
                 continue
         return polled
 
@@ -190,6 +346,9 @@ class RunEmailService:
         public = _public_run(record)
         public["latest_reply_class"] = "no_reply"
         public["follow_up_sent"] = False
+        # Same key on every receipt this method can return, so a caller never has
+        # to tell "absent" from "false" to know whether to expect a browser leg.
+        public["start_browser_onboarding"] = False
         return public
 
     def company_from_checkpoint(self, thread_id: str) -> CompanyProfile | None:
@@ -365,7 +524,12 @@ class RunEmailService:
                 cls = heuristic.classification
                 ai_reply_body: str | None = None
                 classified_by = "heuristic"
-                assistant = build_email_assistant(settings)
+                # The model's own browser-onboarding boolean, recorded but never
+                # obeyed; see ``_browser_onboarding_ready``.
+                model_start_hint: bool | None = None
+                model_reason: str | None = None
+                attempts = _EmailModelAttempts()
+                assistant = build_email_assistant(settings, attempts=attempts)
                 company = self.company_from_record(current)
                 if (
                     reply_text
@@ -381,9 +545,36 @@ class RunEmailService:
                         )
                         cls = ai.classification
                         ai_reply_body = (ai.reply_body or "").strip() or None
+                        model_start_hint = bool(ai.start_browser_onboarding)
                         classified_by = "llm"
-                    except Exception:
+                    except DecisionFailed as failure:
+                        # The chain is bounded now, so the model giving up is a
+                        # typed outcome rather than the silence it used to be: the
+                        # reason code lands in the audit event below next to the
+                        # per-provider attempt rows. Falling back to the offline
+                        # classifier is still the right move — a vendor reply that
+                        # no provider would classify must not park the run on a
+                        # human — but it is no longer indistinguishable from a
+                        # deployment that has no model configured at all.
                         classified_by = "heuristic"
+                        model_reason = failure.reason_code
+                    except Exception:
+                        # Anything the chain did not classify itself, including a
+                        # programming error it deliberately re-raises. Still
+                        # swallowed, because the poller must survive every run:
+                        # this is per-run intake and a raise here would strand the
+                        # reply. It is no longer invisible, which was the actual
+                        # defect — a wrong-shaped call now shows up as this code on
+                        # the ``reply_received`` event of every polled run.
+                        classified_by = "heuristic"
+                        model_reason = "model_unusable"
+
+                # The code owns whether a browser gets driven, not the model.
+                start_browser_onboarding = _browser_onboarding_ready(
+                    classification=cls,
+                    official_setup_urls=heuristic.official_setup_urls,
+                    credential_refs=credential_refs,
+                )
 
                 next_status: RunStatus = "waiting_for_reply"
                 follow_up_sent = False
@@ -465,6 +656,15 @@ class RunEmailService:
                             "follow_up_sent": follow_up_sent,
                             "rounds": rounds,
                             "external_actions": True,
+                            # The code's answer, then the model's, then why the
+                            # model did not answer at all, then the chain itself.
+                            # Kept as four separate keys deliberately: a run where
+                            # the two booleans disagree is the one worth reading,
+                            # and collapsing them would hide exactly that.
+                            "start_browser_onboarding": start_browser_onboarding,
+                            "model_start_browser_hint": model_start_hint,
+                            "model_reason_code": model_reason,
+                            "model_attempts": list(attempts.rows),
                         },
                     )
                 committed = True
@@ -472,6 +672,9 @@ class RunEmailService:
                 # Non-persisted, non-secret classification for the caller's receipt.
                 public["latest_reply_class"] = cls
                 public["follow_up_sent"] = follow_up_sent
+                # The code-owned predicate, so a caller reads the decision this
+                # module made and never has to re-derive it from a model field.
+                public["start_browser_onboarding"] = start_browser_onboarding
             except Exception:
                 if not committed:
                     context._gmail_worker.release_outreach_reply(

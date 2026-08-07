@@ -8,7 +8,7 @@ from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, Self
+from typing import TYPE_CHECKING, Final, Literal, Self
 from urllib.parse import parse_qsl, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -51,7 +51,30 @@ CredentialFieldKind = Literal[
 CaptureMode = Literal["managed_connection", "automatic", "owner_submit", "none"]
 CaptureSource = Literal["input_value", "text"]
 BrowserRecipeScope = Literal["entry_only", "credential_surface"]
-BrowserAction = Literal["navigate", "authenticate_then_navigate", "capture_boundary"]
+# What one reviewed browser step is FOR. The first three move the page; the last
+# three do not, and that distinction is now load-bearing rather than descriptive.
+#
+# Until these existed the recipe language could only say "go somewhere", so a flow
+# whose next move happens on the page already loaded — telegram issuing a token
+# through a chat, a settings panel that opens a dialog — had no way to be written
+# down. The step still cannot name a selector or a value: ``click_control`` and
+# ``await_control`` point at ``control_names``, ``fill_field`` points at
+# ``allowed_value_refs``, and both of those are reviewed allow-lists the model
+# chooses from by id. What an in-page verb actually buys is the REMOVAL of the
+# reviewed navigation candidate, so a step that means "act here" can no longer be
+# satisfied by walking away from the page.
+BrowserAction = Literal[
+    "navigate",
+    "authenticate_then_navigate",
+    "capture_boundary",
+    "click_control",
+    "fill_field",
+    "await_control",
+]
+# The subset that may carry a ``target_url`` and be offered a ``goto`` candidate.
+NAVIGATING_BROWSER_ACTIONS: Final[frozenset[str]] = frozenset(
+    {"navigate", "authenticate_then_navigate", "capture_boundary"}
+)
 # ``email_first`` is a reviewer's claim: a human confirmed the route asks for an
 # email alone and only then for a password. ``dom_detected`` is what a researched
 # route may claim instead -- the entry paths and submit labels are evidence-backed,
@@ -136,6 +159,14 @@ _HOST_PATTERN = re.compile(
 _SENSITIVE_QUERY_NAMES = frozenset(
     {"access_token", "api_key", "code", "key", "password", "secret", "token"}
 )
+# The characters a reviewed URL fragment may use: RFC 3986 unreserved and
+# sub-delims plus "/", "?" and "%", which is every character a hash route needs.
+# Deliberately absent are ":" and "#", so a fragment can never spell a second
+# absolute URL ("https://evil.example") for anything downstream to peel off and
+# follow, and control characters and whitespace, which only ever arrive from a
+# mangled paste. The 256 cap is well above any real route and keeps a fragment
+# from being used as a payload channel inside a reviewed catalog entry.
+_FRAGMENT_PATTERN = re.compile(r"[A-Za-z0-9\-._~!$&'()*+,;=@/?%]{1,256}")
 
 
 class AppRecipeCatalogError(ValueError):
@@ -152,7 +183,29 @@ class _RecipeModel(BaseModel):
 
 
 def _https_url(value: str, label: str) -> str:
+    """Return ``value`` unchanged once it is usable as a reviewed recipe URL.
+
+    PRE: ``value`` is catalog text, not a URL read off a live page.
+    POST: the result is https, carries a host, no userinfo, no sensitive query
+    name, and at most one bounded fragment; otherwise ``ValueError``.
+
+    A fragment is allowed because the client never puts it on the wire: it is a
+    routing artifact the browser keeps to itself, so refusing one buys no
+    security while making real destinations unrepresentable -- neo4j Aura hides
+    its API-key page behind ``#/``, and every SPA hash route reads the same way.
+    Nothing that guards navigation looks at it either: host confinement reads
+    ``urlsplit(...).hostname`` and path matching reads ``.path``, both of which
+    ``urlsplit`` splits the fragment off before returning.
+    """
+
     parsed = urlsplit(value)
+    # The RAW fragment, not ``parsed.fragment``: ``urlsplit`` silently deletes
+    # ASCII tab and newline anywhere in the URL, so the parsed fragment of
+    # "...#a<TAB>b" is a clean "ab" while the tab stays in the value we return.
+    # Reading the text after the first "#" ourselves is what makes the "no
+    # control characters, no whitespace" half of the contract true, and it also
+    # puts any second "#" inside the checked span.
+    _before, _hash, raw_fragment = value.partition("#")
     if (
         not value
         or len(value) > 2_048
@@ -160,7 +213,7 @@ def _https_url(value: str, label: str) -> str:
         or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
-        or parsed.fragment
+        or (raw_fragment and _FRAGMENT_PATTERN.fullmatch(raw_fragment) is None)
     ):
         raise ValueError(f"{label} must be a stable HTTPS URL")
     query_names = {
@@ -169,6 +222,23 @@ def _https_url(value: str, label: str) -> str:
     if query_names & _SENSITIVE_QUERY_NAMES:
         raise ValueError(f"{label} contains sensitive query data")
     return value
+
+
+def _without_fragment(value: str | None) -> str | None:
+    """Return ``value`` with any fragment removed, for boundaries that ban one.
+
+    PRE: ``value`` is a reviewed recipe URL (or ``None``).
+    POST: the result is the same URL up to, but not including, the first ``#``.
+
+    Splitting on the literal ``#`` rather than re-joining ``urlsplit`` parts keeps
+    the surviving text byte-identical, so a URL that never had a fragment is
+    returned unchanged and no percent-encoding is silently rewritten.
+    """
+
+    if value is None:
+        return None
+    head, _, _fragment = value.partition("#")
+    return head
 
 
 def _unique(values: tuple[str, ...], label: str, maximum: int = 30) -> tuple[str, ...]:
@@ -247,6 +317,18 @@ class BrowserStep(_RecipeModel):
     # setting create_if_missing on a run is insufficient: both the run and this
     # recipe-owned allowlist must authorize the control.
     credential_creation_controls: tuple[str, ...] = Field(default=(), max_length=20)
+    # Reviewed accessible names of controls the agent may CONSIDER on this step.
+    #
+    # `completion` answers "is this step done"; it is folded into the checkpoint's
+    # expected_signals, which `generate_candidates` uses as a relevance filter over
+    # element names. Those two jobs pull apart: the Pipedrive step is complete when
+    # the page says "API token", but the control that gets there is named "Generate
+    # new token" -- which matches neither the path nor the completion text, so the
+    # filter dropped the only useful element and the run stopped for a human on a
+    # page it could have finished itself. Naming the controls here restores them as
+    # candidates WITHOUT asserting they must be present for the step to count as
+    # complete (a created token's button may well disappear).
+    control_names: tuple[str, ...] = Field(default=(), max_length=20)
 
     @field_validator("target_url")
     @classmethod
@@ -266,14 +348,44 @@ class BrowserStep(_RecipeModel):
     def validate_creation_controls(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return _unique(value, "browser step creation controls", 20)
 
+    @field_validator("control_names")
+    @classmethod
+    def validate_control_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _unique(value, "browser step control names", 20)
+
     @model_validator(mode="after")
     def validate_step(self) -> Self:
         if not self.completion.has_positive_condition():
             raise ValueError("browser step needs a positive predicate")
         if len(self.hitl_gates) != len(set(self.hitl_gates)):
             raise ValueError("HITL gates contain duplicates")
-        if self.credential_creation_controls and self.action != "capture_boundary":
-            raise ValueError("credential creation controls require a capture-boundary step")
+        # ``click_control`` joins ``capture_boundary`` here because it is the verb
+        # for exactly this act — pressing a reviewed "Create API key" on a page the
+        # run is already on. Every other verb either moves the page or does not
+        # press anything, so authorizing creation on one would be a control the
+        # step can never reach.
+        if self.credential_creation_controls and self.action not in {
+            "capture_boundary",
+            "click_control",
+        }:
+            raise ValueError("credential creation controls require a capture or click step")
+        # Authorizing a control the candidate filter can never surface is a silent
+        # no-op that reads like a working configuration. Require the reviewer to
+        # declare it in both places, so the two lists cannot drift apart.
+        if set(self.credential_creation_controls) - set(self.control_names):
+            raise ValueError("credential creation control is missing from control names")
+        # An in-page step must say what it acts ON, or it authorizes nothing and
+        # merely removes the navigation candidate — a step that can only stall.
+        # The requirement is per verb because the two allow-lists are different
+        # authorities: control_names widens what may be CLICKED, allowed_value_refs
+        # names the reviewed non-secret values that may be TYPED.
+        if self.action not in NAVIGATING_BROWSER_ACTIONS:
+            if self.target_url is not None:
+                raise ValueError("an in-page browser step cannot carry a target url")
+            if self.action == "fill_field" and not self.allowed_value_refs:
+                raise ValueError("fill_field needs at least one allowed value reference")
+            if self.action in {"click_control", "await_control"} and not self.control_names:
+                raise ValueError(f"{self.action} needs at least one reviewed control name")
         return self
 
 
@@ -318,6 +430,27 @@ class BrowserRecipe(_RecipeModel):
     scope: BrowserRecipeScope
     exact_hosts: tuple[str, ...] = Field(min_length=1, max_length=30)
     identity_provider_hosts: tuple[str, ...] = Field(default=(), max_length=30)
+    # Reviewed hosts that only exist on the far side of a successful sign-in: the
+    # console the vendor lands you on, or the hosted-auth callback host it bounces
+    # through (``*.auth0.com``-style tenants, ``clerk.<vendor>``, a separate
+    # ``app.`` origin that the marketing site never links to).
+    #
+    # A fourth host list rather than more ``exact_hosts`` entries, because
+    # ``exact_hosts`` is read by five callers as the answer to "which hosts does
+    # this vendor own for PUBLIC research purposes" -- research-result acceptance
+    # (ops/you/host_policy.py:117), signup-route scanning
+    # (ops/research/signup_agent.py:283), the planner's surface validator
+    # (ops/planner/validator.py:133), verification-link acceptance
+    # (ops/runs/verification.py:447) and the signup overlay
+    # (ops/recipes/signup_overlay.py:120). A post-login console is a place the run
+    # goes, not a place a search result may claim to be, and folding the two would
+    # quietly widen all five.
+    #
+    # Exact hosts only (``wildcard=False``): unlike ``static_resource_hosts``, an
+    # entry here becomes a TOP-LEVEL navigation destination via
+    # ``ops/browser/host_policy.py``, and a wildcard destination is a subdomain
+    # takeover away from being an open redirect target.
+    post_auth_hosts: tuple[str, ...] = Field(default=(), max_length=30)
     static_resource_hosts: tuple[str, ...] = Field(default=(), max_length=30)
     # Email is a separate trust boundary from browser navigation. Sender domains
     # and magic-link hosts must be reviewed explicitly rather than guessed from
@@ -341,6 +474,14 @@ class BrowserRecipe(_RecipeModel):
     def validate_idp_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(
             _host(item, "identity-provider host", wildcard=False)
+            for item in _unique(value, "hosts")
+        )
+
+    @field_validator("post_auth_hosts")
+    @classmethod
+    def validate_post_auth_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(
+            _host(item, "post-authentication host", wildcard=False)
             for item in _unique(value, "hosts")
         )
 
@@ -372,10 +513,43 @@ class BrowserRecipe(_RecipeModel):
             raise ValueError("browser success must combine a path and structural label")
         if self.scope == "entry_only" and not self.success.has_positive_condition():
             raise ValueError("entry-only browser success is unprovable")
+        # A host may be declared once and in one role. Listing the same host as
+        # both a vendor host and a post-auth host is not additive -- it is a
+        # reviewer saying two different things about it, and the reader that
+        # matters (``exact_hosts`` means "the vendor owns this publicly") would
+        # silently win. Refuse it at review time instead of resolving it at
+        # runtime.
+        overlap = set(self.post_auth_hosts) & (
+            set(self.exact_hosts) | set(self.identity_provider_hosts)
+        )
+        if overlap:
+            raise ValueError("post-authentication host is already declared in another host role")
+        # The three navigation host lists are unioned into ONE flat pattern list by
+        # ``ops/browser/host_policy.py``, and that list is serialized across the
+        # browser-service RPC, where both the request model
+        # (browser_service/models.py) and the rebuild
+        # (``allowed_hosts_from_patterns``) refuse anything longer than
+        # ``MAX_ALLOWED_HOST_PATTERNS``. Each field's own ``max_length`` of 30 was
+        # a sufficient bound while only ``exact_hosts`` reached navigation; the
+        # union is not, so a recipe that validates here could still be refused at
+        # session creation with a 422 that names the wire, not the recipe. Counted
+        # after de-duplication because the rebuild counts unique patterns too.
+        # Imported inside the call: host_policy imports THIS module at its top.
+        from ops.browser.host_policy import MAX_ALLOWED_HOST_PATTERNS
+
+        navigation_hosts = {*self.exact_hosts, *self.identity_provider_hosts, *self.post_auth_hosts}
+        if len(navigation_hosts) > MAX_ALLOWED_HOST_PATTERNS:
+            raise ValueError("browser navigation hosts exceed the serialized allow-list bound")
+        # The navigation destinations a step may name. ``post_auth_hosts`` counts
+        # because ``ops/browser/host_policy.py`` now unions it into the run's
+        # navigation allow-list: a step whose target the boundary permits but the
+        # schema refuses would make the field undeclarable for the one flow it
+        # exists for (step 2 = "open the console you were redirected into").
+        step_target_hosts = frozenset((*self.exact_hosts, *self.post_auth_hosts))
         for step in self.steps:
             if step.target_url is not None:
                 host = (urlsplit(step.target_url).hostname or "").casefold()
-                if host not in self.exact_hosts:
+                if host not in step_target_hosts:
                     raise ValueError("browser step target is outside exact navigation hosts")
         return self
 
@@ -789,12 +963,17 @@ def recipe_to_operational_research(
     if recipe.outreach is not None:
         contact_url = recipe.outreach.contact_url or contact_url
         contact_email = recipe.outreach.contact_email
-    reviewed_urls = {
-        "developer_portal_url": recipe.urls.developer_portal,
-        "signup_url": recipe.urls.signup,
-        "login_url": recipe.urls.login,
-        "credential_management_url": recipe.urls.credential_management,
-        "contact_url": contact_url,
+    # The research boundary refuses a fragment on an operational URL
+    # (``ops/core/models.validate_operational_url``), and a recipe may now carry
+    # one. The fragment is exactly the part the server never sees, so dropping it
+    # here loses nothing the research record is for -- it names an entry POINT --
+    # while the recipe itself keeps the hash route the browser actually needs.
+    reviewed_urls: dict[str, str | None] = {
+        "developer_portal_url": _without_fragment(recipe.urls.developer_portal),
+        "signup_url": _without_fragment(recipe.urls.signup),
+        "login_url": _without_fragment(recipe.urls.login),
+        "credential_management_url": _without_fragment(recipe.urls.credential_management),
+        "contact_url": _without_fragment(contact_url),
     }
     operational_url_claims = [
         {"field": field, "url": url, "source_url": url}
@@ -806,15 +985,15 @@ def recipe_to_operational_research(
         {
             "app_name": app_name or recipe.app_name,
             "credential_fields": [field.name for field in recipe.credential_fields],
-            "developer_portal_url": recipe.urls.developer_portal,
-            "signup_url": recipe.urls.signup,
-            "login_url": recipe.urls.login,
-            "credential_management_url": recipe.urls.credential_management,
+            "developer_portal_url": reviewed_urls["developer_portal_url"],
+            "signup_url": reviewed_urls["signup_url"],
+            "login_url": reviewed_urls["login_url"],
+            "credential_management_url": reviewed_urls["credential_management_url"],
             "operational_url_claims": operational_url_claims,
             "access_route": access_route,
             "production_approval_required": recipe.route_kind == "gated",
             "contact_email": contact_email,
-            "contact_url": contact_url,
+            "contact_url": reviewed_urls["contact_url"],
             "evidence_urls": list(dict.fromkeys([*base.evidence_urls, *recipe.evidence_urls])),
         }
     )
@@ -877,6 +1056,10 @@ def recipe_to_browser_trace(recipe: AppRecipe) -> BrowserApiTrace | None:
                         *step.completion.title_contains,
                         *step.completion.visible_text_contains,
                         *step.completion.required_accessible_names,
+                        # Reviewed control labels widen the candidate filter only;
+                        # they are absent from `completion` above, so they never
+                        # become a condition for the step being finished.
+                        *step.control_names,
                     )
                 )
             )
@@ -884,6 +1067,14 @@ def recipe_to_browser_trace(recipe: AppRecipe) -> BrowserApiTrace | None:
             completion=predicate(step.completion),
             allowed_value_refs=step.allowed_value_refs,
             credential_creation_controls=step.credential_creation_controls,
+            # The step's reviewed destination, which used to stop here. Every
+            # three-step recipe already names its API-settings page on step 2 and
+            # the executing loop never saw it, so the one page the run exists to
+            # reach was not among the places it was allowed to go. The host was
+            # checked against ``exact_hosts`` when the recipe was validated, and
+            # ``navigation_allowed`` checks it again before and after the move.
+            target_url=step.target_url,
+            navigates=step.action in NAVIGATING_BROWSER_ACTIONS,
             # Recipe HITL gates describe conditions that trigger a pause; they are
             # not unconditional manual checkpoints. The deterministic gate detector
             # enforces them when they are actually present on the page.
@@ -1013,6 +1204,7 @@ __all__ = [
     "CredentialFieldKind",
     "GATED_SLUGS",
     "MANAGED_AUTH_SLUGS",
+    "NAVIGATING_BROWSER_ACTIONS",
     "OutreachSpec",
     "PLAYWRIGHT_SLUGS",
     "ReadinessTier",

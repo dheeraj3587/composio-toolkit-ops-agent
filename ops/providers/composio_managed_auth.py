@@ -17,6 +17,7 @@ import ipaddress
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Literal, Protocol, cast
 from urllib.parse import urlsplit
 
@@ -272,6 +273,7 @@ class ComposioManagedAuthProvider:
             self._mark_failed(MANAGED_AUTH_LINK_ACTION, safe_effect)
             raise
 
+        already_connected = _multiple_connected_accounts_error()
         try:
             response = await asyncio.to_thread(
                 self._client.connected_accounts.link,
@@ -280,6 +282,18 @@ class ComposioManagedAuthProvider:
                 callback_url=safe_callback,
                 alias=alias,
                 allow_multiple=False,
+            )
+        except already_connected:
+            # Composio refused to create a second connection because an ACTIVE one
+            # already covers this user and auth config, so no link was made. Adopt
+            # the existing connection instead of failing: effect_identity is
+            # per-run, so every retry would present a new identity (and a new
+            # alias) and could never reconcile this app.
+            return await self._adopt_active_connection(
+                toolkit_slug=safe_toolkit,
+                auth_config_id=auth_config_id,
+                effect_identity=safe_effect,
+                binding_digest=binding_digest,
             )
         except Exception:
             self._mark_outcome_unknown(MANAGED_AUTH_LINK_ACTION, safe_effect)
@@ -398,12 +412,68 @@ class ComposioManagedAuthProvider:
             replayed=True,
         )
 
+    async def _adopt_active_connection(
+        self,
+        *,
+        toolkit_slug: str,
+        auth_config_id: str,
+        effect_identity: str,
+        binding_digest: str,
+    ) -> ManagedConnectionStart:
+        """Complete this effect against the ACTIVE connection Composio already holds.
+
+        No link call succeeded, so nothing was duplicated; the run simply inherits
+        the connection that made a second link impossible. An already-active
+        account has no pending redirect, which is exactly right — there is nothing
+        left for the owner to authorize.
+        """
+
+        try:
+            request_id = await self._find_connection_request(
+                toolkit_slug=toolkit_slug,
+                auth_config_id=auth_config_id,
+                alias=None,
+            )
+        except Exception:
+            # The lookup failed, or found two ACTIVE accounts and refused to guess.
+            # Release the reservation before the error escapes: Composio refused
+            # the link, so no effect was spent and "failed" is the honest status.
+            # Leaving it pending is the trap this arm exists to avoid — the next
+            # arrival would read ``reconcile_required`` and reconcile BY ALIAS,
+            # and this run's alias was never written to any connection, so it
+            # would refuse forever even after an operator removed the duplicate.
+            self._mark_failed(MANAGED_AUTH_LINK_ACTION, effect_identity)
+            raise
+        if request_id is None:
+            # Composio reported an active account but will not show it; creating
+            # another link here could duplicate a real connection.
+            self._mark_failed(MANAGED_AUTH_LINK_ACTION, effect_identity)
+            raise ProviderOperationError(
+                capability=_CAPABILITY,
+                reason_code="connection_reconciliation_required",
+            )
+        redirect_url = await self._recover_redirect(request_id, toolkit_slug=toolkit_slug)
+        self._complete_or_fail_closed(
+            action=MANAGED_AUTH_LINK_ACTION,
+            effect_identity=effect_identity,
+            receipt={
+                "request_id": request_id,
+                "toolkit_slug": toolkit_slug,
+                "binding_digest": binding_digest,
+            },
+        )
+        return ManagedConnectionStart(
+            connection_request_id=request_id,
+            redirect_url=redirect_url,
+            replayed=True,
+        )
+
     async def _find_connection_request(
         self,
         *,
         toolkit_slug: str,
         auth_config_id: str,
-        alias: str,
+        alias: str | None,
     ) -> str | None:
         try:
             response = await asyncio.to_thread(
@@ -425,7 +495,16 @@ class ComposioManagedAuthProvider:
                 capability=_CAPABILITY,
                 reason_code="connection_reconciliation_response_invalid",
             )
-        matches = [item for item in items if _optional_string_field(item, "alias") == alias]
+        if alias is None:
+            # Adoption path: match the ACTIVE account the SDK itself found, since
+            # this run's alias was never written to any connection.
+            matches = [
+                item
+                for item in items
+                if (_optional_string_field(item, "status") or "").upper() == "ACTIVE"
+            ]
+        else:
+            matches = [item for item in items if _optional_string_field(item, "alias") == alias]
         if not matches:
             return None
         if len(matches) != 1:
@@ -727,6 +806,29 @@ class ComposioManagedAuthProvider:
             )
         except Exception:
             pass
+
+
+class _UnraisableSdkError(Exception):
+    """Stand-in that can never be raised, used when the SDK class is unavailable."""
+
+
+@lru_cache(maxsize=1)
+def _multiple_connected_accounts_error() -> type[BaseException]:
+    """Resolve ``composio.exceptions.ComposioMultipleConnectedAccountsError`` lazily.
+
+    The SDK stays an optional, lazily imported dependency: when it is absent or
+    has dropped the class, the returned sentinel simply never matches and the
+    existing catch-all keeps its behaviour.
+    """
+
+    try:
+        module = importlib.import_module("composio.exceptions")
+    except ImportError:  # pragma: no cover - the SDK is installed in this project
+        return _UnraisableSdkError
+    error = getattr(module, "ComposioMultipleConnectedAccountsError", None)
+    if isinstance(error, type) and issubclass(error, BaseException):
+        return error
+    return _UnraisableSdkError  # pragma: no cover - guards SDK drift only
 
 
 def _field(value: object, name: str) -> object:

@@ -379,6 +379,10 @@ class RunCreationService:
                 if needs_capability and service._capability_preflight is not None:
                     # Evaluate Composio capability exactly once before any verified
                     # P1 fallback (gated outreach or self-serve browser onboarding).
+                    # The canonical app slug is passed through; the preflight
+                    # resolves the reviewed recipe's toolkit_slug for the catalog
+                    # lookup (see resolve_toolkit_slug), because the hyphen-only
+                    # normalizer cannot spell slugs such as help_scout or googleads.
                     capability_report = service._run_capability_preflight(
                         lookup.record.slug, request.app_name
                     )

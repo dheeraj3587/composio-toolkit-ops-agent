@@ -118,16 +118,23 @@ class ManagedSession:
     # Live-view availability, tracked from reality rather than assumed.
     screenshot_available: bool = False
     interactive_ready: bool = False
-    # Revoked permanently before a reviewed credential surface can be captured.
-    # Existing relays are drained at the same transition; new grants fail closed.
+    # Revoked before a reviewed credential surface can be captured; existing relays
+    # are drained at the same transition and new grants fail closed. Restored ONLY
+    # by an explicit release that the worker backs with a structural, fail-closed
+    # proof that the live page bears no credential content. It used to be write-
+    # once, which meant a run that reached the credential surface and then stalled
+    # — a CAPTCHA, a form the agent could not finish — could never be handed back
+    # to a human, because nobody could see the screen again.
     live_view_allowed: bool = True
     # Browser-context document-start mask installed from the checked-in AppRecipe.
     # This protects headed X11 pixels, not only API-served PNG screenshots.
     live_pixel_mask_installed: bool = False
     # Set only after the worker proves the reviewed credential-page predicate.
     credential_surface_ready: bool = False
-    # Monotonic server-side boundary: grants are revoked and attachments drained
-    # before any automatic reveal or capture operation is allowed to run.
+    # Server-side boundary: grants are revoked and attachments drained before any
+    # automatic reveal or capture operation is allowed to run. Cleared only by the
+    # same proven release that restores ``live_view_allowed``, so re-arming the
+    # surface later re-enters the boundary rather than inheriting a stale one.
     secret_capture_boundary_entered: bool = False
     # The (app, account, owner) triple this session's authenticated state is bound
     # to. None means storage state is not being persisted for this session.

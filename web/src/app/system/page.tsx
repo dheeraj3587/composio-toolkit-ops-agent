@@ -27,6 +27,10 @@ export default async function SystemPage() {
   const failing = checks.filter((check) => check.status !== "pass")
   const providers = health?.providers ?? []
   const unchecked = providers.filter((provider) => provider.status === "configured_not_verified")
+  const browserService = health?.browser_service ?? null
+  const capacityInUse = browserService?.capacity_in_use
+  const capacityTotal = browserService?.capacity_total
+  const showCapacity = typeof capacityInUse === "number" && typeof capacityTotal === "number"
 
   return (
     <div className="page-enter page-stack">
@@ -131,6 +135,11 @@ export default async function SystemPage() {
         ) : (
           <Unavailable copy="No capability state was reported. Nothing is assumed ready." />
         )}
+        {showCapacity ? (
+          <p className="mt-3 text-xs leading-5 text-muted-foreground">
+            Browser capacity: {capacityInUse} / {capacityTotal} in use
+          </p>
+        ) : null}
       </section>
 
       <section aria-labelledby="provenance" className="grid items-stretch gap-6 xl:grid-cols-2">

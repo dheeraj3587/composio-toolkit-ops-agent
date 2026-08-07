@@ -23,6 +23,22 @@ from ops.runs.resume import OnboardingRunControlService
 STALE_REASON_CODE: Final[OnboardingReasonCode] = "run_progress_stale"
 PROGRESS_STALE_EVENT: Final = "onboarding_progress_stale"
 
+# Canonical phases that are WAITING ON A PERSON, not stalled. They keep
+# ``status="browser_running"`` because that pair — browser_running plus one of
+# these two phases — is exactly the precondition
+# ``RunCredentialService.submit_credentials`` checks before accepting an owner's
+# secret (see ops/runs/credentials.py). Treating them as staleness candidates
+# meant the sweep failed the run roughly five minutes after it reached the very
+# page it was asking a human to visit, and the failed row then refused the
+# submission it had just invited. Every ``owner_submit`` app lost its window
+# this way.
+#
+# Nothing leaks by exempting them: the browser session is still reclaimed by the
+# session manager's own inactivity and maximum-lifetime TTLs, which is where a
+# real Chromium process belongs. This sweep's job is detecting a driver that
+# stopped stepping, and a run parked for a person has no driver to fence.
+AWAITING_OWNER_PHASES: Final[frozenset[str]] = frozenset({"credential_ready", "entry_reached"})
+
 
 class LeaseHolders(Protocol):
     """The one lease read this sweep needs: is a live holder driving this run?"""
@@ -161,10 +177,17 @@ class RunLivenessService:
         action-loop lease, so its durable ``updated_at`` boundary is the heartbeat;
         only ``browser_running`` is eligible and its operation timeout remains below
         the staleness window under validated settings.
+
+        The phase-driver branch below already exempts its own waiting states via
+        ``WAITING_PHASES``; ``AWAITING_OWNER_PHASES`` is the canonical runtime's
+        equivalent, and both say the same thing — a run waiting on a person is not
+        a run that stopped.
         """
 
         if record.get("state_engine") == "canonical_v1":
             if record.get("status") != "browser_running":
+                return None
+            if str(record.get("phase") or "") in AWAITING_OWNER_PHASES:
                 return None
             return _moment(str(record.get("updated_at") or ""))
 

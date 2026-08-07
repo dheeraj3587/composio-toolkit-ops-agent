@@ -29,6 +29,8 @@ from api.models import (
     AppCatalogResponse,
     AppResearchResponse,
     AppSearchResponse,
+    CreateRunBatchRequest,
+    CreateRunBatchResponse,
     CreateRunRequest,
     CredentialSubmissionRequest,
     HealthResponse,
@@ -68,7 +70,6 @@ from api.service import (
 )
 from ops.core.logging_setup import configure_logging
 from ops.core.redaction import install_redacting_filter
-from ops.providers.errors import ConfigurationRequiredError
 from ops.runs.errors import ProviderReadinessError
 from ops.runs.service import (
     CredentialSubmissionError,
@@ -101,6 +102,10 @@ _KNOWN_VALIDATION_FIELDS = frozenset(
     {
         "body",
         "body.app_name",
+        # The batch create's app list (design LL-8.1). Named for the same reason
+        # ``body.app_name`` is: a rejected list must say which field was wrong
+        # rather than degrading to "unknown_field".
+        "body.app_names",
         "body.account_mode",
         "body.company",
         "body.company.legal_name",
@@ -565,21 +570,50 @@ def create_app(
         # only in the encrypted account vault, never in run state or logs.
         if payload.browser_login is not None:
             _require_owner_action(request)
-        if payload.onboarding:
-            # The autonomous onboarding driver (design LL-6.3) is built and
-            # tested but has never been bound to a browser: no LoopSessionFactory
-            # implementation exists outside the test fakes, so nothing reads this
-            # field. Accepting it silently produced a run driven by the canonical
-            # runtime while the caller believed it had opted into the phase
-            # machine -- the two differ in where a run pauses and what a retry
-            # replays, so the discrepancy surfaces as a mystery much later.
-            # Refuse with a code that names the actual state instead.
-            raise ConfigurationRequiredError(
-                phase=6,
-                capability="autonomous onboarding driver",
-                reason_code="onboarding_driver_not_wired",
-            )
+        # ``payload.onboarding`` used to be refused here with
+        # ``onboarding_driver_not_wired``, and the refusal was true when it was
+        # written: no ``LoopSessionFactory`` existed outside the test fakes, so
+        # accepting the flag would have produced a run driven by the canonical
+        # runtime while the caller believed it had opted into the phase machine.
+        # Both halves now exist -- ``ops.onboarding.browser_session`` binds the
+        # session over the browser service and ``ops.onboarding.worker`` pumps the
+        # queue -- so the flag is served rather than refused. The route itself
+        # stays a pure request: the run service enqueues, the worker drives, and
+        # nothing about the create response waits on a browser.
         return await run_service.create_run(payload, idempotency_key=idempotency_key)
+
+    @application.post(
+        "/api/runs/batch",
+        response_model=CreateRunBatchResponse,
+        status_code=status.HTTP_201_CREATED,
+        responses={
+            422: {"model": InvalidRequestResponse},
+            500: {"model": InternalErrorResponse},
+        },
+    )
+    async def create_run_batch(
+        payload: CreateRunBatchRequest,
+        run_service: ServiceDependency,
+        idempotency_key: IdempotencyKeyHeader = None,
+    ) -> CreateRunBatchResponse:
+        """Create one run per named app under a single reviewed configuration.
+
+        Declared BEFORE ``/api/runs/{run_id}`` would be a routing hazard in a
+        framework that matched in declaration order against a path parameter, but
+        FastAPI's ``{run_id}`` is constrained by ``RunId``'s pattern and "batch"
+        does not satisfy it, so the two cannot collide.
+
+        No ``_require_owner_action`` gate: this model accepts no ``browser_login``
+        and no other raw secret, so it carries none of the authority that gate
+        exists to protect. The route is otherwise the create route's contract
+        repeated N times.
+
+        201 with per-app results even when every app was rejected — the batch was
+        processed and each app's outcome is data. Only a malformed batch (422) or
+        an infrastructure failure (500) is a transport error.
+        """
+
+        return await run_service.create_run_batch(payload, idempotency_key=idempotency_key)
 
     def _request_carries_internal_token(request: Request) -> bool:
         """True when the request presents the mandatory internal API token.
@@ -598,6 +632,38 @@ def create_app(
         client_host = request.client.host if request.client else None
         return client_host in {"127.0.0.1", "::1", "localhost", "testclient"}
 
+    def _owner_secret_actions_allowed(request: Request) -> bool:
+        """Whether this deployment accepts a raw secret, as the SERVICE sees it.
+
+        The raw-secret opt-in has two readers: this gate, and
+        ``LocalRunService._primary_action``, which draws the "Submit credentials"
+        button from ``Settings.allow_local_credential_submission``. Reading
+        ``os.environ`` here was a second statement of the same rule from a
+        different source, and the two disagree whenever the service was handed an
+        explicit ``Settings`` (any composition that does not go through
+        ``load_settings``, including the deployed one if the flag is set in the
+        process rather than in ``.env``). The visible symptom is the whole point
+        of this gate's rewrite: an enabled button whose route answers 403.
+
+        So ask the live service instead. ``owner_secret_actions_allowed`` is the
+        single definition; the route now admits exactly what the button promised.
+
+        The ``getattr`` follows ``deployment_mutations_allowed`` above: an
+        injected test adapter may predate the hook, and for those we fall back to
+        the process environment, which is the behaviour they were written
+        against. A hook that raises is treated as "not allowed" -- this gate
+        fails closed, because what it protects is raw credential material.
+        """
+
+        service = getattr(request.app.state, "run_service", None)
+        checker = getattr(service, "owner_secret_actions_allowed", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        return _environment_flag("ALLOW_LOCAL_CREDENTIAL_SUBMISSION", default=False)
+
     def _require_local_owner_submission(request: Request) -> None:
         """Gate the owner-only endpoints that touch raw credential material.
 
@@ -607,7 +673,7 @@ def create_app(
         relax this gate.
         """
 
-        if not _environment_flag("ALLOW_LOCAL_CREDENTIAL_SUBMISSION", default=False):
+        if not _owner_secret_actions_allowed(request):
             raise StarletteHTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="local credential submission is disabled",
@@ -619,30 +685,68 @@ def create_app(
             )
 
     def _require_owner_action(request: Request) -> None:
-        """Gate owner actions that never read stored raw secrets back to the network.
+        """Gate the routes that carry a RAW SECRET inbound, and only those.
 
-        Covers the read-only ephemeral live-view URL and autonomous-login
-        credential injection (``browser_login``). These require the explicit
-        opt-in (``ALLOW_LOCAL_CREDENTIAL_SUBMISSION``) and are then reachable from
-        loopback or, in a deployed environment, through the trusted internal-token
-        caller. ``browser_login`` values cross the selected provider's secret
-        boundary for one resume and reusable pairs may remain encrypted in the
-        account vault; no stored secret is ever read back to the network by this
-        path. Endpoints that return raw
-        stored secrets (credential reveal) keep the stricter loopback-only gate.
+        After the agent/owner split this covers exactly three call sites, all of
+        which take a credential in the request body: ``POST /api/runs`` with
+        ``browser_login``, ``POST /api/runs/{run_id}/credentials``, and
+        ``POST /api/runs/{run_id}/resume`` with ``browser_login`` or
+        ``browser_verification``. Nothing else does, which is why nothing else
+        is gated here any more -- see :func:`_require_agent_action`.
+
+        These require the explicit opt-in and are then reachable from loopback
+        or, in a deployed environment, through the trusted internal-token caller.
+        The values cross the selected provider's secret boundary for one resume;
+        reusable pairs may remain encrypted in the account vault, and no stored
+        secret is ever read back to the network by this path. Endpoints that
+        would return raw stored secrets (credential reveal, unimplemented) keep
+        the stricter loopback-only :func:`_require_local_owner_submission`.
         """
 
-        if not _environment_flag("ALLOW_LOCAL_CREDENTIAL_SUBMISSION", default=False):
+        if not _owner_secret_actions_allowed(request):
             raise StarletteHTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="owner action is disabled",
             )
+        _require_trusted_caller(request)
+
+    def _require_trusted_caller(request: Request) -> None:
+        """Admit loopback or the trusted internal-token caller; refuse everything else."""
+
         if _client_is_loopback(request) or _request_carries_internal_token(request):
             return
         raise StarletteHTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="owner action is restricted",
         )
+
+    def _require_agent_action(request: Request) -> None:
+        """Gate the operator controls that carry no credential material at all.
+
+        Connect, poll-connection, outreach, admission decision, pause, reset,
+        retry-step, the provider profile and the live view move no secret in
+        either direction: their bodies name a run, a phase, or a decision, and
+        their responses are closed vocabularies, references and digests.
+
+        They used to sit behind :func:`_require_owner_action`, which additionally
+        demands ``ALLOW_LOCAL_CREDENTIAL_SUBMISSION``. That flag authorizes an
+        owner to hand the deployment a RAW SECRET, which is a different question
+        from whether the operator may press "Connect account", and coupling them
+        broke the console: ``ApiService._primary_action`` enables the managed-auth
+        button on ``managed_auth_configuration_is_valid`` alone, so all 25
+        managed-auth apps rendered an enabled control whose route answered 403.
+        A button that is enabled and then refused is worse than a disabled one --
+        it reads as a backend fault rather than as configuration.
+
+        The trust boundary is unchanged: loopback, or the internal API token that
+        only the server-side UI holds. The live view keeps its own, stricter and
+        purpose-built authority on top of this one -- ``live_view_allowed`` is
+        revoked the moment a run reaches a credential surface -- which is the
+        control that actually protects secret material, rather than a flag named
+        for submission.
+        """
+
+        _require_trusted_caller(request)
 
     @application.post(
         "/api/runs/{run_id}/credentials",
@@ -743,7 +847,7 @@ def create_app(
     ) -> ManagedConnectionResponse:
         """Start or replay the run's managed-auth connection request."""
 
-        _require_owner_action(request)
+        _require_agent_action(request)
         return await run_service.connect_managed(run_id)
 
     @application.post(
@@ -759,7 +863,7 @@ def create_app(
     ) -> ManagedConnectionResponse:
         """Refresh the stored managed connection request without browser fallback."""
 
-        _require_owner_action(request)
+        _require_agent_action(request)
         return await run_service.poll_managed_connection(run_id)
 
     @application.post(
@@ -775,7 +879,7 @@ def create_app(
     ) -> ActionReceipt:
         """Explicitly send reviewed outreach through the controlled-sink boundary."""
 
-        _require_owner_action(request)
+        _require_agent_action(request)
         return await run_service.send_gated_outreach(run_id)
 
     @application.get(
@@ -789,11 +893,12 @@ def create_app(
         request: Request,
         run_service: ServiceDependency,
     ) -> LiveViewResponse:
-        # Owner-only read-only ephemeral live URL. Reachable from loopback or,
-        # when opted in, through the trusted internal-token caller in a deployed
-        # environment. The signed URL is read from the in-memory worker and is
-        # never persisted anywhere.
-        _require_owner_action(request)
+        # Read-only ephemeral live URL, for loopback or the trusted internal-token
+        # caller. The signed URL is read from the in-memory worker and is never
+        # persisted anywhere, and the session's own ``live_view_allowed`` flag --
+        # revoked the moment the run reaches a credential surface -- is what
+        # withholds it from a page that could show a secret.
+        _require_agent_action(request)
         return await run_service.get_live_view(run_id)
 
     @application.get(
@@ -811,7 +916,7 @@ def create_app(
         served from worker memory with no-store caching and is never persisted.
         """
 
-        _require_owner_action(request)
+        _require_agent_action(request)
         image, captured_at = await run_service.get_live_screenshot(run_id)
         return Response(
             content=image,
@@ -855,7 +960,7 @@ def create_app(
         """
 
         if isinstance(payload, RetryStepRequest):
-            _require_owner_action(request)
+            _require_agent_action(request)
             return await run_service.retry_onboarding_step(run_id, payload)
         return await run_service.retry(run_id, payload.capability)
 
@@ -878,7 +983,7 @@ def create_app(
         durable row, and it carries no credential reference.
         """
 
-        _require_owner_action(request)
+        _require_agent_action(request)
         return await run_service.decide_admission(run_id, payload)
 
     @application.post(
@@ -895,7 +1000,7 @@ def create_app(
     ) -> PauseResponse:
         """Stop the run at its next safe boundary, keeping the browser session."""
 
-        _require_owner_action(request)
+        _require_agent_action(request)
         return await run_service.pause_onboarding(
             run_id,
             reason=payload.reason if payload is not None else None,
@@ -920,7 +1025,7 @@ def create_app(
         (Requirement 14.12).
         """
 
-        _require_owner_action(request)
+        _require_agent_action(request)
         return await run_service.reset_onboarding(run_id, confirm=payload.confirm)
 
     @application.get(
@@ -936,7 +1041,7 @@ def create_app(
     ) -> ProviderProfileView:
         """The sanitized provider profile: citations and hosts, never excerpts."""
 
-        _require_owner_action(request)
+        _require_agent_action(request)
         return await run_service.get_provider_profile(run_id)
 
     @application.get(

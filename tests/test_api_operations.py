@@ -249,9 +249,9 @@ def test_browser_provider_defaults_to_playwright_for_legacy_clients() -> None:
     assert request.browser_provider == "playwright"
 
 
-def test_credential_creation_policy_defaults_to_reuse_only_for_legacy_clients() -> None:
+def test_credential_creation_policy_defaults_to_create_if_missing() -> None:
     request = CreateRunRequest.model_validate(_request_payload())
-    assert request.credential_creation_policy == "reuse_only"
+    assert request.credential_creation_policy == "create_if_missing"
 
 
 @pytest.mark.parametrize("policy", ["reuse_only", "create_if_missing"])

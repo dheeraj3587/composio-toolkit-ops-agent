@@ -65,6 +65,47 @@ export function matchesAppQuery(app: AppSearchItem, query: string): boolean {
   return haystack.includes(needle)
 }
 
+/**
+ * The order the readiness groups are shown in, most autonomous first.
+ *
+ * `readiness_tier` is the recipe's own claim about how far the agent gets
+ * unattended, which is what an operator choosing a batch is actually sorting on
+ * — and a different question from `access_route`, which says how the credential
+ * is obtained. Apps the agent can finish alone come first; the tiers that end at
+ * a person (owner submission, then outreach) come last.
+ *
+ * "unknown" is last and is a real bucket: the field is nullable server-side and
+ * absent from an older API, and an app with no tier must still be selectable
+ * rather than silently dropped from the list.
+ */
+const READINESS_TIER_ORDER = [
+  "browser_ready",
+  "managed_auth_ready",
+  "owner_submit_ready",
+  "outreach_ready",
+  "outreach_review_required",
+  "unknown",
+] as const
+
+/**
+ * Group apps by how far the agent gets unattended, so a bulk selection is made
+ * with the cost of each group visible rather than as one undifferentiated list.
+ */
+export function groupAppsByReadinessTier(apps: AppSearchItem[]): [string, AppSearchItem[]][] {
+  const groups = new Map<string, AppSearchItem[]>()
+  for (const app of apps) {
+    const key = app.readiness_tier ?? "unknown"
+    const bucket = groups.get(key)
+    if (bucket) bucket.push(app)
+    else groups.set(key, [app])
+  }
+  const rank = (key: string) => {
+    const index = READINESS_TIER_ORDER.indexOf(key as (typeof READINESS_TIER_ORDER)[number])
+    return index === -1 ? READINESS_TIER_ORDER.length : index
+  }
+  return [...groups.entries()].sort(([left], [right]) => rank(left) - rank(right) || left.localeCompare(right))
+}
+
 /** Group apps by category so a long list stays scannable. */
 export function groupAppsByCategory(apps: AppSearchItem[]): [string, AppSearchItem[]][] {
   const groups = new Map<string, AppSearchItem[]>()

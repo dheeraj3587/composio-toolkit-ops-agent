@@ -26,12 +26,19 @@ Risk levels:
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-from ops.browser.api_trace_catalog import BrowserApiTraceStep
 from ops.browser.candidates import READ_ONLY_ACTIONS, VALUE_ACTIONS, ActionCandidate
 from ops.browser.decider import SnapshotElement
+
+if TYPE_CHECKING:  # pragma: no cover - imported for typing only
+    # Typing-only since the refactor onto ``ActionAuthorization``: this module no
+    # longer reads a trace step at runtime, only the four reviewed facts one
+    # carries. Keeping the import lazy is what lets the driver's action loop —
+    # which has a phase goal and no trace at all — consult the same policy.
+    from ops.browser.api_trace_catalog import BrowserApiTraceStep
 
 RiskLevelName = Literal["read_only", "reversible", "state_changing", "irreversible"]
 
@@ -43,6 +50,99 @@ class RiskDecision:
     level: RiskLevelName
     autonomous_allowed: bool
     reason_code: str
+
+    @property
+    def category(self) -> str:
+        """The irreversible verb family this verdict named, or ``""``.
+
+        The reason code is the durable string; this is the part of it a caller
+        needs when it has to tell a human *what kind* of decision is being asked
+        for. Derived rather than stored so the two cannot drift.
+        """
+
+        if self.reason_code.startswith("irreversible_intent:"):
+            return self.reason_code.split(":", 1)[1]
+        if self.reason_code == "credential_creation_control_not_reviewed":
+            return "creation"
+        return ""
+
+
+@dataclass(frozen=True, slots=True)
+class ActionAuthorization:
+    """What a REVIEWED step authorizes, decoupled from where it was reviewed.
+
+    ``classify`` used to take a :class:`BrowserApiTraceStep` directly, which
+    quietly made the policy unusable anywhere a trace does not exist — and the
+    driver's action loop is exactly that place: it drives a
+    :class:`~ops.onboarding.action_loop.PhaseGoal`, not a checkpoint. The
+    consequence was not a missing feature but a hole: the loop fell back to
+    ``ops/browser/candidates.py``'s substring list, which does not name
+    ``create``/``generate`` or ``save``/``apply``, so "Create API key" and "Save"
+    were emitted as low-risk and were autonomously clickable on that path —
+    bypassing the credential-creation authority this class exists to carry.
+
+    Every field defaults to the closed answer. An authorization nobody
+    constructed authorizes nothing.
+    """
+
+    # Non-secret value references the step approved for fill/select.
+    allowed_value_refs: tuple[str, ...] = ()
+    # The exact accessible names of the controls a human reviewed as the ones
+    # that may create a credential. Empty means "none were reviewed", which is
+    # why ``credential_creation_authorized`` cannot be true without it.
+    credential_creation_controls: tuple[str, ...] = ()
+    # The reviewed step itself says a human must act here.
+    requires_hitl: bool = False
+    # The run's immutable policy said ``create_if_missing`` AND controls were
+    # reviewed. Derived by the constructors below rather than passed separately,
+    # because the two call sites that used to compute it inline are precisely
+    # where one of them forgot to.
+    credential_creation_authorized: bool = False
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint: BrowserApiTraceStep,
+        *,
+        credential_creation_policy: str = "reuse_only",
+    ) -> ActionAuthorization:
+        """The authorization a reviewed API-trace checkpoint carries."""
+
+        controls = tuple(checkpoint.credential_creation_controls)
+        return cls(
+            allowed_value_refs=tuple(checkpoint.allowed_value_refs),
+            credential_creation_controls=controls,
+            requires_hitl=bool(checkpoint.requires_hitl),
+            credential_creation_authorized=(
+                credential_creation_policy == "create_if_missing" and bool(controls)
+            ),
+        )
+
+    @classmethod
+    def for_phase(
+        cls,
+        *,
+        allowed_value_refs: Sequence[str] = (),
+        credential_creation_controls: Sequence[str] = (),
+        requires_hitl: bool = False,
+        credential_creation_policy: str = "reuse_only",
+    ) -> ActionAuthorization:
+        """The authorization a driver phase goal carries.
+
+        Same shape, same defaults, same derivation of
+        ``credential_creation_authorized`` — so a phase cannot authorize
+        credential creation on terms a checkpoint could not.
+        """
+
+        controls = tuple(credential_creation_controls)
+        return cls(
+            allowed_value_refs=tuple(allowed_value_refs),
+            credential_creation_controls=controls,
+            requires_hitl=requires_hitl,
+            credential_creation_authorized=(
+                credential_creation_policy == "create_if_missing" and bool(controls)
+            ),
+        )
 
 
 # Verbs that indicate an irreversible or privilege/money/credential-affecting
@@ -77,10 +177,18 @@ class BrowserActionRiskPolicy:
         self,
         *,
         candidate: ActionCandidate,
-        checkpoint: BrowserApiTraceStep,
+        authorization: ActionAuthorization,
         element: SnapshotElement | None,
-        credential_creation_authorized: bool = False,
     ) -> RiskDecision:
+        """The verdict for one candidate under one reviewed authorization.
+
+        Takes an :class:`ActionAuthorization` rather than a trace checkpoint so
+        every path that drives a browser — the worker's trace loop and the
+        driver's phase loop — can be gated by this one function. See that class
+        for what went wrong while only one of them could call it.
+        """
+
+        credential_creation_authorized = authorization.credential_creation_authorized
         # 1) The candidate generator may already have flagged the intent as
         # requiring a human; that verdict is never downgraded here. Credential
         # create/generate/save candidates are deliberately not pre-flagged, so
@@ -113,7 +221,7 @@ class BrowserActionRiskPolicy:
                     }
                     reviewed_names = {
                         " ".join(name.casefold().split())
-                        for name in checkpoint.credential_creation_controls
+                        for name in authorization.credential_creation_controls
                     }
                     if candidate_names & reviewed_names:
                         return RiskDecision(
@@ -151,7 +259,7 @@ class BrowserActionRiskPolicy:
             # A value action must use a reviewed, non-secret value reference and
             # the checkpoint must authorize that reference.
             if candidate.value_ref is not None:
-                if candidate.value_ref not in set(checkpoint.allowed_value_refs):
+                if candidate.value_ref not in set(authorization.allowed_value_refs):
                     return RiskDecision(
                         level="state_changing",
                         autonomous_allowed=False,
@@ -174,7 +282,7 @@ class BrowserActionRiskPolicy:
             return RiskDecision(
                 level="read_only", autonomous_allowed=True, reason_code="non_interactive_element"
             )
-        if checkpoint.requires_hitl:
+        if authorization.requires_hitl:
             return RiskDecision(
                 level="state_changing",
                 autonomous_allowed=False,
@@ -187,4 +295,9 @@ class BrowserActionRiskPolicy:
         )
 
 
-__all__ = ["BrowserActionRiskPolicy", "RiskDecision", "RiskLevelName"]
+__all__ = [
+    "ActionAuthorization",
+    "BrowserActionRiskPolicy",
+    "RiskDecision",
+    "RiskLevelName",
+]

@@ -152,6 +152,14 @@ def validate_plan(plan: RunPlan, *, recipe: AppRecipe) -> PlanRefusal | None:
     if len(plan.surfaces) > len(browser.steps):
         return _refuse("surface_count_exceeds_recipe", len(browser.steps) + 1)
 
+    # Exact hosts only, and empty wildcards on purpose — this is the planner's own
+    # allow-list, not the run's. A PLAN names surfaces a human reviewed one by one,
+    # so it is checked against what the recipe literally declares; the run's
+    # allow-list is wider by construction (it unions the reviewed identity-provider
+    # and post-auth hosts, and may carry wildcards from domain discovery), and
+    # borrowing that width here would let a plan assert a surface the catalog never
+    # named. ``_check_surface`` already refuses anything outside ``exact_hosts``
+    # before it consults this, so widening it could only ever weaken the check.
     allowed = BrowserAllowedHosts(
         app_slug=recipe.app_slug,
         exact_hosts=browser.exact_hosts,

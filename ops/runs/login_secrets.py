@@ -281,7 +281,21 @@ class RunLoginSecretService:
         account_ref: str,
         run_id: str,
     ) -> dict[str, SecretStr]:
-        """Load one exact run's staged signup pair for retry/resume."""
+        """Load one exact run's staged signup pair for retry/resume.
+
+        **Returns VALUES, and is therefore not the verb the login re-route wants.**
+        The field names here line up exactly with what
+        :class:`~ops.onboarding.publishers.VaultLoginReferenceBinder` produces,
+        which makes this look like a drop-in for the duplicate-account re-route.
+        It is not: that path hands what it gets to the browser secret broker,
+        which redeems a ``vault://`` reference plus a one-shot grant *inside* the
+        browser process, so plaintext never exists in this one. Substituting this
+        method there would move real sign-in credentials through the driver and
+        into the ``PhaseStep`` the ledger records — a layer whose whole contract is
+        that it holds references only. Use
+        ``SQLiteSecretStore.account_login_references`` (after promotion) for that,
+        and keep this for the in-process retry/resume it was written for.
+        """
 
         store = self._context._secret_store
         if store is None:

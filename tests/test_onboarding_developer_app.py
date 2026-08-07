@@ -31,6 +31,7 @@ from ops.onboarding.driver import (
 from ops.onboarding.effects import EFFECT_PROVIDER, create_dev_app_key
 from ops.onboarding.lease import Lease, deadline_after
 from ops.onboarding.phase import OnboardingPhase
+from ops.playwright.actions import ActionExecutionResult
 from ops.providers.profile import FieldEvidence, FlowSpec, ProviderProfile, compute_profile_digest
 
 RUN_ID = "run-devapp-1"
@@ -58,6 +59,7 @@ def _profile() -> ProviderProfile:
             supported=True,
             entry_url="https://console.example.com/apps",
             steps=("Open the developer console", "Create app"),
+            control_names=("Create app",),
         ),
         oauth_flow=FlowSpec(kind="oauth", supported=False, entry_url=None),
         api_key_flow=FlowSpec(
@@ -113,8 +115,18 @@ class _Session:
             raw_elements=_RAW_ELEMENTS,
         )
 
-    async def act(self, candidate: ActionCandidate) -> None:
+    async def act(self, candidate: ActionCandidate) -> ActionExecutionResult:
         self.acted.append(candidate)
+        # Typed, like the executor: the loop counts an action only when the
+        # session says one actually ran.
+        return ActionExecutionResult(
+            status="executed",
+            candidate_id=candidate.candidate_id,
+            before_url="https://console.example.com/apps",
+            after_url="https://console.example.com/apps/created",
+            before_generation=1,
+            after_generation=2,
+        )
 
 
 class _Sessions:

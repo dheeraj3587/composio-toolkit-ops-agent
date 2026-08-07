@@ -70,6 +70,22 @@ class _PwSession:
     # on the session rather than on the worker because the worker is one process
     # serving several runs, and a model is a property of the run that asked for it.
     inference: Any = None
+    # The provider that answered THIS session's most recent decision, taken from
+    # the InferenceResult the chain returned. It lives here because the chain is
+    # shared across runs and exposes no per-call accessor, so reading it off the
+    # chain after the fact would attribute another run's provider to this one.
+    last_inference_provider: str | None = None
+    # The model's own one-line justification for THIS session's most recent
+    # choice, taken off the CandidateChoice the decider returned. Kept here for
+    # the same reason the provider is: the chain is shared across runs, so it has
+    # no per-call accessor to read after the fact. It is what the operator
+    # console renders as the agent's chain of thought, and it is re-screened for
+    # secret material before it is ever stored.
+    last_choice_reason: str | None = None
+    # This drive's action-loop trail, oldest first, capped by the observation
+    # contract. Reset at the start of every navigate so a trail describes one
+    # operation rather than the session's whole life.
+    step_trail: list[Any] = field(default_factory=list)
     # True only when the WORKER acquired its own capacity slot for this session.
     # False in service mode, where the manager owns capacity — so the worker must
     # not release a slot it never took.

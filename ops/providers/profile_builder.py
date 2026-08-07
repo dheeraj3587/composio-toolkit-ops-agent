@@ -76,6 +76,7 @@ from ops.browser.host_policy import registrable_domain as resolve_registrable_do
 from ops.core.config import Settings
 from ops.core.models import validate_https_url
 from ops.onboarding.phase import OnboardingReasonCode
+from ops.providers.anchor_discovery import HomepageAnchorDiscovery, SelfScopedSourceFetcher
 from ops.providers.errors import ConfigurationRequiredError, PhaseUnavailableError
 from ops.providers.profile import (
     APPROVAL_REQUIREMENTS,
@@ -99,6 +100,10 @@ from ops.research.operational_research import (
 )
 
 if TYPE_CHECKING:
+    # Type-only so the builder keeps its one-way dependency on the reviewed
+    # catalog: it borrows the catalog's route vocabulary without importing the
+    # catalog loader, which pulls in browser setup values this module never uses.
+    from ops.recipes.app_recipes import RouteKind
     from ops.research.operational_research import EvidenceContentFetcherLike, EvidenceDiscovery
 
 LOGGER = logging.getLogger("composio_ops.provider_profile_builder")
@@ -254,12 +259,18 @@ if TYPE_CHECKING:
 # docs URL costs an action-loop retry.
 MIN_CORROBORATIONS: Final = 2
 
-# The fields a profile cannot be assembled without. They are also the only
-# claims that vote on which registrable domain the provider owns: a blog post's
-# link to a third-party mirror, an OAuth flow hosted on an identity provider, or
-# a docs URL on a documentation SaaS must not get a say in domain ownership —
-# they are admitted only if they already agree with the resolved domain.
-_REQUIRED_FIELDS: Final[frozenset[str]] = frozenset(
+# The claims that vote on which registrable domain the provider owns, and the
+# claims held to two sources rather than one. A blog post's link to a
+# third-party mirror, an OAuth flow hosted on an identity provider, or a docs
+# URL on a documentation SaaS must not get a say in domain ownership — they are
+# admitted only if they already agree with the resolved domain.
+#
+# This set is deliberately NOT the per-route required set below. It is the
+# evidence bar, not the completeness bar: a managed-auth provider still has a
+# signup page somewhere on the internet, and if research finds one it should
+# still vote on the domain and still owe two sources. Narrowing the voters per
+# route would only make a domain disagreement harder to detect.
+_ANCHOR_FIELDS: Final[frozenset[str]] = frozenset(
     {"registrable_domain", "signup_url", "login_url"}
 )
 
@@ -286,6 +297,93 @@ _FLOW_FIELDS: Final[Mapping[str, FlowKind]] = {
     "api_key_flow": "api_key",  # pragma: allowlist secret
     "pat_flow": "pat",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _RequiredFields:
+    """The corroborated fields one access route cannot produce a profile without.
+
+    ``any_of`` exists because a managed-auth provider's stand-in for a signup
+    page is wherever its credential is minted, and that is not a single field
+    here: ``ProviderProfile`` surfaces the credential-management URL as
+    *whichever* flow was corroborated (``ops.providers.profile`` maps the first
+    flow entry URL onto ``credential_management_url``). Naming one flow field
+    would reject a provider that mints API keys in favour of one that mints
+    PATs, so the requirement is "at least one flow", not "this flow".
+    """
+
+    all_of: frozenset[str]
+    any_of: frozenset[str] = frozenset()
+
+    def missing(self, chosen: Mapping[str, FieldEvidence]) -> tuple[str, ...]:
+        """The required fields this build failed to corroborate, for the fact log.
+
+        PRE: ``chosen`` maps a field name to the one corroborated evidence kept
+        for it, so membership means "corroborated", not "claimed".
+
+        POST: empty iff the profile may be assembled. An unmet ``any_of`` is
+        reported as a single ``a|b|c`` subject rather than one line per
+        alternative, because four lines would read as four independent gaps when
+        corroborating any one of them would have closed the gate.
+        """
+
+        absent = sorted(self.all_of - set(chosen))
+        if self.any_of and self.any_of.isdisjoint(chosen):
+            absent.append("|".join(sorted(self.any_of)))
+        return tuple(absent)
+
+
+# The self-serve set, and the fallback for a route the caller did not supply or
+# this table does not know. Falling back to the strictest set means a caller that
+# forgets to thread its route gets today's behaviour — a blocked run it can see —
+# rather than a profile quietly assembled from a bare domain.
+_STRICTEST_REQUIRED_FIELDS: Final = _RequiredFields(
+    all_of=frozenset({"registrable_domain", "signup_url", "login_url"})
+)
+
+# What "complete enough to act on" means per access route. Keyed by the catalog's
+# own ``RouteKind`` (``ops.recipes.app_recipes``) rather than a second enum
+# invented here, so a route added there cannot silently inherit a required-field
+# set nobody wrote — it lands on the strictest one instead.
+#
+# ``registrable_domain`` is mandatory in every route on purpose: it is the
+# confinement anchor every admitted URL is checked against and the seed of the
+# browser host allow-list, so a profile without it would be unconfined rather
+# than merely incomplete.
+_REQUIRED_FIELDS_BY_ROUTE: Final[Mapping[RouteKind, _RequiredFields]] = {
+    # Self-serve. The run signs itself up, so the signup page is the whole point
+    # of the profile and its absence means there is nothing to drive.
+    "playwright": _STRICTEST_REQUIRED_FIELDS,
+    # Managed auth / key import. Half the catalog has no self-serve signup URL
+    # and never will — the account already exists and the operator brings the
+    # credential. Demanding ``signup_url`` here is unsatisfiable by construction,
+    # which is what used to sink these runs into the inconclusive branch. What is
+    # actually needed is where to sign in, and where the credential is minted.
+    "managed_auth": _RequiredFields(
+        all_of=frozenset({"registrable_domain", "login_url"}),
+        any_of=frozenset(_FLOW_FIELDS),
+    ),
+    # Gated. Access is granted out of band (partner form, sales review), so no
+    # login or credential page is reachable until a human grant that has not
+    # happened yet. Only the confinement anchor can honestly be demanded.
+    "gated": _RequiredFields(all_of=frozenset({"registrable_domain"})),
+}
+
+
+def _required_fields(route_kind: RouteKind | None) -> _RequiredFields:
+    """The required-field set for one access route. Unknown route -> strictest.
+
+    PRE: ``route_kind`` is a ``RouteKind`` member or ``None``; it is treated as
+    untrusted, because it reaches here from a run record rather than a literal.
+
+    POST: never returns a set looser than the caller demonstrated it is entitled
+    to. Absent, misspelled and future route kinds all resolve to the self-serve
+    set, so the failure mode of a bad route is a blocked run, not a thin profile.
+    """
+
+    if route_kind is None:
+        return _STRICTEST_REQUIRED_FIELDS
+    return _REQUIRED_FIELDS_BY_ROUTE.get(route_kind, _STRICTEST_REQUIRED_FIELDS)
 
 # What each flow mints, keyed by flow kind rather than by provider: research may
 # say *where* a credential comes from, never what kind of material a page will
@@ -436,6 +534,68 @@ def _perplexity_discovery(settings: Settings) -> ProfileDiscovery:
     return PerplexitySearchDiscovery(key)
 
 
+#: The flag ``homepage_anchors`` is opted into by, read defensively.
+#:
+#: ``Settings`` forbids extra fields, so this is ``False`` on a deployment whose
+#: configuration has not grown the field yet and the operator's value once it
+#: has. The read is written this way, rather than as an attribute, because the
+#: field belongs to ``ops/core/config.py`` — a file this change does not own —
+#: and a registration that imports a name that may not exist yet would fail at
+#: import time rather than default to off, which is the wrong direction for a
+#: capability switch to fail in.
+_ANCHOR_DISCOVERY_FLAG: Final = "onboarding_research_homepage_anchors_enabled"
+
+
+def _homepage_anchors_enabled(settings: Settings) -> bool:
+    """Whether the operator opted into harvesting the provider's own anchors.
+
+    Defaults OFF, and the reasoning is not the same as Perplexity's. Perplexity
+    is off because it spends money on a third party. This adapter spends nothing,
+    needs no key, and reads only the provider's own site through the already
+    hardened fetcher, so cost is not the argument. Two other things are:
+
+    * it is the first adapter that would make a stock deployment issue outbound
+      HTTP to a host chosen by data rather than by an operator. Every capability
+      in this repo is opted into before it can reach the network, and "it is only
+      the provider's homepage" is exactly the reasoning that rule exists to stop;
+    * turning it on would replace a LOUD failure with a quiet one. A deployment
+      that enabled no adapter raises ``research_adapters_not_configured`` before
+      a run starts. Defaulted on, that same deployment would instead register one
+      adapter, run, and block later on ``research_adapters_unavailable`` — the
+      same outcome, reported further from its cause and after more work.
+
+    On means: engaged during the research phase only, with a seed URL, against
+    that seed's own registrable domain.
+    """
+
+    return bool(getattr(settings, _ANCHOR_DISCOVERY_FLAG, False))
+
+
+def _homepage_anchor_discovery(settings: Settings) -> ProfileDiscovery:
+    """The homepage-anchor harvester, holding a fetcher that opens no socket yet.
+
+    PRE:  ``_homepage_anchors_enabled(settings)``.
+    POST: the returned port has performed no I/O and holds no connection. It
+          first reaches the network inside ``discover``, i.e. once a run has
+          actually entered the research phase.
+
+    ``SelfScopedSourceFetcher`` is constructed rather than injected because the
+    adapter table maps ``Settings`` alone to a port, and ``Settings`` carries no
+    HTTP client. That is safe here precisely because the fetcher derives its
+    allowlist from the seed URL it is handed and builds its client per call, so
+    holding one costs nothing and grants nothing until a page is requested.
+
+    No credential is read, so there is no ``ConfigurationRequiredError`` branch
+    to mirror ``_perplexity_discovery``'s: this adapter cannot be enabled-but-
+    unkeyed. What it can be is enabled-but-unseeded — ``ProfileDiscovery.discover``
+    carries only ``app_name``, so a run whose operator passed no ``hint_url``
+    gives this adapter no page to read and it returns ``()`` with a log line
+    saying why.
+    """
+
+    return HomepageAnchorDiscovery(SelfScopedSourceFetcher())
+
+
 # The registered adapters, in the order discovery engages them.
 #
 # You.com is deliberately absent, and it is worth saying why rather than leaving
@@ -446,6 +606,22 @@ def _perplexity_discovery(settings: Settings) -> ProfileDiscovery:
 # for one would be a switch that turns nothing on. A You.com profile-discovery
 # adapter is a new port implementation plus one row here.
 _REGISTRATIONS: Final[tuple[_AdapterRegistration, ...]] = (
+    # First, when it is on: it costs nothing, involves no third party, and a
+    # provider naming its own gates on its own site is better evidence than a
+    # search result describing them. Candidate order survives into the fetch
+    # budget, so the cheaper and more accurate source gets the earlier slots.
+    #
+    # ``keyed`` is unconditionally true because there is no credential to hold.
+    # It is not "this adapter can produce something" — that would be a claim
+    # about the run's hint URL, which registration cannot see — and reporting it
+    # as a missing key would name a configuration mistake that was not made.
+    _AdapterRegistration(
+        name="homepage_anchors",
+        enabled=_homepage_anchors_enabled,
+        keyed=lambda _settings: True,
+        missing_key_reason="homepage_anchor_discovery_unavailable",
+        build=_homepage_anchor_discovery,
+    ),
     _AdapterRegistration(
         name="perplexity_search",
         enabled=lambda settings: settings.onboarding_research_perplexity_enabled,
@@ -527,6 +703,7 @@ async def build_profile(
     provider_name: str,
     app_slug: str,
     hint_url: str | None = None,
+    route_kind: RouteKind | None = None,
     adapters: Sequence[DiscoveryAdapter],
     fetcher: ProfileEvidenceFetcher,
     extractor: ProfileExtractor,
@@ -534,6 +711,15 @@ async def build_profile(
     facts: ResearchFactRecorder | None = None,
 ) -> ProfileBuildOutcome:
     """Build, corroborate, digest and persist one immutable profile for this run.
+
+    ``route_kind`` is how the caller reaches this provider, and it selects which
+    fields the profile must carry (see ``_REQUIRED_FIELDS_BY_ROUTE``). It is a
+    parameter rather than something inferred from ``app_slug`` because the slug
+    is exactly what this function is here to research: a provider with no
+    reviewed recipe has no row to look the route up in, and inferring one from
+    the name would be a guess dressed as a fact. Omitting it is safe — the
+    strictest, self-serve set applies — but a managed-auth or gated provider
+    passed without its route will block on a signup page it does not have.
 
     PRE:
       P1. ``app_slug`` matches ``^[a-z0-9]+(?:-[a-z0-9]+)*$``.
@@ -605,8 +791,8 @@ async def build_profile(
         log=log,
     )
     chosen = _best_per_field(evidence)
-    if not _REQUIRED_FIELDS.issubset(chosen):
-        for field in sorted(_REQUIRED_FIELDS - set(chosen)):
+    if absent := _required_fields(route_kind).missing(chosen):
+        for field in absent:
             log.add("field_uncorroborated", subject=field, detail="required_field_missing")
         return ResearchInconclusive("research_no_evidence", log.collected())
 
@@ -800,7 +986,7 @@ def _resolve_domain(claims: Sequence[ProfileClaim], *, log: _FactLog) -> str | N
 
     domains: set[str] = set()
     for claim in claims:
-        if claim.field not in _REQUIRED_FIELDS:
+        if claim.field not in _ANCHOR_FIELDS:
             continue
         resolved = _claim_domain(claim)
         if resolved is not None:
@@ -897,7 +1083,7 @@ def _corroborated_evidence(
     urls_by_digest = _urls_by_digest(digests)
     evidence: list[FieldEvidence] = []
     for (field, value), sources in sorted(support.items()):
-        required = MIN_CORROBORATIONS if field in _REQUIRED_FIELDS else 1
+        required = MIN_CORROBORATIONS if field in _ANCHOR_FIELDS else 1
         if len(sources) < required:
             log.add(
                 "field_uncorroborated",
@@ -1029,7 +1215,7 @@ def _enum_value(chosen: Mapping[str, FieldEvidence], field: str, *, default: str
 def _profile_confidence(chosen: Mapping[str, FieldEvidence]) -> float:
     """The weakest required field's confidence: a profile is as good as its floor."""
 
-    required = [chosen[field].confidence for field in sorted(_REQUIRED_FIELDS) if field in chosen]
+    required = [chosen[field].confidence for field in sorted(_ANCHOR_FIELDS) if field in chosen]
     return min(required) if required else 0.0
 
 

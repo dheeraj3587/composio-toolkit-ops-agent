@@ -14,6 +14,7 @@ from ops.onboarding.action_loop import (
     PhaseGoal,
     run_action_loop,
 )
+from ops.playwright.actions import ActionExecutionResult
 
 _ALLOWED = BrowserAllowedHosts(
     app_slug="example", exact_hosts=("console.example.com",), vendor_wildcard_domains=()
@@ -49,8 +50,19 @@ class _Session:
             raw_elements=_RAW_ELEMENTS,
         )
 
-    async def act(self, candidate: ActionCandidate) -> None:
+    async def act(self, candidate: ActionCandidate) -> ActionExecutionResult:
         self.acted.append(candidate)
+        # The real executor answers with a typed result, and the loop refuses an
+        # untyped one outright — a session that says nothing must never read as an
+        # action that worked. This double answers on the same terms.
+        return ActionExecutionResult(
+            status="executed",
+            candidate_id=candidate.candidate_id,
+            before_url="https://console.example.com/apps",
+            after_url="https://console.example.com/apps/created",
+            before_generation=1,
+            after_generation=2,
+        )
 
 
 class _Decider:
@@ -105,6 +117,8 @@ def test_short_cycle_returns_done_with_the_phase_success_code() -> None:
         instruction="Create a new developer application.",
         success_reason_code="developer_app_created",
         signals=("Create app",),
+        credential_creation_controls=("Create app",),
+        credential_creation_policy="create_if_missing",
     )
     session = _Session()
     decider = _Decider()

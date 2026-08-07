@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
@@ -51,6 +52,7 @@ from ops.email.verification import (
     VerificationPurpose,
 )
 from ops.gmail.worker import GmailSignupPreflight, GmailWorker
+from ops.onboarding.browser_session import BrowserSessionService, ServiceLoopSessionFactory
 from ops.onboarding.composition import SettingsRunPlanner
 from ops.onboarding.driver import (
     RunPlanner,
@@ -58,6 +60,7 @@ from ops.onboarding.driver import (
     SQLitePhaseHistoryStore,
 )
 from ops.onboarding.lease_store import SQLiteLeaseStore, SQLiteRunQueue
+from ops.onboarding.worker import OnboardingWorker
 from ops.planner.adherence import AdherenceOutcome, RouteAdherenceMonitor
 from ops.planner.decide import PlanOutcome
 from ops.planner.plan import RunPlan
@@ -182,6 +185,40 @@ LOGGER = logging.getLogger("composio_ops.run_service")
 
 _GATED_OUTREACH_ROUTES = frozenset({"approval_required", "partner_gated"})
 
+# How many runs' worth of in-memory verification counters one process keeps.
+# Sized well above any plausible number of runs verifying at once, so the eviction
+# below only ever discards counters for runs that finished long ago.
+_MAX_TRACKED_OTP_RUNS = 512
+
+
+class _BoundedRunCounters(dict[str, int]):
+    """A per-run counter map that cannot outgrow the process it lives in.
+
+    A ``dict`` subclass rather than a mapping of its own so that the one writer
+    (``ops.runs.verification``, which does ``counters[run_id] =
+    counters.get(run_id, 0) + 1``) and the tests that hand a plain ``{}`` in its
+    place both keep working untouched.
+
+    Eviction is by insertion order, which is safe here for a reason worth being
+    explicit about: this counter is NOT a budget. The budget that bounds
+    autonomous verification lives in ``run_gate_attempts`` and is keyed by
+    ``(run_id, gate)``, so it survives the deploy that used to refund it; and the
+    freshness of the challenge itself is bounded by the persisted
+    ``verification_requested_at`` timestamp. What is left here is the sanitized
+    "how many times has this process tried" figure, and discarding the oldest one
+    costs an observation, never a safety property. If a real budget is ever moved
+    back into this map, it must move into storage instead.
+    """
+
+    def __setitem__(self, key: str, value: int) -> None:
+        # Re-inserting refreshes the key's position, so a run that is still being
+        # polled is never the oldest entry and never the one evicted.
+        super().pop(key, None)
+        super().__setitem__(key, value)
+        while len(self) > _MAX_TRACKED_OTP_RUNS:
+            oldest = next(iter(self))
+            super().__delitem__(oldest)
+
 
 class _YouComWiringMarker:
     """Display-only marker so the wiring audit can show "You.com is
@@ -250,7 +287,33 @@ class RunService:
         self._credential_capturer = credential_capturer
         self._credential_validator = credential_validator
         self._managed_auth_provider = managed_auth_provider
-        self._run_locks: dict[str, threading.RLock] = {}
+        # One RLock per run id, created on demand and evicted by REFERENCE, not by
+        # age or by size.
+        #
+        # This used to be a plain dict that was never evicted, and the comment
+        # here defended that: every call site holds the returned lock across a
+        # `with` block this class cannot see the end of, so evicting on a timer or
+        # at a size cap would let a second caller build a FRESH lock for a run
+        # another thread is still inside — a hole in the mutual exclusion that
+        # guards every projection, bought for a few hundred bytes. That reasoning
+        # was right about the danger and wrong about the only way out: the
+        # condition for safe eviction is not "old enough", it is "nobody is
+        # holding it", and that is precisely what a weak value dictionary
+        # measures. An entry disappears exactly when the last strong reference to
+        # its lock does, so a lock can never be replaced underneath a holder, and
+        # a process that has touched a hundred thousand runs holds locks only for
+        # the handful currently in flight.
+        #
+        # The one obligation this places on callers is the one every one of the
+        # ~20 sites already meets: bind the lock to a name (`lock =
+        # self._run_lock(run_id)`) or use it directly in a `with`, both of which
+        # keep a strong reference for the whole critical section. Calling
+        # `self._run_lock(run_id).acquire()` and discarding the reference would
+        # not be safe — but that is a use no caller has ever made, and it was
+        # already indefensible for other reasons (nothing would ever release it).
+        self._run_locks: weakref.WeakValueDictionary[str, threading.RLock] = (
+            weakref.WeakValueDictionary()
+        )
         self._run_locks_guard = threading.Lock()
         # Resources owned and closed by this service when built at startup.
         self._http_client: httpx.AsyncClient | None = None
@@ -266,21 +329,33 @@ class RunService:
         # operations always resolve from _browser_workers using the persisted run.
         self._browser_worker: BrowserWorker | None = None
         self._gmail_worker: GmailWorker | None = None
-        # Bounded per-run count of autonomous email-OTP resume attempts.
-        self._otp_attempts: dict[str, int] = {}
+        # Sanitized per-run count of autonomous email-OTP resume attempts THIS
+        # PROCESS has made. Deliberately not the budget: the durable one is
+        # ``run_gate_attempts`` (keyed by run and gate, so a deploy cannot refund
+        # it) plus the persisted ``verification_requested_at`` freshness window,
+        # and this map is only ever written, never read to decide anything. It was
+        # a plain dict that grew by one entry per run for the life of the process;
+        # the bound is what makes it a counter rather than a leak.
+        self._otp_attempts: dict[str, int] = _BoundedRunCounters()
         # Background email poller (autonomous "listen for replies").
         self._email_poller_thread: threading.Thread | None = None
         self._email_poller_stop = threading.Event()
-        # Autonomous advancement: bounded per-run count of machine-resolved human
-        # gates (e.g. a login form we already hold credentials for), plus its own
-        # sweep thread. Kept separate from the email poller because it must run
-        # even when Gmail is not configured.
-        self._autonomous_advances: dict[str, int] = {}
+        # Autonomous advancement: its own sweep thread, kept separate from the
+        # email poller because it must run even when Gmail is not configured.
+        # The per-run attempt budget it spends is NOT held here any more. It was
+        # a plain dict, which meant every deploy refunded every budget every run
+        # had spent, so an unresolvable gate was retried a few seconds apart for
+        # the life of the deployment and the bound was decorative. It now lives
+        # in ``run_gate_attempts``, and ``retry_browser_run`` is what refunds it.
         self._advance_thread: threading.Thread | None = None
         self._advance_stop = threading.Event()
         # The takeover sweep owns its own thread, so the service holds the instance
         # rather than a handle to it.
         self._takeover_service: RunTakeoverService | None = None
+        # The onboarding queue pump, for the same reason: it owns a thread and a
+        # composed port graph, so it is built once and remembered rather than
+        # re-derived per access like the stateless collaborators below.
+        self._onboarding_worker: OnboardingWorker | None = None
         # Asynchronous browser execution: when enabled (production live mode), a
         # self-serve browser run commits at browser_running with the live view
         # available immediately, and the bounded onboarding task runs in a
@@ -498,16 +573,23 @@ class RunService:
         recipe: AppRecipe,
         expected_state_revision: int,
         expected_effect_identity: str | None,
+        evidence: str = "",
     ) -> bool | None:
         """Atomically commit the run's one catalog-confined replacement plan.
 
         ``None`` means the observed browser operation no longer owns the run,
         ``False`` means no valid replacement can be committed, and ``True`` means
         revision 2 is already valid or was committed with the run projection.
+
+        ``evidence`` is what the adherence outcome observed -- where the plan said
+        the run would be and where it actually is. Without it the replacement plan
+        is byte-identical to the plan it replaces and the one authorized re-plan is
+        spent proving the route is reproducible. It is already sanitized model input
+        (``ops.planner.adherence.replan_evidence``) and is not persisted here.
         """
 
         planning = self._planning
-        planned = planning.planner.plan_for(recipe=recipe, revision=2)
+        planned = planning.planner.plan_for(recipe=recipe, revision=2, evidence=evidence)
         outcome = (
             planned
             if isinstance(planned, PlanOutcome)
@@ -613,6 +695,78 @@ class RunService:
         )
         self._takeover_service = service
         return service
+
+    @property
+    def _onboarding(self) -> OnboardingWorker | None:
+        """The onboarding queue pump, or ``None`` when nothing can drive a run.
+
+        This is the composition that closes roadmap 4.7: it is the only place
+        ``OnboardingPorts.deps_for`` and ``drive_run`` are reached from outside a
+        test, and the only place the ``sessions`` port — the one port
+        ``build_onboarding_ports`` deliberately does NOT bind, because whoever owns
+        the browser owns the session's lifecycle — is bound to a real
+        implementation.
+
+        Three ``None`` answers, all of them absences this deployment genuinely
+        has rather than refusals invented here:
+
+        * no browser service configured, so ``ServiceLoopSessionFactory`` would
+          have nothing to start a session against;
+        * no decision-model key, which ``OnboardingWorker.drivable`` reads off the
+          composition root's own ``unavailable`` map — claiming a run that cannot
+          be composed and releasing it again is a spin that looks like work;
+        * the port graph itself refused to compose (a live-capability flag set
+          with its credential missing raises ``ConfigurationRequiredError`` by
+          design), which must not take the whole API process down with it.
+
+        Built through ``CanonicalRuntime.onboarding_ports()`` rather than
+        ``build_onboarding_ports`` directly so the phase history, the leases, the
+        profile store and the vault are opened against the same ledger file and
+        the same secret store this service already holds. Cached because that
+        method caches per runtime instance and ``self._canonical`` is a fresh
+        instance per access.
+        """
+
+        existing = cast("OnboardingWorker | None", getattr(self, "_onboarding_worker", None))
+        if existing is not None:
+            return existing
+        settings = self._settings or Settings.from_env()
+        browser = self._browser_worker_for("playwright")
+        # Exactly ONE backend can drive the observe/act loop: the out-of-process
+        # browser service's RPC client. ``ServiceLoopSessionFactory`` addresses a
+        # session by id against that client, and the client's ``_session_hosts``
+        # map is process-local, so the factory and the client must be the same
+        # object in the same process. The in-process ``PlaywrightBrowserWorker``
+        # also defines ``observe_session`` — a duck-typed ``hasattr`` admitted it
+        # here and produced a session-not-found deep inside the loop instead of a
+        # clean "this deployment cannot drive onboarding". Name the admitted type
+        # instead, and fail closed for anything unrecognised: a backend we cannot
+        # reason about must not be handed the queue.
+        from ops.browser.service_client import BrowserServiceClient
+
+        if not isinstance(browser, BrowserServiceClient):
+            LOGGER.info(
+                "the onboarding worker is unwired: driving the loop needs the browser service "
+                "client, and this deployment's browser backend is %s",
+                "unconfigured" if browser is None else type(browser).__name__,
+            )
+            return None
+        try:
+            ports = self._canonical.onboarding_ports()
+        except ConfigurationRequiredError as error:
+            LOGGER.warning(
+                "the onboarding ports could not be composed (%s); the queue will not be driven",
+                error.reason_code,
+            )
+            return None
+        sessions = ServiceLoopSessionFactory(
+            service=cast("BrowserSessionService", browser),
+            ledger=self.storage,
+            profiles=ports.profiles,
+        )
+        worker = OnboardingWorker(ports=ports, sessions=sessions, settings=settings)
+        self._onboarding_worker = worker
+        return worker
 
     @classmethod
     def from_paths(
@@ -777,6 +931,7 @@ class RunService:
             # unavailable; the email worker handles only bounded inbox work.
             self._start_autonomous_advancer()
             self._start_onboarding_takeover()
+            self._start_onboarding_worker()
             self._start_email_poller()
 
     def _reconcile_stranded_runs(self) -> None:
@@ -850,6 +1005,24 @@ class RunService:
         takeover = self._takeover
         if takeover is not None:
             takeover.start()
+
+    def _start_onboarding_worker(self) -> None:
+        """Start the pump that drives runs created with ``onboarding: true``.
+
+        The wiring audit records the answer either way, because "the run was
+        enqueued and nothing ever claimed it" is exactly the failure this pump
+        exists to end and it must be visible on ``GET /api/health`` rather than
+        only in a log line nobody reads.
+        """
+
+        worker = self._onboarding
+        started = worker.start() if worker is not None else False
+        self._record_wiring(
+            "onboarding_worker",
+            worker,
+            configured=self._settings is None or self._settings.onboarding_worker_enabled,
+            wired=started,
+        )
 
     def reconcile_idle_browser_runs(self, *, limit: int = 100) -> int:
         """Recover runs stuck at ``browser_running`` with nothing driving them."""
@@ -1486,6 +1659,14 @@ class RunService:
         if takeover is not None:
             takeover.stop()
             self._takeover_service = None
+        pump = cast("OnboardingWorker | None", getattr(self, "_onboarding_worker", None))
+        if pump is not None:
+            # Joined before the browser workers below are closed: a drive in
+            # flight is still observing through one of them, and closing the
+            # client underneath it would turn an orderly stop into the crash the
+            # fencing token has to recover from.
+            pump.stop()
+            self._onboarding_worker = None
         workflow = self._workflow
         self._workflow = None
         if workflow is not None:

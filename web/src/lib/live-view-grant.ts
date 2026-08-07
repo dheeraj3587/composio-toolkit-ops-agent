@@ -1,6 +1,9 @@
 import "server-only"
 
 import { ApiError } from "@/lib/api"
+// One origin check, shared with the schema that guards the same hop, so the two
+// can never disagree about which host counts as ours.
+import { isOwnBrowserServiceEndpoint } from "@/lib/api-schemas"
 
 const INTERACTIVE_ENDPOINT = "/internal/browser/live-view/novnc"
 const SESSION_PATTERN = /^[A-Za-z0-9_-]{1,180}$/
@@ -23,14 +26,7 @@ export function sameOriginInteractivePath(value: string): string {
   const queryKeys = [...parsed.searchParams.keys()]
   const session = parsed.searchParams.get("session")
   const token = parsed.searchParams.get("token")
-  const validEndpoint =
-    parsed.protocol === "http:" &&
-    parsed.hostname === "browser-worker" &&
-    parsed.port === "8081" &&
-    parsed.pathname === INTERACTIVE_ENDPOINT &&
-    parsed.username === "" &&
-    parsed.password === "" &&
-    parsed.hash === ""
+  const validEndpoint = isOwnBrowserServiceEndpoint(parsed, INTERACTIVE_ENDPOINT)
   const validQuery =
     queryKeys.length === 2 &&
     new Set(queryKeys).size === 2 &&

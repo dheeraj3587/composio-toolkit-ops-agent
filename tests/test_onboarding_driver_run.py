@@ -41,6 +41,7 @@ from ops.onboarding.phase import RESUMABLE_PHASES, OnboardingPhase, OnboardingRe
 from ops.planner.plan import RunPlan
 from ops.planner.store import RunPlanStore
 from ops.planner.validator import PlanRefusal, validate_plan
+from ops.playwright.actions import ActionExecutionResult
 from ops.providers.profile import (
     FieldEvidence,
     FlowSpec,
@@ -95,6 +96,7 @@ def _profile() -> ProviderProfile:
             kind="developer_app",
             supported=True,
             entry_url="https://console.example.com/apps",
+            control_names=("Create app",),
         ),
         oauth_flow=FlowSpec(kind="oauth", supported=False, entry_url=None),
         api_key_flow=FlowSpec(
@@ -138,8 +140,16 @@ class _Session:
             raw_elements=_RAW_ELEMENTS,
         )
 
-    async def act(self, candidate: ActionCandidate) -> None:
+    async def act(self, candidate: ActionCandidate) -> ActionExecutionResult:
         self.acted.append(candidate)
+        return ActionExecutionResult(
+            status="executed",
+            candidate_id=candidate.candidate_id,
+            before_url="https://console.example.com/apps",
+            after_url="https://console.example.com/apps/created",
+            before_generation=1,
+            after_generation=2,
+        )
 
 
 class _Sessions:
@@ -165,6 +175,11 @@ class _Goals:
             instruction="Create a new developer application.",
             success_reason_code="developer_app_created",
             signals=("Create app",),
+            # The reviewed control that may create it. Without a named control the
+            # risk policy refuses every "Create" click, which is the correct
+            # fail-closed answer for a goal nobody reviewed for creation.
+            credential_creation_controls=("Create app",),
+            credential_creation_policy="create_if_missing",
         )
 
 

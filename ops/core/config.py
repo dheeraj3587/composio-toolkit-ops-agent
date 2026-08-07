@@ -5,8 +5,9 @@ from __future__ import annotations
 import hmac
 import os
 from collections.abc import Mapping
+from math import ceil
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
@@ -15,8 +16,76 @@ from ops.browser.session_capability import (
     BrowserSessionCapabilityError,
     validate_capability_owner,
 )
-from ops.core.inference import DecisionBudget
 from ops.core.models import validate_vault_reference
+
+# The three physical costs of one live browser operation, in seconds.
+#
+# These live here rather than in ``ops/playwright/worker.py`` because they are
+# what makes the outer budget checkable: the worker's own wall clock used to be
+# a hardcoded 270 s that nobody compared against anything, and 270 plus a 45 s
+# navigation is exactly the 315 s the client is willing to wait — so a loop that
+# used its whole budget was aborted client-side with no step named, and the
+# staleness sweep fenced the run one second later. The validator below now
+# refuses that arrangement at startup, and
+# :func:`agent_loop_budget_seconds` derives the loop's share from whatever the
+# client budget actually is.
+#
+# BROWSER_NAVIGATION_BUDGET_SECONDS is the ``_NAV_TIMEOUT_MS`` the worker gives
+# the one navigation that precedes the loop. BROWSER_REPLY_BUDGET_SECONDS is
+# what must survive after the loop stops: serializing the observation,
+# persisting encrypted storage state, and writing the RPC reply. The minimum is
+# the point below which a loop is not worth starting — one observe, one decide,
+# one act, one verify.
+BROWSER_NAVIGATION_BUDGET_SECONDS: Final[float] = 45.0
+BROWSER_REPLY_BUDGET_SECONDS: Final[float] = 20.0
+MIN_BROWSER_LOOP_SECONDS: Final[float] = 30.0
+# The browser service's own outer ceiling on one operation. The loop never gets
+# more than this however generous the client budget is, because exceeding it
+# means the service kills the operation rather than the client waiting for it.
+MAX_BROWSER_LOOP_SECONDS: Final[float] = 270.0
+# Slack deliberately left unspent between the end of one whole operation and the
+# moment the client stops waiting.
+#
+# Without it the chain is exact rather than ordered, and exact is not safe here.
+# At the production defaults the arithmetic ran 45 (navigation) + 250 (loop) +
+# 20 (reply) = 315, which is EXACTLY
+# ``BROWSER_SERVICE_CLIENT_TIMEOUT_SECONDS``; the staleness sweep then floors a
+# canonical run's window at ceil(315) + 1 = 316 s (see
+# ``ops/runs/liveness.py::_stale_seconds``), so a loop that spent its whole
+# budget lost the race to the client abort and had one second of margin against
+# being fenced. Twenty seconds turns both into orderings that hold:
+#
+#     45 + 230 + 20 = 295 s operation
+#                   < 300 s the browser service's own BROWSER_OPERATION_TIMEOUT
+#                   < 315 s the client budget
+#                   < 316 s the staleness window
+#
+# and the cost is 20 s of a 250 s loop, paid to convert a client-side abort that
+# names no step and reports no observation into an in-worker ``navigation_timeout``
+# that carries the whole step trail back.
+BROWSER_OPERATION_MARGIN_SECONDS: Final[float] = 20.0
+
+
+def agent_loop_budget_seconds(client_timeout_seconds: float) -> float:
+    """The wall clock one action loop may spend, given the client's outer budget.
+
+    The loop gets what is left after the navigation that precedes it, the reply
+    that follows it and the unspent margin that keeps the whole operation
+    strictly inside the client budget — capped at the service's own operation
+    ceiling and floored at the point below which a loop cannot complete a single
+    iteration. The floor is a clamp, not a promise: a client budget too small to
+    hold navigation, a floor-sized loop, a reply and the margin is refused by
+    :meth:`Settings.browser_operation_budget_fits_the_client_timeout` at
+    startup, so the clamp is never silently overrunning a live deployment.
+    """
+
+    remaining = (
+        float(client_timeout_seconds)
+        - BROWSER_NAVIGATION_BUDGET_SECONDS
+        - BROWSER_REPLY_BUDGET_SECONDS
+        - BROWSER_OPERATION_MARGIN_SECONDS
+    )
+    return min(MAX_BROWSER_LOOP_SECONDS, max(MIN_BROWSER_LOOP_SECONDS, remaining))
 
 
 def _optional(value: str | None) -> str | None:
@@ -338,6 +407,19 @@ class Settings(BaseModel):
     # Bound shared-mailbox work per cycle so one large backlog cannot starve the
     # API or monopolize the connected Gmail account.
     email_poll_max_runs_per_cycle: int = Field(default=25, ge=1, le=100)
+    # Bounds for ONE email-reply model call, read by ``ops.email.ai.email_budget``.
+    # Declared here so the numbers are tunable per deployment: that function reads
+    # them through ``getattr`` because both of its callers hand it a bare
+    # ``object``, and until these fields existed its fallbacks (120/45/5) were the
+    # only values there were — a poller thread walking up to
+    # EMAIL_POLL_MAX_RUNS_PER_CYCLE runs had no way to buy itself a shorter worst
+    # case. ``email_budget`` treats 0/absent as "use the fallback", so these
+    # defaults are deliberately the same non-zero numbers rather than 0: a 0.0
+    # default here would read as "unset" and silently restore 120/45/5 while
+    # looking configurable.
+    email_model_total_seconds: float = Field(default=120.0, ge=1.0)
+    email_model_provider_seconds: float = Field(default=45.0, ge=1.0)
+    email_model_max_providers: int = Field(default=5, ge=1, le=5)
     max_unclear_retries: int = Field(default=1, ge=0)
     max_browser_attempts: int = Field(default=2, ge=1)
     max_hitl_count: int = Field(default=3, ge=0)
@@ -350,7 +432,15 @@ class Settings(BaseModel):
     # How many times a run may be auto-advanced past a machine-resolvable human
     # gate (e.g. a login form we hold credentials for) before it truly waits for
     # a human. Bounded so a persistently failing login can never loop forever.
-    max_autonomous_advances: int = Field(default=2, ge=0, le=10)
+    #
+    # Two was too few to reach a credential page unattended: one onboarding run
+    # legitimately crosses several distinct machine-resolvable gates in sequence
+    # — a login, an emailed verification, a declared terms acceptance — and this
+    # budget is per RUN, not per gate, so a run that resolved two honestly had no
+    # attempts left for the third and stopped for a human on a gate the policy had
+    # already classified as autonomous. Five covers the longest reviewed ladder
+    # with headroom while still terminating a genuine retry loop.
+    max_autonomous_advances: int = Field(default=5, ge=0, le=10)
     # Cadence of the autonomous advancement sweep, in seconds.
     autonomous_advance_interval_seconds: int = Field(default=20, ge=5)
     # Bounded retry for transient Composio Gmail READ failures only (sends are
@@ -433,6 +523,25 @@ class Settings(BaseModel):
     # `probe_failed` and the run keeps waiting, so this stays under the tightest
     # interval rather than queueing behind it.
     onboarding_takeover_probe_timeout_seconds: float = Field(default=5.0, ge=1.0, le=15.0)
+    # The queue pump (`ops.onboarding.worker`). It defaults ON for the same reason
+    # the takeover watcher does, and with a narrower blast radius: it only ever
+    # drives a run that was explicitly created with `onboarding: true` and is
+    # therefore already sitting in `onboarding_queue`. A run nobody enqueued is
+    # never touched, so the flag off is "the queue is not read" and not "the agent
+    # is safe" -- the safety is the enqueue, not the switch. Like every other
+    # sweep it is still gated by `ops_startup_automation_enabled` and by deployment
+    # acceptance, and it refuses to start at all when the deployment has no
+    # decision-model key (there is nothing for it to drive).
+    onboarding_worker_enabled: bool = True
+    # How long the pump waits after finding an empty queue. Claim jitter is added
+    # on top, so two workers on one host do not contend on the same
+    # `BEGIN IMMEDIATE` every cycle.
+    onboarding_worker_interval_seconds: int = Field(default=5, ge=1, le=60)
+    # How many runs one process drives at once. Each concurrent run holds one
+    # browser container for the length of a phase, so this is sized against the
+    # browser service rather than against CPU; the single-host constraint
+    # (Requirement 21.7) is what makes a per-process bound the deployment's bound.
+    onboarding_worker_max_concurrent_runs: int = Field(default=3, ge=1, le=10)
     # Progress liveness (Requirements 4.2, 4.9). The staleness window sits above the
     # slowest single step (act 40 s plus verify 20 s) with room for one retry, and far
     # below the loop wall clock of 900 s, so a working-but-slow run is not marked
@@ -444,12 +553,57 @@ class Settings(BaseModel):
     # `browser_step_deadlines_fit_inside_the_client_budget` below rather than merely
     # documented, because a set that sums past the outer budget turns a per-step
     # timeout into a client-side abort that names no step at all. The defaults sum to
-    # 100 s, under the browser service's own 120 s operation ceiling and far under the
+    # 115 s, under the browser service's own 120 s operation ceiling and far under the
     # 315 s client budget.
+    #
+    # Decide is the widest of the four because it is the only step that waits on a
+    # provider chain rather than on Chromium. It moves in LOCKSTEP with
+    # `onboarding_action_decision_total_seconds` below, which floors it: a decide
+    # deadline shorter than the chain it waits on would cancel a decision the
+    # chain was still allowed to make, which is the failure this pair exists to
+    # prevent. Its ceiling is 120 rather than 60 so that the pair can still be
+    # raised together by a deployment; the sum of the four is what actually has
+    # to fit, and the validator below is what checks it.
     onboarding_step_observe_timeout_seconds: int = Field(default=20, ge=5, le=60)
-    onboarding_step_decide_timeout_seconds: int = Field(default=20, ge=5, le=60)
+    onboarding_step_decide_timeout_seconds: int = Field(default=60, ge=5, le=120)
     onboarding_step_act_timeout_seconds: int = Field(default=40, ge=5, le=90)
     onboarding_step_verify_timeout_seconds: int = Field(default=20, ge=5, le=60)
+    # One page decision of the LIVE browser action loop (Requirement 4.7's decide
+    # step, and every ``build_json_inference`` call that does not name its own
+    # budget). Sourced by ``ops.core.inference.action_decision_budget``.
+    #
+    # These three used to be frozen literals on ``DecisionBudget`` with no
+    # environment variable at all — 15 s total, 6 s per provider, 3 providers —
+    # and that combination made half the configured chain unreachable. The chain
+    # is Mercury, Groq, Cerebras, OpenRouter, Gemini; ``max_providers=3`` meant
+    # the last two were never asked, and 6 s per attempt cancelled Mercury at
+    # ``reasoning_effort="high"`` — the very deliberation this deployment pays
+    # for — so the loop reported ``all_providers_failed`` and fell through to a
+    # human gate on a page the chain could have read.
+    #
+    # 25 s per provider covers a high-effort Mercury answer with headroom. 60 s
+    # total is the ceiling, not the expectation: a refused, rate-limited or
+    # unconfigured provider fails in milliseconds, so all five stay reachable,
+    # and only providers that actually HANG spend their slice — at which point
+    # about two of them fit inside the total and the chain moves on rather than
+    # waiting for a sixth answer that is not coming.
+    #
+    # Against the loop that pays for them: the loop gets 230 s at the production
+    # client timeout (see BROWSER_OPERATION_MARGIN_SECONDS), so three fully
+    # timed-out decisions would consume it. That is the correct outcome — every
+    # provider hanging for 25 s is a provider outage, and burning twenty steps on
+    # it would only turn one honest ``navigation_timeout`` into twenty.
+    onboarding_action_decision_total_seconds: float = Field(default=60.0, ge=5.0, le=120.0)
+    onboarding_action_decision_provider_seconds: float = Field(default=25.0, ge=2.0, le=60.0)
+    onboarding_action_max_providers: int = Field(default=5, ge=1, le=5)
+    # How many iterations one browser operation's action loop may take. The loop's
+    # other bound is wall clock (``agent_loop_budget_seconds``); this one bounds a
+    # loop whose steps are all cheap and deterministic, so a page that oscillates
+    # between two states without ever repeating a fingerprint still terminates.
+    # The ceiling is ``ops.browser.worker.MAX_OBSERVATION_STEPS`` (40): steps past
+    # it are executed but truncated out of the observation, so the operator console
+    # would show a trail that does not describe the run.
+    browser_agent_max_steps: int = Field(default=20, ge=1, le=40)
     # Pre-flight planning (Requirement 5.3). Paid once per run, before any browser
     # session exists, so the total is wider than one action decision while each
     # provider attempt stays short and how much of the chain one plan may consume
@@ -616,6 +770,86 @@ class Settings(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def browser_operation_budget_fits_the_client_timeout(self) -> Settings:
+        """Keep one whole browser operation inside the budget the client will wait.
+
+        This is the LIVE budget, and it is a different set of numbers from the
+        four per-step deadlines checked below. Those four deadlines bound the
+        driver's loop, which nothing in production reaches; the numbers here
+        bound the Playwright worker's own action loop, which is the only browser
+        loop that runs.
+
+        One operation is a navigation, then the loop, then the reply — and the
+        reply is the part that used to be forgotten. At the previous hardcoded
+        values a 45 s navigation plus a 270 s loop came to exactly the 315 s the
+        client waits, so a loop that spent its whole budget was cut off
+        client-side as ``browser_service_unreachable``, naming no step and
+        reporting no observation, and one second later the staleness sweep
+        fenced the run. Two failures, neither of them the truth.
+
+        Three inequalities have to hold, and all three are asserted here rather
+        than argued in prose, because every one of them used to be an arithmetic
+        coincidence that a later edit to any single constant could break
+        silently:
+
+            navigation + loop + reply  <  client timeout  <  staleness window
+
+        The first is what keeps a spent loop reporting its own timeout instead of
+        being cut off mid-reply. The second is what keeps the sweep from fencing a
+        run the client is still legitimately waiting on. At the production
+        defaults: 45 + 230 + 20 = 295 < 315 < 316.
+
+        The staleness window is recomputed here with the same formula
+        ``ops/runs/liveness.py::_stale_seconds`` uses for a canonical run. It is
+        duplicated deliberately: that module imports Settings, so Settings cannot
+        import it back, and an assertion that would go stale is still worth more
+        than a comment that already has.
+        """
+
+        floor = (
+            BROWSER_NAVIGATION_BUDGET_SECONDS
+            + MIN_BROWSER_LOOP_SECONDS
+            + BROWSER_REPLY_BUDGET_SECONDS
+            + BROWSER_OPERATION_MARGIN_SECONDS
+        )
+        if self.browser_service_client_timeout_seconds < floor:
+            raise ValueError(
+                "BROWSER_SERVICE_CLIENT_TIMEOUT_SECONDS="
+                f"{self.browser_service_client_timeout_seconds} cannot hold one browser "
+                f"operation: {BROWSER_NAVIGATION_BUDGET_SECONDS}s of navigation, a "
+                f"{MIN_BROWSER_LOOP_SECONDS}s minimum action loop, "
+                f"{BROWSER_REPLY_BUDGET_SECONDS}s to serialize and reply and "
+                f"{BROWSER_OPERATION_MARGIN_SECONDS}s of unspent margin require at "
+                f"least {floor}s"
+            )
+        operation_seconds = (
+            BROWSER_NAVIGATION_BUDGET_SECONDS
+            + agent_loop_budget_seconds(self.browser_service_client_timeout_seconds)
+            + BROWSER_REPLY_BUDGET_SECONDS
+        )
+        if operation_seconds >= self.browser_service_client_timeout_seconds:
+            raise ValueError(
+                f"one browser operation ({operation_seconds}s: "
+                f"{BROWSER_NAVIGATION_BUDGET_SECONDS}s navigation, "
+                f"{agent_loop_budget_seconds(self.browser_service_client_timeout_seconds)}s "
+                f"action loop, {BROWSER_REPLY_BUDGET_SECONDS}s reply) is not below "
+                "BROWSER_SERVICE_CLIENT_TIMEOUT_SECONDS="
+                f"{self.browser_service_client_timeout_seconds}"
+            )
+        stale_window_seconds = max(
+            float(self.onboarding_progress_stale_seconds),
+            float(ceil(self.browser_service_client_timeout_seconds) + 1),
+        )
+        if self.browser_service_client_timeout_seconds >= stale_window_seconds:
+            raise ValueError(
+                "BROWSER_SERVICE_CLIENT_TIMEOUT_SECONDS="
+                f"{self.browser_service_client_timeout_seconds} is not below the "
+                f"progress staleness window of {stale_window_seconds}s, so the sweep "
+                "would fence a run the client is still waiting on"
+            )
+        return self
+
+    @model_validator(mode="after")
     def browser_step_deadlines_fit_inside_the_client_budget(self) -> Settings:
         """Keep the four per-step deadlines inside the outer browser-operation budget.
 
@@ -642,12 +876,32 @@ class Settings(BaseModel):
                 "BROWSER_SERVICE_CLIENT_TIMEOUT_SECONDS="
                 f"{self.browser_service_client_timeout_seconds}"
             )
-        decision_budget_seconds = DecisionBudget().total_seconds
+        # Read off the settings rather than off ``DecisionBudget()``'s frozen
+        # defaults. Those defaults were the whole reason this floor was checkable
+        # in the first place and the whole reason the pair could not be tuned: the
+        # budget was a literal with no environment variable, so raising the decide
+        # deadline alone did nothing and raising the budget alone was impossible.
+        # ``ops.core.inference.action_decision_budget`` builds the live budget
+        # from exactly these three fields, so the number floored here is the number
+        # the chain will actually be allowed to spend.
+        decision_budget_seconds = self.onboarding_action_decision_total_seconds
         if self.onboarding_step_decide_timeout_seconds < decision_budget_seconds:
             raise ValueError(
                 "ONBOARDING_STEP_DECIDE_TIMEOUT_SECONDS="
-                f"{self.onboarding_step_decide_timeout_seconds} must be at least the "
-                f"decision budget of {decision_budget_seconds}s"
+                f"{self.onboarding_step_decide_timeout_seconds} must be at least "
+                "ONBOARDING_ACTION_DECISION_TOTAL_SECONDS="
+                f"{decision_budget_seconds}"
+            )
+        if (
+            self.onboarding_action_decision_provider_seconds
+            > self.onboarding_action_decision_total_seconds
+        ):
+            raise ValueError(
+                "ONBOARDING_ACTION_DECISION_PROVIDER_SECONDS="
+                f"{self.onboarding_action_decision_provider_seconds} cannot exceed "
+                "ONBOARDING_ACTION_DECISION_TOTAL_SECONDS="
+                f"{self.onboarding_action_decision_total_seconds}: a per-attempt slice "
+                "wider than the whole decision leaves the chain one provider"
             )
         return self
 
@@ -828,11 +1082,20 @@ class Settings(BaseModel):
             "email_poll_max_runs_per_cycle": _integer(
                 source.get("EMAIL_POLL_MAX_RUNS_PER_CYCLE"), default=25
             ),
+            "email_model_total_seconds": _float(
+                source.get("EMAIL_MODEL_TOTAL_SECONDS"), default=120.0
+            ),
+            "email_model_provider_seconds": _float(
+                source.get("EMAIL_MODEL_PROVIDER_SECONDS"), default=45.0
+            ),
+            "email_model_max_providers": _integer(
+                source.get("EMAIL_MODEL_MAX_PROVIDERS"), default=5
+            ),
             "max_unclear_retries": _integer(source.get("MAX_UNCLEAR_RETRIES"), default=1),
             "browser_login_credential_reuse": _boolean(
                 source.get("BROWSER_LOGIN_CREDENTIAL_REUSE"), default=True
             ),
-            "max_autonomous_advances": _integer(source.get("MAX_AUTONOMOUS_ADVANCES"), default=2),
+            "max_autonomous_advances": _integer(source.get("MAX_AUTONOMOUS_ADVANCES"), default=5),
             "autonomous_advance_interval_seconds": _integer(
                 source.get("AUTONOMOUS_ADVANCE_INTERVAL_SECONDS"), default=20
             ),
@@ -903,6 +1166,15 @@ class Settings(BaseModel):
             "onboarding_takeover_probe_timeout_seconds": _float(
                 source.get("ONBOARDING_TAKEOVER_PROBE_TIMEOUT_SECONDS"), default=5.0
             ),
+            "onboarding_worker_enabled": _boolean(
+                source.get("ONBOARDING_WORKER_ENABLED"), default=True
+            ),
+            "onboarding_worker_interval_seconds": _integer(
+                source.get("ONBOARDING_WORKER_INTERVAL_SECONDS"), default=5
+            ),
+            "onboarding_worker_max_concurrent_runs": _integer(
+                source.get("ONBOARDING_WORKER_MAX_CONCURRENT_RUNS"), default=3
+            ),
             "onboarding_progress_stale_seconds": _integer(
                 source.get("ONBOARDING_PROGRESS_STALE_SECONDS"), default=180
             ),
@@ -913,7 +1185,7 @@ class Settings(BaseModel):
                 source.get("ONBOARDING_STEP_OBSERVE_TIMEOUT_SECONDS"), default=20
             ),
             "onboarding_step_decide_timeout_seconds": _integer(
-                source.get("ONBOARDING_STEP_DECIDE_TIMEOUT_SECONDS"), default=20
+                source.get("ONBOARDING_STEP_DECIDE_TIMEOUT_SECONDS"), default=60
             ),
             "onboarding_step_act_timeout_seconds": _integer(
                 source.get("ONBOARDING_STEP_ACT_TIMEOUT_SECONDS"), default=40
@@ -921,6 +1193,16 @@ class Settings(BaseModel):
             "onboarding_step_verify_timeout_seconds": _integer(
                 source.get("ONBOARDING_STEP_VERIFY_TIMEOUT_SECONDS"), default=20
             ),
+            "onboarding_action_decision_total_seconds": _float(
+                source.get("ONBOARDING_ACTION_DECISION_TOTAL_SECONDS"), default=60.0
+            ),
+            "onboarding_action_decision_provider_seconds": _float(
+                source.get("ONBOARDING_ACTION_DECISION_PROVIDER_SECONDS"), default=25.0
+            ),
+            "onboarding_action_max_providers": _integer(
+                source.get("ONBOARDING_ACTION_MAX_PROVIDERS"), default=5
+            ),
+            "browser_agent_max_steps": _integer(source.get("BROWSER_AGENT_MAX_STEPS"), default=20),
             "onboarding_plan_decision_total_seconds": _float(
                 source.get("ONBOARDING_PLAN_DECISION_TOTAL_SECONDS"), default=20.0
             ),
