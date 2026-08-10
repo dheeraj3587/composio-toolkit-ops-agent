@@ -561,6 +561,102 @@ async def _unfilled_required_control(form: Any) -> bool:
     return False
 
 
+_SUBMIT_CONTROL_SELECTOR = "button, input[type='submit'], [role='button']"
+_SUBMIT_SCOPE_MAX_DEPTH = 10
+
+
+async def _submit_controls(form: Any, *, limit: int = 12) -> list[Any]:
+    """The controls that can submit a form, including the ones that aren't buttons.
+
+    Real buttons are resolved first and, where a form has any, are the whole
+    answer. Only a form offering none falls through to ``role="button"``, which
+    keeps the widening strictly additive: no page that resolves a submit today
+    gains a candidate, so none can be pushed from ``unique`` into ``ambiguous``
+    by this lookup.
+
+    The fallback exists because a vendor is free to build its submit out of a
+    ``<span>`` and an ARIA role, and Coda does exactly that -- its ``Continue``
+    is ``<span role="button" tabindex="0">`` and the signup card contains no
+    ``<button>`` or ``input[type=submit]`` anywhere. Restricting the lookup to
+    real buttons reported the reviewed submit as missing on a page that was
+    rendering it.
+
+    Widening the pool does not widen what gets clicked: callers still match the
+    reviewed label exactly and still refuse anything but a single match. The
+    ARIA disabled check is the other half of the same story -- ``is_enabled``
+    only knows the native ``disabled`` property, which a span cannot carry, so
+    a greyed-out span would otherwise read as ready to click.
+    """
+
+    native = await _visible_enabled(form.locator("button, input[type='submit']"), limit=limit)
+    controls = native or await _visible_enabled(form.locator(_SUBMIT_CONTROL_SELECTOR), limit=limit)
+    live: list[Any] = []
+    for control in controls:
+        try:
+            disabled = await control.get_attribute("aria-disabled", timeout=1_000)
+        except Exception:
+            disabled = None
+        if isinstance(disabled, str) and disabled.strip().casefold() == "true":
+            continue
+        live.append(control)
+    return live
+
+
+async def _credential_scope(field: Any) -> Any | None:
+    """Return the element bounding a credential form, real ``<form>`` or not.
+
+    A real ``<form>`` is what every reviewed recipe was authored against and
+    stays the first choice. But a vendor that renders its signup card as plain
+    divs behind a JS submit handler has no ``<form>`` element anywhere in the
+    document, and refusing those made the email rung structurally undrivable on
+    pages that visibly offer it: Coda serves exactly one visible
+    ``input[type=email]`` and a ``Continue`` button with zero forms on the page,
+    which surfaced as ``signup_email_step_not_supported`` against a page whose
+    email step was right there.
+
+    The fallback is the nearest ancestor that also contains a control able to
+    submit the field. That keeps every downstream scope check -- legal gate,
+    required controls, submit lookup, identity handoff -- as narrow as the form
+    would have been, rather than widening them to the whole frame where a cookie
+    banner's ``Allow All`` and ``Reject All`` buttons live. The form's ``action``
+    is the one thing lost, and only where there was never a form to carry one;
+    a JS submit reaches the network as a fetch, which the host allowlist already
+    confines by request interception rather than by attribute inspection.
+    """
+
+    try:
+        form = field.locator("xpath=ancestor::form[1]")
+        if int(await form.count()) == 1:
+            return form
+    except Exception:
+        return None
+    try:
+        depth = await field.evaluate(
+            """(element, options) => {
+                let node = element.parentElement;
+                let up = 1;
+                while (node && up <= options.maxDepth) {
+                    if (node.querySelector(options.selector)) return up;
+                    node = node.parentElement;
+                    up += 1;
+                }
+                return 0;
+            }""",
+            {"selector": _SUBMIT_CONTROL_SELECTOR, "maxDepth": _SUBMIT_SCOPE_MAX_DEPTH},
+        )
+    except Exception:
+        return None
+    if not isinstance(depth, int) or depth < 1:
+        return None
+    scope = field.locator(f"xpath=ancestor::*[{depth}]")
+    try:
+        if int(await scope.count()) != 1:
+            return None
+    except Exception:
+        return None
+    return scope
+
+
 async def _email_only_surfaces(
     page: Any,
     patterns: Sequence[str],
@@ -576,11 +672,8 @@ async def _email_only_surfaces(
             continue
         if await _visible_enabled(surface.frame.locator(_PASSWORD_SELECTOR), limit=4):
             continue
-        try:
-            form = email_field.locator("xpath=ancestor::form[1]")
-            if int(await form.count()) != 1:
-                continue
-        except Exception:
+        form = await _credential_scope(email_field)
+        if form is None:
             continue
         form_email_status, _form_email = await _unique_visible(form, _EMAIL_SELECTOR)
         if form_email_status != "unique":
@@ -613,11 +706,8 @@ async def _email_password_surfaces(
         passwords = await _visible_enabled(surface.frame.locator(_PASSWORD_SELECTOR), limit=4)
         if len(passwords) not in {1, 2}:
             continue
-        try:
-            form = email_field.locator("xpath=ancestor::form[1]")
-            if int(await form.count()) != 1:
-                continue
-        except Exception:
+        form = await _credential_scope(email_field)
+        if form is None:
             continue
         form_passwords = await _visible_enabled(form.locator(_PASSWORD_SELECTOR), limit=4)
         if len(form_passwords) != len(passwords):
@@ -639,11 +729,8 @@ async def _password_continuation_surfaces(
         passwords = await _visible_enabled(surface.frame.locator(_PASSWORD_SELECTOR), limit=4)
         if len(passwords) not in {1, 2}:
             continue
-        try:
-            form = passwords[0].locator("xpath=ancestor::form[1]")
-            if int(await form.count()) != 1:
-                continue
-        except Exception:
+        form = await _credential_scope(passwords[0])
+        if form is None:
             continue
         form_passwords = await _visible_enabled(form.locator(_PASSWORD_SELECTOR), limit=4)
         if len(form_passwords) != len(passwords):
@@ -666,13 +753,21 @@ async def _page_shape(page: Any) -> str:
 
     try:
         shape = await page.evaluate(
-            """() => ({
-                path: location.pathname,
-                inputs: [...document.querySelectorAll('form input')]
-                  .map(i => i.type).slice(0, 20),
-                buttons: [...document.querySelectorAll('form button')]
-                  .map(b => (b.innerText || '').trim()).filter(Boolean).slice(0, 12),
-            })"""
+            """() => {
+                // Scope to forms where there are any, and fall back to the
+                // document where there are none -- a page with no <form> is
+                // precisely the shape that reaches these pauses, and reporting
+                // two empty lists for it described nothing at all.
+                const scoped = document.querySelector('form') ? 'form ' : '';
+                return {
+                    path: location.pathname,
+                    forms: document.querySelectorAll('form').length,
+                    inputs: [...document.querySelectorAll(scoped + 'input')]
+                      .map(i => i.type).slice(0, 20),
+                    buttons: [...document.querySelectorAll(scoped + 'button')]
+                      .map(b => (b.innerText || '').trim()).filter(Boolean).slice(0, 12),
+                };
+            }"""
         )
     except Exception:
         return "<unavailable>"
@@ -731,7 +826,7 @@ async def _exact_submit(
     labels: Sequence[str],
 ) -> tuple[str, Any | None]:
     wanted = {label.strip().casefold() for label in labels}
-    controls = await _visible_enabled(form.locator("button, input[type='submit']"), limit=12)
+    controls = await _submit_controls(form)
     matches: list[Any] = []
     for control in controls:
         if (await _submit_text(control)).casefold() in wanted:
@@ -762,7 +857,7 @@ async def _own_submit(form: Any) -> tuple[str, Any | None]:
     grants no new page, no new host, and no new form.
     """
 
-    controls = await _visible_enabled(form.locator("button, input[type='submit']"), limit=12)
+    controls = await _submit_controls(form)
     matches: list[Any] = []
     for control in controls:
         if not _THIRD_PARTY_IDENTITY.search(await _submit_text(control)):
