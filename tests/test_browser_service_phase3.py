@@ -20,7 +20,7 @@ import re
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -30,6 +30,7 @@ from pydantic import SecretStr
 from browser_service.auth import OWNER_HEADER, TOKEN_HEADER
 from browser_service.main import (
     UvicornWebSocketLogFilter,
+    _LiveAttachment,
     create_app,
     install_browser_service_log_filters,
 )
@@ -1303,7 +1304,13 @@ class TestInteractiveHitlGrants:
                 == 200
             )
             client.app.state.live_attachments[session_id] = {  # type: ignore[index]
-                _DoneAttachment(): _StuckSocket()
+                # Registered as a CONTROL relay: that is the kind an autonomous
+                # drive must terminate before it touches the page, and so the
+                # kind whose refusal to close has to strand the drive.
+                _DoneAttachment(): _LiveAttachment(
+                    access="control",
+                    socket=cast(Any, _StuckSocket()),
+                )
             }
             response = client.post(
                 f"/internal/browser/sessions/{session_id}/resume",
@@ -2221,7 +2228,13 @@ class TestServiceOwnsTheRealSession:
             assert session is not None
             session.hitl_pending = True
             client.app.state.live_attachments[session_id] = {  # type: ignore[index]
-                _DoneAttachment(): _StuckSocket()
+                # Registered as a CONTROL relay: that is the kind an autonomous
+                # drive must terminate before it touches the page, and so the
+                # kind whose refusal to close has to strand the drive.
+                _DoneAttachment(): _LiveAttachment(
+                    access="control",
+                    socket=cast(Any, _StuckSocket()),
+                )
             }
 
             first = client.delete(f"/internal/browser/sessions/{session_id}", headers=_headers())

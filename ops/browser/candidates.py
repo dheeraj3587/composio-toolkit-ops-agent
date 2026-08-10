@@ -400,9 +400,7 @@ def _normalize(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
 
 
-def _interleave(
-    groups: Sequence[Sequence[ActionCandidate]], limit: int
-) -> list[ActionCandidate]:
+def _interleave(groups: Sequence[Sequence[ActionCandidate]], limit: int) -> list[ActionCandidate]:
     """Flatten per-element candidate groups breadth-first, under ``limit``.
 
     PRE: ``groups`` holds one entry per element, each ordered by descending

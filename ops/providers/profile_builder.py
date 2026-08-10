@@ -270,9 +270,7 @@ MIN_CORROBORATIONS: Final = 2
 # signup page somewhere on the internet, and if research finds one it should
 # still vote on the domain and still owe two sources. Narrowing the voters per
 # route would only make a domain disagreement harder to detect.
-_ANCHOR_FIELDS: Final[frozenset[str]] = frozenset(
-    {"registrable_domain", "signup_url", "login_url"}
-)
+_ANCHOR_FIELDS: Final[frozenset[str]] = frozenset({"registrable_domain", "signup_url", "login_url"})
 
 # Claim fields whose value is an https URL, and therefore subject to the HTTPS +
 # matching-registrable-domain admission check.
@@ -363,6 +361,16 @@ _REQUIRED_FIELDS_BY_ROUTE: Final[Mapping[RouteKind, _RequiredFields]] = {
         all_of=frozenset({"registrable_domain", "login_url"}),
         any_of=frozenset(_FLOW_FIELDS),
     ),
+    # Managed key. The same shape as managed auth and for the same reason -- the
+    # account exists and the owner brings the credential -- so it gets its own
+    # entry rather than the strictest fallback, which demands a ``signup_url``
+    # these apps do not have. It is written out instead of aliased because the
+    # table above promises one honest set per route; the fact that two routes
+    # agree today is not a reason to make them the same row tomorrow.
+    "managed_key": _RequiredFields(
+        all_of=frozenset({"registrable_domain", "login_url"}),
+        any_of=frozenset(_FLOW_FIELDS),
+    ),
     # Gated. Access is granted out of band (partner form, sales review), so no
     # login or credential page is reachable until a human grant that has not
     # happened yet. Only the confinement anchor can honestly be demanded.
@@ -384,6 +392,7 @@ def _required_fields(route_kind: RouteKind | None) -> _RequiredFields:
     if route_kind is None:
         return _STRICTEST_REQUIRED_FIELDS
     return _REQUIRED_FIELDS_BY_ROUTE.get(route_kind, _STRICTEST_REQUIRED_FIELDS)
+
 
 # What each flow mints, keyed by flow kind rather than by provider: research may
 # say *where* a credential comes from, never what kind of material a page will

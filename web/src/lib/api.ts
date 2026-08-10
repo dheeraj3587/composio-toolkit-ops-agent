@@ -13,6 +13,7 @@ import {
   healthResponseSchema,
   liveViewResponseSchema,
   managedConnectionResponseSchema,
+  managedKeyConnectionResponseSchema,
   pauseResponseSchema,
   providerProfileResponseSchema,
   providerStatusSchema,
@@ -37,6 +38,7 @@ import type {
   IntegratorOutput,
   LiveViewResponse,
   ManagedConnectionResponse,
+  ManagedKeyConnectionResponse,
   ModelCatalogResponse,
   OnboardingPhase,
   OperationsBatchRequestInput,
@@ -288,6 +290,40 @@ export function pollManagedConnection(runId: string): Promise<ManagedConnectionR
     runPath(runId, "/poll-connection"),
     managedConnectionResponseSchema,
     { method: "POST" },
+    CREDENTIAL_TIMEOUT_MS,
+  )
+}
+
+/**
+ * Publish one owner-held key as an ACTIVE Composio connected account.
+ *
+ * The managed_key sibling of `submitCredentials`, and separate from it for the
+ * same reason the routes are separate: this body carries no company block (the
+ * run already holds the reviewed request it was created from) and the result is
+ * a connection rather than a vaulted bundle. The raw value leaves this
+ * server-only client immediately for the loopback API and is never logged,
+ * cached, or returned to the browser.
+ */
+export function submitManagedKey(
+  runId: string,
+  credentials: Record<string, string>,
+): Promise<ManagedKeyConnectionResponse> {
+  const fields = Object.keys(credentials)
+  if (fields.length === 0 || fields.length > 20) {
+    throw new ApiError(400, "INVALID_CREDENTIAL_FIELDS", "Provide one to twenty credential fields.")
+  }
+  for (const field of fields) {
+    if (!CREDENTIAL_FIELD_PATTERN.test(field) || !credentials[field]) {
+      throw new ApiError(400, "INVALID_CREDENTIAL_FIELD", "A credential field is invalid.")
+    }
+  }
+  return apiRequest(
+    runPath(runId, "/managed-key"),
+    managedKeyConnectionResponseSchema,
+    {
+      method: "POST",
+      body: JSON.stringify({ credentials }),
+    },
     CREDENTIAL_TIMEOUT_MS,
   )
 }

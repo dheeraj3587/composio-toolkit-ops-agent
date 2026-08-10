@@ -73,7 +73,7 @@ def _company() -> CompanyProfile:
     )
 
 
-def _request(app_name: str = "Close") -> OperationsRequest:
+def _request(app_name: str = "Freshdesk") -> OperationsRequest:
     return OperationsRequest(
         app_name=app_name,
         company=_company(),
@@ -82,7 +82,7 @@ def _request(app_name: str = "Close") -> OperationsRequest:
 
 
 def _recipe(*, contact_email: str | None = VENDOR, contact_url: str | None = None) -> AppRecipe:
-    base = get_app_recipe("close")
+    base = get_app_recipe("freshdesk")
     assert base is not None and base.outreach is not None
     payload = base.model_dump(mode="python")
     outreach = dict(payload["outreach"])
@@ -106,7 +106,7 @@ def test_preparation_has_no_side_effect_and_exposes_only_reviewed_metadata() -> 
 
     assert gmail.calls == []
     assert asdict(route.target) == {
-        "app_slug": "close",
+        "app_slug": "freshdesk",
         "intended_recipient": VENDOR,
         "template_id": "gated-access-v1",
         "sending_policy": "controlled_sink_only",
@@ -158,7 +158,7 @@ def test_route_requires_gated_recipe_and_matching_request() -> None:
     with pytest.raises(GatedRoutePolicyError) as mismatch:
         GatedRoute(
             recipe=_recipe(),
-            request=_request("Freshdesk"),
+            request=_request("Ramp"),
             gmail=cast(GmailWorker, gmail),
         )
 
@@ -169,13 +169,13 @@ def test_route_requires_gated_recipe_and_matching_request() -> None:
 
 def test_review_required_and_url_only_contacts_cannot_send_email() -> None:
     gmail = _RecordingGmail()
-    unreviewed = get_app_recipe("plain")
+    unreviewed = get_app_recipe("help-scout")
     assert unreviewed is not None
 
     with pytest.raises(GatedRoutePolicyError) as review_required:
         GatedRoute(
             recipe=unreviewed,
-            request=_request("Plain"),
+            request=_request("Help Scout"),
             gmail=cast(GmailWorker, gmail),
         )
     with pytest.raises(GatedRoutePolicyError) as email_missing:

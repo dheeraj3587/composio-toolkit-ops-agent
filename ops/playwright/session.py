@@ -113,9 +113,18 @@ class _PwSession:
     lifecycle: str = "ACTIVE"
     active_operations: int = 0
     # --- Phase 2: multi-page, dialog, download and staged-egress state ---
-    # Page registry (popups/new tabs). Set up in _launch; the newest page is
+    # Page registry (popups/new tabs). Installed by
+    # ``PlaywrightBrowserWorker._install_interaction_guards``, which ``start``
+    # calls for EVERY session — the comment here used to say "_launch", and the
+    # only real caller was ``navigate_onboarding``, so an observe/act session
+    # (the one the onboarding driver uses) ran with no registry, no dialog
+    # handler, no download guard and a ``None`` egress policy. The newest page is
     # never trusted automatically (see BrowserPageRegistry.consider_popup).
     pages: BrowserPageRegistry | None = field(default=None)
+    # The host patterns the guards above were wired against. Re-installing over
+    # a live context would stack a second route handler on it, so the installer
+    # compares this and rebuilds only the policy when the allow-list widens.
+    guarded_patterns: tuple[str, ...] | None = field(default=None)
     dialog_records: list[DialogRecord] = field(default_factory=list)
     download_records: list[DownloadRecord] = field(default_factory=list)
     egress: EgressStageTracker = field(default_factory=EgressStageTracker)

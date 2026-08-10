@@ -40,7 +40,11 @@ from ops.browser.worker import (
 )
 from ops.core.logging_setup import run_context
 from ops.core.model_catalog import ModelSelection
-from ops.core.models import OperationalResearch, OperationsRequest
+from ops.core.models import (
+    OperationalResearch,
+    OperationsRequest,
+    validate_vault_reference,
+)
 from ops.core.secret_store import AccountLoginStateError, SQLiteSecretStore, parse_vault_reference
 from ops.core.state import BrowserProvider, RunStatus
 from ops.core.storage import (
@@ -70,6 +74,8 @@ from ops.recipes.app_recipes import (
     get_app_recipe,
     get_app_recipe_for_name,
     load_app_recipe_catalog,
+    managed_key_companion_plan,
+    managed_key_publish_plan,
     recipe_to_operational_research,
 )
 from ops.research.p1_adapter import P1LookupFound, P1OperationalAdapter
@@ -85,7 +91,12 @@ from ops.runs.idempotency import (
     validate_idempotency_key,
 )
 from ops.runs.liveness import AWAITING_OWNER_PHASES
-from ops.runs.projections import _PERSISTED_EXECUTION_MODE, _public_run, _slugify
+from ops.runs.projections import (
+    _PERSISTED_EXECUTION_MODE,
+    _clean_credential_value,
+    _public_run,
+    _slugify,
+)
 from ops.runs.recipe_snapshot import (
     RecipeSnapshotError,
     build_recipe_snapshot,
@@ -1292,6 +1303,14 @@ class CanonicalRuntime:
             if plan_only or recipe.route_kind != "managed_auth"
             else "connection_required"
         )
+        # One arm per ``RouteKind``, and the final arm is ``gated`` by
+        # elimination rather than by default. ``managed_key`` needs its own arm
+        # precisely because it must not inherit the gated one: a managed-key run
+        # reported as ``outreach_review`` claims it is waiting on a vendor
+        # approval reply, a route ``connect_managed_run`` and the outreach
+        # handlers both refuse for it, so the console would offer a review that
+        # can never arrive. Its real wait is the owner pasting a key that is
+        # published to Composio directly.
         phase = (
             "route_selected"
             if plan_only
@@ -1299,6 +1318,8 @@ class CanonicalRuntime:
             if recipe.route_kind == "managed_auth"
             else "browser_pending"
             if recipe.route_kind == "playwright"
+            else "key_submission_required"
+            if recipe.route_kind == "managed_key"
             else "outreach_review"
         )
         reason = _initial_reason(recipe)
@@ -2376,6 +2397,16 @@ class CanonicalRuntime:
                 "expected_completion_signal": "human_completed",
                 "live_view_available": True,
                 "hitl_generation": observation.hitl_generation,
+                # The page the gate was observed on, recorded because nothing else
+                # persists it: the run row's only URL column is the live-view link,
+                # and the audit payloads carry no page. Without it the autonomous
+                # sweep in ``ops.runs.advance`` cannot build a
+                # ``ProfileGateAuthority``, whose domain-confinement check is a
+                # comparison against exactly this URL — so every profile-authorized
+                # gate stayed human-only no matter what the operator had approved.
+                # Already ``sanitize_browser_url``-ed by ``BrowserObservation``, and
+                # it is the same value the driver path passes as ``gate_url``.
+                "gate_url": observation.current_url,
             }
             if action_type == "email_otp":
                 hitl["verification_requested_at"] = (
@@ -2532,11 +2563,29 @@ class CanonicalRuntime:
                         effect_identity=expected_effect_identity,
                         events=(ready_event,),
                     )
-                _intent, reserved = transaction.reserve_side_effect(
+                intent, reserved = transaction.reserve_side_effect(
                     run_id=run_id,
                     operation_key=effect_identity,
                     provider="playwright_vault",
                 )
+                if not reserved and str(intent.get("status") or "") == "failed":
+                    # The capture key is run-scoped on purpose: a fresh key per
+                    # attempt would let a restart press Create at the vendor twice.
+                    # But ``reserve_side_effect`` reserves only on a fresh INSERT,
+                    # so the row's terminal states were all equally unreservable --
+                    # including ``failed``, which is written at exactly one place
+                    # below: the grant reservation raising BEFORE the browser is
+                    # asked to do anything. That state proves the vendor was not
+                    # touched, so recycling it duplicates nothing. Without this a
+                    # transient grant failure pinned the run in
+                    # ``effect_reconciliation`` for good, and every retry took the
+                    # same route back to it.
+                    transaction.update_side_effect(
+                        run_id=run_id,
+                        operation_key=effect_identity,
+                        status="pending",
+                    )
+                    reserved = True
                 transaction.update_run(
                     run_id,
                     status="browser_running",
@@ -2672,9 +2721,21 @@ class CanonicalRuntime:
         changes: dict[str, object] = {}
         if final.bundle is not None:
             changes["integrator_bundle"] = final.bundle
+        # The phase has to distinguish the two non-completed finals, because
+        # ``credential_ready`` is in RETRY_DENIED_PHASES: it means "parked on a page
+        # a human was asked to visit", and a run whose validation call came back
+        # invalid is not that. Filing a failed validation under it answered the
+        # operator's Retry with browser_retry_requires_reconciliation forever, on a
+        # status whose entire meaning is "an operator can fix this".
+        if final.status == "completed":
+            final_phase = "completed"
+        elif final.status == "configuration_required":
+            final_phase = "credential_validation_failed"
+        else:
+            final_phase = "credential_ready"
         return _AppliedBrowserOutcome(
             status=cast(RunStatus, final.status),
-            phase="completed" if final.status == "completed" else "credential_ready",
+            phase=final_phase,
             reason_code=final.reason_code,
             provider_browser="credential_page_ready",
             effect_identity=effect_identity,
@@ -3015,6 +3076,12 @@ class CanonicalRuntime:
                             discard_reason=discarded,
                         )
                     return None
+                if record is None:
+                    # Unreachable: an absent row is itself a discard reason
+                    # (``run_row_absent``), so it returned above. Stated rather
+                    # than assumed, because the compare-and-set below is only
+                    # sound against a row that exists.
+                    raise RuntimeError("browser run disappeared")
                 revision = int(record.get("state_revision", 0) or 0) + 1
                 changes: dict[str, object] = {
                     "status": outcome.status,
@@ -3699,6 +3766,227 @@ class CanonicalRuntime:
                 "redirect_url": started.redirect_url,
                 "replayed": started.replayed,
                 "state": "pending",
+            }
+        finally:
+            lock.release()
+
+    def submit_managed_key(self, run_id: str, fields: Mapping[str, SecretStr]) -> dict[str, Any]:
+        """Publish an owner-held key as an ACTIVE Composio connection.
+
+        This is the terminal step of the ``managed_key`` route and the only
+        caller of :meth:`ComposioManagedAuthProvider.create_api_key_connection`.
+        It is a sibling of :meth:`connect_managed_run` rather than of the owner
+        credential submission in ``ops/runs/credentials.py``, because what it
+        produces is a connected account, not a vaulted bundle: there is no
+        browser session to release, no integrator bundle to build, and the run
+        completes when Composio reports the account ACTIVE.
+
+        The raw key is written to the encrypted vault and handed to the provider
+        in a ``SecretStr``, and nowhere else. Run state, audit payloads, and the
+        returned projection carry the ``vault://`` reference only.
+        """
+
+        provider = self._context._managed_auth_provider
+        store = self._context._secret_store
+        lock = self._context._run_lock(run_id)
+        if not lock.acquire(blocking=False):
+            raise RunConflictError(run_id, "submit_managed_key")
+        reference: str | None = None
+        try:
+            current = self._context.storage.get_run(run_id)
+            if current is None:
+                raise KeyError("run was not found")
+            if current.get("state_engine") != "canonical_v1":
+                raise CredentialSubmissionError("legacy_run_is_read_only")
+            if current.get("execution_mode") != "operations":
+                raise CredentialSubmissionError("plan_only_run_is_read_only")
+            if current.get("phase") != "key_submission_required":
+                raise CredentialSubmissionError("run_not_awaiting_key")
+            recipe = self._recipe_for_run(current)
+            scheme, detail = managed_key_publish_plan(recipe)
+            if scheme is None:
+                # ``detail`` already names the specific obstacle -- an unreviewed
+                # auth scheme, a companion field this route cannot carry -- so it
+                # is surfaced verbatim rather than flattened to a generic refusal.
+                raise CredentialSubmissionError(detail)
+            secret_field = detail
+            if store is None:
+                raise CredentialSubmissionError("credential_boundary_not_configured")
+            if provider is None:
+                raise CredentialSubmissionError("composio_managed_auth_not_configured")
+            expected = {field.name for field in recipe.credential_fields}
+            if set(fields) != expected:
+                raise CredentialSubmissionError("credential_fields_do_not_match_recipe")
+            cleaned = _clean_credential_value(fields[secret_field].get_secret_value())
+            if not cleaned:
+                raise CredentialSubmissionError("empty_credential_value")
+
+            # The companion is account identity, not a credential: Jira's
+            # Atlassian email, Harvest's account id. It travels to the provider
+            # beside the key and is deliberately NOT vaulted -- vaulting a
+            # non-secret would put a value the operator must be able to read back
+            # behind a boundary designed to make reading impossible.
+            companion: tuple[str, str] | None = None
+            companion_plan = managed_key_companion_plan(recipe)
+            if companion_plan is not None:
+                companion_field, companion_state_key = companion_plan
+                if companion_field is None:
+                    raise CredentialSubmissionError(companion_state_key)
+                companion_value = _clean_credential_value(
+                    fields[companion_field].get_secret_value()
+                )
+                if not companion_value:
+                    raise CredentialSubmissionError("empty_credential_value")
+                companion = (companion_state_key, companion_value)
+
+            effect_identity = f"{run_id}:managed-key-publish:v1"
+            with self._context.storage.unit_of_work() as transaction:
+                _effect, reserved = transaction.reserve_side_effect(
+                    run_id=run_id,
+                    operation_key=effect_identity,
+                    provider="composio_managed_auth",
+                )
+                record = transaction.get_run(run_id)
+                if record is None:
+                    raise KeyError("run was not found")
+                transaction.update_run(
+                    run_id,
+                    phase="key_publish_reserved",
+                    reason_code="key_publish_reserved",
+                    effect_identity=effect_identity,
+                    state_revision=int(record.get("state_revision", 0) or 0) + 1,
+                )
+                transaction.append_audit_event(
+                    run_id=run_id,
+                    event_type="managed_key_publish_reserved",
+                    payload={"kinds": sorted(fields), "external_actions": False},
+                )
+            if not reserved:
+                raise CredentialSubmissionError("key_publish_reconciliation_required")
+
+            # Vault before the provider call: if the publish outcome is unknown,
+            # the key is still recoverable for reconciliation instead of being
+            # lost with only the owner able to re-supply it.
+            try:
+                reference = validate_vault_reference(
+                    store.put(app_slug=recipe.app_slug, kind=secret_field, value=cleaned)
+                )
+            except Exception:
+                self._context.storage.update_side_effect(
+                    run_id=run_id,
+                    operation_key=effect_identity,
+                    status="failed",
+                )
+                raise CredentialSubmissionError("vault_write_failed") from None
+
+            try:
+                published = asyncio.run(
+                    provider.create_api_key_connection(
+                        toolkit_slug=recipe.toolkit_slug,
+                        auth_scheme=cast(Any, scheme),
+                        secret=SecretStr(cleaned),
+                        effect_identity=effect_identity,
+                        companion=companion,
+                    )
+                )
+            except Exception as exc:
+                reason = _safe_reason(exc, "managed_key_publish_failed")
+                with self._context.storage.unit_of_work() as transaction:
+                    record = transaction.get_run(run_id)
+                    if record is None:
+                        raise KeyError("run was not found") from None
+                    revision = int(record.get("state_revision", 0) or 0) + 1
+                    transaction.update_run(
+                        run_id,
+                        status="configuration_required",
+                        phase="key_publish_failed",
+                        reason_code=reason,
+                        external_actions=True,
+                        state_revision=revision,
+                        last_projected_revision=revision,
+                    )
+                    transaction.append_audit_event(
+                        run_id=run_id,
+                        event_type="managed_key_publish_failed",
+                        payload={"reason_code": reason, "external_actions": True},
+                    )
+                raise CredentialSubmissionError(reason) from None
+            finally:
+                del cleaned
+
+            active = published.active
+            status: RunStatus = "completed" if active else "configuration_required"
+            # The connected account id rides in the bundle, exactly as the OAuth
+            # path carries its connection request id: there is no run column for
+            # it, and inventing one would split the same fact across two shapes.
+            bundle: dict[str, object] | None = None
+            if active:
+                bundle = build_integrator_bundle(
+                    research=OperationalResearch.model_validate(
+                        current.get("operational_research")
+                    ),
+                    company=OperationsRequest.model_validate(current.get("request")).company,
+                    credential_refs={secret_field: reference},
+                    validation=None,
+                    stage="managed_connection_ready",
+                    provider_account_id=published.connected_account_id,
+                    operational_notes=(
+                        "Owner-held key was published to Composio, which reported "
+                        "the connected account ACTIVE.",
+                    ),
+                ).model_dump(mode="json")
+            with self._context.storage.unit_of_work() as transaction:
+                record = transaction.get_run(run_id)
+                if record is None:
+                    raise KeyError("run was not found")
+                revision = int(record.get("state_revision", 0) or 0) + 1
+                transaction.update_run(
+                    run_id,
+                    status=status,
+                    phase="completed" if active else "key_publish_incomplete",
+                    reason_code=published.reason_code,
+                    integrator_bundle=bundle,
+                    provider_status={
+                        "recipe": recipe.readiness_tier,
+                        "composio": "active" if active else published.state,
+                        "browser": "not_started",
+                        "email": "not_started",
+                        "validation": "not_started",
+                    },
+                    external_actions=True,
+                    state_revision=revision,
+                    last_projected_revision=revision,
+                )
+                transaction.append_audit_event(
+                    run_id=run_id,
+                    event_type="managed_key_published",
+                    payload={
+                        "status": status,
+                        "auth_scheme": scheme,
+                        "reference": reference,
+                        "replayed": published.replayed,
+                        "external_actions": True,
+                    },
+                )
+                if active:
+                    transaction.append_audit_event(
+                        run_id=run_id,
+                        event_type="run_completed",
+                        payload={"status": "completed", "external_actions": True},
+                    )
+                updated = transaction.get_run(run_id)
+                if updated is None:  # pragma: no cover
+                    raise RuntimeError("managed key run disappeared")
+            self._context.storage.update_side_effect(
+                run_id=run_id,
+                operation_key=effect_identity,
+                status="completed",
+            )
+            return {
+                "run": _public_run(updated),
+                "connected_account_id": published.connected_account_id,
+                "state": published.state,
+                "replayed": published.replayed,
             }
         finally:
             lock.release()

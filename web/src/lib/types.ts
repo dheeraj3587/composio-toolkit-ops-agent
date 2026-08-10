@@ -24,7 +24,11 @@ export type RunStatus =
 export type ExecutionMode = "plan_only" | "execute_when_configured"
 export type AccountMode = "existing_account" | "create_account"
 export type CredentialCreationPolicy = "reuse_only" | "create_if_missing"
-export type RouteKind = "managed_auth" | "playwright" | "gated"
+/** The recipe's reviewed route, carried verbatim on every run summary. Must
+ * stay in step with `ops/recipes/app_recipes.py`'s `RouteKind`: a value the
+ * backend can emit but this union omits fails Zod parsing and turns the whole
+ * run fetch into a 502, not a degraded render. */
+export type RouteKind = "managed_auth" | "managed_key" | "playwright" | "gated"
 export type ReadinessTier =
   | "managed_auth_ready"
   | "browser_ready"
@@ -115,6 +119,7 @@ export interface OperationalResearch {
   authorization_url: string | null
   token_url: string | null
   credential_fields: string[]
+  credential_secret_fields: string[]
   credential_creation_instructions: string[]
   scopes: ScopeRequirement[]
   developer_portal_url: string | null
@@ -437,6 +442,16 @@ export interface ManagedConnectionResponse {
   connection_request_id: string
   state: "pending" | "active" | "terminal"
   redirect_url?: string | null
+  replayed: boolean
+}
+
+/** The managed_key route's result: an owner-held key published to Composio,
+ * which answers with an already-resolved connected account rather than a
+ * redirect to follow. Carries no credential. */
+export interface ManagedKeyConnectionResponse {
+  run: RunSummary
+  connected_account_id: string
+  state: "pending" | "active" | "terminal"
   replayed: boolean
 }
 
@@ -843,8 +858,11 @@ export type SignupSource = "reviewed" | "runtime_research" | "unavailable"
 
 /** How an app is connected, from its reviewed recipe. "managed_auth" apps are
  * connected through Composio's OAuth — an existing account is signed in, never
- * registered — which is why they legitimately have no signup route. */
-export type ConnectRoute = "managed_auth" | "playwright" | "gated"
+ * registered — which is why they legitimately have no signup route.
+ * "managed_key" apps are the other half of that: the owner already holds a
+ * long-lived key from the vendor's own settings page, and it is published to
+ * Composio directly, so there is no redirect and no browser. */
+export type ConnectRoute = "managed_auth" | "managed_key" | "playwright" | "gated"
 
 export interface AppCapabilitiesResponse {
   app_slug: string

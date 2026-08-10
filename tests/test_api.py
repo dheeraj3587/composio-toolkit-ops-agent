@@ -194,6 +194,11 @@ def test_exact_requested_routes_are_registered(harness: ApiHarness) -> None:
         ("/api/runs/{run_id}/poll-connection", "POST"),
         ("/api/runs/{run_id}/outreach", "POST"),
         ("/api/runs/{run_id}/credentials", "POST"),
+        # The managed_key route's terminal step: an owner-held key published to
+        # Composio. Separate from /credentials because it takes custody of a
+        # secret without vaulting a bundle, and from /connect because /connect
+        # mints a redirect and never receives a credential.
+        ("/api/runs/{run_id}/managed-key", "POST"),
         ("/api/runs/{run_id}/live-view", "GET"),
         # Backward-compatible addition: masked PNG frames for the self-hosted
         # Playwright live view (Browser Use keeps using live-view's hosted URL).
@@ -275,7 +280,9 @@ def test_create_and_detail_expose_verified_phase_two_contract(harness: ApiHarnes
     assert run["external_actions"] is False
     assert str(run["thread_id"]).startswith("sqlite_")
     assert run["state_engine"] == "canonical_v1"
-    assert run["route_kind"] == "managed_auth"
+    # HubSpot was promoted onto the owner-submitted key route. The readiness tier
+    # is unchanged: managed_key reaches the same unattended depth as managed_auth.
+    assert run["route_kind"] == "managed_key"
     assert run["readiness_tier"] == "managed_auth_ready"
 
     research = created["research"]

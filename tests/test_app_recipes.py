@@ -17,6 +17,7 @@ from ops.credentials.validator import pipedrive_validation_policy
 from ops.recipes.app_recipes import (
     GATED_SLUGS,
     MANAGED_AUTH_SLUGS,
+    MANAGED_KEY_SLUGS,
     PLAYWRIGHT_SLUGS,
     AppRecipeCatalogError,
     get_app_recipe,
@@ -44,19 +45,27 @@ def _raw_recipe(value: dict[str, object], app_slug: str) -> dict[str, object]:
     return next(item for item in apps if isinstance(item, dict) and item["app_slug"] == app_slug)
 
 
-def test_catalog_is_the_exact_approved_25_14_11_matrix() -> None:
+def test_catalog_is_the_exact_approved_7_23_14_6_matrix() -> None:
     catalog = load_app_recipe_catalog()
-    expected = (*MANAGED_AUTH_SLUGS, *PLAYWRIGHT_SLUGS, *GATED_SLUGS)
+    expected = (*MANAGED_AUTH_SLUGS, *MANAGED_KEY_SLUGS, *PLAYWRIGHT_SLUGS, *GATED_SLUGS)
 
     assert catalog.schema_version == "1.0"
-    assert tuple(recipe.app_slug for recipe in catalog.apps) == expected
+    # Membership, not file order: the catalog validator now compares sorted, so a
+    # future app promoted onto ``managed_key`` changes its own recipe rather than
+    # having to be moved into a new block of the JSON. The per-route assertions
+    # below still pin exactly which apps belong to which route.
+    assert sorted(recipe.app_slug for recipe in catalog.apps) == sorted(expected)
     assert Counter(recipe.route_kind for recipe in catalog.apps) == {
-        "managed_auth": 25,
+        "managed_auth": 7,
+        "managed_key": 23,
         "playwright": 14,
-        "gated": 11,
+        "gated": 6,
     }
     assert tuple(recipe.app_slug for recipe in recipes_for_route("managed_auth")) == (
         MANAGED_AUTH_SLUGS
+    )
+    assert sorted(recipe.app_slug for recipe in recipes_for_route("managed_key")) == sorted(
+        MANAGED_KEY_SLUGS
     )
     assert tuple(recipe.app_slug for recipe in recipes_for_route("playwright")) == (
         PLAYWRIGHT_SLUGS
@@ -181,7 +190,10 @@ def test_apify_recipe_declares_a_complete_automated_secret_boundary() -> None:
 
 
 def test_gated_routes_expose_only_reviewed_email_outreach() -> None:
-    email_ready = {"close", "freshdesk", "ahrefs", "brex"}
+    # close, ahrefs and brex left this route on 2026-08-08: each turned out to
+    # mint its own key from a settings page, so they are managed-key now and a
+    # vendor email would be asking permission for something already permitted.
+    email_ready = {"freshdesk"}
     for recipe in recipes_for_route("gated"):
         assert recipe.outreach is not None
         if recipe.app_slug in email_ready:
@@ -226,9 +238,9 @@ def test_readiness_and_navigation_overclaims_fail_closed() -> None:
         parse_app_recipe_catalog(unreviewed_signup_path)
 
     contact_overclaim = deepcopy(_raw_catalog())
-    close = _raw_recipe(contact_overclaim, "close")
-    close["readiness_tier"] = "outreach_ready"
-    outreach = close["outreach"]
+    freshdesk = _raw_recipe(contact_overclaim, "freshdesk")
+    freshdesk["readiness_tier"] = "outreach_ready"
+    outreach = freshdesk["outreach"]
     assert isinstance(outreach, dict)
     outreach["contact_url"] = None
     outreach["contact_email"] = None
@@ -239,8 +251,10 @@ def test_readiness_and_navigation_overclaims_fail_closed() -> None:
 def test_operational_research_projection_preserves_the_locked_p1_contract() -> None:
     pipedrive = get_app_recipe("pipedrive")
     github = get_app_recipe("github")
-    close = get_app_recipe("close")
-    assert pipedrive is not None and github is not None and close is not None
+    stripe = get_app_recipe("stripe")
+    help_scout = get_app_recipe("help-scout")
+    assert pipedrive is not None and github is not None
+    assert stripe is not None and help_scout is not None
 
     pipedrive_research = recipe_to_operational_research(pipedrive)
     assert pipedrive_research.app_slug == "pipedrive"
@@ -249,11 +263,20 @@ def test_operational_research_projection_preserves_the_locked_p1_contract() -> N
     assert pipedrive_research.credential_management_url == pipedrive.urls.credential_management
     assert pipedrive_research.credential_fields == ["api_token"]
 
+    # GitHub is managed-key now, so it projects a credential schema where it used
+    # to project none. Stripe still holds the pure managed-auth shape: a redirect
+    # nobody types a secret into, hence no fields and no credential URL.
     github_research = recipe_to_operational_research(github, app_name="GitHub")
     assert github_research.access_route == "self_serve"
-    assert github_research.credential_fields == []
+    assert github_research.credential_fields == ["personal_access_token"]
+    assert github_research.credential_management_url == github.urls.credential_management
 
-    close_research = recipe_to_operational_research(close)
-    assert close_research.access_route == "partner_gated"
-    assert close_research.production_approval_required is True
-    assert close_research.contact_url is None
+    stripe_research = recipe_to_operational_research(stripe, app_name="Stripe")
+    assert stripe_research.access_route == "self_serve"
+    assert stripe_research.credential_fields == []
+    assert stripe_research.credential_management_url is None
+
+    help_scout_research = recipe_to_operational_research(help_scout)
+    assert help_scout_research.access_route == "approval_required"
+    assert help_scout_research.production_approval_required is True
+    assert help_scout_research.contact_url is None

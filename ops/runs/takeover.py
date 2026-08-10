@@ -2,8 +2,14 @@
 
 The decision itself is :func:`ops.browser.takeover.decide_takeover`, and the commit
 is the existing ``OnboardingRunControlService``. This module only polls the runs
-standing at ``captcha_paused`` and applies what the decision says, which is why the
-happy path issues no browser call beyond the worker's own ``/resume`` RPC.
+standing at a durable human-gate pause and applies what the decision says, which is
+why the happy path issues no browser call beyond the worker's own ``/resume`` RPC.
+
+This is a general "a human cleared the gate, continue the run" mechanism, not a
+CAPTCHA one. The gates it may act on are enumerated in
+:data:`TAKEOVER_ELIGIBLE_GATES`, whose entry condition is stated there: the run
+must be able to OBSERVE the clearance. Nothing here ever continues a run because
+time passed.
 """
 
 from __future__ import annotations
@@ -14,6 +20,7 @@ from collections.abc import Coroutine, Mapping
 from typing import Any, Final, Protocol, cast, get_args
 
 from ops.browser.link_log import log_event
+from ops.browser.readiness import browser_service_configured
 from ops.browser.takeover import ClearanceObservation, decide_takeover
 from ops.browser.worker import HumanActionType
 from ops.core.config import Settings
@@ -30,6 +37,111 @@ TAKEOVER_CONTINUED_EVENT: Final = "onboarding_takeover_continued"
 # The gate a CAPTCHA pause parked on when the run row no longer names one.
 DEFAULT_PAUSED_GATE: Final[HumanActionType] = "captcha"
 _HUMAN_ACTION_TYPES: Final[frozenset[str]] = frozenset(get_args(HumanActionType))
+
+TAKEOVER_ELIGIBLE_GATES: Final[frozenset[HumanActionType]] = frozenset(
+    {
+        "captcha",
+        "email_otp",
+        "device_approval",
+        "passkey",
+        "security_key",
+        "oauth_grant",
+        "legal_acceptance",
+        "account_selection",
+        "billing",
+        "login_required",
+    }
+)
+"""The gates a human may clear WHILE THE RUN IS WATCHING, and no others.
+
+ENTRY CONDITION, and the only one: clearance must be OBSERVABLE. Concretely, a
+gate belongs here if and only if ``ops.playwright.gates.classify_structural_gate``
+can NAME it, because that classifier is the entirety of what a clearance read
+reports — ``PlaywrightBrowserWorker.probe_human_gate`` returns its verdict and
+nothing else, and ``decide_takeover`` continues a run only on ``observed gate !=
+paused gate``. A gate the classifier cannot name is a gate whose CONTINUED
+PRESENCE the run cannot see, so its "absence" would not be an observation at all;
+it would be the lack of one, and continuing a run on that is the exact failure
+this feature exists to prevent. Time is never an entry condition: nothing in this
+module continues a run because a pause got old.
+
+Membership, one line of evidence each — all ten are returned by
+``classify_structural_gate`` and all ten are structural, so the surface a human
+acts on is the surface whose disappearance is the clearance:
+
+``captcha``
+    The interactive widget or reviewed challenge frame; solving it removes it.
+``email_otp``
+    A visible code input; an accepted code navigates the page off it.
+``device_approval``
+    The authenticator / "approve this sign-in" prompt, gone once approved.
+``passkey`` and ``security_key``
+    The authenticator prompt. The run can never SATISFY either, but it can see
+    the page leave them, which is all this sweep needs.
+``oauth_grant``
+    The Allow/Authorize control, gone once a human grants or denies.
+``legal_acceptance``
+    The explicit consent BUTTON (never a footer link — see the classifier).
+``account_selection``
+    The chooser, gone once a human picks a tenant.
+``billing``
+    The payment surface, replaced when a human completes it.
+``login_required``
+    A federated hand-off, classified only while it is the page's ONLY way in; a
+    completed sign-in navigates off it.
+
+DELIBERATELY ABSENT, each because the classifier cannot name it, so a page still
+showing the gate would report something else — or nothing — and be misread as
+clearance:
+
+``phone_otp``
+    No structural rule produces it: a code field classifies as ``email_otp``. A
+    run parked here would see a different gate on the first read and continue
+    while the challenge is still up.
+``provider_verification``
+    The text classifier's catch-all for a gate nothing recognized. Structurally
+    it is never named, so an unrecognized gate that is still on the page reads as
+    NO gate — the worst possible false clearance, and the same ambiguity for
+    which ``ops.access.gate_policy`` keeps it human-only.
+``signup_authorization``
+    Cleared by the operator's recorded admission decision, not by anything on a
+    page. No page read can ever see it change.
+"""
+
+# Named rather than derived by subtraction so a new ``HumanActionType`` cannot be
+# admitted by accident: the assertion below forces whoever adds one to say which
+# side it falls on, exactly as ``ops.playwright.gates`` forces a vocabulary map.
+UNOBSERVABLE_GATES: Final[frozenset[HumanActionType]] = frozenset(
+    {"phone_otp", "provider_verification", "signup_authorization"}
+)
+
+assert TAKEOVER_ELIGIBLE_GATES | UNOBSERVABLE_GATES == _HUMAN_ACTION_TYPES, (
+    "every human gate must declare whether the run can observe its clearance"
+)
+assert not (TAKEOVER_ELIGIBLE_GATES & UNOBSERVABLE_GATES), (
+    "a gate is either observable or it is not"
+)
+
+
+def takeover_sweep_configured(settings: Settings) -> bool:
+    """Whether this process may run the takeover sweep at all.
+
+    The predicate is ``browser_service_configured`` — an addressable browser
+    SERVICE — and pointedly NOT ``allow_live_browser``. The opt-in governs whether
+    this process may START a session; the sweep starts nothing, it reads a session
+    a human is already sitting in. Keying it off the opt-in made the watcher dead
+    in exactly the deployment that needs it most: an API that never launches a
+    browser itself, in front of a browser service where a person is solving the
+    challenge right now.
+
+    Composition roots must consult this rather than the browser worker's own
+    wiring flag. ``ops.runs.service.RunService._takeover`` still builds the sweep
+    only when a worker exposing ``probe_gate_clearance`` was wired, which the live
+    opt-in gates — that construction site is the remaining half of this change and
+    is owned elsewhere.
+    """
+
+    return bool(settings.onboarding_takeover_enabled and browser_service_configured(settings))
 
 
 class ClearanceProbe(Protocol):
@@ -104,7 +216,7 @@ class RunTakeoverService:
     def start(self) -> None:
         """Start the polling thread unless it is switched off or already running."""
 
-        if not self._settings.onboarding_takeover_enabled:
+        if not takeover_sweep_configured(self._settings):
             return
         if self._thread is not None and self._thread.is_alive():
             return
@@ -144,7 +256,7 @@ class RunTakeoverService:
     def sweep(self, *, limit: int = 100) -> int:
         """Apply one takeover decision per paused run; return how many continued."""
 
-        if not self._settings.onboarding_takeover_enabled or self._stop.is_set():
+        if not takeover_sweep_configured(self._settings) or self._stop.is_set():
             return 0
         continued = 0
         offset = 0
@@ -161,9 +273,18 @@ class RunTakeoverService:
                 run_id = str(record.get("run_id") or "")
                 if not run_id:
                     continue
-                canonical = _is_canonical_captcha_wait(record)
+                canonical = _is_canonical_gate_wait(record)
                 if not canonical:
+                    # The phase driver keeps a reattachable session at exactly one
+                    # human gate: ``captcha_paused`` is the only member of
+                    # ``SESSION_BEARING_PHASES`` that is a pause, because its other
+                    # gates take ``PhaseStep.pause`` into the sessionless ``paused``
+                    # bucket. There is nothing to read for those, so the broadening
+                    # this module gained lands on the canonical runtime above, where
+                    # every gate parks at ``challenge_pending`` holding its session.
                     if record.get("phase") != CAPTCHA_PAUSED_PHASE:
+                        continue
+                    if _paused_gate(record) not in TAKEOVER_ELIGIBLE_GATES:
                         continue
                     if not self._standing_at_captcha_pause(run_id):
                         continue
@@ -271,6 +392,7 @@ class RunTakeoverService:
             run_id,
             gate,
             canonical=canonical,
+            reason_code=decision.reason_code,
             expected_state_revision=state_revision,
             expected_session_id=session_id,
             expected_hitl_generation=hitl_generation,
@@ -293,6 +415,7 @@ class RunTakeoverService:
         gate: HumanActionType,
         *,
         canonical: bool,
+        reason_code: OnboardingReasonCode,
         expected_state_revision: int,
         expected_session_id: str,
         expected_hitl_generation: int,
@@ -321,7 +444,11 @@ class RunTakeoverService:
                     "gate": gate,
                     "hitl_generation": expected_hitl_generation,
                     "onboarding_phase": str(result.get("phase") or "browser_running"),
-                    "reason_code": "captcha_resolved",
+                    # The decision's own code, not the literal ``captcha_resolved``
+                    # this used to write: the sweep continues nine other gates now,
+                    # and a row that named the wrong one would be the only durable
+                    # account of why the run moved.
+                    "reason_code": reason_code,
                 },
             )
             return True
@@ -366,8 +493,19 @@ def _takeover_watch_key(
     )
 
 
-def _is_canonical_captcha_wait(record: Mapping[str, object]) -> bool:
-    """Whether this is the canonical runtime's explicitly typed CAPTCHA pause."""
+def _is_canonical_gate_wait(record: Mapping[str, object]) -> bool:
+    """Whether this is a canonical durable pause on a gate the run can watch.
+
+    Every canonical human gate parks the same way — ``waiting_for_hitl`` at
+    ``challenge_pending``, holding its session and its HITL generation — so the
+    only thing that distinguishes one from another is the typed request, and
+    reading ``type == "captcha"`` here was the whole of why nine other gates sat
+    until an operator clicked resume. The membership test is
+    :data:`TAKEOVER_ELIGIBLE_GATES`, so a gate whose clearance is unobservable is
+    still not a candidate: this widens what the sweep may watch, never what it may
+    infer. A positive generation stays required — it is the CAS token every write
+    downstream binds to.
+    """
 
     hitl = record.get("hitl_request")
     return bool(
@@ -375,7 +513,7 @@ def _is_canonical_captcha_wait(record: Mapping[str, object]) -> bool:
         and record.get("status") == "waiting_for_hitl"
         and record.get("phase") == CANONICAL_CHALLENGE_PHASE
         and isinstance(hitl, Mapping)
-        and hitl.get("type") == "captcha"
+        and hitl.get("type") in TAKEOVER_ELIGIBLE_GATES
         and _paused_hitl_generation(record) > 0
     )
 
@@ -404,7 +542,10 @@ __all__ = [
     "CAPTCHA_PAUSED_PHASE",
     "DEFAULT_PAUSED_GATE",
     "TAKEOVER_CONTINUED_EVENT",
+    "TAKEOVER_ELIGIBLE_GATES",
+    "UNOBSERVABLE_GATES",
     "CanonicalTakeoverControl",
     "ClearanceProbe",
     "RunTakeoverService",
+    "takeover_sweep_configured",
 ]

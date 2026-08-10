@@ -590,7 +590,17 @@ jobs:
           status, before = call("GET", "/api/runs")
           if status != 200 or before.get("total") != 0:
               raise SystemExit(1)
-          status, blocked = call("POST", "/api/runs", payload)
+          # The acceptance marker gates CREDENTIAL INTAKE, not every write. An
+          # operator must be able to drive the release they are accepting, so
+          # POST /api/runs is admitted here on purpose and probing it would
+          # prove nothing. The credential route is the one the marker still
+          # owns, and it is refused in middleware on the path shape alone --
+          # before auth, before the run is looked up -- so a run that does not
+          # exist is exactly as good a probe as one that does, and it persists
+          # nothing either way.
+          status, blocked = call(
+              "POST", "/api/runs/ci-acceptance-probe/credentials", payload
+          )
           if (
               status != 503
               or blocked.get("error") != "deployment_not_accepted"

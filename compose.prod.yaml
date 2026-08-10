@@ -208,6 +208,15 @@ services:
       ALLOW_LIVE_VENDOR_EMAIL: "false"
       BROWSER_SERVICE_TOKEN: ${BROWSER_SERVICE_TOKEN:?BROWSER_SERVICE_TOKEN is required}
       BROWSER_SERVICE_PORT: "8081"
+      # THIS SERVICE HAS NO env_file. Every variable the worker reads must be
+      # listed here as an explicit ${VAR} passthrough, or it does not exist
+      # inside the container no matter what .env.production says. The complete
+      # read surface is browser_service/settings.py::from_env plus the
+      # ops.core.config.Settings fields the in-process Playwright worker uses;
+      # both are enumerated below rather than left to defaults, because a knob
+      # that silently ignores the host file is worse than one that has none.
+      BROWSER_SERVICE_HOST: ${BROWSER_SERVICE_HOST:-0.0.0.0}
+      BROWSER_SERVICE_MAX_REQUEST_BYTES: ${BROWSER_SERVICE_MAX_REQUEST_BYTES:-262144}
       BROWSER_SERVICE_OWNER: ${BROWSER_SERVICE_OWNER:-production-owner}
       BROWSER_SESSION_INACTIVITY_SECONDS: ${BROWSER_SESSION_INACTIVITY_SECONDS:-900}
       BROWSER_SESSION_MAX_AGE_SECONDS: ${BROWSER_SESSION_MAX_AGE_SECONDS:-3600}
@@ -216,6 +225,9 @@ services:
       # Capacity has one source of truth. browser-entrypoint.sh derives the
       # display-stack count from PLAYWRIGHT_MAX_SESSIONS, and the service derives
       # its display pool from the same value. Supported range is 1..10.
+      # browser-entrypoint.sh also honours BROWSER_DISPLAY_SLOTS, which is
+      # deliberately NOT passed through: it would let the display-stack count
+      # disagree with the session pool the service actually leases from.
       PLAYWRIGHT_MAX_SESSIONS: "${PLAYWRIGHT_MAX_SESSIONS:-2}"
       # Give each bounded operation enough time for multi-page login/signup and
       # email verification. Outer callers retain additional transport headroom.
@@ -226,6 +238,27 @@ services:
       BROWSER_INTERACTIVE_HITL_ENABLED: ${BROWSER_INTERACTIVE_HITL_ENABLED:-true}
       DISPLAY: ${DISPLAY:-:99}
       BROWSER_DISPLAY_NUM: ${BROWSER_DISPLAY_NUM:-99}
+      # Chromium needs a writable HOME even headless-adjacent; the image WORKDIR
+      # is on the read-only root filesystem. browser-entrypoint.sh and
+      # ops/browser/process_hardening.py must agree on the same directory, so it
+      # is declared once here instead of being defaulted twice.
+      BROWSER_HOME: ${BROWSER_HOME:-/tmp/browser-home}
+      # Per-slot VNC/noVNC listener bases. browser-entrypoint.sh starts the
+      # x11vnc pairs from these and browser_service/settings.py derives the same
+      # ranges; without the passthrough only the image defaults were reachable
+      # and moving a base in .env.production changed nothing inside the worker.
+      # Control ports are base..base+slots-1, view-only ports the same from the
+      # view base; keep at least ten between them (display_pool supports ten).
+      BROWSER_VNC_PORT: ${BROWSER_VNC_PORT:-5900}
+      BROWSER_VIEW_ONLY_VNC_PORT: ${BROWSER_VIEW_ONLY_VNC_PORT:-5910}
+      BROWSER_NOVNC_PORT: ${BROWSER_NOVNC_PORT:-6080}
+      # Configuration-supplied ONLY. The grant URL origin is never derived from a
+      # request header or page content, so this must name this service on the
+      # private network and must match what web/src/lib/api-schemas.ts expects
+      # from BROWSER_SERVICE_URL, or every live-view grant is refused. Pinned to
+      # the same literal the api and web services use for exactly that reason.
+      BROWSER_NOVNC_BASE_URL: http://browser-worker:8081
+      BROWSER_LIVE_VIEW_TOKEN_SECONDS: ${BROWSER_LIVE_VIEW_TOKEN_SECONDS:-300}
       # The policy-constrained browser action loop needs at least one JSON
       # inference backend. Values stay inside this private service.
       # Mercury (Inception) is FIRST in build_json_inference's chain and is now
@@ -248,6 +281,44 @@ services:
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-nvidia/nemotron-3-ultra-550b-a55b:free}
       GOOGLE_GENAI_API_KEY: ${GOOGLE_GENAI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
+      # ── Action-loop budgets (ops.core.config.Settings, constructed IN here) ──
+      # browser_service/main.py builds a PlaywrightBrowserWorker with
+      # Settings.from_env(), so these are read inside this container, not in the
+      # API. Two consequences, both of which cost a run when ignored:
+      #   1. A value tuned only in .env.production applied to the API and was
+      #      silently the field default here — the loop the operator was tuning
+      #      is the one that never saw the change.
+      #   2. Settings validates these against each other. Passing a subset means
+      #      a raised budget here meets a defaulted floor there and
+      #      Settings.from_env() RAISES, taking the worker down at first session.
+      #      That is why the whole coherent group travels together.
+      BROWSER_AGENT_MAX_STEPS: ${BROWSER_AGENT_MAX_STEPS:-20}
+      ONBOARDING_ACTION_DECISION_TOTAL_SECONDS: ${ONBOARDING_ACTION_DECISION_TOTAL_SECONDS:-60}
+      ONBOARDING_ACTION_DECISION_PROVIDER_SECONDS: ${ONBOARDING_ACTION_DECISION_PROVIDER_SECONDS:-25}
+      ONBOARDING_ACTION_MAX_PROVIDERS: ${ONBOARDING_ACTION_MAX_PROVIDERS:-5}
+      # The four per-step deadlines are summed against the client timeout, and
+      # the decide deadline is floored by the decision budget above.
+      ONBOARDING_STEP_OBSERVE_TIMEOUT_SECONDS: ${ONBOARDING_STEP_OBSERVE_TIMEOUT_SECONDS:-20}
+      ONBOARDING_STEP_DECIDE_TIMEOUT_SECONDS: ${ONBOARDING_STEP_DECIDE_TIMEOUT_SECONDS:-60}
+      ONBOARDING_STEP_ACT_TIMEOUT_SECONDS: ${ONBOARDING_STEP_ACT_TIMEOUT_SECONDS:-40}
+      ONBOARDING_STEP_VERIFY_TIMEOUT_SECONDS: ${ONBOARDING_STEP_VERIFY_TIMEOUT_SECONDS:-20}
+      ONBOARDING_PROGRESS_STALE_SECONDS: ${ONBOARDING_PROGRESS_STALE_SECONDS:-180}
+      # Read here only so this container's Settings validates the same nesting
+      # the API enforces (worker 300 < client 315 < web 330 < Caddy 345). The
+      # worker's own wall clock stays BROWSER_OPERATION_TIMEOUT_SECONDS above.
+      BROWSER_SERVICE_CLIENT_TIMEOUT_SECONDS: ${BROWSER_SERVICE_CLIENT_TIMEOUT_SECONDS:-315}
+      # How long the worker waits when probing whether a human took the page over.
+      ONBOARDING_TAKEOVER_PROBE_TIMEOUT_SECONDS: ${ONBOARDING_TAKEOVER_PROBE_TIMEOUT_SECONDS:-5}
+      # Business identity typed into vendor signup and "tell us about your
+      # company" forms by ops/playwright/actions.py — which runs here. Unset
+      # means the form field is left blank and the run stops at a human gate on
+      # a page it had everything else it needed to finish. Not secrets;
+      # COMPANY_WORK_EMAIL_REF is deliberately NOT passed (vault reference, and
+      # no browser-side reader).
+      COMPANY_LEGAL_NAME: ${COMPANY_LEGAL_NAME:-}
+      COMPANY_WEBSITE: ${COMPANY_WEBSITE:-}
+      COMPANY_USE_CASE: ${COMPANY_USE_CASE:-}
+      COMPANY_EXPECTED_VOLUME: ${COMPANY_EXPECTED_VOLUME:-}
       BROWSER_STORAGE_STATE_KEY: ${BROWSER_STORAGE_STATE_KEY:-}
       BROWSER_STORAGE_STATE_DIR: /browser-data/storage-state
       # A provider name, not a secret: which identity provider the signup driver
@@ -266,6 +337,9 @@ services:
       # page text.
       OPS_LOG_LEVEL: ${OPS_LOG_LEVEL:-INFO}
       OPS_ALLOW_DEBUG_LOGGING: ${OPS_ALLOW_DEBUG_LOGGING:-false}
+      # ops/browser/link_log.py keeps its own level so navigation/link decisions
+      # can be turned up without raising the whole service to DEBUG.
+      BROWSER_LINK_LOG_LEVEL: ${BROWSER_LINK_LOG_LEVEL:-INFO}
       PYTHONPATH: /app
     volumes:
       - browser_profiles:/browser-data
@@ -329,6 +403,15 @@ services:
       OPS_API_URL: ${OPS_API_URL:-http://api:8000}
       OPS_INTERNAL_API_TOKEN: ${OPS_INTERNAL_API_TOKEN:?OPS_INTERNAL_API_TOKEN is required}
       OPS_DEMO_MODE: ${OPS_DEMO_MODE:-false}
+      # Not a secret and not a fetch target: web/src/lib/api-schemas.ts compares a
+      # live-view grant's origin against this to prove the grant points at OUR
+      # browser service. Unset falls back to the literal http://browser-worker:8081,
+      # so a deployment that moves the service turns every grant into a 502
+      # INVALID_INTERACTIVE_GRANT with nothing in the UI explaining it. Must stay
+      # identical to the api service's BROWSER_SERVICE_URL and to the worker's
+      # BROWSER_NOVNC_BASE_URL, so it is the same literal all three places rather
+      # than an interpolation only one of them would honour.
+      BROWSER_SERVICE_URL: http://browser-worker:8081
       # Application-level session auth. These values are server-only and must
       # never use a NEXT_PUBLIC_ prefix.
       OPS_AUTH_USERNAME: ${OPS_AUTH_USERNAME:?OPS_AUTH_USERNAME is required}

@@ -13,14 +13,31 @@ plaintext enters the deciding process at all. That is a structural property of
 the port's shape rather than a rule the caller has to remember — there is no
 method here that could return a secret.
 
-**The signup route is never autonomous.** Creating an account has legal and
-billing consequences, so it takes a human. Two mechanisms enforce that and they
-are deliberately redundant. :class:`AdmissionDecision` refuses at construction to
-represent a signup that a system decided (Requirement 3.6), the admission table's
-``CHECK (route <> 'signup' OR decided_by = 'operator')`` refuses to store one
-(task 10.2), and ``ops.access.gate_policy`` keeps ``signup_authorization`` permanently
-human-only (Requirement 3.7). Any one of the three failing leaves the other two
-standing.
+**The signup route is never decided by a machine — but it need not be decided
+per run.** Creating an account has legal and billing consequences, so the
+authority behind it is always a person. Until 2026-08-09 that person had to
+answer once per run, which put a human in the middle of all fifty apps. The owner
+authorized unattended account creation, and the way this module implements it is
+to move the human *earlier* rather than remove them: a
+:class:`StandingSignupAuthorization` is one owner's durable, per-app-slug,
+timestamped statement that this deployment may create an account on that
+provider. A run covered by one signs up with no prompt; a run not covered by one
+still stops and asks, exactly as before.
+
+What is deliberately NOT relaxed is attribution. Every stored signup still names
+a human authority and the moment they gave it. :class:`AdmissionDecision` still
+refuses at construction to represent a signup a system decided for itself
+(Requirement 3.6) — ``decided_by="system"`` is rejected on the signup route as it
+always was — and the admission table's ``CHECK`` still refuses to store one. What
+widened is the set of human authorities from one member to two, and the second is
+distinguishable from the first in the durable row forever: ``decided_by`` reads
+``standing_authorization`` and the reason code reads
+``standing_signup_authorization``, so an auditor can always tell an account
+created under a blanket authorization from one a person approved by name.
+
+The complement lives in ``ops.access.gate_policy``: a ``signup_authorization``
+gate observed mid-page resolves only against a recorded signup decision confined
+to the run's own profile domain, never against page text.
 
 Field names line up with two neighbours on purpose
 --------------------------------------------------
@@ -65,7 +82,12 @@ AdmissionRoute = Literal["login", "signup", "cancelled"]
 # decision: anything richer would be a second place to encode routing policy.
 AdmissionInput = Literal["create_account", "cancel"]
 
-AdmissionDecider = Literal["system", "operator"]
+AdmissionDecider = Literal["system", "operator", "standing_authorization"]
+
+# The deciders that may stand behind a signup route. Both name a human: one who
+# answered about this run, and one who authorized this app slug in advance.
+# ``system`` is absent and must stay absent — that omission is Requirement 3.6.
+SIGNUP_DECIDERS: Final[frozenset[str]] = frozenset({"operator", "standing_authorization"})
 
 # The gate type of the one prompt this module ever emits. Never inferred from a
 # page — ``ops.browser.worker.HumanActionType`` carries the same note next to the
@@ -138,10 +160,13 @@ class AdmissionDecision:
     credential_refs: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
-        if self.route == "signup" and self.decided_by != "operator":
+        if self.route == "signup" and self.decided_by not in SIGNUP_DECIDERS:
             # Property 7, as a construction error rather than a review convention:
-            # no autonomous path can self-approve account creation.
-            raise ValueError("signup route requires an operator decision")
+            # no autonomous path can self-approve account creation. A standing
+            # authorization is not an autonomous path — it is an owner's recorded
+            # decision made before the run existed — which is why it is admitted
+            # here and ``system`` still is not.
+            raise ValueError("signup route requires a human authority")
         if self.route == "login" and not self.credential_refs:
             raise ValueError("login route requires credential references")
         _identifier(self.run_id, field="run id")
@@ -160,6 +185,57 @@ class AdmissionDecision:
             # keeps a credential *value* out of this tuple and out of every row,
             # response, and log line built from it.
             parse_vault_reference(reference)
+
+
+@dataclass(frozen=True, slots=True)
+class StandingSignupAuthorization:
+    """One owner's durable, per-app statement that this deployment may sign up.
+
+    This is what replaced the per-run prompt on the signup route. It is *not* a
+    capability flag: a flag says "signups are allowed", which is a property of the
+    software, whereas this names a person, a provider, and a moment, which is a
+    property of a decision somebody made and can be held to.
+
+    ``app_slug`` is deliberately required and never wildcarded here. The
+    deployment-configuration reader that produces these does support a catalog-wide
+    grant, but it expands it into one authorization per slug at read time, so every
+    stored decision still names the specific provider it authorized rather than a
+    blanket that later reads as "we authorized everything".
+
+    Constructing one validates it, because the value flows straight into an
+    :class:`AdmissionDecision` whose ``actor_owner_id`` and ``decided_at`` are the
+    audit trail. An unusable authorization must fail here, where the run is still
+    reversible, rather than at the durable write.
+    """
+
+    app_slug: str
+    authorized_by: str  # the owner id the resulting decision is attributed to
+    authorized_at: str  # ISO-8601 UTC, the moment the authorization was given
+
+    def __post_init__(self) -> None:
+        _identifier(self.app_slug, field="app slug")
+        _identifier(self.authorized_by, field="authorizing owner id")
+        if not self.authorized_at:
+            raise ValueError("a standing authorization must carry its timestamp")
+
+
+class StandingSignupAuthority(Protocol):
+    """Lookup for a pre-recorded, per-app authorization to create an account.
+
+    One method, returning a record or ``None``. Narrow on purpose: a port that
+    could answer "is signup allowed in general" would let a caller act on a
+    boolean with no person attached to it, and the whole point of this path is
+    that the person survives into the durable row.
+    """
+
+    def signup_authorization(self, *, app_slug: str) -> StandingSignupAuthorization | None:
+        """The standing authorization covering ``app_slug``, if one exists.
+
+        PRE:  ``app_slug`` names the run's provider as the catalog spells it.
+        POST: an authorization whose ``app_slug`` equals the argument, or ``None``
+              when this deployment has none for that provider. Returning ``None``
+              is the fail-closed answer and costs the run one operator prompt.
+        """
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,22 +344,53 @@ def admit_from_vault(
     account_ref: str,
     owner_id: str,
     decided_at: str | None = None,
+    standing: StandingSignupAuthority | None = None,
 ) -> AdmissionOutcome:
-    """Decide the run's route from the vault alone (Requirements 3.1 - 3.4).
+    """Decide the run's route from the vault and the owner's standing grants.
+
+    Three outcomes, not two. ``standing`` is optional and defaults to absent, so a
+    caller that does not pass one keeps the pre-2026-08-09 behavior exactly:
+    omitting it can only ever cost a prompt, never grant one.
 
     PRE:  the run's provider profile is committed and ``profile_digest`` is its
           content address; no browser session exists yet.
     POST: references present ⟹ phase ``route_selected_login``, a ``system``
           decision with reason ``credentials_present``, and zero prompts.
-          References absent ⟹ phase ``awaiting_admission``, reason
+          References absent and ``standing`` covers ``app_slug`` ⟹ phase
+          ``route_selected_signup``, a ``standing_authorization`` decision with
+          reason ``standing_signup_authorization`` attributed to the AUTHORIZING
+          owner rather than to ``owner_id``, and zero prompts. References absent
+          and no authorization ⟹ phase ``awaiting_admission``, reason
           ``signup_authorization_required``, no decision yet, and exactly one
-          ``signup_authorization`` prompt. Either way no value is read, nothing is
-          persisted, and no side effect is reserved — this function decides and
+          ``signup_authorization`` prompt. On every path no value is read, nothing
+          is persisted, and no side effect is reserved — this function decides and
           returns.
     """
 
     result = probe_login_refs(probe, app_slug=app_slug, account_ref=account_ref)
     if not result.credentials_present:
+        authorization = standing.signup_authorization(app_slug=app_slug) if standing else None
+        if authorization is not None and authorization.app_slug == app_slug:
+            # Attributed to whoever gave the authorization, and stamped with when
+            # they gave it, not with now: the durable row has to answer "who
+            # agreed to this provider's terms, and when" long after the run is
+            # gone, and "the tenant that happened to own the run, at the moment
+            # the agent got there" answers neither question.
+            return AdmissionOutcome(
+                phase="route_selected_signup",
+                reason_code="standing_signup_authorization",
+                probe=result,
+                decision=AdmissionDecision(
+                    run_id=run_id,
+                    profile_digest=profile_digest,
+                    route="signup",
+                    reason_code="standing_signup_authorization",
+                    decided_by="standing_authorization",
+                    actor_owner_id=authorization.authorized_by,
+                    decided_at=authorization.authorized_at,
+                ),
+                prompts=(),
+            )
         return AdmissionOutcome(
             phase="awaiting_admission",
             reason_code="signup_authorization_required",
@@ -321,9 +428,10 @@ def decide_from_operator(
     """Turn one operator answer into the durable decision (Requirements 3.5, 3.8).
 
     ``decided_by`` is fixed to ``"operator"`` here rather than accepted as an
-    argument: this is the only function that produces a signup route, and the only
-    caller is the API handler acting on a person's submission, so there is no
-    parameter through which a system caller could claim to be one.
+    argument: the only caller is the API handler acting on a person's submission,
+    so there is no parameter through which a system caller could claim to be one.
+    :func:`admit_from_vault` is the only other producer of a signup route, and it
+    fixes its own decider to ``"standing_authorization"`` for the same reason.
     """
 
     if admission_input == "create_account":
@@ -347,12 +455,15 @@ __all__ = [
     "ADMISSION_GATE",
     "ADMISSION_PROMPT_LIMIT",
     "REQUIRED_LOGIN_FIELDS",
+    "SIGNUP_DECIDERS",
     "AdmissionDecider",
     "AdmissionDecision",
     "AdmissionInput",
     "AdmissionOutcome",
     "AdmissionRoute",
     "CredentialReferenceProbe",
+    "StandingSignupAuthority",
+    "StandingSignupAuthorization",
     "VaultProbeResult",
     "admission_prompt",
     "admit_from_vault",

@@ -10,6 +10,7 @@ import {
   submitBrowserLoginAction,
   submitBrowserVerificationAction,
   submitCredentialAction,
+  submitManagedKeyAction,
   type AdmissionDecisionState,
   type BrowserLoginState,
   type BrowserVerificationState,
@@ -336,6 +337,103 @@ export function BrowserVerificationForm({ runId }: { runId: string }) {
           role={verificationState.tone === "error" ? "alert" : "status"}
         >
           {verificationState.message}
+        </p>
+      ) : null}
+    </form>
+  )
+}
+
+/**
+ * The managed_key route's only operator surface: paste one owner-held key.
+ *
+ * It lives beside `CredentialSubmitForm` because it is the same act of custody
+ * and must clear the DOM value the same way, but it is a distinct form and not
+ * a prop on that one. A managed_key run has no browser session, so none of the
+ * `BrowserUiState` permissions that gate the form below exist for it; and the
+ * backend refuses a managed_key run at `/credentials`, so a shared form with a
+ * switched endpoint would render an enabled control that 4xx's.
+ */
+export function ManagedKeySubmitForm({
+  runId,
+  fields,
+  disabledReason,
+}: {
+  runId: string
+  /**
+   * EVERY reviewed credential field, in recipe order, each with whether it is
+   * secret. Both parts are load-bearing. The route compares the submitted field
+   * set to the recipe's and refuses any difference with
+   * `credential_fields_do_not_match_recipe`, so a form that renders one box can
+   * never publish a two-field app -- jira (`username` + `api_token`) and harvest
+   * (`personal_access_token` + `account_id`) are both that shape. And the secret
+   * flag is not positional: jira's FIRST field is the non-secret one, so the
+   * single box this form used to render asked for the key under the name of the
+   * field that is not the key.
+   */
+  fields: { name: string; label: string; secret: boolean }[]
+  disabledReason?: string | null
+}) {
+  const [submitState, submitFormAction] = useActionState(submitManagedKeyAction, initialSubmit)
+
+  if (disabledReason) {
+    return <p className="text-xs leading-5 text-muted-foreground">{disabledReason}</p>
+  }
+
+  return (
+    <form
+      action={submitFormAction}
+      onSubmit={(event) => {
+        // Published to Composio and vaulted server-side; clear the DOM values now.
+        const form = event.currentTarget
+        queueMicrotask(() => {
+          for (const field of fields) {
+            const input = form.elements.namedItem(`value:${field.name}`)
+            if (input instanceof HTMLInputElement && field.secret) input.value = ""
+          }
+        })
+      }}
+      className="space-y-2"
+    >
+      <input type="hidden" name="run_id" value={runId} />
+      <input type="hidden" name="field_names" value={fields.map((field) => field.name).join(",")} />
+
+      {fields.map((field) => (
+        <div key={field.name} className="space-y-2">
+          <label
+            htmlFor={`managed-key-${runId}-${field.name}`}
+            className="flex items-center gap-1.5 data-label"
+          >
+            <KeyRound className="size-3 text-brand-600" aria-hidden="true" />
+            {field.label}
+          </label>
+          <input
+            id={`managed-key-${runId}-${field.name}`}
+            name={`value:${field.name}`}
+            type={field.secret ? "password" : "text"}
+            autoComplete="off"
+            spellCheck={false}
+            required
+            className={`${FIELD_CLASS} font-mono`}
+            placeholder={
+              field.secret
+                ? "Paste the key from the vendor's own settings page"
+                : "The account this key belongs to"
+            }
+          />
+        </div>
+      ))}
+      <p className="text-2xs text-muted-foreground">
+        The key is encrypted into the vault and published to Composio under this app&apos;s reviewed
+        auth scheme. Only a vault:// reference is stored; the raw value never enters run state,
+        logs, or this page.
+      </p>
+      <FormSubmitButton label="Publish key to Composio" pendingLabel="Publishing…" />
+      {submitState.message ? (
+        <p
+          className={submitState.tone === "error" ? "text-xs text-destructive" : "text-xs text-emerald-700 dark:text-emerald-300"}
+          role={submitState.tone === "error" ? "alert" : "status"}
+        >
+          {submitState.message}
         </p>
       ) : null}
     </form>

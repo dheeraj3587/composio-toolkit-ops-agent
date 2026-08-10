@@ -17,7 +17,7 @@ from ops.runs.service import RunService
 
 def _request() -> OperationsRequest:
     return OperationsRequest(
-        app_name="HubSpot",
+        app_name="Stripe",
         company=CompanyProfile(
             legal_name="Example Company",
             website="https://example.test",

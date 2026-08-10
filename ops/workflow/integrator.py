@@ -119,12 +119,34 @@ def _readiness(
     return "configuration_required"
 
 
+# The two credential fields that genuinely mean OAuth. They are excluded from the
+# direct-token test below because "secret" and "id" are not token suffixes, but
+# naming them is what keeps a future rename from quietly reclassifying an OAuth
+# developer-app bundle as a key one.
+_OAUTH_CREDENTIAL_FIELDS = frozenset({"oauth_client_id", "oauth_client_secret"})
+
+
 def _auth_scheme(methods: list[str], credential_refs: dict[str, str]) -> str:
     # Concrete captured fields are stronger evidence than a provider's list of all
     # supported methods. Pipedrive advertises OAuth and personal API tokens; when
     # this run actually captured ``api_token``, calling the handoff OAuth2 is false.
+    #
+    # The suffix test generalizes that beyond the three exact names it started
+    # with, because the managed-key catalog names the same kind of material a
+    # dozen different ways -- ``personal_access_token``, ``bot_token``,
+    # ``user_auth_token``, ``private_app_access_token``. Every one of those used
+    # to fall through to the advertised-methods list, and for the vendors that
+    # also offer OAuth (GitHub, Notion, Asana, Slack, ...) that returned
+    # ``oauth2``. That is not merely a mislabel: ``oauth_selected`` above then
+    # publishes ``authorization_url``, ``token_url``, ``scopes`` and the
+    # company's ``callback_urls`` into a bundle for a run where no authorization
+    # code was ever exchanged, describing a flow the integrator cannot perform.
     normalized_fields = {field.casefold().replace("-", "_") for field in credential_refs}
-    if normalized_fields & {"api_key", "apikey", "api_token"}:
+    direct = normalized_fields - _OAUTH_CREDENTIAL_FIELDS
+    if any(
+        name in {"api_key", "apikey", "api_token"} or name.endswith(("_token", "_key"))
+        for name in direct
+    ):
         return "api_key"
 
     normalized = " ".join(methods).casefold()

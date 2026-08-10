@@ -14,7 +14,19 @@ Three gates are permanently human-only and must never be added:
 
 ``captcha``
     Resolving it autonomously means defeating an anti-bot control. Out of scope
-    by policy, not by omission.
+    by policy, not by omission — and specifically NOT by buying the capability
+    either: wiring a third-party solving service was considered and rejected by
+    the owner, so a person solves every CAPTCHA and no code here should grow a
+    ``solver_service`` resolution.
+
+    Human-solved does not mean human-paced. The cost of this policy is bounded
+    by ``ops.runs.takeover``, which watches every paused run and continues it as
+    soon as it can *observe* that the gate is gone, so the agent takes the wheel
+    back within one poll interval of the person finishing rather than whenever
+    an operator next looks at the console. The complement is enforced in
+    ``browser_service``: while the agent drives, human input is denied outright
+    (see ``_take_exclusive_browser_control``), so the two never hold the same
+    page at the same moment.
 ``phone_otp``
     Needs a programmable-number provider that this system does not have.
 ``device_approval``
@@ -28,9 +40,23 @@ because it is ambiguous by construction: it can stand for a CAPTCHA, a device
 check, a consent screen, or an account chooser, and auto-resuming it can turn a
 solvable gate into a failed login before an operator can attach.
 
-``signup_authorization`` joins them permanently: creating an account has legal
-and billing consequences, so resolving it autonomously would mean the agent
-authorizing contract acceptance and spending on the owner's behalf.
+``signup_authorization`` is the one gate that moved. It was permanently human-only
+on the reasoning that creating an account has legal and billing consequences, and
+that reasoning still holds — what changed on 2026-08-09 is *when* the person
+supplies the authorization, not whether one exists. The owner may now record a
+standing, per-app, timestamped authorization (see
+``ops.onboarding.standing_authorization``), and a run covered by one carries a
+recorded ``AdmissionDecision(route="signup")`` naming that person before it ever
+reaches a page. This gate therefore resolves ``profile_declared`` — against that
+recorded decision, confined to the profile's own registrable domain — and stays
+``human_only`` for every run without one, which is still the default.
+
+The circularity objection this file used to raise ("a gate cannot supply its own
+authorization") is answered rather than waived: the authority is not the gate and
+not the page, it is a decision that predates the run. What would be circular, and
+is still refused, is a signup the *system* decided — ``decided_by="system"`` is
+rejected by ``AdmissionDecision`` construction and by the admission table's CHECK,
+so no authority this module accepts can be one the software minted for itself.
 
 Two authority paths, never page text
 ------------------------------------
@@ -56,6 +82,11 @@ from urllib.parse import urlsplit
 # consult, including its conservative ``co.uk``-style suffix handling. Deriving
 # domain confinement from a second implementation would let the boundaries drift.
 from ops.browser.host_policy import registrable_domain as resolve_registrable_domain
+
+# The deciders a stored signup route may name. Imported rather than restated so
+# this policy and the record it reads cannot come to disagree about which
+# authorities are human.
+from ops.onboarding.admission import SIGNUP_DECIDERS
 from ops.recipes.app_recipes import get_app_recipe
 
 # How a gate may be resolved. ``human_only`` is the fail-closed default.
@@ -91,6 +122,11 @@ _AUTONOMOUS_RESOLUTION: dict[str, GateResolution] = {
     "login_required": "reusable_login",
     "email_otp": "emailed_verification",
     "legal_acceptance": "recipe_declared",
+    # Resolvable only against the run's recorded signup decision — there is no
+    # recipe path for it, because a checked-in catalog cannot record who
+    # authorized creating an account and when. A run with no such decision gets
+    # "human_only" from ``_profile_authorizes`` and pauses exactly as before.
+    "signup_authorization": "profile_declared",
 }
 
 # Gates that must never resolve without a person. Kept explicit rather than
@@ -109,26 +145,29 @@ HUMAN_ONLY_GATES: frozenset[str] = frozenset(
         # legal_acceptance's recipe-declared resolution. Phase 7B revisits this
         # for the managed-auth OAuth routes; until then it stays human-only.
         "oauth_grant",
-        # Autonomous account choice needs a reviewed, unambiguous recipe selector.
-        # No recipe declares one yet, so choosing would be a guess about which
-        # tenant to onboard.
+        # Still human-only HERE, and deliberately so: by the time this gate is
+        # raised, the one case that needs no judgement has already been handled
+        # upstream. ``ops.browser.login.drive_login`` clicks a chooser entry when
+        # its visible label contains the run's own sign-in address and no other
+        # entry does -- an identity match against a value the run already holds,
+        # not a choice. Anything that reaches this table is a chooser where that
+        # match was absent or ambiguous, and picking one there would be a guess
+        # about which tenant to onboard.
         "account_selection",
-        # Creating an account has legal and billing consequences. Autonomous
-        # resolution would mean the agent authorizing spending and contract
-        # acceptance on the owner's behalf. Permanently human-only; must never be
-        # added to ``_AUTONOMOUS_RESOLUTION``. Listed here as well as being
-        # covered by the fail-closed default so the intent survives future edits.
-        "signup_authorization",
+        # ``signup_authorization`` used to be listed here. It is not any more --
+        # see the module docstring. It remains human-only for every run that
+        # holds no recorded signup decision, which is the fail-closed default
+        # rather than an entry in this set.
     }
 )
 
-# Gates a per-run provider profile may authorize. Deliberately a single member:
-# accepting the provider's own terms at the moment its signup form is submitted
-# is the one consent the operator's affirmative admission decision already
-# covers — approving account creation *is* approving the terms that creation is
-# subject to. Nothing else belongs here, and ``signup_authorization`` least of
-# all: a gate cannot supply its own authorization.
-PROFILE_DECLARABLE_GATES: frozenset[str] = frozenset({"legal_acceptance"})
+# Gates a per-run provider profile may authorize. Both members are the same
+# consent seen at two moments: the recorded affirmative admission decision IS the
+# authorization to create the account, and approving account creation is
+# approving the terms that creation is subject to. Nothing whose authority is a
+# scope decision about someone else's data belongs here -- ``oauth_grant``
+# notably does not.
+PROFILE_DECLARABLE_GATES: frozenset[str] = frozenset({"legal_acceptance", "signup_authorization"})
 
 # A profile digest is a sha256 content address. Checking the shape refuses an
 # empty or placeholder digest, which would otherwise let an uncommitted profile
@@ -232,7 +271,10 @@ def _profile_authorizes(action_type: str, authority: ProfileGateAuthority | None
     * a person made the decision and made it affirmatively — an operator's
       ``cancelled`` and the system's own ``login`` routing both fail here, so the
       only thing that grants this authority is a human approving account
-      creation;
+      creation. Since 2026-08-09 that human may have approved it per run
+      (``operator``) or in advance for this app (``standing_authorization``);
+      ``system`` is still refused, and is the only value that could mean the
+      software authorized itself;
     * the gate was observed inside the profile's one registrable domain.
     """
 
@@ -244,7 +286,9 @@ def _profile_authorizes(action_type: str, authority: ProfileGateAuthority | None
         return False
     if authority.admission_profile_digest != authority.profile_digest:
         return False
-    if authority.admission_route != "signup" or authority.admission_decided_by != "operator":
+    if authority.admission_route != "signup":
+        return False
+    if authority.admission_decided_by not in SIGNUP_DECIDERS:
         return False
     return _within_profile_domain(authority.gate_url, authority.registrable_domain)
 
@@ -286,6 +330,16 @@ def resolve_gate(
         if _profile_authorizes(action_type, profile_authority):
             return "profile_declared"
         return "human_only"
+    if resolution == "profile_declared":
+        # A gate whose ONLY authority is the run's own profile. Unlike the branch
+        # above there is no catalog fallback to try first, and returning the
+        # mapping's value directly would grant the gate to every run — which is
+        # precisely the bug the fail-closed default exists to prevent.
+        return (
+            "profile_declared"
+            if _profile_authorizes(action_type, profile_authority)
+            else "human_only"
+        )
     return resolution
 
 

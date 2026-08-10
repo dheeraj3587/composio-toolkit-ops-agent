@@ -70,7 +70,7 @@ def test_run_service_records_canonical_recipe_and_final_route(tmp_path: Path) ->
 
     assert run["status"] == "route_selected"
     assert run["access_route"] == "self_serve"
-    assert run["route_kind"] == "managed_auth"
+    assert run["route_kind"] == "managed_key"
     assert run["readiness_tier"] == "managed_auth_ready"
     assert run["state_engine"] == "canonical_v1"
     assert run["external_actions"] is False
@@ -79,7 +79,7 @@ def test_run_service_records_canonical_recipe_and_final_route(tmp_path: Path) ->
         "route_selected",
     ]
     assert timeline[0]["payload"]["recipe_version"] == run["recipe_version"]
-    assert timeline[-1]["payload"]["reason_code"] == "managed_connection_required"
+    assert timeline[-1]["payload"]["reason_code"] == "owner_submission_route_ready"
 
 
 def test_run_service_records_typed_unknown_without_external_probe(tmp_path: Path) -> None:
@@ -375,7 +375,7 @@ def test_default_execution_mode_is_plan_only(tmp_path: Path) -> None:
 def test_operations_token_enters_canonical_managed_connection_state(tmp_path: Path) -> None:
     service = RunService.from_paths(db_path=tmp_path / "private" / "ops.db")
 
-    run = service.create_run(request_for("HubSpot"), execution_mode="execute_when_configured")
+    run = service.create_run(request_for("Stripe"), execution_mode="execute_when_configured")
 
     # Persisted "operations" token maps to the logical public value.
     assert run["execution_mode"] == "execute_when_configured"

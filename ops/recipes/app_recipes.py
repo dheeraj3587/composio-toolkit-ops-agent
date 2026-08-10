@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
@@ -21,7 +22,13 @@ if TYPE_CHECKING:
     from ops.credentials.capture_specs import CredentialCaptureSpec
     from ops.credentials.validator import CredentialValidationPolicy
 
-RouteKind = Literal["managed_auth", "playwright", "gated"]
+# ``managed_key`` is the synchronous sibling of ``managed_auth``: the owner
+# already holds a key, and it is imported straight into a Composio connected
+# account instead of being redirected for. It is a separate kind rather than a
+# flag on ``managed_auth`` because it is the one route that legitimately carries
+# BOTH a credential surface (a reviewed page the key is read off) and managed-auth
+# publication, and ``managed_auth``'s contract forbids the first outright.
+RouteKind = Literal["managed_auth", "managed_key", "playwright", "gated"]
 ReadinessTier = Literal[
     "managed_auth_ready",
     "browser_ready",
@@ -96,14 +103,31 @@ SendingPolicy = Literal["controlled_sink_only"]
 
 MANAGED_AUTH_SLUGS = (
     "salesforce",
+    "zendesk",
+    "gorgias",
+    "google-ads",
+    "monday",
+    "stripe",
+    "quickbooks",
+)
+# The auth styles a key route can actually import. ``oauth2`` is absent by
+# construction: an OAuth app is what ``managed_auth`` exists for, and a recipe
+# claiming both would have no single answer to "what does the owner supply?".
+_KEY_AUTH_STYLES: Final[frozenset[str]] = frozenset(
+    {"api_key", "bearer_token", "personal_access_token", "bot_token"}
+)
+
+# Apps whose owner can mint a long-lived key from a settings page unaided, so
+# the key is published to Composio instead of a browser driving an OAuth
+# redirect. Every entry here was promoted off ``managed_auth`` or ``gated`` on
+# 2026-08-08 against an evidenced ``urls.credential_management`` page; the
+# tuple is what makes each promotion explicit rather than implicit.
+MANAGED_KEY_SLUGS: tuple[str, ...] = (
     "hubspot",
     "attio",
-    "zendesk",
     "intercom",
-    "gorgias",
     "slack",
     "discord",
-    "google-ads",
     "mailchimp",
     "gumroad",
     "github",
@@ -114,13 +138,147 @@ MANAGED_AUTH_SLUGS = (
     "linear",
     "jira",
     "asana",
-    "monday",
     "clickup",
     "harvest",
-    "stripe",
-    "quickbooks",
     "fathom",
+    "close",
+    "plain",
+    "sendgrid",
+    "ahrefs",
+    "brex",
 )
+
+# The Composio auth scheme each managed-key app's credential is published under.
+#
+# This is a REVIEWED fact, not a derived one, which is why it is a table rather
+# than a rule over ``auth_styles``. ``auth_styles`` records every way a vendor
+# will accept a credential -- most rows list two or three -- so deriving from it
+# would mean picking one and calling the guess evidence. Publishing under the
+# wrong scheme does not fail loudly: Composio accepts the connection and every
+# later tool call 401s, with nothing in this system pointing back at the cause.
+#
+# The evidence used for each entry below is the recipe's OWN reviewed validation
+# policy, because that policy is a request that was checked against the live
+# vendor: ``auth_scheme: "bearer"`` with an empty prefix is an ``Authorization:
+# Bearer <key>`` header, which is BEARER_TOKEN; ``api_key_header`` with an empty
+# prefix is a raw key header, which is API_KEY.
+#
+# An app absent from this table is refused at publish time with
+# ``managed_key_auth_scheme_not_reviewed``. That is deliberate and is not a bug
+# to be closed by adding a plausible guess -- see ``MANAGED_KEY_SCHEME_UNREVIEWED``
+# for what each absent app is actually waiting on.
+MANAGED_KEY_AUTH_SCHEMES: Mapping[str, str] = MappingProxyType(
+    {
+        "hubspot": "BEARER_TOKEN",
+        "attio": "BEARER_TOKEN",
+        "intercom": "BEARER_TOKEN",
+        "slack": "BEARER_TOKEN",
+        "gumroad": "BEARER_TOKEN",
+        "github": "BEARER_TOKEN",
+        "supabase": "BEARER_TOKEN",
+        "sentry": "BEARER_TOKEN",
+        "notion": "BEARER_TOKEN",
+        "airtable": "BEARER_TOKEN",
+        "asana": "BEARER_TOKEN",
+        "fathom": "BEARER_TOKEN",
+        "sendgrid": "BEARER_TOKEN",
+        "ahrefs": "BEARER_TOKEN",
+        "brex": "BEARER_TOKEN",
+        # Plain's authentication page states the header verbatim as
+        # ``Authorization: Bearer plainApiKey_xxx``, which is bearer with an
+        # empty prefix. Its reviewed probe is a POST because the API is GraphQL
+        # only; see the note on ``no_validation_evidence`` below for what that
+        # probe had to establish before this entry could exist.
+        "plain": "BEARER_TOKEN",
+        "clickup": "API_KEY",
+        # Linear's own GraphQL guide: "you need to pass the API key with header:
+        # Authorization: <API_KEY>" -- no scheme word at all, which is a raw key
+        # header and therefore API_KEY. The page contrasts this explicitly with
+        # its OAuth tokens, which DO take "Bearer ", so the absence is a stated
+        # fact rather than a doc omission.
+        "linear": "API_KEY",
+        # Jira Cloud authenticates as HTTP basic: the username is the Atlassian
+        # account email and the API token is the password. That is why it needed
+        # the companion mapping rather than a scheme guess -- the token alone
+        # names no account. See MANAGED_KEY_COMPANION_STATE_KEYS.
+        "jira": "BASIC",
+    }
+)
+
+# Managed-key apps that are deliberately not publishable yet, and why. Keeping
+# the reason next to the slug is what stops a later reader from "fixing" the
+# omission by guessing a scheme: none of these is blocked on someone noticing.
+#
+# ``header_prefix`` -- Discord is sent as ``Authorization: Bot <token>``, which
+#   is neither a bare key nor a Bearer token, so it needs evidence of which
+#   scheme Composio's Discord toolkit expects rather than a coin flip.
+# ``no_validation_evidence`` -- the recipe carries no validation policy, so this
+#   catalog holds no checked request to read the scheme off. A reviewed probe
+#   promotes these; POST validation already promoted Linear this way, and Plain
+#   left on 2026-08-09 the same way. What is left is Mailchimp, whose endpoint
+#   host is data-centre scoped (``<dc>.api.mailchimp.com``) and so
+#   unrepresentable.
+#
+#   Plain's blocker was that a GraphQL error is served as a 200 and would read
+#   as a pass. Two facts retired it. A bad bearer token is rejected by Plain at
+#   the transport with a clean 401, before GraphQL executes, so a rejected
+#   credential was never the 200 case. And Plain publishes its full SDL at
+#   ``/graphql/v1/schema.graphql``, where ``type Query`` declares the no-argument
+#   ``myWorkspace: Workspace`` -- documented as "the Workspace associated with
+#   the current API key" -- over a ``Workspace`` whose first field is ``id: ID!``.
+#   That makes ``data.myWorkspace.id`` a verified identity path, which is what
+#   turns the remaining 200-with-errors cases (schema drift, a key with no
+#   workspace in context) into ``validation_identity_unconfirmed`` instead of a
+#   false pass.
+#
+# ``basic_secret_position_unverified`` -- Close's HTTP shape IS now reviewed (the
+#   key is the basic username against an empty password), but a basic pair maps
+#   to more than one Composio scheme depending on which side the toolkit expects
+#   the key on, and this catalog's probe does not establish that. Publishing on
+#   the wrong side is the silent-401 failure this table exists to prevent.
+#
+# ``companion_consumption_unverified`` -- the provider CAN now carry a companion
+#   value (see ``MANAGED_KEY_COMPANION_STATE_KEYS``), and the connection-state
+#   type accepts the field, but accepting a field is not the same as using it.
+#   Harvest needs its account id to reach the ``Harvest-Account-Id`` header on
+#   the outbound vendor call, and whether Composio's Harvest toolkit does that
+#   mapping cannot be established from the SDK types alone. Jira left this state
+#   because BASIC's ``username`` is consumed by the HTTP basic-auth header
+#   itself, which is protocol, not toolkit behaviour.
+#
+# ``multi_field`` was a fourth reason and is retired: carrying a second value is
+# no longer the obstacle for either app.
+MANAGED_KEY_SCHEME_UNREVIEWED: Mapping[str, str] = MappingProxyType(
+    {
+        "harvest": "companion_consumption_unverified",
+        "discord": "header_prefix",
+        "mailchimp": "no_validation_evidence",
+        "close": "basic_secret_position_unverified",
+    }
+)
+
+# Managed-key apps whose key does not identify an account on its own, mapped to
+# the connection-state field their second, NON-SECRET value occupies.
+#
+# Both values here are account identity, not credentials: Jira authenticates as
+# HTTP basic where the username is the Atlassian account email and the API token
+# is the password, and Harvest requires the account id its token is scoped to.
+# Publishing either app without its companion produces a connection Composio
+# reports ACTIVE and that 401s on first use -- the exact failure
+# ``managed_key_publish_plan`` exists to prevent -- so the provider treats a
+# missing companion for BASIC as a refusal rather than a default.
+#
+# The recipe field supplying the value is derived, not listed: it is the app's
+# single non-secret credential field. That derivation is checked by the catalog
+# validator, so an edit adding a second non-secret field to one of these recipes
+# fails loudly here instead of silently choosing one.
+MANAGED_KEY_COMPANION_STATE_KEYS: Mapping[str, str] = MappingProxyType(
+    {
+        "jira": "username",
+        "harvest": "account_id",
+    }
+)
+
 PLAYWRIGHT_SLUGS = (
     "pipedrive",
     "telegram",
@@ -138,16 +296,11 @@ PLAYWRIGHT_SLUGS = (
     "xero",
 )
 GATED_SLUGS = (
-    "close",
     "freshdesk",
-    "plain",
     "help-scout",
     "meta-ads",
     "linkedin-ads",
-    "sendgrid",
-    "ahrefs",
     "snowflake",
-    "brex",
     "ramp",
 )
 
@@ -630,7 +783,13 @@ class CaptureSpec(_RecipeModel):
 
 class ValidationPolicy(_RecipeModel):
     endpoint: str
-    method: Literal["GET"]
+    # ``POST`` is admitted for the providers that publish no readable GET at all:
+    # a GraphQL-only API (Linear) and a client-credentials token mint (Ramp). It
+    # does NOT widen what validation may do. The endpoint still has to be the one
+    # the reviewed recipe names, the body below is checked-in static text, and no
+    # secret is ever interpolated into it — a POST whose proof needs the secret in
+    # its body is not expressible here on purpose.
+    method: Literal["GET", "POST"] = "GET"
     auth_scheme: ValidationAuthScheme
     credential_field: str = Field(pattern=r"^[a-z][a-z0-9_]{0,99}$")
     header_name: str = Field(min_length=1, max_length=100)
@@ -642,6 +801,17 @@ class ValidationPolicy(_RecipeModel):
     extra_headers: tuple[tuple[str, str], ...] = Field(default=(), max_length=10)
     # The non-secret username field for ``basic_auth`` credential pairs.
     username_field: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,99}$")
+    # The other two basic-auth shapes, where the vendor documents a fixed literal
+    # on one side and the credential on the other: Close and Help Scout send the
+    # key as the username against an empty / dummy password, Mailchimp sends a
+    # dummy username against the key. A literal lives here in the reviewed
+    # catalog, in git, so nothing secret is expressible in either field.
+    basic_username_literal: str | None = Field(default=None, max_length=100)
+    basic_password_literal: str | None = Field(default=None, max_length=100)
+    # The reviewed, static, non-secret body a ``POST`` probe sends, and its media
+    # type. Both are meaningless on a ``GET`` and refused there.
+    request_body: str | None = Field(default=None, max_length=2_000)
+    request_content_type: str | None = Field(default=None, max_length=100)
 
     @field_validator("endpoint")
     @classmethod
@@ -654,16 +824,40 @@ class ValidationPolicy(_RecipeModel):
             if "\r" in text or "\n" in text:
                 raise ValueError("validation header is invalid")
         _unique(self.account_identifier_paths, "account identifier paths", 20)
+        literals = (self.basic_username_literal, self.basic_password_literal)
+        counterparts = (self.username_field, *literals)
         if self.auth_scheme == "basic_auth":
-            if self.username_field is None:
-                raise ValueError("basic validation requires a username field")
-            if self.username_field == self.credential_field:
+            # Exactly one counterpart, so the recipe -- not the code building the
+            # request -- decides which side of the pair the secret occupies.
+            if sum(value is not None for value in counterparts) != 1:
+                raise ValueError("basic validation needs exactly one counterpart")
+            if self.username_field is not None and self.username_field == self.credential_field:
                 raise ValueError("basic validation needs distinct username and secret fields")
-        elif self.username_field is not None:
+            for literal in literals:
+                # A colon is what basic auth splits the pair on, so a literal
+                # holding one would quietly move the boundary between the two.
+                if literal is not None and ":" in literal:
+                    raise ValueError("basic validation literal is invalid")
+        elif any(value is not None for value in counterparts):
             raise ValueError("username field is only valid for basic validation")
         if self.auth_scheme != "api_key_header" and self.header_value_prefix:
             raise ValueError("header value prefix is only valid for api-key validation")
-        names = {self.header_name.casefold()}
+        if self.method == "POST":
+            # A POST with nothing to say is not a probe any of these providers
+            # answer, and a body with no declared media type is one the provider
+            # is entitled to reject. Requiring both keeps the reviewed request
+            # fully described by the recipe rather than half-assembled in code.
+            if not self.request_body or not self.request_content_type:
+                raise ValueError("post validation requires a body and its content type")
+        elif self.request_body is not None or self.request_content_type is not None:
+            raise ValueError("a validation body is only valid for post validation")
+        # The body may hold newlines — a GraphQL document routinely does — but the
+        # media type becomes a header, so it may not.
+        if self.request_content_type is not None and (
+            "\r" in self.request_content_type or "\n" in self.request_content_type
+        ):
+            raise ValueError("validation request media type is invalid")
+        names = {self.header_name.casefold(), "content-type"}
         for name, value in self.extra_headers:
             if not name or "\r" in name or "\n" in name or "\r" in value or "\n" in value:
                 raise ValueError("static validation header is invalid")
@@ -741,6 +935,8 @@ class AppRecipe(_RecipeModel):
             ):
                 raise ValueError("managed-auth contract is invalid")
             return self
+        if self.route_kind == "managed_key":
+            return self._validate_managed_key()
         if self.route_kind == "playwright":
             return self._validate_playwright()
         if (
@@ -756,6 +952,92 @@ class AppRecipe(_RecipeModel):
             self.outreach.contact_url or self.outreach.contact_email
         ):
             raise ValueError("outreach-ready route needs a contact")
+        return self
+
+    def _validate_managed_key(self) -> Self:
+        """A key the owner already holds, published to Composio as managed auth.
+
+        Neither existing contract can state this. ``managed_auth`` forbids a
+        credential surface outright -- no browser, no credential fields, no
+        validation -- because its whole flow is a redirect nobody types a secret
+        into, and it demands ``oauth2``. ``playwright`` permits all three but ends
+        with the secret in this project's vault, which is the opposite of handing
+        it to the provider. A key route is both halves at once: a reviewed page
+        the key is read off, and a managed connection created from it, so the
+        credential's only destination is Composio.
+
+        Outreach stays forbidden exactly as it is for ``managed_auth``: a key the
+        owner can mint themselves is by definition not a route that needs a
+        vendor's permission, and permitting both would let one recipe justify a
+        real vendor email for an app it can already onboard unattended.
+        """
+
+        if self.readiness_tier != "managed_auth_ready" or self.outreach is not None:
+            raise ValueError("managed-key contract is invalid")
+        if not set(self.auth_styles) & _KEY_AUTH_STYLES:
+            raise ValueError("managed-key route needs a key auth style")
+        if self.urls.credential_management is None:
+            raise ValueError("managed-key route needs a reviewed credential-management URL")
+        if not self.credential_fields or not any(field.secret for field in self.credential_fields):
+            raise ValueError("managed-key route needs an owner credential schema")
+        if self.capture.mode not in {"owner_submit", "automatic"}:
+            raise ValueError("managed-key capture must be owner-submit or automatic")
+        browser = self.browser
+        if browser is None:
+            # With no reviewed browser the owner reaches the page themselves, so
+            # nothing may claim the page was driven or the value read off it.
+            if self.capture.mode != "owner_submit":
+                raise ValueError("managed-key automatic capture needs a reviewed browser entry")
+            return self
+        if self.urls.login is None:
+            raise ValueError("managed-key browser entry needs a reviewed login URL")
+        login_host = (urlsplit(self.urls.login).hostname or "").casefold()
+        first = browser.steps[0]
+        if login_host not in browser.exact_hosts:
+            raise ValueError("login URL is outside exact navigation hosts")
+        if first.action != "navigate" or first.target_url != self.urls.login:
+            raise ValueError("first managed-key step must open the reviewed login URL")
+        if self.capture.mode == "owner_submit":
+            if browser.scope != "entry_only":
+                raise ValueError("owner-submit route needs a reviewed entry-only policy")
+            return self
+        if browser.scope != "credential_surface":
+            raise ValueError("managed-key automatic capture needs a credential surface")
+        return self._validate_secret_boundary(browser)
+
+    def _validate_secret_boundary(self, browser: BrowserRecipe) -> Self:
+        """Every automatically captured value is declared, and confined to review.
+
+        Shared by the two routes that drive a credential surface so they cannot
+        drift about what "captured" means: a captured field must be a declared
+        credential field, anything validation reads must have been captured, and
+        every capture selector must already be marked sensitive in the browser
+        recipe -- otherwise a secret would be read through a selector the redactor
+        does not know to blind.
+
+        ``validation`` is optional here, unlike in the Playwright contract that
+        this was extracted from: only that route promises a local check. A
+        managed-key route learns the key is good when Composio accepts the
+        connection, so an absent policy contributes no required fields rather
+        than failing the check.
+        """
+
+        field_names = {field.name for field in self.credential_fields}
+        capture_fields = self.capture.capture_fields
+        captured_names = {field.field_name for field in capture_fields}
+        validation_fields: set[str] = set()
+        if self.validation is not None:
+            validation_fields.add(self.validation.credential_field)
+            if self.validation.username_field is not None:
+                validation_fields.add(self.validation.username_field)
+        capture_selectors = {selector for field in capture_fields for selector in field.selectors}
+        if (
+            not capture_fields
+            or not captured_names <= field_names
+            or not validation_fields <= captured_names
+            or not capture_selectors <= set(browser.sensitive_selectors)
+        ):
+            raise ValueError("secret boundary is inconsistent")
         return self
 
     def _validate_playwright(self) -> Self:
@@ -803,21 +1085,7 @@ class AppRecipe(_RecipeModel):
             or self.urls.credential_management is None
         ):
             raise ValueError("browser-ready contract is incomplete")
-        field_names = {field.name for field in self.credential_fields}
-        capture_fields = self.capture.capture_fields
-        captured_names = {field.field_name for field in capture_fields}
-        validation_fields = {self.validation.credential_field}
-        if self.validation.username_field is not None:
-            validation_fields.add(self.validation.username_field)
-        capture_selectors = {selector for field in capture_fields for selector in field.selectors}
-        if (
-            not capture_fields
-            or not captured_names <= field_names
-            or not validation_fields <= captured_names
-            or not capture_selectors <= set(self.browser.sensitive_selectors)
-        ):
-            raise ValueError("secret boundary is inconsistent")
-        return self
+        return self._validate_secret_boundary(self.browser)
 
     @property
     def browser_ready(self) -> bool:
@@ -839,16 +1107,36 @@ class AppRecipeCatalog(_RecipeModel):
         if self.schema_version != "1.0":
             raise ValueError("unsupported app recipe schema version")
         slugs = tuple(recipe.app_slug for recipe in self.apps)
-        expected = (*MANAGED_AUTH_SLUGS, *PLAYWRIGHT_SLUGS, *GATED_SLUGS)
-        if slugs != expected:
+        expected = (*MANAGED_AUTH_SLUGS, *MANAGED_KEY_SLUGS, *PLAYWRIGHT_SLUGS, *GATED_SLUGS)
+        # Compared as sorted multisets rather than as a sequence. Exact membership
+        # and duplicate detection are unchanged; what is deliberately no longer
+        # pinned is FILE ORDER, so promoting one app onto ``managed_key`` is a
+        # route change inside its own recipe instead of a forced move of its JSON
+        # object into a different block -- a diff that would read as if the whole
+        # catalog had been rewritten. Every app's route stays pinned individually
+        # by ``expected_routes`` below, so nothing can change route by moving.
+        if sorted(slugs) != sorted(expected):
             raise ValueError("app recipe catalog does not match the approved matrix")
         expected_routes = {
             **{slug: "managed_auth" for slug in MANAGED_AUTH_SLUGS},
+            **{slug: "managed_key" for slug in MANAGED_KEY_SLUGS},
             **{slug: "playwright" for slug in PLAYWRIGHT_SLUGS},
             **{slug: "gated" for slug in GATED_SLUGS},
         }
         if any(recipe.route_kind != expected_routes[recipe.app_slug] for recipe in self.apps):
             raise ValueError("an app is assigned to the wrong approved route")
+        # Every managed-key app must have had the publish-scheme decision made
+        # for it, one way or the other. Without this, promoting an app onto
+        # ``managed_key`` and forgetting the scheme table would look like a
+        # success at review time and surface much later as a connection that
+        # authenticates against nothing. Overlap is rejected too: an app cannot
+        # be both reviewed and pending review.
+        reviewed = set(MANAGED_KEY_AUTH_SCHEMES)
+        pending = set(MANAGED_KEY_SCHEME_UNREVIEWED)
+        if reviewed & pending:
+            raise ValueError("a managed-key app is both scheme-reviewed and scheme-pending")
+        if reviewed | pending != set(MANAGED_KEY_SLUGS):
+            raise ValueError("managed-key auth schemes do not cover the approved managed-key set")
         return self
 
 
@@ -930,11 +1218,67 @@ def get_app_recipe_for_name(app_name: str) -> AppRecipe | None:
 def recipes_for_route(route_kind: RouteKind) -> tuple[AppRecipe, ...]:
     """Return recipes for one canonical route."""
 
-    if route_kind not in {"managed_auth", "playwright", "gated"}:
+    if route_kind not in {"managed_auth", "managed_key", "playwright", "gated"}:
         raise ValueError("unknown app recipe route")
     return tuple(
         recipe for recipe in load_app_recipe_catalog().apps if recipe.route_kind == route_kind
     )
+
+
+def managed_key_publish_plan(recipe: AppRecipe) -> tuple[str, str] | tuple[None, str]:
+    """Return ``(auth_scheme, secret_field)`` for a publishable managed-key recipe.
+
+    Returns ``(None, reason_code)`` when the app is on the managed-key route but
+    cannot be published yet, so the caller refuses with a reason that names the
+    real obstacle instead of a generic failure. Callers must treat a ``None``
+    scheme as a refusal and never fall back to a default: publishing a key under
+    a guessed scheme produces a connection Composio reports as ACTIVE and that
+    401s on first use, which is strictly worse than not connecting at all.
+    """
+
+    if recipe.route_kind != "managed_key":
+        return (None, "run_is_not_managed_key")
+    scheme = MANAGED_KEY_AUTH_SCHEMES.get(recipe.app_slug)
+    if scheme is None:
+        pending = MANAGED_KEY_SCHEME_UNREVIEWED.get(recipe.app_slug, "unknown")
+        return (None, f"managed_key_scheme_not_reviewed_{pending}")
+    secrets = [field.name for field in recipe.credential_fields if field.secret]
+    if len(secrets) != 1:
+        # Unreachable for the reviewed catalog -- the matrix validator pins every
+        # multi-secret app into MANAGED_KEY_SCHEME_UNREVIEWED -- but checked here
+        # because this function decides which value is handed to a provider.
+        return (None, "managed_key_secret_field_ambiguous")
+    if managed_key_companion_plan(recipe) == (None, "managed_key_companion_field_ambiguous"):
+        # An app declared as needing a companion whose recipe cannot supply
+        # exactly one is not publishable: BASIC would be refused at the provider,
+        # and a bearer app would silently publish without its account id.
+        return (None, "managed_key_companion_field_ambiguous")
+    return (scheme, secrets[0])
+
+
+def managed_key_companion_plan(
+    recipe: AppRecipe,
+) -> tuple[str, str] | tuple[None, str] | None:
+    """Return ``(recipe_field, connection_state_key)`` for a two-value key app.
+
+    ``None`` means this app needs no companion, which is the common case and is
+    distinct from a failure. ``(None, reason_code)`` means the app is declared as
+    needing one but its recipe cannot supply it unambiguously.
+
+    The recipe field is derived rather than listed: it is the app's single
+    non-secret credential field. Deriving it keeps one fact in one place -- the
+    catalog already says which fields exist and which are secret -- and the
+    ambiguity branch below is what stops that derivation from quietly picking a
+    field when a later edit adds a second non-secret one.
+    """
+
+    state_key = MANAGED_KEY_COMPANION_STATE_KEYS.get(recipe.app_slug)
+    if state_key is None:
+        return None
+    companions = [field.name for field in recipe.credential_fields if not field.secret]
+    if len(companions) != 1:
+        return (None, "managed_key_companion_field_ambiguous")
+    return (companions[0], state_key)
 
 
 def recipe_to_operational_research(
@@ -950,7 +1294,14 @@ def recipe_to_operational_research(
     if isinstance(lookup, P1LookupNotFound):
         raise AppRecipeCatalogError(f"{recipe.app_slug} is absent from the locked P1 snapshot")
     base = to_operational_research(lookup.record)
-    if recipe.route_kind in {"managed_auth", "playwright"}:
+    # ``managed_key`` is self-serve for the same reason the other two are: the
+    # owner can complete it alone. This is also the SECOND gate a browser-driven
+    # key route has to pass -- ``ops/browser/host_policy.py`` admits the route
+    # KIND, but ``build_browser_allowed_hosts`` separately refuses any
+    # ``access_route`` outside ``BROWSER_ROUTES``, and without this line the
+    # branch below would label the route ``approval_required`` (it has no
+    # outreach, by contract) and every navigation would be refused.
+    if recipe.route_kind in {"managed_auth", "managed_key", "playwright"}:
         access_route = "self_serve"
     elif recipe.outreach is not None and (
         recipe.outreach.contact_url or recipe.outreach.contact_email
@@ -985,6 +1336,9 @@ def recipe_to_operational_research(
         {
             "app_name": app_name or recipe.app_name,
             "credential_fields": [field.name for field in recipe.credential_fields],
+            "credential_secret_fields": [
+                field.name for field in recipe.credential_fields if field.secret
+            ],
             "developer_portal_url": reviewed_urls["developer_portal_url"],
             "signup_url": reviewed_urls["signup_url"],
             "login_url": reviewed_urls["login_url"],
@@ -1185,6 +1539,11 @@ def recipe_to_validation_policy(recipe: AppRecipe) -> CredentialValidationPolicy
         header_value_prefix=validation.header_value_prefix,
         extra_headers=validation.extra_headers,
         username_field=validation.username_field,
+        basic_username_literal=validation.basic_username_literal,
+        basic_password_literal=validation.basic_password_literal,
+        method=validation.method,
+        request_body=validation.request_body,
+        request_content_type=validation.request_content_type,
     )
 
 
@@ -1204,6 +1563,10 @@ __all__ = [
     "CredentialFieldKind",
     "GATED_SLUGS",
     "MANAGED_AUTH_SLUGS",
+    "MANAGED_KEY_AUTH_SCHEMES",
+    "MANAGED_KEY_COMPANION_STATE_KEYS",
+    "MANAGED_KEY_SCHEME_UNREVIEWED",
+    "MANAGED_KEY_SLUGS",
     "NAVIGATING_BROWSER_ACTIONS",
     "OutreachSpec",
     "PLAYWRIGHT_SLUGS",
@@ -1222,6 +1585,8 @@ __all__ = [
     "recipe_predicate",
     "recipe_to_browser_trace",
     "recipe_to_capture_spec",
+    "managed_key_companion_plan",
+    "managed_key_publish_plan",
     "recipe_to_operational_research",
     "recipe_to_validation_policy",
     "recipes_for_route",

@@ -946,6 +946,9 @@ function accountCreationUnavailableReason({
     if (connectRoute === "managed_auth") {
       return `${selectedAppName} connects through Composio's managed OAuth, so there is no signup form to fill in — an account is signed in, not registered. Choose “I have an account” and the agent authorizes it through Composio.`
     }
+    if (connectRoute === "managed_key") {
+      return `${selectedAppName} connects with a key you mint yourself on its own settings page, so there is no signup form to fill in and no browser to drive. Choose “I have an account”; the run stops to let you paste the key once, and it is published to Composio from there.`
+    }
     if (connectRoute === "gated") {
       return `${selectedAppName} does not offer self-serve registration — access is granted by the vendor (sales, approval, or an invitation). Once you hold an account, choose “I have an account”.`
     }
@@ -980,6 +983,9 @@ function browserSignInUnavailableReason({
   if (!selectedAppName || !capabilitiesReady) return null
   if (connectRoute === "managed_auth") {
     return `${selectedAppName} connects through Composio's managed OAuth. You authorize it in ${selectedAppName}'s own window, so the agent never handles your password — there is nothing to enter here.`
+  }
+  if (connectRoute === "managed_key") {
+    return `${selectedAppName} is connected with a key you already hold, not by signing in. No browser is driven on this route, so a password entered here would not be used.`
   }
   if (connectRoute === "gated") {
     return `${selectedAppName} is reached through a vendor-granted route rather than a sign-in page the agent can drive, so a password entered here would not be used.`

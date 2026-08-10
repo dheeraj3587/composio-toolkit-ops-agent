@@ -238,12 +238,27 @@ def acceptance_api(tmp_path: Path) -> Iterator[tuple[TestClient, RunService, Set
         yield client, core, settings
 
 
-def test_candidate_release_rejects_api_mutations_without_persisting(
+def test_candidate_release_rejects_credential_intake_but_admits_operator_writes(
     acceptance_api: tuple[TestClient, RunService, Settings],
 ) -> None:
-    client, core, settings = acceptance_api
+    """The gate is credential intake, not "every ``/api/`` mutation".
 
-    blocked = client.post("/api/runs", json=_create_payload())
+    It used to refuse every write, which locked an operator out of their own
+    release for as long as its background sweeps were inert: they could not start
+    a run, resume one, or watch it. Being unaccepted is a statement about
+    autonomous maintenance, not about whether a person may drive. What an
+    unaccepted deployment must never do is take custody of a secret, so that --
+    and the broker subtree below -- is all this refuses.
+    """
+
+    client, core, settings = acceptance_api
+    credential_path = f"/api/runs/run_{'a' * 32}/credentials"
+    credential_body = {
+        "company": _create_payload()["company"],
+        "credentials": {"api_key": "unused-placeholder"},  # pragma: allowlist secret
+    }
+
+    blocked = client.post(credential_path, json=credential_body)
 
     assert blocked.status_code == 503
     assert blocked.json() == {
@@ -253,33 +268,45 @@ def test_candidate_release_rejects_api_mutations_without_persisting(
     assert blocked.headers["retry-after"] == "5"
     assert core.storage.count_runs() == 0
 
-    write_deployment_acceptance_marker(settings)
-    accepted = client.post("/api/runs", json=_create_payload())
-    assert accepted.status_code == 201
+    # An ordinary operator write carries no credential material and is admitted.
+    admitted = client.post("/api/runs", json=_create_payload())
+    assert admitted.status_code == 201
     assert core.storage.count_runs() == 1
+
+    write_deployment_acceptance_marker(settings)
+    # Acceptance stops being the answer here; the route's own owner-secret gate
+    # is what refuses on this deployment, and it answers 403 rather than 503.
+    accepted = client.post(credential_path, json=credential_body)
+    assert accepted.status_code == 403
 
 
 def test_marker_is_rechecked_for_each_new_mutation_admission(
     acceptance_api: tuple[TestClient, RunService, Settings],
 ) -> None:
-    """New requests see revocation; deploy must quiesce already-admitted work."""
+    """New requests see revocation; deploy must quiesce already-admitted work.
+
+    Also the memoized read's invalidation contract: the decision is cached on the
+    marker's on-disk identity, so a revoked marker must be refused by the very
+    next request rather than answered from the previous one's cache entry.
+    """
 
     client, core, settings = acceptance_api
+    credential_path = f"/api/runs/run_{'a' * 32}/credentials"
+    credential_body = {
+        "company": _create_payload()["company"],
+        "credentials": {"api_key": "unused-placeholder"},  # pragma: allowlist secret
+    }
     write_deployment_acceptance_marker(settings)
-    accepted = client.post("/api/runs", json=_create_payload())
-    assert accepted.status_code == 201
+    accepted = client.post(credential_path, json=credential_body)
+    assert accepted.status_code != 503
 
     # Production never revokes a marker under a running release: deploy/restore
     # closes admission and stops services first. This removal demonstrates the
     # gate's uncached behavior, while documenting why it is not an in-flight lock.
     settings.ops_deploy_acceptance_marker_path.unlink()
-    blocked = client.post(
-        "/api/runs",
-        headers={"Idempotency-Key": f"idem_{'b' * 32}"},
-        json=_create_payload(),
-    )
+    blocked = client.post(credential_path, json=credential_body)
     assert blocked.status_code == 503
-    assert core.storage.count_runs() == 1
+    assert core.storage.count_runs() == 0
 
 
 def test_candidate_release_keeps_read_only_health_available(
@@ -293,25 +320,25 @@ def test_candidate_release_keeps_read_only_health_available(
     assert core.storage.count_runs() == 0
 
 
-def test_candidate_release_blocks_live_view_grant_before_service_call(
+def test_candidate_release_keeps_the_live_view_watchable(
     acceptance_api: tuple[TestClient, RunService, Settings],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """An operator must be able to watch a run on an unaccepted release.
+
+    This used to assert the opposite -- a 503 before the service was ever called.
+    That reading of the marker was wrong: the live view is a read, it moves no
+    secret in either direction (``live_view_allowed`` is revoked the moment a run
+    reaches a credential surface), and refusing it left the one release an
+    operator most needs to observe the one they could not see. The request now
+    reaches the service and gets the run's real answer.
+    """
+
     client, _core, _settings_value = acceptance_api
-    service = client.app.state.run_service
-    called = False
 
-    async def unexpected_live_view(run_id: str) -> None:
-        del run_id
-        nonlocal called
-        called = True
-
-    monkeypatch.setattr(service, "get_live_view", unexpected_live_view)
     response = client.get(f"/api/runs/run_{'a' * 32}/live-view")
 
-    assert response.status_code == 503
-    assert response.json()["error"] == "deployment_not_accepted"
-    assert called is False
+    assert response.status_code == 404
+    assert response.json()["error"] == "run_not_found"
 
 
 def test_candidate_release_rejects_browser_broker_mutations(

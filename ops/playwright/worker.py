@@ -50,6 +50,7 @@ from ops.browser.candidates import (
 )
 from ops.browser.decider import (
     MAX_ELEMENTS,
+    SnapshotElement,
     build_choice_prompt,
     build_snapshot,
     candidate_choice_schema,
@@ -306,6 +307,27 @@ def _active_page(session: _PwSession) -> Any:
         if page is not None:
             return page
     return session.page
+
+
+async def _pinned(locator: Any) -> Any:
+    """Bind a positional locator to the DOM node it currently resolves to.
+
+    Returns an ``ElementHandle`` — which supports every verb the executor uses
+    (click/fill/press/select_option/check/uncheck/scroll_into_view_if_needed/
+    focus) with the same signatures — so an action cannot silently re-target
+    while Playwright waits for actionability.
+
+    Falls back to the locator itself when the handle cannot be taken (a detached
+    node, a frame that navigated mid-resolution). That is not a weakening: the
+    locator would then fail against a missing element, which is the outcome we
+    want, and raising here would report a target problem as a browser crash.
+    """
+
+    try:
+        handle = await locator.element_handle(timeout=_ACTION_TIMEOUT_MS)
+    except Exception:
+        return locator
+    return handle if handle is not None else locator
 
 
 @dataclass(frozen=True, slots=True)
@@ -728,6 +750,26 @@ class PlaywrightBrowserWorker:
         )
         if selection is not None:
             session.inference = build_json_inference(self._settings, selection=selection)
+        # The popup registry, dialog handler, download guard and staged egress
+        # policy are installed for EVERY session, not only for the ones that go
+        # through ``navigate_onboarding``. The onboarding driver deliberately
+        # never calls that verb — it drives observe/act — so those sessions ran
+        # with ``egress_policy is None`` (making ``advance_to`` inert) and with no
+        # page registry at all, which is why a provider console that opens its
+        # credential UI in a popup could not be driven on that path.
+        #
+        # Failure here is fatal to the session by design: these are security
+        # controls, and ``_install_interaction_guards`` raises rather than
+        # continuing unguarded. The session is destroyed before it is published,
+        # so no caller can observe a registered but unguarded one.
+        try:
+            await self._install_interaction_guards(session, seeded_patterns)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await self._loop.run(_shutdown_session(session), timeout=_OP_TIMEOUT_SECONDS)
+            if capacity_owned:
+                self._capacity.release()
+            raise
         with self._registry_lock:
             self._sessions[handle] = session
         return BrowserSessionContext(
@@ -2177,12 +2219,22 @@ class PlaywrightBrowserWorker:
                 return _result("blocked", fresh.url, fresh.generation, "policy_blocked")
 
         target_index: int | None = None
+        target_element: SnapshotElement | None = None
         if candidate.identity is not None:
-            matches = [element for element in fresh.elements if candidate.identity.matches(element)]
-            if len(matches) == 0:
+            # The SAME ordered tier resolver the planner used, not the bare
+            # ``matches`` predicate. ``ElementIdentity.matches`` is only the
+            # role/name/type/frame tier; going through it directly dropped the
+            # reviewed ``test_id`` tier that sits ABOVE it, so two same-named
+            # controls on one console — "Create" beside "Create" — resolved as
+            # ``target_ambiguous`` on every iteration even when the planner had
+            # told them apart by test id, and the phase died at
+            # ``_MAX_REPEATED_STATE``.
+            resolution, target_element = resolve_identity(candidate.identity, fresh.elements)
+            if resolution == "not_found" or target_element is None:
                 return _result("stale", fresh.url, fresh.generation, "target_not_found")
-            if len(matches) > 1:
+            if resolution == "ambiguous":
                 return _result("stale", fresh.url, fresh.generation, "target_ambiguous")
+            matches = [target_element]
             # Credential-bearing fields are WRITTEN by code-owned injection and by
             # nothing else. The candidate generator already refuses to emit a value
             # action against a ``secretish`` element, so on the loop path this is
@@ -2241,7 +2293,18 @@ class PlaywrightBrowserWorker:
                     # Every remaining action needs a resolved element.
                     raise BrowserActionExpectedError("target_not_found")
                 else:
-                    locator = fresh.locators[target_index]
+                    # PIN the element before acting. ``fresh.locators[i]`` is a
+                    # lazy positional locator (``nth(i)``) that Playwright
+                    # re-resolves on every actionability retry for up to
+                    # ``_ACTION_TIMEOUT_MS``. A banner that self-dismisses in that
+                    # window shifts every later index by one and the click lands on
+                    # a DIFFERENT control than the one the identity resolved —
+                    # exactly the positional guess ``ElementIdentity`` was written
+                    # to prevent. An ``ElementHandle`` is bound to the DOM node, so
+                    # a shifted index cannot re-point it; if the node is gone the
+                    # action fails against that node rather than succeeding against
+                    # its replacement.
+                    locator = await _pinned(fresh.locators[target_index])
                     if action == "click":
                         await locator.click(timeout=_ACTION_TIMEOUT_MS)
                     elif action in {"fill", "type"}:
@@ -2597,13 +2660,22 @@ class PlaywrightBrowserWorker:
         session: _PwSession,
         patterns: tuple[str, ...],
         *,
-        recipe: AppRecipe,
+        recipe: AppRecipe | None = None,
     ) -> None:
         """Install the page/popup registry, dialog handler and download guard.
 
         All three are installed BEFORE any navigation or action, so a popup,
         dialog or download can never appear unguarded. Host sets come only from
         the reviewed per-app patterns — never from page content or model output.
+
+        Called from ``start`` for every session and again from
+        ``navigate_onboarding`` once research has resolved a wider reviewed
+        pattern set. The second call must not stack a second context route on the
+        same browser, so wiring happens once and later calls only REBUILD the
+        egress policy — which the route handler reads per request through
+        ``policy_provider``. ``recipe`` may be ``None``: the extensions resolver
+        falls back to the catalog entry for the session's own app slug, and an app
+        with no reviewed recipe simply gets no extensions.
         """
 
         extras = reviewed_egress_extensions(session.app_slug, recipe=recipe)
@@ -2615,8 +2687,18 @@ class PlaywrightBrowserWorker:
             passive_asset_hosts=extras.passive_asset_hosts,
             post_auth_hosts=extras.post_auth_hosts,
         )
-        policy = session.egress_policy
-        registry = BrowserPageRegistry(url_allowed=lambda url: navigation_allowed(url, patterns))
+        if session.pages is not None:
+            # Already wired. The policy above is now current and the registry's
+            # own allow-list reads ``session.patterns`` live, so there is nothing
+            # left to install.
+            session.guarded_patterns = patterns
+            return
+        registry = BrowserPageRegistry(
+            # Reads the session's CURRENT patterns rather than closing over the
+            # tuple passed in, so a later reviewed widening reaches popup
+            # admission without re-registering the handler.
+            url_allowed=lambda url: navigation_allowed(url, session.patterns)
+        )
         dialog_policy = DialogPolicy()
         # Downloads are refused by default; a trace may approve one later.
         download_policy = DownloadPolicy()
@@ -2628,7 +2710,8 @@ class PlaywrightBrowserWorker:
             await session.context.route(
                 "**/*",
                 make_egress_route_handler(
-                    policy=policy, stage_provider=lambda: session.egress.stage
+                    policy_provider=lambda: session.egress_policy,
+                    stage_provider=lambda: session.egress.stage,
                 ),
             )
             registry.register(session.page, active=True)
@@ -2678,6 +2761,7 @@ class PlaywrightBrowserWorker:
                 reason_code="interaction_guard_install_failed",
             ) from None
         session.pages = registry
+        session.guarded_patterns = patterns
 
     def _pending_interaction_gate(self, session: _PwSession) -> BrowserObservation | None:
         """Surface a dialog/download that needs a human, then clear the record.

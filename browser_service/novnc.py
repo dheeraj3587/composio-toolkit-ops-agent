@@ -38,6 +38,10 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ops.browser.live_view import LiveViewAccess
 
 LOGGER = logging.getLogger("browser_service.novnc")
 
@@ -82,7 +86,7 @@ def authorize_live_view(
     view_allowed: bool = True,
     hitl_pending: bool = False,
     hitl_generation: int = 0,
-) -> str:
+) -> LiveViewAccess:
     """Authorize one view/control attachment and return its signed capability.
 
     Fail-closed ordering: the feature flag, then the signed grant, then the live

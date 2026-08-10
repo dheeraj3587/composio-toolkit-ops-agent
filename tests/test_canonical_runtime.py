@@ -50,6 +50,7 @@ from ops.providers.profile_store import SQLiteProviderProfileStore
 from ops.recipes.app_recipes import (
     GATED_SLUGS,
     MANAGED_AUTH_SLUGS,
+    MANAGED_KEY_SLUGS,
     PLAYWRIGHT_SLUGS,
     get_app_browser_trace,
     get_app_recipe,
@@ -502,10 +503,22 @@ def test_exact_fifty_recipe_matrix_routes_to_canonical_plan_state(tmp_path: Path
     catalog = load_app_recipe_catalog()
     counts = Counter(recipe.route_kind for recipe in catalog.apps)
 
-    assert counts == {"managed_auth": 25, "playwright": 14, "gated": 11}
+    # 23 apps were promoted off ``managed_auth``/``gated`` onto the previously
+    # empty ``managed_key`` route on 2026-08-08, so the matrix is still exactly
+    # fifty apps but redistributed across four routes instead of three.
+    assert counts == {
+        "managed_auth": 7,
+        "managed_key": 23,
+        "playwright": 14,
+        "gated": 6,
+    }
     assert (
         tuple(recipe.app_slug for recipe in catalog.apps if recipe.route_kind == "managed_auth")
         == MANAGED_AUTH_SLUGS
+    )
+    assert (
+        tuple(recipe.app_slug for recipe in catalog.apps if recipe.route_kind == "managed_key")
+        == MANAGED_KEY_SLUGS
     )
     assert (
         tuple(recipe.app_slug for recipe in catalog.apps if recipe.route_kind == "playwright")
@@ -538,14 +551,17 @@ def test_execute_route_initial_states_are_truthful_and_provider_free(tmp_path: P
     context = _RuntimeContext(tmp_path)
     runtime = CanonicalRuntime(cast(Any, context))
 
+    # ``github`` and ``close`` both moved to the ``managed_key`` route on
+    # 2026-08-08, so the exemplars here are apps that still hold the routes this
+    # test is about: Stripe for managed auth, Freshdesk for gated outreach.
     managed = runtime.create_run(
-        _request("GitHub"),
+        _request("Stripe"),
         idempotency_key=None,
         execution_mode="execute_when_configured",
         browser_login=None,
     )
     gated = runtime.create_run(
-        _request("Close"),
+        _request("Freshdesk"),
         idempotency_key=None,
         execution_mode="execute_when_configured",
         browser_login=None,
@@ -569,8 +585,10 @@ def test_managed_connect_replay_and_poll_are_idempotent_and_outside_uow(
 ) -> None:
     context = _RuntimeContext(tmp_path)
     runtime = CanonicalRuntime(cast(Any, context))
+    # Stripe replaces GitHub as the managed-auth exemplar: ``github`` moved to
+    # the ``managed_key`` route on 2026-08-08 and no longer starts a connection.
     created = runtime.create_run(
-        _request("GitHub"),
+        _request("Stripe"),
         idempotency_key=None,
         execution_mode="execute_when_configured",
         browser_login=None,
@@ -582,9 +600,9 @@ def test_managed_connect_replay_and_poll_are_idempotent_and_outside_uow(
     pending = runtime.poll_managed_connection(run_id)
     active = runtime.poll_managed_connection(run_id)
 
-    assert first["connection_request_id"] == "connection_github"
+    assert first["connection_request_id"] == "connection_stripe"
     assert first["replayed"] is False
-    assert first["redirect_url"] == "https://connect.example.test/connection_github"
+    assert first["redirect_url"] == "https://connect.example.test/connection_stripe"
     assert replay["connection_request_id"] == first["connection_request_id"]
     assert replay["replayed"] is True
     assert replay["redirect_url"] is None
@@ -598,16 +616,16 @@ def test_managed_connect_replay_and_poll_are_idempotent_and_outside_uow(
     assert active["run"]["status"] == "completed"
     assert active["run"]["phase"] == "completed"
     assert context._managed_auth_provider.poll_calls == [
-        ("connection_github", "github"),
-        ("connection_github", "github"),
+        ("connection_stripe", "stripe"),
+        ("connection_stripe", "stripe"),
     ]
     persisted = context.storage.get_run(run_id)
     assert persisted is not None
-    assert persisted["connection_request_id"] == "connection_github"
+    assert persisted["connection_request_id"] == "connection_stripe"
     bundle = persisted["integrator_bundle"]
     assert isinstance(bundle, dict)
     assert bundle["readiness"] == "credentials_ready"
-    assert bundle["provider_account_id"] == "connection_github"
+    assert bundle["provider_account_id"] == "connection_stripe"
     assert bundle["credential_refs"] == {}
     assert "connect.example.test" not in context.storage.db_path.read_text(
         encoding="utf-8", errors="ignore"
@@ -619,8 +637,10 @@ def test_managed_connect_and_poll_reject_unsafe_callback_before_provider_call(
 ) -> None:
     context = _RuntimeContext(tmp_path)
     runtime = CanonicalRuntime(cast(Any, context))
+    # Stripe replaces GitHub as the managed-auth exemplar (``github`` moved to
+    # the ``managed_key`` route on 2026-08-08).
     created = runtime.create_run(
-        _request("GitHub"),
+        _request("Stripe"),
         idempotency_key=None,
         execution_mode="execute_when_configured",
         browser_login=None,
@@ -657,14 +677,17 @@ def test_managed_and_gated_operations_ignore_catalog_mutation(
     gmail = _FakeGmail()
     context._gmail_worker = gmail
     runtime = CanonicalRuntime(cast(Any, context))
+    # ``github`` and ``close`` moved to the ``managed_key`` route on 2026-08-08,
+    # so Stripe and Freshdesk are the exemplars that still exercise the managed
+    # connect and gated outreach operations this test freezes.
     managed = runtime.create_run(
-        _request("GitHub"),
+        _request("Stripe"),
         idempotency_key=None,
         execution_mode="execute_when_configured",
         browser_login=None,
     )
     gated = runtime.create_run(
-        _request("Close"),
+        _request("Freshdesk"),
         idempotency_key=None,
         execution_mode="execute_when_configured",
         browser_login=None,
@@ -677,15 +700,17 @@ def test_managed_and_gated_operations_ignore_catalog_mutation(
     runtime.connect_managed_run(str(managed["run_id"]))
     runtime.send_gated_outreach(str(gated["run_id"]))
 
-    assert context._managed_auth_provider.start_calls[0][0] == "github"
-    assert gmail.recipients == ["support@close.com"]
+    assert context._managed_auth_provider.start_calls[0][0] == "stripe"
+    assert gmail.recipients == ["devplatforms@dev-assist.freshservice.com"]
 
 
 def test_plan_only_managed_run_cannot_start_or_poll_connection(tmp_path: Path) -> None:
     context = _RuntimeContext(tmp_path)
     runtime = CanonicalRuntime(cast(Any, context))
+    # Stripe keeps this a genuinely managed-auth run; ``github`` moved to the
+    # ``managed_key`` route on 2026-08-08 and would prove nothing about connect.
     created = runtime.create_run(
-        _request("GitHub"),
+        _request("Stripe"),
         idempotency_key=None,
         execution_mode="plan_only",
         browser_login=None,

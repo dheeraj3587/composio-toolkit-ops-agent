@@ -347,6 +347,22 @@ def make_session_closer(
     return _close
 
 
+@dataclass(frozen=True, slots=True)
+class _LiveAttachment:
+    """One open noVNC relay, tagged with the capability it was authorized under.
+
+    The access level is recorded rather than re-derived because the two kinds of
+    attachment have to be treated differently and cannot be told apart later: a
+    ``control`` relay terminates at this session's read-write x11vnc listener and
+    is a live keyboard on the page, while a ``view`` relay terminates at the
+    ``-viewonly`` listener on a different port and is structurally incapable of
+    sending input. Only the first conflicts with an agent that is driving.
+    """
+
+    access: Literal["view", "control"]
+    socket: WebSocket
+
+
 def _set_hitl_pending(session: ManagedSession, pending: bool) -> None:
     """Cross a HITL boundary while revoking grants and final-probe debt."""
 
@@ -417,20 +433,43 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
     app.state.secret_broker = None
     app.state.readiness = _ReadinessCache()
     # Open interactive attachments are process-local and deliberately never
-    # persisted. Resume drains this registry before autonomous browser work starts.
-    live_attachments: dict[str, dict[asyncio.Task[Any], WebSocket]] = {}
+    # persisted. Every autonomous drive drains this registry's CONTROL entries
+    # before it touches the page; closing and capture drain all of them.
+    live_attachments: dict[str, dict[asyncio.Task[Any], _LiveAttachment]] = {}
     app.state.live_attachments = live_attachments
 
     async def _drain_live_attachments(
-        session_id: str, *, close_reason: str = "hitl_resumed"
+        session_id: str,
+        *,
+        close_reason: str = "hitl_resumed",
+        access: Literal["view", "control"] | None = None,
     ) -> bool:
-        attached = list(live_attachments.get(session_id, {}).items())
+        """Close this session's open relays and report whether any survived.
+
+        ``access=None`` drains every attachment and is what closing a session and
+        entering the secret-capture boundary need: one is tearing the browser
+        down, the other is about to render credential material to pixels that no
+        stream may carry, view-only included.
+
+        ``access="control"`` drains only the relays that can send input. That is
+        what an agent taking the wheel needs, and the distinction matters: a
+        person watching an autonomous run is not interfering with it, and draining
+        their view relay on every step would make the live view unusable during
+        exactly the work it exists to show.
+        """
+
+        session_attachments = live_attachments.get(session_id, {})
+        attached = [
+            (task, attachment)
+            for task, attachment in session_attachments.items()
+            if access is None or attachment.access == access
+        ]
         if not attached:
             return True
-        for _task, attached_socket in attached:
+        for _task, attachment in attached:
             with contextlib.suppress(Exception):
-                await attached_socket.close(code=1001, reason=close_reason)
-        tasks = [task for task, _attached_socket in attached if not task.done()]
+                await attachment.socket.close(code=1001, reason=close_reason)
+        tasks = [task for task, _attachment in attached if not task.done()]
         if tasks:
             _done, pending = await asyncio.wait(
                 tasks,
@@ -442,7 +481,58 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
                 with contextlib.suppress(Exception):
                     await asyncio.gather(*pending, return_exceptions=True)
         await asyncio.sleep(0)
-        return not live_attachments.get(session_id)
+        remaining = live_attachments.get(session_id, {})
+        return not any(
+            access is None or attachment.access == access for attachment in remaining.values()
+        )
+
+    async def _take_exclusive_browser_control(
+        session: ManagedSession, *, close_reason: str
+    ) -> None:
+        """Hand this session to the agent alone, or refuse to drive it at all.
+
+        Every verb that MOVES the browser autonomously passes through here,
+        because "the agent is driving" and "a person is driving" must never be
+        true at the same moment. They are not two views of one page; they are one
+        Chromium on one private X display. An open control relay is a live
+        keyboard and mouse on the very window the worker is about to act on, so a
+        human clicking mid-step does not merely race the agent's next click -- it
+        can navigate the page out from under a TOCTOU check that has already
+        re-resolved its element, landing a reviewed action on a surface nobody
+        reviewed.
+
+        The ordering is the one ``resume`` established and it is load-bearing:
+        revoke FIRST, drain second. Signed grants are stateless, so revocation is
+        enforced by the live flag ``authorize_live_view`` consults on every
+        attach; clearing it first means a socket finishing its handshake between
+        the two steps is refused with ``control_not_allowed`` rather than slipping
+        past a drain that had already looked.
+
+        ``observe`` deliberately does NOT call this. It reads the page and moves
+        nothing, and it is the same read the takeover sweep uses to notice that a
+        person has cleared a gate -- draining there would disconnect the human
+        mid-CAPTCHA to check whether they had finished it.
+
+        On a failed drain the previous HITL state is restored rather than left
+        cleared, so a socket that will not close strands nothing: the run stays
+        parked at its gate where the operator can still reach it, and the caller
+        may retry. Restoring also bumps ``hitl_generation``, which invalidates
+        every control grant minted for the gate this call tried to leave --
+        including the one the undrained socket is holding.
+        """
+
+        was_pending = session.hitl_pending
+        _set_hitl_pending(session, False)
+        if await _drain_live_attachments(
+            session.session_id, close_reason=close_reason, access="control"
+        ):
+            return
+        if was_pending:
+            _set_hitl_pending(session, True)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="live_attachment_drain_failed",
+        )
 
     async def _enter_secret_capture_boundary(session: ManagedSession) -> None:
         """Revoke every live pixel capability before automatic reveal/capture.
@@ -912,6 +1002,10 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             if denial is not None:
                 session.reason_code = denial.reason_code
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=denial.reason_code)
+        # One step of an agent loop is still the agent taking the wheel, and this
+        # is the verb that touches the page. Costs nothing on the common path: the
+        # registry lookup returns empty and the HITL write is a no-op.
+        await _take_exclusive_browser_control(session, close_reason="agent_acting")
         try:
             with manager.lease(session_id) as leased:
                 result = await asyncio.wait_for(
@@ -965,6 +1059,12 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             caller_capability_digest=caller_capability_digest,
         )
         caller_capability = require_session_capability_value(auth)
+        # A reattached session can still be carrying the control relay a previous
+        # gate handed out. ``resume`` has always drained before driving; this verb
+        # drives the same browser through the same loop and had not, which left
+        # the one path where an autonomous drive and a human's keyboard could
+        # reach the page together.
+        await _take_exclusive_browser_control(session, close_reason="agent_navigating")
         try:
             with manager.lease(session_id) as leased:
                 observation = await _drive(
@@ -1019,17 +1119,11 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
             )
         if not session.hitl_pending:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="hitl_not_pending")
-        # Revoke stale grants before closing attachments. A socket racing this
-        # transition will fail its handshake because HITL is no longer pending.
-        _set_hitl_pending(session, False)
-        if not await _drain_live_attachments(session_id):
-            # The operator must be able to retry Resume after the stale socket
-            # finally closes. Leaving this false would strand the run forever.
-            _set_hitl_pending(session, True)
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="live_attachment_drain_failed",
-            )
+        # This is the handover the whole gate exists for: the person has done
+        # their part, and the agent takes the wheel back the instant they have.
+        # The revoke-then-drain body now lives in the shared guard so the other
+        # driving verbs cannot diverge from it.
+        await _take_exclusive_browser_control(session, close_reason="hitl_resumed")
         try:
             with manager.lease(session_id) as leased:
                 observation = await _drive(
@@ -1509,7 +1603,9 @@ def create_app(settings: BrowserServiceSettings | None = None) -> FastAPI:
         attachment_task = asyncio.current_task()
         if attachment_task is None:  # pragma: no cover - ASGI always owns a task
             raise RuntimeError("websocket_task_missing")
-        live_attachments.setdefault(session_id, {})[attachment_task] = websocket
+        live_attachments.setdefault(session_id, {})[attachment_task] = _LiveAttachment(
+            access=access, socket=websocket
+        )
 
         reason = "live_view_accept_failed"
         try:

@@ -2,9 +2,10 @@ import type { Metadata } from "next"
 import Link from "next/link"
 import { notFound } from "next/navigation"
 import { connection } from "next/server"
-import { ArrowLeft, CircleOff, Clock3, Cpu, Fingerprint, Globe2, Mail, Route, Settings2 } from "lucide-react"
+import { ArrowLeft, CircleOff, Clock3, Cpu, Fingerprint, Globe2, KeyRound, Mail, Route, Settings2 } from "lucide-react"
 
 import { AgentTrace } from "@/components/agent-trace"
+import { ManagedKeySubmitForm } from "@/components/browser-hitl-forms"
 import { HitlLiveControls, OnboardingControlBar } from "@/components/hitl-live-controls"
 import { CanonicalPrimaryAction } from "@/components/canonical-primary-action"
 import { PhaseActionForm } from "@/components/phase-action-form"
@@ -93,6 +94,37 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
     (browser
       ? ["running", "waiting_for_hitl", "credential_page_ready"].includes(browser.lifecycle)
       : ["waiting_for_hitl", "browser_running"].includes(detail.run.status))
+
+  // A managed_key run has no browser session and never will: the owner already
+  // holds the key, so there is nothing to drive and nothing to watch. Its one
+  // operator surface is the key form, which therefore takes the
+  // `#credential-submission` anchor the projected primary action points at.
+  const isManagedKey = detail.run.route_kind === "managed_key"
+  // The field name must be the recipe's own, byte for byte -- the backend
+  // refuses a mismatch with `credential_fields_do_not_match_recipe` -- so an
+  // absent research projection disables the form rather than guessing one.
+  // Every reviewed field, not just the first: the route compares the submitted
+  // set to the recipe's and refuses a mismatch outright, and the secret one is
+  // not always first (jira leads with `username`).
+  const managedKeySecrets = new Set(detail.research?.credential_secret_fields ?? [])
+  const managedKeyFields = (detail.research?.credential_fields ?? []).map((name) => ({
+    name,
+    label: humanize(name),
+    // An unprojected secret list masks everything: over-masking a plain account
+    // id is a cosmetic loss, under-masking a key is not.
+    secret: managedKeySecrets.size === 0 || managedKeySecrets.has(name),
+  }))
+  const managedKeyBlockedReason = !isManagedKey
+    ? null
+    : isPlanOnly
+      ? "Plan Only runs do not accept credentials. Create an Execute run to publish the key."
+      : managedKeyFields.length === 0
+        ? "The reviewed credential field is not on this run yet, so a key cannot be matched to it."
+        : primaryAction?.kind === "submit_credentials" && primaryAction.enabled
+          ? null
+          : primaryAction
+            ? `Key submission is not available: ${humanize(primaryAction.reason_code).toLowerCase()}.`
+            : "The backend has not authorized key submission for this run."
 
   // Interactive Playwright HITL has priority over generic controls.
   const interactivePlaywrightResume = Boolean(
@@ -260,6 +292,22 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         <div className="mb-3"><p className="eyebrow">Execution surfaces</p><h2 id="execution-surfaces" className="mt-1 text-xl font-semibold">Provider and human gates</h2></div>
         <div className={hasBrowserSession ? "grid gap-6 lg:grid-cols-2" : "grid gap-6 lg:grid-cols-3"}>
           <div className={hasBrowserSession ? "lg:col-span-2" : "h-full"}>
+            {isManagedKey ? (
+              <CapabilityPanel title="Managed key" icon={KeyRound} phase={browserPhase}>
+                <div id="credential-submission" className="scroll-mt-6 space-y-3">
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    This app is connected with a key you already hold. Create it on the vendor&apos;s own
+                    settings page, paste it once here, and it is published to Composio as a connected
+                    account. No browser is driven and no OAuth redirect is involved.
+                  </p>
+                  <ManagedKeySubmitForm
+                    runId={runId}
+                    fields={managedKeyFields}
+                    disabledReason={managedKeyBlockedReason}
+                  />
+                </div>
+              </CapabilityPanel>
+            ) : (
             <CapabilityPanel title="Browser onboarding" icon={Globe2} phase={browserPhase}>
               {hasBrowserSession ? (
                 <div id="credential-submission" className="scroll-mt-6">
@@ -280,6 +328,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
                 <ControlUnavailable />
               )}
             </CapabilityPanel>
+            )}
           </div>
           <HitlPanel
             request={isPlanOnly ? null : detail.hitl_request}

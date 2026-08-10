@@ -185,6 +185,15 @@ def apply_signup_finding(recipe: AppRecipe, finding: SignupRouteFinding) -> AppR
         raise SignupOverlayRefused("recipe declares no browser policy")
     if finding.app_slug != recipe.app_slug:
         raise SignupOverlayRefused("finding belongs to a different app")
+    if browser.signup is not None:
+        # Gap-fill only, exactly as :func:`apply_credential_finding` is, and for a
+        # sharper reason: a researched route can never assert that submitting the
+        # form accepts the vendor's terms (see the ``False`` below), so installing
+        # one OVER a reviewed policy that does assert it would silently convert an
+        # unattended signup into one that stops for a person. The reviewed catalog
+        # owning this app's signup route is what makes the finding obsolete, so it
+        # is refused here and dropped rather than kept and shadowed.
+        raise SignupOverlayRefused("reviewed recipe already declares a signup route")
 
     split = urlsplit(finding.signup_url)
     if (split.hostname or "").casefold() not in browser.exact_hosts:

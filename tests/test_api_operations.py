@@ -50,7 +50,11 @@ def test_catalog_search_and_research_are_verified_safe_projections(tmp_path: Pat
 def test_app_research_response_includes_explicit_nullable_fields(tmp_path: Path) -> None:
     application = create_app(db_path=tmp_path / "private" / "ops.db")
     with TestClient(application) as client:
-        response = client.get("/api/apps/github/research")
+        # Salesforce replaces GitHub as the exemplar: GitHub moved to managed_key,
+        # which carries a developer portal, a signup URL and a contact URL, so it
+        # can no longer show that an ABSENT field still serializes as an explicit
+        # null instead of being omitted -- which is the whole point here.
+        response = client.get("/api/apps/salesforce/research")
 
     assert response.status_code == 200
     research = response.json()["research"]
@@ -141,7 +145,9 @@ def test_run_detail_explains_route_and_configuration_without_claiming_success(
 ) -> None:
     application = create_app(db_path=tmp_path / "private" / "ops.db")
     with TestClient(application) as client:
-        created = client.post("/api/runs", json=_payload())
+        # Stripe, not the default HubSpot: this asserts the managed-auth route's
+        # own reason code, so the exemplar has to stay on route_kind managed_auth.
+        created = client.post("/api/runs", json=_payload("Stripe"))
 
     assert created.status_code == 201
     body = created.json()
@@ -338,9 +344,14 @@ def test_execute_when_configured_via_api_waits_for_managed_connection_without_ke
     service = LocalRunService(db_path=tmp_path / "private" / "ops.db", settings=Settings())
     application = create_app(service=service)
     with TestClient(application) as client:
+        # The waiting-for-a-connection behaviour belongs to the managed_auth route,
+        # so the exemplar is Stripe rather than the payload's default HubSpot.
         response = client.post(
             "/api/runs",
-            json=_request_payload(execution_mode="execute_when_configured"),
+            json=_request_payload(
+                app_name="Stripe",
+                execution_mode="execute_when_configured",
+            ),
         )
 
     assert response.status_code == 201
@@ -374,9 +385,14 @@ def test_invalid_managed_auth_callback_disables_api_action_and_provider_state(
     )
     application = create_app(service=service)
     with TestClient(application) as client:
+        # Only a managed_auth run offers "Connect account" at all, so the callback
+        # this test invalidates has to belong to one -- Stripe, not HubSpot.
         created = client.post(
             "/api/runs",
-            json=_request_payload(execution_mode="execute_when_configured"),
+            json=_request_payload(
+                app_name="Stripe",
+                execution_mode="execute_when_configured",
+            ),
         )
         run_id = created.json()["run"]["run_id"]
         connect = client.post(f"/api/runs/{run_id}/connect")
@@ -411,9 +427,14 @@ def test_execute_when_configured_does_not_put_langgraph_on_the_new_run_path(
     service = LocalRunService(db_path=tmp_path / "private" / "ops.db", settings=settings)
     application = create_app(service=service)
     with TestClient(application) as client:
+        # Stripe keeps this on the managed_auth route, where the run parks at
+        # connection_required -- the state a LangGraph checkpoint would be written at.
         response = client.post(
             "/api/runs",
-            json=_request_payload(execution_mode="execute_when_configured"),
+            json=_request_payload(
+                app_name="Stripe",
+                execution_mode="execute_when_configured",
+            ),
         )
 
     assert response.status_code == 201

@@ -47,6 +47,8 @@ from api.models import (
     HitlRequestView,
     LiveViewResponse,
     ManagedConnectionResponse,
+    ManagedKeyConnectionResponse,
+    ManagedKeySubmissionRequest,
     ModelCatalogResponse,
     ModelOptionView,
     OnboardingControlsView,
@@ -112,6 +114,7 @@ from ops.recipes.app_recipes import (
     get_app_recipe,
     get_app_recipe_for_name,
     load_app_recipe_catalog,
+    managed_key_publish_plan,
     recipe_to_operational_research,
 )
 from ops.recipes.signup_overlay import SignupOverlayRefused, install_signup_finding
@@ -250,6 +253,12 @@ class RunService(Protocol):
     async def connect_managed(self, run_id: str) -> ManagedConnectionResponse: ...
 
     async def poll_managed_connection(self, run_id: str) -> ManagedConnectionResponse: ...
+
+    async def submit_managed_key(
+        self,
+        run_id: str,
+        request: ManagedKeySubmissionRequest,
+    ) -> ManagedKeyConnectionResponse: ...
 
     async def send_gated_outreach(self, run_id: str) -> ActionReceipt: ...
 
@@ -954,6 +963,37 @@ class LocalRunService:
                     "managed_connection_required"
                     if managed_enabled
                     else "composio_managed_auth_not_configured"
+                ),
+            )
+        if summary.route_kind == "managed_key":
+            # Whether this app can be published at all is decided by the catalog,
+            # not here, and it is asked BEFORE the owner-secret flag so a refusal
+            # names the real obstacle. Enabling the form for an app whose auth
+            # scheme is unreviewed would take custody of a live key and then fail
+            # at the provider call, which is the one outcome worth avoiding.
+            recipe = get_app_recipe(summary.app_slug)
+            scheme, detail = (
+                managed_key_publish_plan(recipe) if recipe is not None else (None, "recipe_missing")
+            )
+            if scheme is None:
+                return PrimaryAction(kind="none", enabled=False, reason_code=detail)
+            if summary.phase != "key_submission_required":
+                return PrimaryAction(
+                    kind="none",
+                    enabled=False,
+                    reason_code="managed_key_not_awaiting_submission",
+                )
+            # Same predicate as the route that receives the secret, for the same
+            # reason it is shared on the playwright branch below: the button and
+            # the route must not be able to answer differently.
+            owner_actions_enabled = self.owner_secret_actions_allowed()
+            return PrimaryAction(
+                kind="submit_credentials",
+                enabled=owner_actions_enabled,
+                reason_code=(
+                    "managed_key_submission_required"
+                    if owner_actions_enabled
+                    else "owner_credential_submission_disabled"
                 ),
             )
         if summary.route_kind == "playwright":
@@ -2828,6 +2868,37 @@ class LocalRunService:
             onboarding=projected,
         )
 
+    def _cancel_sync(self, run_id: str) -> ActionReceipt:
+        """End the run and release its session, or say why it cannot be ended.
+
+        Reported as the ``resume`` action because that is the route the signal
+        arrives on; the detail says plainly which of the two happened. A phase the
+        table gives no ``cancelled`` edge is a refusal, not a silent no-op — a
+        half-cancelled run holding a released session looks resumable and is not.
+        """
+
+        outcome = self._run_controls().cancel_run(run_id)
+        state = self._onboarding_state(run_id)
+        if not outcome.accepted:
+            return ActionReceipt(
+                run_id=run_id,
+                action="resume",
+                status="no_change",
+                detail="This run is already finished, or its phase cannot be cancelled.",
+                onboarding=state,
+            )
+        return ActionReceipt(
+            run_id=run_id,
+            action="resume",
+            status="accepted",
+            detail=(
+                "The run is cancelled and its browser session was released."
+                if outcome.browser_session_released
+                else "The run is cancelled."
+            ),
+            onboarding=state,
+        )
+
     def _resume_sync(
         self,
         run_id: str,
@@ -2835,13 +2906,22 @@ class LocalRunService:
         browser_login: Mapping[str, SecretStr] | None = None,
         signal: str = "completed",
     ) -> ActionReceipt:
+        if signal == "cancelled":
+            # ``cancelled`` ends a run rather than continuing it. That sentence was
+            # already in the comment below and nowhere in the code: the signal was
+            # handed to ``resume_run``, which never branches on it, so the console's
+            # "Cancel the run" button RESUMED the run it was cancelling.
+            # ``cancel_run`` releases the session, commits the ``cancelled``
+            # boundary, and refuses fail-closed on a phase with no such edge — the
+            # same committer the admission form's cancel route already used.
+            return self._cancel_sync(run_id)
         if signal == "completed" and not browser_login:
             # The owner's continuation of a paused onboarding run is committed by
             # the phase machine, not by the LangGraph resume. Both conjuncts are
-            # load-bearing: ``cancelled`` ends a run rather than continuing it, and
-            # a credential-bearing resume is a gate this waiting phase does not
-            # represent — routing either one here would drop what the caller asked
-            # for. Every other run, onboarding or not, keeps the path it had.
+            # load-bearing: ``cancelled`` is handled above, and a credential-bearing
+            # resume is a gate this waiting phase does not represent — routing
+            # either one here would drop what the caller asked for. Every other
+            # run, onboarding or not, keeps the path it had.
             onboarding_receipt = self._resume_onboarding_phase(run_id)
             if onboarding_receipt is not None:
                 return onboarding_receipt
@@ -2893,7 +2973,16 @@ class LocalRunService:
                 available_in=("canonical_v1",),
                 error="phase_unavailable",
             )
-        if detail.run.execution_mode == "plan_only" or detail.run.status != "waiting_for_hitl":
+        if detail.run.execution_mode == "plan_only" or (
+            detail.run.status != "waiting_for_hitl" and signal != "cancelled"
+        ):
+            # ``cancelled`` is exempt from the waiting-for-HITL requirement on
+            # purpose. The console derives ``can_cancel`` from the PHASE table
+            # (``"cancelled" in targets``), which is true for far more phases than
+            # ``waiting_for_hitl`` covers, so every cancel outside that one status
+            # 409'd on a button the console had enabled. ``cancel_run`` re-checks
+            # the same phase edge itself and refuses fail-closed, so nothing is
+            # cancelled here that the phase table does not permit.
             raise PhaseUnavailableError(
                 run_id=run_id,
                 action="resume",
@@ -3148,6 +3237,36 @@ class LocalRunService:
     async def connect_managed(self, run_id: str) -> ManagedConnectionResponse:
         self._require_started()
         return await run_in_threadpool(self._connect_managed_sync, run_id)
+
+    def _submit_managed_key_sync(
+        self,
+        run_id: str,
+        request: ManagedKeySubmissionRequest,
+    ) -> ManagedKeyConnectionResponse:
+        try:
+            payload = self._service.submit_managed_key(
+                run_id,
+                fields=dict(request.credentials),
+            )
+        except KeyError:
+            raise RunNotFoundError(run_id) from None
+        run = payload.get("run")
+        if not isinstance(run, dict):
+            raise RuntimeError("managed key response is missing its run")
+        return ManagedKeyConnectionResponse(
+            run=LocalRunService._summary(run),
+            connected_account_id=str(payload.get("connected_account_id") or ""),
+            state=payload.get("state", "pending"),
+            replayed=bool(payload.get("replayed", False)),
+        )
+
+    async def submit_managed_key(
+        self,
+        run_id: str,
+        request: ManagedKeySubmissionRequest,
+    ) -> ManagedKeyConnectionResponse:
+        self._require_started()
+        return await run_in_threadpool(self._submit_managed_key_sync, run_id, request)
 
     def _poll_managed_sync(self, run_id: str) -> ManagedConnectionResponse:
         try:

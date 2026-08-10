@@ -222,6 +222,21 @@ class OperationalResearch(StrictModel):
     authorization_url: str | None
     token_url: str | None
     credential_fields: list[str]
+    # Which of ``credential_fields`` hold a secret. Names only -- this says which
+    # box on the operator's form masks its input and which is plain account
+    # identity (Jira's Atlassian email, Harvest's account id), nothing more.
+    #
+    # It exists because the submission routes require the WHOLE field set to
+    # match the recipe, and the console had only an ordered list of names to work
+    # from. It rendered ``credential_fields[0]`` as the one masked box, which for
+    # jira is ``username`` -- so the console asked for the key under the name of
+    # the field that is not the key, and then submitted a one-field set the
+    # backend refuses with ``credential_fields_do_not_match_recipe``.
+    #
+    # Defaulted, so a research record persisted before this field existed
+    # re-validates unchanged; an empty list means "not projected", and the
+    # console falls back to masking every field, which is the safe direction.
+    credential_secret_fields: list[str] = Field(default_factory=list)
     # Bounded, non-secret prose describing HOW to create the credential (e.g.
     # "Open Settings > Private apps > Create app"). Never a rendered credential
     # value, never long research prose, never a browser-generated session URL.

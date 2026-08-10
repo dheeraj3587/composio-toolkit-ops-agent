@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import os
 from collections.abc import Mapping
+from datetime import datetime
 from math import ceil
 from pathlib import Path
 from typing import Any, Final, Literal
@@ -630,12 +631,46 @@ class Settings(BaseModel):
     # adapter may run there is a distinct decision — and, like every capability
     # flag in this file, defaults to off so a configured key alone never spends.
     onboarding_research_perplexity_enabled: bool = False
+    # The homepage-anchor harvester's opt-in. It reads the provider's own site
+    # through the hardened fetcher and spends nothing, but it is off by default
+    # for the two reasons `_homepage_anchors_enabled` states: it is the first
+    # adapter that would make a stock deployment issue outbound HTTP to a
+    # data-chosen host, and defaulting it on converts a loud
+    # `research_adapters_not_configured` at startup into a quiet
+    # `research_adapters_unavailable` mid-run.
+    #
+    # Declared here because it was NOT declared anywhere. The registration table
+    # reads it with `getattr(settings, ..., False)` and `Settings.from_env` had no
+    # entry for it, so the flag was unreachable: an operator could write
+    # ONBOARDING_RESEARCH_HOMEPAGE_ANCHORS_ENABLED=true and get silence. A
+    # capability nothing can turn on is not a default, it is a dead adapter.
+    onboarding_research_homepage_anchors_enabled: bool = False
     # Requirement 2.5: the per-adapter attempt cap. Discovery retries only an
     # adapter that RAISED — an adapter returning no candidate has answered, and
     # asking it again would just re-spend. 2 keeps one transient failure
     # survivable while bounding a permanently unreachable adapter to a single
     # retry, so it cannot extend discovery without bound.
     onboarding_research_adapter_attempts: int = Field(default=2, ge=1, le=4)
+
+    # The owner's standing authorization to create accounts, which is what makes
+    # the signup route unattended. Three fields rather than one boolean, because
+    # what the admission record has to preserve is not "signups are on" but *who*
+    # authorized *which providers* and *when* — see
+    # `ops.onboarding.admission.StandingSignupAuthorization`.
+    #
+    # `onboarding_signup_authorized_apps` is a comma-separated list of catalog
+    # slugs, or the single token `*` for the whole catalog. Empty (the default) is
+    # the fail-closed state: every run with no stored credentials stops and asks a
+    # person, exactly as it did before this existed. A wildcard is expanded to the
+    # concrete slug on every lookup, so no decision row ever records `*`.
+    onboarding_signup_authorized_apps: tuple[str, ...] = ()
+    # The person the resulting decisions are attributed to, and the moment they
+    # authorized. Both are required whenever the list above is non-empty — an
+    # authorization with nobody's name on it is exactly the untraceable signup
+    # this design exists to avoid — and `model_validator` below enforces that
+    # rather than leaving it to the reader.
+    onboarding_signup_authorized_by: str | None = None
+    onboarding_signup_authorized_at: str | None = None
 
     @property
     def onboarding_research_perplexity_configured(self) -> bool:
@@ -751,6 +786,40 @@ class Settings(BaseModel):
             raise ValueError(
                 "BROWSER_SERVICE_OWNER must be an HTTP-safe ASCII identifier"
             ) from None
+
+    @model_validator(mode="after")
+    def standing_signup_authorization_names_its_author(self) -> Settings:
+        """Refuse a standing signup grant that nobody's name is attached to.
+
+        The whole justification for unattended account creation is that a person
+        authorized it in advance and the durable decision row says who and when.
+        A deployment that lists apps but no author would produce rows attributing
+        a vendor contract to nobody, so it is rejected at startup rather than
+        discovered later in an audit — by which point the accounts exist.
+
+        Deliberately not an `is not None` pair check only: an empty or blank
+        author is the same failure spelled differently, and `_identifier` in the
+        admission module would reject it at the far end of a run instead of here.
+        """
+
+        if not self.onboarding_signup_authorized_apps:
+            return self
+        author = (self.onboarding_signup_authorized_by or "").strip()
+        moment = (self.onboarding_signup_authorized_at or "").strip()
+        if not author or not moment:
+            raise ValueError(
+                "ONBOARDING_SIGNUP_AUTHORIZED_APPS requires both "
+                "ONBOARDING_SIGNUP_AUTHORIZED_BY and ONBOARDING_SIGNUP_AUTHORIZED_AT"
+            )
+        if any(character.isspace() or not character.isprintable() for character in author):
+            raise ValueError("ONBOARDING_SIGNUP_AUTHORIZED_BY must be a single-line identifier")
+        try:
+            datetime.fromisoformat(moment)
+        except ValueError:
+            raise ValueError(
+                "ONBOARDING_SIGNUP_AUTHORIZED_AT must be an ISO-8601 timestamp"
+            ) from None
+        return self
 
     @model_validator(mode="after")
     def onboarding_lease_renewal_fits_inside_the_lease(self) -> Settings:
@@ -1221,9 +1290,19 @@ class Settings(BaseModel):
             "onboarding_research_perplexity_enabled": _boolean(
                 source.get("ONBOARDING_RESEARCH_PERPLEXITY_ENABLED"), default=False
             ),
+            "onboarding_research_homepage_anchors_enabled": _boolean(
+                source.get("ONBOARDING_RESEARCH_HOMEPAGE_ANCHORS_ENABLED"), default=False
+            ),
             "onboarding_research_adapter_attempts": _integer(
                 source.get("ONBOARDING_RESEARCH_ADAPTER_ATTEMPTS"), default=2
             ),
+            "onboarding_signup_authorized_apps": _csv(
+                source.get("ONBOARDING_SIGNUP_AUTHORIZED_APPS")
+            ),
+            "onboarding_signup_authorized_by": source.get("ONBOARDING_SIGNUP_AUTHORIZED_BY")
+            or None,
+            "onboarding_signup_authorized_at": source.get("ONBOARDING_SIGNUP_AUTHORIZED_AT")
+            or None,
             "ops_db_path": Path(source.get("OPS_DB_PATH", "./private/ops.db")),
             "checkpoint_db_path": Path(
                 source.get("CHECKPOINT_DB_PATH", "./private/checkpoints.db")

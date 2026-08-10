@@ -67,7 +67,8 @@ def select_initial_target(
 
 def make_egress_route_handler(
     *,
-    policy: BrowserEgressPolicy,
+    policy: BrowserEgressPolicy | None = None,
+    policy_provider: Callable[[], BrowserEgressPolicy | None] | None = None,
     stage_provider: Callable[[], EgressStage],
 ) -> Callable[[Any], Awaitable[None]]:
     """Build the route handler that makes ``BrowserEgressPolicy`` the authority.
@@ -79,7 +80,17 @@ def make_egress_route_handler(
 
     Unknown resource kinds fail closed inside ``policy.permits``. A stage-provider
     error is treated as the STRICTEST stage rather than the most permissive.
+
+    ``policy_provider`` exists because the route is installed ONCE per browser
+    context, at session start, while the reviewed allow-list can legitimately
+    widen later (research resolves, a recipe binds). Re-routing to swap the policy
+    would stack a second handler on the same context; reading the current policy
+    per request does not. A provider that answers ``None`` — or raises — blocks
+    the request, because "no policy" is the same fail-closed state as "denied".
     """
+
+    if (policy is None) == (policy_provider is None):
+        raise ValueError("exactly one of policy or policy_provider is required")
 
     blocked_seen: set[tuple[str, str, str]] = set()
 
@@ -97,7 +108,12 @@ def make_egress_route_handler(
         except Exception:
             stage = EgressStage.CREDENTIAL_SURFACE  # fail closed: tightest stage
 
-        if policy.permits(url=url, kind=kind, stage=stage):
+        try:
+            current = policy if policy is not None else (policy_provider or (lambda: None))()
+        except Exception:
+            current = None
+
+        if current is not None and current.permits(url=url, kind=kind, stage=stage):
             await route.continue_()
         else:
             host = (urlsplit(url).hostname or "").casefold()

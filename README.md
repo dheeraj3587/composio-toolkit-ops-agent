@@ -88,14 +88,15 @@ the run model below.
 
 ## Current readiness
 
-Catalog membership is not a claim that every app is fully autonomous or live-verified. The 50 recipes have four deliberately different capabilities:
+Catalog membership is not a claim that every app is fully autonomous or live-verified. The 50 recipes have five deliberately different capabilities:
 
 | Capability | Apps | Current behavior |
 | --- | ---: | --- |
-| Managed authentication | 25 | Start a Composio authorization link, poll the connected account, and produce a reference-only bundle after Composio reports it active. |
+| Managed authentication | 7 | Start a Composio authorization link, poll the connected account, and produce a reference-only bundle after Composio reports it active. |
+| Managed key | 23 | The owner mints a long-lived key on the vendor's own settings page and pastes it once; it is vaulted and published to Composio, which reports the account active synchronously. No redirect and no browser. 16 are publishable today; 7 name the specific reviewed fact they are still missing. |
 | Complete Playwright browser flow | 7 | A reviewed login-to-credential trace, automatic secret capture, read-only validation, and encrypted vault handoff. |
 | Playwright entry plus owner submission | 7 | Open the reviewed public sign-in entry, then let the owner submit the independently obtained credential into the encrypted vault. These recipes do not claim credential-page navigation, automatic capture, or live validation. |
-| Gated/outreach | 11 | No browser automation. Four reviewed email routes support explicit controlled-sink outreach; seven remain truthfully review-required. |
+| Gated/outreach | 6 | No browser automation. One reviewed email route supports explicit controlled-sink outreach; five remain truthfully review-required. |
 
 See [docs/APP_RECIPES.md](docs/APP_RECIPES.md) for the exact app matrix and promotion requirements.
 

@@ -132,7 +132,7 @@ from ops.runs.idempotency import (  # noqa: F401
 )
 from ops.runs.idempotency import validate_idempotency_key as validate_idempotency_key
 from ops.runs.live_view import RunLiveViewService
-from ops.runs.liveness import RunLivenessService
+from ops.runs.liveness import RunLivenessScheduler, RunLivenessService
 from ops.runs.login_secrets import RunLoginSecretService
 from ops.runs.projections import (  # noqa: F401
     _LOGICAL_EXECUTION_MODE,
@@ -159,7 +159,11 @@ from ops.runs.state_projection import (  # noqa: F401
     RunProjectionService,
     _validate_created_projection,
 )
-from ops.runs.takeover import ClearanceProbe, RunTakeoverService
+from ops.runs.takeover import (
+    ClearanceProbe,
+    RunTakeoverService,
+    takeover_sweep_configured,
+)
 from ops.runs.verification import (  # noqa: F401
     RunVerificationService,
     _verification_backoff,
@@ -349,6 +353,13 @@ class RunService:
         # in ``run_gate_attempts``, and ``retry_browser_run`` is what refunds it.
         self._advance_thread: threading.Thread | None = None
         self._advance_stop = threading.Event()
+        # Stall detection used to ride along inside the advancement loop, which
+        # meant a deployment that never advanced a run never noticed a stalled
+        # one either — the sweep most needed on a quiet fleet was the one that
+        # never got to run. It owns its own thread now, held here beside the
+        # others so shutdown joins every sweep in one place.
+        self._liveness_thread: threading.Thread | None = None
+        self._liveness_stop = threading.Event()
         # The takeover sweep owns its own thread, so the service holds the instance
         # rather than a handle to it.
         self._takeover_service: RunTakeoverService | None = None
@@ -930,6 +941,7 @@ class RunService:
             # Independent maintenance handles reconciliation even when Gmail is
             # unavailable; the email worker handles only bounded inbox work.
             self._start_autonomous_advancer()
+            self._start_liveness_sweep()
             self._start_onboarding_takeover()
             self._start_onboarding_worker()
             self._start_email_poller()
@@ -999,12 +1011,39 @@ class RunService:
 
         self._advance.start()
 
-    def _start_onboarding_takeover(self) -> None:
-        """Start the sweep that continues a run once a human clears its gate."""
+    def _start_liveness_sweep(self) -> None:
+        """Start the sweep that marks runs whose loop stopped reporting progress."""
 
+        RunLivenessScheduler(self).start()
+
+    def _start_onboarding_takeover(self) -> None:
+        """Start the sweep that continues a run once a human clears its gate.
+
+        ``takeover_sweep_configured`` deliberately does NOT gate on
+        ``allow_live_browser`` — reading whether a gate is still on the page is
+        an observation, not a session start. This construction site still does,
+        and stays that way on purpose: the clearance probe is served by a real
+        :class:`BrowserWorker`, which can also *open* sessions, and building one
+        while the live opt-in is off would hand this process exactly the
+        capability that flag exists to withhold.
+
+        What changes is that the gap is now stated. A sweep that cannot be built
+        used to return ``None`` in silence, so a fleet of runs parked at a gate a
+        human had already cleared looked identical to a fleet with no gates at
+        all. The wiring row puts the answer on ``GET /api/health``, where the
+        operator wondering why nothing resumed will actually look.
+        """
+
+        settings = self._settings or Settings.from_env()
         takeover = self._takeover
         if takeover is not None:
             takeover.start()
+        self._record_wiring(
+            "onboarding_takeover",
+            takeover,
+            configured=takeover_sweep_configured(settings),
+            wired=takeover is not None,
+        )
 
     def _start_onboarding_worker(self) -> None:
         """Start the pump that drives runs created with ``onboarding: true``.
@@ -1655,6 +1694,10 @@ class RunService:
         if self._advance_thread is not None:
             self._advance_thread.join(timeout=5)
             self._advance_thread = None
+        self._liveness_stop.set()
+        if self._liveness_thread is not None:
+            self._liveness_thread.join(timeout=5)
+            self._liveness_thread = None
         takeover = cast("RunTakeoverService | None", getattr(self, "_takeover_service", None))
         if takeover is not None:
             takeover.stop()
@@ -2104,6 +2147,16 @@ class RunService:
         """Advance a managed run only after Composio reports ACTIVE."""
 
         return self._canonical.poll_managed_connection(run_id)
+
+    def submit_managed_key(
+        self,
+        run_id: str,
+        *,
+        fields: Mapping[str, SecretStr],
+    ) -> dict[str, Any]:
+        """Publish one owner-held key as an ACTIVE Composio connected account."""
+
+        return self._canonical.submit_managed_key(run_id, fields)
 
     def send_gated_outreach(self, run_id: str) -> dict[str, Any]:
         """Execute reviewed outreach only through the controlled Gmail boundary."""

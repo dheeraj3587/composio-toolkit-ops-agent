@@ -262,6 +262,133 @@ run id, gate type, phase, reason code, session id, attachment outcome, plan
 revision, and bounded divergence fields; they never contain full URLs, signed
 live-view grants, page text, or credentials.
 
+### Human gates: solving one, and handing it back
+
+CAPTCHAs are solved by a person. No third-party solving service is integrated
+and none should be: `captcha` is a permanent member of the human-only gate set
+in `ops/access/gate_policy.py`, alongside phone OTP, billing, passkeys, and
+security keys.
+
+What you do **not** have to do is disconnect or click resume afterwards. The
+takeover sweep polls each attached paused run every
+`ONBOARDING_TAKEOVER_INTERVAL_SECONDS` and continues it as soon as it can
+observe that the gate is gone from the page. Solve the CAPTCHA and the agent
+resumes on its own, typically within five seconds. It continues only on an
+observed change, never because time passed, so walking away from a gate you did
+not finish leaves the run parked rather than driving it blind. Closing the tab
+mid-gate is also safe: the run records a one-shot debt and probes once more on
+detach, which covers "solved it, then closed the window".
+
+The agent and a human never hold the page at the same moment. One Chromium on
+one private X display is the whole surface, so an open control connection is a
+live keyboard on the page the agent is about to act on. Every verb that moves
+the browser — navigate, act, resume — first revokes control and drains any open
+control connection; only then does it touch the page. In practice:
+
+- Your control session ends by itself when the agent takes back over. You will
+  see the live view close with reason `agent_navigating`, `agent_acting`, or
+  `hitl_resumed`. That is the handover working, not a fault.
+- **View-only watchers are not disconnected.** Watching an autonomous run is not
+  interfering with it, so the read-only stream stays up for the whole drive.
+  Control and view are served by separate listeners, and the view listener is
+  started `-viewonly`, so a modified client cannot promote itself.
+- Requesting a live view while the agent is driving returns a view grant with
+  `control_allowed: false`. Control is minted only while the run records a gate.
+- If a control connection refuses to close, the agent **stops** rather than
+  driving alongside it: the request fails with `live_attachment_drain_failed`
+  and the run stays at its gate where you can still reach it. Re-check the
+  console for a stuck live-view tab, close it, and retry.
+
+### Standing signup authorization
+
+By default a run that finds nothing in the vault to sign in with stops at
+`awaiting_admission` and asks a person whether to create an account. That prompt
+is the boundary where somebody accepts the provider's terms of service, so it is
+never answered by the software: `decided_by="system"` on a signup route is
+refused by the dataclass, by the `onboarding_admission_decisions` CHECK, and by
+the gate policy, and it will stay refused.
+
+What can move is *when* the person answers. A standing authorization is the
+owner deciding once, in advance, per app, that account creation is approved —
+recorded as deployment configuration rather than an API call, so granting and
+revoking are both reviewed deploys and the running system cannot grant itself
+anything:
+
+```dotenv
+ONBOARDING_SIGNUP_AUTHORIZED_APPS=apify,firecrawl   # or * for the whole catalog
+ONBOARDING_SIGNUP_AUTHORIZED_BY=dheeraj
+ONBOARDING_SIGNUP_AUTHORIZED_AT=2026-08-09T00:00:00+00:00
+```
+
+All three are required together. Configuring apps without a name and a timestamp
+fails startup validation, because an authorization nobody signed is not one.
+Unknown slugs are dropped rather than trusted, and `*` is expanded against the
+catalog at load — the wildcard is never stored on a decision row.
+
+A covered run records a real admission decision with
+`decided_by="standing_authorization"`, `actor_owner_id` naming whoever granted
+it, and `decided_at` stamped with when they granted it — not with when the run
+happened to reach the phase. Reading a signup back, you can always tell the two
+human authorities apart: `operator` answered a question about *that run*,
+`standing_authorization` approved *the app* beforehand. Runs already parked at
+`awaiting_admission` are released by the next sweep after the deploy; they do not
+need a reset. An operator decision that already exists is never overwritten.
+
+An authorization also reaches runs that paused *mid-flight* on a
+`signup_authorization` gate, which it did not before 2026-08-09. The autonomous
+sweep classifies each paused gate through `ops/access/gate_policy.py`, and that
+policy grants a profile-authorized gate only when it can confine the decision to
+the profile's own registrable domain — which means it needs the URL the gate was
+observed on. Nothing persisted one: the run row's only URL column is the
+live-view link. So the sweep passed no authority, the policy answered
+`human_only` for every run, and a perfectly good standing authorization was
+invisible to exactly the runs it was granted for. The pause payload now records
+the observed page, so the sweep builds the same authority the driver builds and
+the two agree.
+
+Nothing was widened to do it. All six checks still have to hold — a committed
+profile, an admission decision naming *that* profile, an affirmative signup route
+decided by `operator` or `standing_authorization`, and a gate URL inside the
+profile's one registrable domain — and any one of them missing yields
+`human_only`. Runs that paused before the field existed have no recorded URL and
+stay human-only, which is the answer they were already getting; clear them by
+hand or retry them.
+
+Understand what this buys and what it spends. It buys unattended signup: the
+agent fills the form with the deployment's identity, accepts that provider's
+terms in the owner's name, and completes email verification with no human in the
+loop. It spends the per-run record of who agreed. The per-app row is the trail
+that remains. Leave `ONBOARDING_SIGNUP_AUTHORIZED_APPS` empty and every signup
+goes back to asking; that is the fail-closed default and the pre-2026-08-09
+behaviour.
+
+### Provider profile research
+
+A standing authorization only helps an app the agent can actually drive, and for
+an app with no reviewed recipe that takes a provider profile. The confinement
+allow-list a browser session runs under *is* `profile.allowed_hosts()`, so with
+no profile the driver raises `PhaseNotDrivable` before the browser is asked to do
+anything. Profiles are built by research adapters, and every adapter is opt-in:
+
+```dotenv
+ONBOARDING_RESEARCH_PERPLEXITY_ENABLED=true      # needs PERPLEXITY_API_KEY
+ONBOARDING_RESEARCH_HOMEPAGE_ANCHORS_ENABLED=true
+```
+
+With both false, `research_adapters()` raises `research_adapters_not_configured`
+at startup and no recipe-free app is drivable at all — which is loud on purpose.
+A flag turned on without its key raises there too, rather than degrading into a
+mid-run `research_adapters_unavailable` that reads like a provider outage.
+
+Do not confuse these with the `YOU_*` flags. Those enrich a *reviewed* catalog
+entry using the official host list that entry already carries. These start from a
+provider name and nothing else, which is the only input an unreviewed app has.
+The Perplexity adapter is the one that makes an unknown app drivable; the
+homepage-anchor harvester is keyless and spends nothing but needs a seed URL, so
+it supplements discovery rather than replacing it. It is off by default because
+it is the first adapter that makes a stock deployment issue outbound HTTP to a
+host chosen from data.
+
 ### Application authentication
 
 Application auth is the single human login boundary. Caddy handles TLS and
@@ -580,13 +707,51 @@ Review logs before sharing them even though application logging is designed to s
 
 ### Managed authentication
 
-1. Create an `execute_when_configured` run for one of the 25 managed apps.
+1. Create an `execute_when_configured` run for one of the 7 managed-authentication apps.
 2. Select **Connect account**.
 3. Complete the provider authorization in the returned Composio flow.
 4. Return to the run and select **Check connection**.
 5. Treat the run as complete only after Composio reports the account `ACTIVE`.
 
 The final bundle contains a provider account identifier. It does not expose OAuth tokens.
+
+### Managed key
+
+The other half of the managed set: 23 apps whose credential is a long-lived key
+you mint yourself on the vendor's own settings page. There is no OAuth redirect,
+no browser session, and no **Connect account** step — Composio reports the
+connection `ACTIVE` synchronously when the key is published.
+
+1. Create an `execute_when_configured` run. It stops at phase
+   `key_submission_required`, and the run page shows the **Managed key** panel.
+2. Mint the key at the app's reviewed credential-management URL — the per-app
+   table in `docs/APP_RECIPES.md` names it.
+3. Paste it once into the panel and select **Publish key to Composio**.
+4. Treat the run as complete only after the panel reports the connected account
+   active. Anything else leaves the run at `configuration_required` with a
+   sanitized reason code.
+
+The key is written to the encrypted vault before the provider call, so a publish
+whose outcome is unknown stays recoverable; only a `vault://` reference reaches
+run state, the timeline, and the bundle. As with the OAuth path, the bundle
+carries a provider account identifier and never the credential.
+
+Publication requires the deployment's owner-credential gate
+(`ALLOW_LOCAL_CREDENTIAL_SUBMISSION`), not the agent-action gate that
+`POST /api/runs/{id}/connect` uses. The distinction is what the request body
+carries: `/connect` asks the deployment to mint a link,
+`POST /api/runs/{id}/managed-key` hands it a live credential. For the same
+reason the route is withheld on an unaccepted release, alongside
+`POST /api/runs/{id}/credentials`.
+
+16 of the 23 can be published today. The remaining 7 — Jira, Harvest, Discord,
+Mailchimp, Linear, Close, and Plain — return a disabled action naming the
+specific obstacle (a companion non-secret field, an unreviewed header prefix, or
+no reviewed validation request to read the auth scheme from). This is deliberate:
+publishing a key under a guessed scheme produces a connection Composio reports
+`ACTIVE` that fails authentication on every later tool call, which is worse than
+not connecting at all. `MANAGED_KEY_SCHEME_UNREVIEWED` in
+`ops/recipes/app_recipes.py` records what each one is waiting on.
 
 ### Gmail signup and verification
 
@@ -628,19 +793,19 @@ unavailable rather than assuming the sender authenticated.
 
 Pipedrive is the only complete browser recipe today. It has a reviewed login URL, credential-management URL, structured success predicate, automatic capture specification, and read-only validation policy.
 
-The remote surface is view-only during autonomous work. Control is available only when the run records a human gate, such as CAPTCHA, MFA, device approval, or account selection. After the operator finishes the gate, disconnect control and resume the same run.
+The remote surface is view-only during autonomous work. Control is available only when the run records a human gate, such as CAPTCHA, MFA, device approval, or account selection. Finish the gate and stop there — the agent observes the clearance and continues the same run by itself, and it terminates your control connection when it does. See "Human gates: solving one, and handing it back" above.
 
 Do not call the run successful until the sanitized timeline records credential capture and validation and the output endpoint returns a bundle.
 
 ### Owner-submit entry routes
 
-The 13 owner-submit recipes open only the reviewed public account entry. They do not claim to log in, navigate to credential settings, create a credential, capture it, or validate it.
+The 7 owner-submit recipes — bright-data, dataforseo, klaviyo, neo4j, shopify, telegram, and xero — open only the reviewed public account entry. They do not claim to log in, navigate to credential settings, create a credential, capture it, or validate it. They are Playwright recipes whose `browser.scope` is `entry_only`; that field, not the readiness tier, is what the runtime branches on.
 
 After independently obtaining the expected credential, submit it once through the owner-only encrypted form. The run reaches `credentials_ready`; the bundle records that validation was not reviewed.
 
 ### Gated routes
 
-Four gated recipes have reviewed email contacts: Close, Freshdesk, Ahrefs, and Brex. They still send only to the configured controlled sink and only after an explicit owner action. The other seven remain `outreach_review_required`; provider keys or a recipient override must never upgrade that catalog readiness.
+One gated recipe has a reviewed email contact: Freshdesk. It still sends only to the configured controlled sink and only after an explicit owner action. The other five — Help Scout, Meta Ads, LinkedIn Ads, Snowflake, and Ramp — remain `outreach_review_required`; provider keys or a recipient override must never upgrade that catalog readiness. Close, Ahrefs, and Brex left this route for `managed_key` once their credential-management pages were reviewed.
 
 `OUTREACH_RECIPIENT_OVERRIDE` is deployment-wide and is never supplied by the
 run-creation form or API. Reply polling accepts only an exact parsed RFC sender

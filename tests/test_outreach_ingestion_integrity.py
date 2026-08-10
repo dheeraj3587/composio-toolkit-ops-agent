@@ -430,7 +430,7 @@ class _RunEmailGmail:
         assert thread_id == self.thread.thread_id
         assert expected_sender == self.expected_sender
         assert owner_run_id.startswith("run_")
-        assert app_slug == "close"
+        assert app_slug == "freshdesk"
         self.claimed_message_ids.append(message_id)
         return GmailOutreachMessageClaim(
             status="acquired",
@@ -467,7 +467,7 @@ class _RunEmailGmail:
     ("recipient_override", "expected_sender"),
     (
         (CONTROLLED, CONTROLLED),
-        (None, "support@close.com"),
+        (None, "devplatforms@dev-assist.freshservice.com"),
     ),
 )
 def test_poll_email_claims_and_classifies_only_exact_authenticated_sender(
@@ -485,7 +485,7 @@ def test_poll_email_claims_and_classifies_only_exact_authenticated_sender(
     service.initialize()
     created = service.create_run(
         OperationsRequest(
-            app_name="Close",
+            app_name="Freshdesk",
             company=CompanyProfile(
                 legal_name="Example Labs",
                 website="https://example.com",

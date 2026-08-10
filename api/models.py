@@ -866,6 +866,34 @@ class RunDetailResponse(StrictApiModel):
     autonomy: AutonomyOutcomeView | None = None
 
 
+class ManagedKeySubmissionRequest(StrictApiModel):
+    """One owner-held key, submitted for publication to Composio.
+
+    Values are never echoed in responses, logs, timeline, checkpoints, or the
+    IntegratorBundle. Unlike ``CredentialSubmissionRequest`` this carries no
+    company block: a managed-key run already holds the reviewed request it was
+    created from, and the bundle is built from that rather than from the body
+    that carries the secret.
+    """
+
+    credentials: dict[CredentialFieldName, SecretStr] = Field(min_length=1, max_length=20)
+
+
+class ManagedKeyConnectionResponse(StrictApiModel):
+    """Result of publishing an owner key, carrying no credential.
+
+    Separate from ``ManagedConnectionResponse`` because the two identify their
+    connection differently and neither field is optional in its own route: the
+    OAuth path has a connection request awaiting a redirect, while this path has
+    an already-resolved connected account and never a redirect.
+    """
+
+    run: RunSummary
+    connected_account_id: str = Field(min_length=1, max_length=200)
+    state: Literal["pending", "active", "terminal"]
+    replayed: bool = False
+
+
 class ManagedConnectionResponse(StrictApiModel):
     """Immediate managed-auth result; redirect_url is ephemeral and no-store."""
 
@@ -1423,8 +1451,13 @@ class AppResearchResponse(StrictApiModel):
     # broken app -- it is an app whose reviewed route is Composio's managed
     # OAuth, where an account is signed in rather than registered. Without this
     # the console could only say a signup route was missing, which read as "this
-    # app does not work" for the 36 of 50 apps that connect this way.
-    connect_route: Literal["managed_auth", "playwright", "gated"] | None = None
+    # app does not work" for the 30 of 50 apps that connect this way.
+    #
+    # Every member of ``RouteKind`` must appear here. This field is assigned
+    # ``recipe.route_kind`` verbatim, so a route the recipe schema accepts but
+    # this literal omits is not a narrower contract -- it is a 500 on the
+    # research endpoint for every app on that route.
+    connect_route: Literal["managed_auth", "managed_key", "playwright", "gated"] | None = None
 
 
 class ModelOptionView(StrictApiModel):

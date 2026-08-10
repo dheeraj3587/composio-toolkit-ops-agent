@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -24,6 +25,10 @@ ValidationAuthScheme = Literal["bearer", "api_key_header", "basic_auth"]
 # bounded account identifier. The response body itself is never persisted.
 _MAX_VALIDATION_BODY_BYTES = 64 * 1024
 _MAX_ACCOUNT_IDENTIFIER_LENGTH = 128
+# One segment of an identifier path: an optional object key followed by any
+# number of list subscripts, so ``data[0]`` and a bare ``tasks`` both parse.
+_PATH_SEGMENT = re.compile(r"(?P<key>[^\[\]]*)(?P<indexes>(?:\[\d+\])*)")
+_PATH_INDEX = re.compile(r"\[(\d+)\]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,9 +62,30 @@ class CredentialValidationPolicy:
     # Static, non-secret headers a provider requires alongside the credential
     # (for example an API revision pin). Never used to carry secret material.
     extra_headers: tuple[tuple[str, str], ...] = ()
-    # The non-secret username reference for ``basic_auth``. Required for that
-    # scheme and forbidden for the others.
+    # The non-secret username reference for ``basic_auth``, for the providers
+    # whose basic pair is two real credentials (DataForSEO's login/password).
     username_field: str | None = None
+    # The other two basic-auth shapes, where only ONE side is a credential and
+    # the other is a fixed literal the vendor documents: Close sends the key as
+    # the username with an EMPTY password, Help Scout with a dummy ``X``, and
+    # Mailchimp sends a dummy username with the key as the password. Before these
+    # existed such a provider had to be encoded as a second vaulted field that
+    # does not exist, or left unvalidated -- which is what actually happened.
+    #
+    # Both are non-secret by construction: a literal lives in the reviewed
+    # catalog, in git, so anything secret is unrepresentable here. Exactly one of
+    # these three fields is set for ``basic_auth``, which is what fixes WHICH
+    # side the credential occupies rather than leaving it to the caller.
+    basic_username_literal: str | None = None
+    basic_password_literal: str | None = None
+    # ``POST`` exists for providers that publish no readable GET: a GraphQL-only
+    # API, or a token mint whose success IS the proof the credentials work. The
+    # body is reviewed static text carried verbatim from the recipe; no secret is
+    # ever interpolated into it, so a probe that would need one is unbuildable
+    # here rather than assembled from a template.
+    method: Literal["GET", "POST"] = "GET"
+    request_body: str | None = None
+    request_content_type: str | None = None
 
     def __post_init__(self) -> None:
         if not self.app_slug or not self.allowed_endpoints:
@@ -79,20 +105,41 @@ class CredentialValidationPolicy:
             raise ValueError("validation header name is invalid")
         if self.auth_scheme == "bearer" and self.header_name.casefold() != "authorization":
             raise ValueError("bearer validation must use the Authorization header")
+        literals = (self.basic_username_literal, self.basic_password_literal)
         if self.auth_scheme == "basic_auth":
             if self.header_name.casefold() != "authorization":
                 raise ValueError("basic validation must use the Authorization header")
-            if not self.username_field or len(self.username_field) > 100:
+            if self.username_field is not None and len(self.username_field) > 100:
                 raise ValueError("basic validation requires a username field")
-        elif self.username_field is not None:
+            # Exactly one, so the credential's side of the pair is decided by the
+            # reviewed policy and never inferred at request time.
+            if sum(value is not None for value in (self.username_field, *literals)) != 1:
+                raise ValueError("basic validation needs exactly one counterpart")
+            for literal in literals:
+                if literal is not None and (len(literal) > 100 or ":" in literal):
+                    # A colon is the separator basic auth splits on, so a literal
+                    # containing one would silently move the boundary.
+                    raise ValueError("basic validation literal is invalid")
+        elif self.username_field is not None or any(value is not None for value in literals):
             raise ValueError("username field is only valid for basic validation")
         if self.auth_scheme != "api_key_header" and self.header_value_prefix:
             raise ValueError("header value prefix is only valid for api-key validation")
         if len(self.header_value_prefix) > 100 or _has_header_break(self.header_value_prefix):
             raise ValueError("header value prefix is invalid")
+        if self.method == "POST":
+            if not self.request_body or not self.request_content_type:
+                raise ValueError("post validation requires a body and its content type")
+        elif self.request_body is not None or self.request_content_type is not None:
+            raise ValueError("a validation body is only valid for post validation")
+        if self.request_content_type is not None and (
+            len(self.request_content_type) > 100 or _has_header_break(self.request_content_type)
+        ):
+            raise ValueError("validation request media type is invalid")
+        if self.request_body is not None and len(self.request_body) > 2_000:
+            raise ValueError("validation request body is too long")
         if len(self.extra_headers) > 10:
             raise ValueError("too many static validation headers")
-        seen = {self.header_name.casefold(), "accept"}
+        seen = {self.header_name.casefold(), "accept", "content-type"}
         for name, value in self.extra_headers:
             if (
                 not name
@@ -151,8 +198,8 @@ class CredentialValidator:
             )
         validate_vault_reference(reference)
         username_reference: str | None = None
-        if policy.auth_scheme == "basic_auth":
-            username_reference = credential_refs.get(policy.username_field or "")
+        if policy.auth_scheme == "basic_auth" and policy.username_field is not None:
+            username_reference = credential_refs.get(policy.username_field)
             if username_reference is None:
                 return _result(
                     status="invalid",
@@ -171,19 +218,35 @@ class CredentialValidator:
             if policy.auth_scheme == "bearer":
                 headers[policy.header_name] = f"Bearer {raw_value}"
             elif policy.auth_scheme == "basic_auth":
-                raw_username = self._secret_store.get(username_reference or "")
-                encoded = base64.b64encode(f"{raw_username}:{raw_value}".encode()).decode("ascii")
+                # Which side the credential occupies was decided by the reviewed
+                # policy, not here: a second vault reference, a literal username,
+                # or a literal password, in that order, exactly one of which the
+                # policy guarantees is present.
+                if username_reference is not None:
+                    raw_username = self._secret_store.get(username_reference)
+                    pair = f"{raw_username}:{raw_value}"
+                    del raw_username
+                elif policy.basic_username_literal is not None:
+                    pair = f"{policy.basic_username_literal}:{raw_value}"
+                else:
+                    pair = f"{raw_value}:{policy.basic_password_literal}"
+                encoded = base64.b64encode(pair.encode()).decode("ascii")
                 headers[policy.header_name] = f"Basic {encoded}"
-                del raw_username, encoded
+                del pair, encoded
             else:
                 headers[policy.header_name] = f"{policy.header_value_prefix}{raw_value}"
             del raw_value
             account_identifier: str | None = None
+            content: bytes | None = None
+            if policy.method == "POST":
+                headers["Content-Type"] = policy.request_content_type or ""
+                content = (policy.request_body or "").encode()
             try:
                 async with self._http_client.stream(
-                    "GET",
+                    policy.method,
                     endpoint,
                     headers=headers,
+                    content=content,
                     follow_redirects=False,
                 ) as response:
                     status_code = response.status_code
@@ -224,6 +287,20 @@ class CredentialValidator:
             headers.clear()
 
         if 200 <= status_code < 300:
+            if policy.account_identifier_paths and account_identifier is None:
+                # A 2xx that named no account did not prove the credential works.
+                # Some providers (Jira most notably) answer an unauthenticated or
+                # badly-authenticated read with an ANONYMOUS 200 rather than a
+                # 401, so "the request succeeded" and "the credential is good" are
+                # different facts. Declaring identifier paths is how a policy says
+                # which one it needs; a policy that cannot bind the response to an
+                # account declares none and keeps the plain 2xx meaning.
+                return _result(
+                    status="invalid",
+                    endpoint=endpoint,
+                    http_status=status_code,
+                    reason_code="validation_identity_unconfirmed",
+                )
             return _result(
                 status="valid",
                 endpoint=endpoint,
@@ -363,6 +440,35 @@ def _result(
     )
 
 
+def _step(current: Any, part: str) -> Any:
+    """Walk one ``key`` or ``key[index]`` segment of an identifier path.
+
+    Index support exists because several providers answer the cheapest identity
+    read with a COLLECTION rather than an object -- Klaviyo's ``/api/accounts``
+    returns ``data[0].id``, DataForSEO's returns ``tasks[0].result[0].login`` --
+    and without it those paths resolve to nothing. That is no longer a harmless
+    miss: since a declared path that binds no account now makes the result
+    ``invalid``, a path this reader could not follow would turn a working key
+    into a reported failure. Out-of-range and non-list values return ``None``,
+    which the caller treats the same as an absent key.
+    """
+
+    match = _PATH_SEGMENT.fullmatch(part)
+    if match is None:
+        return None
+    key = match.group("key")
+    if key:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    for raw_index in _PATH_INDEX.findall(match.group("indexes")):
+        index = int(raw_index)
+        if not isinstance(current, list) or index >= len(current):
+            return None
+        current = current[index]
+    return current
+
+
 def _extract_account_identifier(body: bytes, paths: tuple[str, ...]) -> str | None:
     """Read one bounded scalar id from a JSON body; never return free text.
 
@@ -378,10 +484,8 @@ def _extract_account_identifier(body: bytes, paths: tuple[str, ...]) -> str | No
     for path in paths:
         current: Any = parsed
         for part in path.split("."):
-            if isinstance(current, dict) and part in current:
-                current = current[part]
-            else:
-                current = None
+            current = _step(current, part)
+            if current is None:
                 break
         if isinstance(current, (str, int)):
             candidate = str(current)

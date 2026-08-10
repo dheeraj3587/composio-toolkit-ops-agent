@@ -174,7 +174,15 @@ def project_status(phase: OnboardingPhase, *, credential_ready: bool = False) ->
 # starts the walk again, preserving every vault reference.
 _LEGAL_PHASE_TRANSITIONS: dict[OnboardingPhase, frozenset[OnboardingPhase]] = {
     "research": frozenset({"vault_check", "blocked", "cancelled"}),
-    "vault_check": frozenset({"route_selected_login", "awaiting_admission", "blocked"}),
+    # ``vault_check -> route_selected_signup`` is the standing-authorization edge.
+    # The vault check has three outcomes, not two: credentials exist (login), the
+    # owner has pre-authorized account creation for this app (signup, no person
+    # involved), or neither (go ask). It is a separate edge rather than a quick
+    # pass through ``awaiting_admission`` on purpose — entering that phase emits
+    # the one prompt this system has, and an authorized run must cost zero.
+    "vault_check": frozenset(
+        {"route_selected_login", "route_selected_signup", "awaiting_admission", "blocked"}
+    ),
     "awaiting_admission": frozenset({"route_selected_signup", "cancelled", "paused"}),
     "route_selected_login": frozenset({"authenticated", "captcha_paused", "paused", "cancelled"}),
     "route_selected_signup": frozenset({"signup", "paused", "cancelled"}),
@@ -253,6 +261,12 @@ OnboardingReasonCode = Literal[
     "signup_authorization_required",
     "operator_approved_signup",
     "operator_cancelled",
+    # Account creation proceeded with no prompt because the owner had already
+    # authorized it for this app slug, once, out of band. Deliberately a distinct
+    # code from ``operator_approved_signup``: both are human authorizations, but
+    # only that one names a person who answered a question about THIS run, and an
+    # auditor reading a signup back needs to be able to tell the two apart.
+    "standing_signup_authorization",
     # --- pre-flight plan ----------------------------------------------------
     # Raised by the plan validator before any browser session exists: a surface
     # the plan would drive is absent from the recipe catalog, so the run is

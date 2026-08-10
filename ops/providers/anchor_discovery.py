@@ -261,7 +261,7 @@ def _normalized_candidate(href: str, *, page_url: str, page_domain: str) -> str 
 
     * a non-https scheme covers ``mailto:``, ``javascript:`` and plain http —
       none is a fetchable evidence document, and http would be a downgrade;
-    * userinfo (``https://user:pw@host/``) is how a URL is made to READ as one
+    * userinfo (the ``user:pw@`` prefix before a host) is how a URL is made to READ as one
       host and RESOLVE to another, which is the whole point of confining
       research to one domain;
     * a different registrable domain is a third-party link — a status page, a

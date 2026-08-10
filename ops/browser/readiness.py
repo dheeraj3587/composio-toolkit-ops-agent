@@ -36,6 +36,29 @@ class BrowserReadiness:
         return self.status == "ready"
 
 
+def browser_service_configured(settings: Settings) -> bool:
+    """Whether the isolated browser service is addressable, live opt-in aside.
+
+    Deliberately INDEPENDENT of ``allow_live_browser``. That flag governs whether
+    this process may *start* a browser session; it says nothing about whether an
+    already-running service can be *read*. Sweeps that only observe an existing
+    session — the takeover watcher in ``ops.runs.takeover`` — must key off this
+    predicate, because keying off the opt-in made them dead in exactly the
+    deployment where a paused run is least likely to be watched by anyone.
+
+    The three values are the same ones ``_build_browser_worker`` requires before
+    it will construct a ``BrowserServiceClient``, so a caller that passes here can
+    always build one. The in-process sandbox is NOT a substitute: it serves no
+    clearance route, so it cannot answer the read these callers need.
+    """
+
+    return bool(
+        settings.browser_service_url
+        and settings.browser_service_token is not None
+        and settings.browser_session_capability_key is not None
+    )
+
+
 def browser_configuration_state(
     settings: Settings,
     provider: BrowserProvider | None = None,
@@ -56,11 +79,7 @@ def browser_configuration_state(
         return False
     if bool(getattr(settings, "playwright_in_process_sandbox", False)):
         return True
-    return bool(
-        settings.browser_service_url
-        and settings.browser_service_token is not None
-        and settings.browser_session_capability_key is not None
-    )
+    return browser_service_configured(settings)
 
 
 async def probe_playwright(*, timeout_seconds: float = 30.0) -> BrowserReadiness:
@@ -182,6 +201,7 @@ __all__ = [
     "BrowserReadiness",
     "ReadinessStatus",
     "browser_configuration_state",
+    "browser_service_configured",
     "main",
     "probe_playwright",
 ]

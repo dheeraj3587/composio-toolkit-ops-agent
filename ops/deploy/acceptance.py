@@ -39,6 +39,16 @@ _SCHEMA_VERSION = 1
 _MANUAL_NONCE = "manual-unaccepted"
 _MAX_MARKER_BYTES = 512
 
+# Admission asks this question on request paths, not just once per process, so the
+# answer is memoized against the marker file's own identity: inode, device, size,
+# mode, owner, and both timestamps. Any write, replace, chmod or chown produces a
+# different identity and therefore a full re-read, which is what keeps rollback
+# revocation visible to the very next request. A missing or unstattable marker is
+# never served from cache at all.
+_CACHE_LIMIT = 32
+_CACHE_LOCK = threading.Lock()
+_CACHE: dict[tuple[str, str], tuple[tuple[int, ...], bool]] = {}
+
 
 class AcceptanceSettings(Protocol):
     app_revision: str
@@ -99,13 +109,69 @@ def deployment_payload_is_accepted(
     )
 
 
+def _marker_identity(path: Path) -> tuple[int, ...] | None:
+    """The marker's on-disk identity, or ``None`` when it cannot be stat'ed.
+
+    Deliberately an ``lstat``: a marker replaced by a symlink reports a different
+    inode and mode, so it can never be answered from a cached decision that was
+    made about the regular file it displaced.
+    """
+
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    return (
+        info.st_ino,
+        info.st_dev,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        info.st_size,
+        info.st_mode,
+        info.st_uid,
+    )
+
+
+def _forget(key: tuple[str, str]) -> None:
+    with _CACHE_LOCK:
+        _CACHE.pop(key, None)
+
+
 def deployment_is_accepted(settings: AcceptanceSettings) -> bool:
     """Return true only for the exact revision+nonce marker, without mutating it."""
 
     configured = _configuration(settings)
     if configured is None:
         return False
-    _revision, _nonce, path = configured
+    revision, nonce, path = configured
+    # Keyed by the marker path AND the digest this deployment expects, so a
+    # same-path redeploy under a fresh nonce can never read the previous
+    # release's decision.
+    key = (str(path), _expected_digest(revision, nonce))
+    identity = _marker_identity(path)
+    if identity is None:
+        _forget(key)
+        return False
+    with _CACHE_LOCK:
+        cached = _CACHE.get(key)
+    if cached is not None and cached[0] == identity:
+        return cached[1]
+    accepted = _validate_marker_file(settings, path)
+    if _marker_identity(path) == identity:
+        with _CACHE_LOCK:
+            if len(_CACHE) >= _CACHE_LIMIT:
+                _CACHE.clear()
+            _CACHE[key] = (identity, accepted)
+    else:
+        # The file changed underneath the read. The decision belongs to whichever
+        # inode was open, so it is returned but never remembered for this identity.
+        _forget(key)
+    return accepted
+
+
+def _validate_marker_file(settings: AcceptanceSettings, path: Path) -> bool:
+    """Read and validate the marker file itself, with no memoization."""
+
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if not isinstance(no_follow, int) or no_follow == 0:
         # Production is Linux. On a platform that cannot guarantee a no-follow

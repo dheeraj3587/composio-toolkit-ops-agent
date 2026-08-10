@@ -126,6 +126,7 @@ from ops.onboarding.publishers import (
     VaultLoginReferenceBinder,
 )
 from ops.onboarding.setup_refs import phase_value_refs, run_setup_values
+from ops.onboarding.standing_authorization import SettingsStandingSignupAuthority
 from ops.planner.adherence import RouteAdherenceMonitor
 from ops.planner.decide import PlanOutcome, decide_run_plan
 from ops.planner.store import RunPlanStore, SQLiteRunPlanStore
@@ -762,6 +763,12 @@ class OnboardingPorts:
                     credentials=credentials,
                     developer_app=self.developer_app,
                     owner_id=self.settings.browser_service_owner,
+                    # The owner's standing per-app authorization to create
+                    # accounts, or None when this deployment configures none.
+                    # Built from settings, so granting or revoking it is a
+                    # reviewed deploy rather than something the running system
+                    # can do to itself.
+                    standing=SettingsStandingSignupAuthority.from_settings(self.settings),
                 )
             )
         # ``route_selected_signup`` is a pure policy read with no ports at all, so

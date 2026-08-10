@@ -461,7 +461,17 @@ def _classify_backend_error(exc: Exception) -> DecisionReasonCode:
         return "rate_limited"
     if isinstance(exc, TimeoutError | httpx.TimeoutException):
         return "provider_timeout"
+    # httpx puts the status on the RESPONSE, not the exception: the only thing
+    # that raises here is `response.raise_for_status()`, and an
+    # httpx.HTTPStatusError has no `status_code` attribute at all. So the direct
+    # getattr never once fired on the live path, and a rejected API key -- the
+    # single most common real failure, and the one an operator can actually fix --
+    # was reported as `all_providers_failed`, which reads as "every provider is
+    # down" and sends the diagnosis in precisely the wrong direction.
+    response = getattr(exc, "response", None)
     status = getattr(exc, "status_code", None)
+    if status is None and response is not None:
+        status = getattr(response, "status_code", None)
     if status in (401, 403):
         return "authentication_failed"
     if isinstance(exc, json.JSONDecodeError):

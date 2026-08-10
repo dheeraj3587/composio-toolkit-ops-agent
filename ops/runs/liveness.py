@@ -9,13 +9,16 @@ alone, because pausing under it would be the watcher fighting the driver.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from math import ceil
 from typing import Final, Protocol
 
+from ops.browser.link_log import log_event
 from ops.core.config import Settings
 from ops.core.storage import OperationsStorage
+from ops.deploy.acceptance import wait_for_deployment_acceptance
 from ops.onboarding.driver import WAITING_PHASES, PhaseHistoryStore
 from ops.onboarding.phase import TERMINAL_PHASES, OnboardingReasonCode
 from ops.runs.resume import OnboardingRunControlService
@@ -128,6 +131,15 @@ class RunLivenessService:
             return False
         if record.get("state_engine") == "canonical_v1":
             if self._canonical is None:
+                # Only the canonical runtime may tear a stale browser down, so
+                # without it this run is knowingly left alone. Say so: a silent
+                # skip here is indistinguishable from "nothing was stale", and it
+                # is the difference between a healthy sweep and a stranded run.
+                log_event(
+                    "runs.liveness.canonical_control_unavailable",
+                    run_id=run_id,
+                    stale_seconds=stale_seconds,
+                )
                 return False
             return self._canonical.pause_stale_run(
                 run_id,
@@ -206,6 +218,70 @@ class RunLivenessService:
         return max(readable) if readable else None
 
 
+class RunLivenessContext(Protocol):
+    """Run-service state the scheduled liveness sweep drives.
+
+    The thread handle and stop event stay owned by the service, exactly as the
+    autonomous advancer's do, so shutdown joins them in one place and a test can
+    replace ``_liveness_stop`` directly.
+    """
+
+    _settings: Settings | None
+    _liveness_thread: threading.Thread | None
+    _liveness_stop: threading.Event
+
+    def mark_stale_runs(self, *, limit: int = 100) -> int: ...
+
+
+class RunLivenessScheduler:
+    """The thread that runs the liveness sweep on a cadence of its own.
+
+    Stall detection used to ride along inside the autonomous advancement loop,
+    which meant a deployment that never advanced a run never noticed a stalled
+    one either. It is its own sweep now, started alongside the others and gated
+    on the same deployment acceptance marker.
+    """
+
+    def __init__(self, context: RunLivenessContext) -> None:
+        self._context = context
+
+    def start(self) -> None:
+        """Start the sweep that marks runs whose loop stopped reporting progress."""
+
+        context = self._context
+        settings = context._settings or Settings.from_env()
+        if context._liveness_thread is not None and context._liveness_thread.is_alive():
+            return
+        # Shares the advancement cadence rather than introducing a knob: this is
+        # exactly how often the sweep already ran when it was a passenger there.
+        # Both names are declared and range-validated on ``Settings`` (``ge=5``
+        # and 1.0-300.0), so they are read directly: a ``getattr`` default here
+        # would silently substitute a second, unvalidated cadence for a typo.
+        interval = int(settings.autonomous_advance_interval_seconds)
+        initial_delay = float(settings.ops_automation_start_delay_seconds)
+        context._liveness_stop.clear()
+        thread = threading.Thread(
+            target=self._loop,
+            args=(interval, initial_delay),
+            name="run-liveness",
+            daemon=True,
+        )
+        context._liveness_thread = thread
+        thread.start()
+
+    def _loop(self, interval: int, initial_delay: float) -> None:
+        if self._context._liveness_stop.wait(initial_delay):
+            return
+        settings = self._context._settings or Settings.from_env()
+        if not wait_for_deployment_acceptance(settings, self._context._liveness_stop):
+            return
+        while not self._context._liveness_stop.wait(interval):
+            try:
+                self._context.mark_stale_runs()
+            except Exception:  # pragma: no cover - the loop must never die
+                pass
+
+
 def _moment(value: str) -> datetime | None:
     """One stored ``...Z`` instant as an aware datetime; ``None`` if unreadable."""
 
@@ -221,5 +297,7 @@ __all__ = [
     "STALE_REASON_CODE",
     "CanonicalLivenessControl",
     "LeaseHolders",
+    "RunLivenessContext",
+    "RunLivenessScheduler",
     "RunLivenessService",
 ]

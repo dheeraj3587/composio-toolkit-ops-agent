@@ -19,6 +19,7 @@ import {
   resumeWithBrowserVerification,
   retryOnboardingStep,
   submitCredentials,
+  submitManagedKey,
 } from "@/lib/api"
 import { onboardingPhaseSchema } from "@/lib/api-schemas"
 import { humanize } from "@/lib/format"
@@ -637,5 +638,58 @@ export async function submitCredentialAction(
       return { message: "The credential could not be submitted.", tone: "error", status: null }
     }
     return { message: "The credential submission failed.", tone: "error", status: null }
+  }
+}
+
+/**
+ * Publish an owner-held key on a managed_key run.
+ *
+ * Shares `CredentialSubmitState` with the action above because the surface
+ * reports the same three things, but it is a separate action rather than a
+ * branch inside it: this route takes no company block, and posting a
+ * managed_key run's key to `/credentials` is refused by the backend with
+ * `run_is_not_playwright`. Keeping them apart is what makes that impossible to
+ * do by accident.
+ */
+export async function submitManagedKeyAction(
+  _previousState: CredentialSubmitState,
+  formData: FormData,
+): Promise<CredentialSubmitState> {
+  const runId = String(formData.get("run_id") ?? "").slice(0, 180)
+  // The whole reviewed field set travels together: the route refuses any subset
+  // with `credential_fields_do_not_match_recipe`, so a two-field app publishes
+  // only if both values arrive in one submission.
+  const fieldNames = String(formData.get("field_names") ?? "")
+    .split(",")
+    .map((name) => name.trim().slice(0, 100))
+    .filter(Boolean)
+  const fields: Record<string, string> = {}
+  for (const name of fieldNames) {
+    const value = String(formData.get(`value:${name}`) ?? "")
+    if (!value) continue
+    fields[name] = value
+  }
+  if (!runId || fieldNames.length === 0 || Object.keys(fields).length !== fieldNames.length) {
+    return { message: "A run reference and every key value are required.", tone: "error", status: null }
+  }
+  try {
+    const detail = await submitManagedKey(runId, fields)
+    revalidatePath(`/runs/${encodeURIComponent(runId)}`)
+    const active = detail.state === "active"
+    return {
+      message: active
+        ? "Composio reports the connected account active. The IntegratorBundle is ready in Output."
+        : `The key was published but Composio reports the connection ${detail.state}. Run status: ${detail.run.status.replaceAll("_", " ")}.`,
+      tone: active ? "neutral" : "error",
+      status: detail.run.status,
+    }
+  } catch (error) {
+    if (error instanceof PhaseConflictError) {
+      return { message: "The run is not ready to accept a key yet.", tone: "error", status: null }
+    }
+    if (error instanceof ApiError) {
+      return { message: "The key could not be published.", tone: "error", status: null }
+    }
+    return { message: "The key submission failed.", tone: "error", status: null }
   }
 }

@@ -51,6 +51,7 @@ returns a classified outcome and commits nothing (Requirement 4.20).
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from time import monotonic
@@ -530,6 +531,9 @@ class LoopTelemetry(Protocol):
         """
 
 
+LOGGER = logging.getLogger("composio_ops.onboarding_action_loop")
+
+
 # --- the loop ---------------------------------------------------------------
 # Candidate actions that move the page. Only these are checked against the
 # allow-list before execution; everything else acts within the current document.
@@ -554,7 +558,17 @@ _POSTCONDITION_PREDICATES: Final[dict[str, Callable[[BrowserObservation], bool]]
         observation.reason_code in {"verification_email_found", "captcha_resolved"}
         or observation.status in _AUTHENTICATED_STATUSES
     ),
-    "developer_app_present": lambda observation: observation.developer_app_id is not None,
+    # ``developer_app_id`` is only ever populated by the in-process trace loop,
+    # which reads it out of a provider-specific console. The single-step
+    # observe/act path cannot know it, and requiring it made this postcondition
+    # unsatisfiable for every run the driver actually drives. Reaching a
+    # credential surface or an authenticated console after the developer-app
+    # phase acted is the evidence that path CAN produce; the app's real existence
+    # is proven downstream anyway, by the capture that fails without it.
+    "developer_app_present": lambda observation: (
+        observation.developer_app_id is not None
+        or (observation.status in _AUTHENTICATED_STATUSES and observation.human_action_type is None)
+    ),
     "credential_visible": lambda observation: (
         observation.status == "credential_page_ready" and bool(observation.credential_field_labels)
     ),
@@ -892,15 +906,34 @@ async def run_action_loop(
     stage: LoopStage = "observe"
 
     def report(ended_at: LoopStage) -> None:
-        """One progress row per iteration, so a stalled loop is visible (I5)."""
+        """One progress row per iteration, so a stalled loop is visible (I5).
+
+        ``step_index`` is floored at 1 because the durable sink's own bound is
+        ``1 <= step_index``, and the PRE-LOOP observation reports at ``iteration
+        == 0``. That combination raised ``ValueError`` out of the containment
+        clause that exists precisely so an unreadable page cannot end the run —
+        straight through ``_drive_phase`` and out of ``drive_run``, where the
+        worker recorded ``driver_raised`` and re-deferred forever. The first
+        report belongs to step 1.
+
+        Telemetry never decides anything, so a sink that refuses a row must not
+        stop the loop. It is logged and swallowed; the same is true of
+        :func:`report_decision`.
+        """
 
         progress = getattr(telemetry, "progress", None)
-        if callable(progress):
+        if not callable(progress):
+            return
+        try:
             progress(
-                step_index=iteration,
+                step_index=max(iteration, 1),
                 stage=ended_at,
                 elapsed_ms=max(int((clock() - step_started) * 1000), 0),
             )
+        except _PROGRAMMING_ERRORS:
+            raise
+        except Exception:
+            LOGGER.warning("onboarding loop could not record a progress row", exc_info=True)
 
     def report_decision(
         outcome: StepDecision,
@@ -922,18 +955,52 @@ async def run_action_loop(
         record = getattr(telemetry, "decision", None)
         if not callable(record):
             return
-        record(
-            step_index=iteration,
-            decision=outcome,
-            reason_code=reason_code,
-            candidate_label=None if candidate is None else candidate.semantic_target,
-            action=None if candidate is None else candidate.action,
-            target_host=None if candidate is None else candidate.url,
-            reason=reason,
-        )
+        try:
+            record(
+                step_index=max(iteration, 1),
+                decision=outcome,
+                reason_code=reason_code,
+                candidate_label=None if candidate is None else candidate.semantic_target,
+                action=None if candidate is None else candidate.action,
+                target_host=None if candidate is None else candidate.url,
+                reason=reason,
+            )
+        except _PROGRAMMING_ERRORS:
+            raise
+        except Exception:
+            LOGGER.warning("onboarding loop could not record a decision row", exc_info=True)
 
     async def observe(seconds: float) -> LoopObservation:
         return await asyncio.wait_for(session.observe(), seconds)
+
+    # The candidate whose action the session confirmed it EXECUTED but whose
+    # effect was never read back, because the verifying observation timed out or
+    # raised. Non-``None`` only inside that window.
+    executed_unverified: ActionCandidate | None = None
+
+    def _unverified_action(candidate: ActionCandidate) -> LoopResult:
+        """End the phase after an action that ran but could not be verified.
+
+        The alternative — carrying on — meant re-planning against the snapshot
+        taken BEFORE the action, whose candidate ids still resolve, so the loop
+        could pick the same control again. For an irreversible one ("Create API
+        key", "Save") that mints a second credential at the provider and captures
+        neither, up to ``MAX_ACTION_FAILURES`` times. ``outcome_unknown`` is the
+        code the driver's effect bookkeeping already reads as "a second attempt
+        must reconcile rather than repeat", which is exactly the situation.
+        """
+
+        remember(candidate, "failed", reason_code="outcome_unknown")
+        telemetry.reject("outcome_unknown")
+        report_decision("rejected", reason_code="outcome_unknown", candidate=candidate)
+        return _result(
+            "exhausted",
+            observation,
+            "outcome_unknown",
+            actions=actions,
+            model_calls=model_calls,
+            denials=denials,
+        )
 
     # Derived once: it is a property of the reviewed goal, not of the page, and
     # nothing inside the loop may widen it mid-phase.
@@ -1362,13 +1429,22 @@ async def run_action_loop(
             telemetry.action(candidate_id=candidate.candidate_id, actions_executed=actions)
 
             stage = "verify"
+            # Recorded BEFORE the verifying observation, not after. The scratchpad
+            # entry used to be written only once ``observe`` returned, so an action
+            # that ran and then could not be read left no trace of having run at
+            # all — and the next iteration re-planned against the PRE-action
+            # snapshot with the same candidate ids, which is how "Create API key"
+            # could be clicked more than once. ``executed_unverified`` is what the
+            # containment clauses below read to refuse exactly that.
+            executed_unverified = candidate
+            remember(candidate, "executed")
             seen = await observe(deadlines.verify_seconds)
+            executed_unverified = None
             check = check_postconditions(
                 goal, seen.observation, previously_satisfied=satisfied_before
             )
             if memory is not None:
                 memory = memory.with_postconditions(check.satisfied)
-            remember(candidate, "executed", at=seen.observation)
             if check.all_met:  # Q1
                 report("verify")
                 return _result(
@@ -1407,6 +1483,8 @@ async def run_action_loop(
                     model_calls=model_calls,
                     denials=denials,
                 )
+            if executed_unverified is not None:
+                return _unverified_action(executed_unverified)
             no_progress += 1
         except _PROGRAMMING_ERRORS:
             # The same rule the worker's trace loop keeps: a programming error is
@@ -1445,6 +1523,8 @@ async def run_action_loop(
                     model_calls=model_calls,
                     denials=denials,
                 )
+            if executed_unverified is not None:
+                return _unverified_action(executed_unverified)
             action_failures += 1
             no_progress += 1
             if action_failures >= MAX_ACTION_FAILURES:

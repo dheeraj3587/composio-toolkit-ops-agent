@@ -21,6 +21,7 @@ const research: OperationalResearch = {
   authorization_url: null,
   token_url: null,
   credential_fields: [],
+  credential_secret_fields: [],
   credential_creation_instructions: [],
   scopes: [],
   developer_portal_url: null,

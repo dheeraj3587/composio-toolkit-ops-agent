@@ -65,17 +65,25 @@ class AuditSink(Protocol):
     ) -> int: ...
 
 
-def _observed(observed_url: str) -> tuple[str, str, bool]:
-    """The canonical observed host and path, plus whether it had to be elided."""
+def _observed(observed_url: str) -> tuple[str, str, bool, str]:
+    """Canonical host and REPORTABLE path, whether it was elided, and the true path.
+
+    The fourth element is the load-bearing one. Elision is a reporting rule — a
+    path the sanitizer would rewrite must not be quoted back into a prompt or an
+    audit row — and it used to be applied before the comparison, so a run that
+    landed on EXACTLY its planned surface was reported as divergent whenever that
+    surface happened to contain a token-shaped segment. The comparison now uses
+    the real path; only what is reported is elided.
+    """
 
     try:
         surface = canonical_surface(observed_url, purpose="entry")
     except ValueError:
-        return ELIDED, ELIDED, True
+        return ELIDED, ELIDED, True, ELIDED
     rebuilt = f"https://{surface.host}{surface.path}"
     if sanitize_url(rebuilt) != rebuilt:
-        return surface.host, ELIDED, True
-    return surface.host, surface.path, False
+        return surface.host, ELIDED, True, surface.path
+    return surface.host, surface.path, False, surface.path
 
 
 def observe_surface(*, plan: RunPlan, step_index: int, observed_url: str) -> Divergence | None:
@@ -88,8 +96,11 @@ def observe_surface(*, plan: RunPlan, step_index: int, observed_url: str) -> Div
     expected = plan.surface_for_step(step_index)
     if expected is None:
         return None
-    host, path, unresolved = _observed(observed_url)
-    if not unresolved and (host, path) == (expected.host, expected.path):
+    host, path, unresolved, true_path = _observed(observed_url)
+    if host != ELIDED and (host, true_path) == (expected.host, expected.path):
+        # On the planned surface. The plan's own path is by construction one the
+        # planner recorded, so agreeing with it is proof of adherence whether or
+        # not the sanitizer would rewrite it for display.
         return None
     return Divergence(
         expected_host=expected.host,

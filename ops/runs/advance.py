@@ -13,16 +13,26 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Mapping
-from typing import Final, Protocol
+from pathlib import Path
+from typing import TYPE_CHECKING, Final, Protocol
 
 from pydantic import SecretStr
 
-from ops.access.gate_policy import GateResolution, autonomous_gates, resolve_gate
+from ops.access.gate_policy import (
+    PROFILE_DECLARABLE_GATES,
+    GateResolution,
+    ProfileGateAuthority,
+    autonomous_gates,
+    resolve_gate,
+)
 from ops.browser.link_log import log_event
 from ops.core.config import Settings
 from ops.core.storage import OperationsStorage
 from ops.deploy.acceptance import wait_for_deployment_acceptance
 from ops.runs.errors import CredentialSubmissionError, RunConflictError
+
+if TYPE_CHECKING:  # Import-time cost paid only by the type checker.
+    from ops.providers.profile_store import ProviderProfileStore
 
 # Retained as the module's published view of the autonomous gate set. It is now
 # derived from the declarative policy instead of being hard-coded empty, so the
@@ -119,6 +129,105 @@ class RunAdvanceService:
 
     def __init__(self, context: RunAdvanceContext) -> None:
         self._context = context
+        # Opened on first profile-declarable gate and memoized, not in __init__:
+        # a deployment that never reaches one should not create the file, and the
+        # sweep is constructed on every service instance including ones that only
+        # ever serve recipe-driven runs.
+        self._profiles: ProviderProfileStore | None = None
+        self._profiles_resolved = False
+        self._profiles_lock = threading.Lock()
+
+    def _profile_store(self) -> ProviderProfileStore | None:
+        """The content-addressed profile store, or ``None`` if unreachable.
+
+        Constructed here rather than read off the run service because the service
+        holds none — ``api.service`` and ``ops.onboarding.composition`` each build
+        their own from the same two facts, and this is the third caller that needs
+        one. It is opened exactly as they do, so all three address the same file
+        under the same tenant owner; a store scoped to one owner cannot read
+        another's profile, which is what keeps this read from widening anything.
+
+        Failure is not raised. Every caller treats ``None`` as "no authority",
+        which withholds autonomy rather than granting it.
+        """
+
+        with self._profiles_lock:
+            if self._profiles_resolved:
+                return self._profiles
+            self._profiles_resolved = True
+            settings = self._context._settings
+            if settings is None:
+                return None
+            try:
+                from ops.onboarding.composition import PROFILE_DATABASE_NAME
+                from ops.providers.profile_store import SQLiteProviderProfileStore
+
+                self._profiles = SQLiteProviderProfileStore(
+                    Path(self._context.storage.db_path).parent / PROFILE_DATABASE_NAME,
+                    owner=settings.browser_service_owner,
+                )
+            except Exception:
+                log_event("browser.autonomous_advance.profile_store_unavailable", level=30)
+                self._profiles = None
+            return self._profiles
+
+    def _profile_authority(
+        self,
+        *,
+        run_id: str,
+        record: Mapping[str, object],
+    ) -> ProfileGateAuthority | None:
+        """Project the run's durable profile and admission decision onto the policy's shape.
+
+        This is the call the sweep used to omit. It could not supply one before
+        because ``ProfileGateAuthority.gate_url`` is the page the gate was observed
+        on and nothing persisted it; the pause payload now records it (see
+        ``ops.workflow.canonical_runtime``), so the last missing fact is durable.
+        Substituting the profile's own signup URL was the tempting shortcut and is
+        exactly what must not happen: it would make the domain-confinement check
+        compare the profile against itself and pass vacuously.
+
+        Every field comes from a row written before the gate was observed, and a
+        missing or malformed one yields ``None`` rather than a partial authority.
+        ``resolve_gate`` re-checks all six regardless — nothing is asserted here.
+        """
+
+        hitl = record.get("hitl_request")
+        if not isinstance(hitl, Mapping):
+            return None
+        gate_url = hitl.get("gate_url")
+        if not isinstance(gate_url, str) or not gate_url:
+            # A run paused before this field existed. It stays human-only, which
+            # is the same answer it has been getting all along.
+            return None
+        store = self._profile_store()
+        if store is None:
+            return None
+        try:
+            profile = store.get_for_run(run_id=run_id)
+            if profile is None:
+                return None
+            decision = self._context.storage.read_admission_decision(run_id=run_id)
+        except Exception:
+            # A sweep that dies on one unreadable run stops advancing every other
+            # one, so this is contained the same way ``_attempt`` contains a
+            # resolver failure.
+            log_event(
+                "browser.autonomous_advance.profile_authority_unreadable",
+                level=30,
+                run_id=run_id,
+            )
+            return None
+        if decision is None:
+            return None
+        return ProfileGateAuthority(
+            profile_digest=profile.profile_digest,
+            registrable_domain=profile.registrable_domain,
+            gate_url=gate_url,
+            admission_route=decision.route,
+            admission_decided_by=decision.decided_by,
+            admission_profile_digest=decision.profile_digest,
+        )
 
     def start(self) -> None:
         """Start the sweep that auto-resumes machine-resolvable human gates.
@@ -208,7 +317,28 @@ class RunAdvanceService:
                     continue
                 app_slug = str(record.get("app_slug") or "unknown")
                 action_type = context._hitl_action_type(record)
-                resolution = resolve_gate(action_type, app_slug=app_slug)
+                # ``profile_authority`` is supplied now. It used to be omitted
+                # because the URL the gate was observed on was not durable
+                # anywhere; the pause payload records it, so the sweep can build
+                # the same authority ``accept_legal_terms`` builds on the driver
+                # path, and the two agree about what a profile may authorize.
+                #
+                # Built only for the gates a profile may ever authorize. This
+                # sweep runs every few seconds over every waiting run, and the
+                # authority costs two reads; for a gate outside
+                # ``PROFILE_DECLARABLE_GATES`` the policy discards it in its first
+                # clause, so paying for it would buy nothing. The narrowing is a
+                # cost decision and not a second policy: the set is imported from
+                # the policy rather than restated, so widening it there widens it
+                # here with no edit.
+                authority = (
+                    self._profile_authority(run_id=run_id, record=record)
+                    if action_type in PROFILE_DECLARABLE_GATES
+                    else None
+                )
+                resolution = resolve_gate(
+                    action_type, app_slug=app_slug, profile_authority=authority
+                )
                 if resolution == "human_only":
                     continue
                 gate = str(action_type)
@@ -220,7 +350,13 @@ class RunAdvanceService:
                     # escalation.
                     if attempts == budget:
                         context.storage.spend_gate_attempt(run_id, budget_key)
-                        self._escalate(run_id, gate, "attempt_budget_exhausted")
+                        self._escalate(
+                            run_id,
+                            gate,
+                            "attempt_budget_exhausted",
+                            attempts_spent=attempts,
+                            budget=budget,
+                        )
                     continue
                 if resolution == "reusable_login" and not context._reusable_login_values(
                     app_slug,
@@ -229,7 +365,13 @@ class RunAdvanceService:
                     # Nothing to inject: asking the worker again would just
                     # re-raise the same gate. The owner still needs to supply
                     # credentials once.
-                    self._escalate(run_id, gate, "reusable_login_unavailable")
+                    self._escalate(
+                        run_id,
+                        gate,
+                        "reusable_login_unavailable",
+                        attempts_spent=attempts,
+                        budget=budget,
+                    )
                     continue
                 spent = context.storage.spend_gate_attempt(run_id, budget_key)
                 if not self._attempt(run_id, resolution):
@@ -284,7 +426,15 @@ class RunAdvanceService:
             )
             return False
 
-    def _escalate(self, run_id: str, gate: str, reason_code: str) -> None:
+    def _escalate(
+        self,
+        run_id: str,
+        gate: str,
+        reason_code: str,
+        *,
+        attempts_spent: int,
+        budget: int,
+    ) -> None:
         """Record that a gate is being handed back to an owner, with a cause.
 
         Durably as well as to the log. A stdout line is gone with the container,
@@ -292,6 +442,14 @@ class RunAdvanceService:
         indistinguishable — in every operator surface — from one this sweep had
         simply not reached yet: both read as ``waiting_for_hitl`` with no stated
         cause, which is the stall this handed to a person with no way to see it.
+
+        ``attempts_spent`` and ``budget`` are what turn the row from an assertion
+        into evidence: "this run spent 3 of 3" answers *why nothing else will
+        happen* without the reader having to know what the ceiling was configured
+        to be at the time, which is a setting they cannot recover after the fact.
+        Both are integers this sweep computed from its own attempts table and its
+        own configuration — like ``gate`` and ``reason_code``, nothing here is
+        derived from provider text or from a run-authored payload.
 
         The run's STATUS is deliberately untouched. It is already
         ``waiting_for_hitl``; the person it is waiting for is the same person, and
@@ -303,10 +461,26 @@ class RunAdvanceService:
             run_id=run_id,
             gate=gate,
             reason_code=reason_code,
+            attempts_spent=attempts_spent,
+            budget=budget,
         )
-        self._record_escalation(run_id, gate, reason_code)
+        self._record_escalation(
+            run_id,
+            gate,
+            reason_code,
+            attempts_spent=attempts_spent,
+            budget=budget,
+        )
 
-    def _record_escalation(self, run_id: str, gate: str, reason_code: str) -> None:
+    def _record_escalation(
+        self,
+        run_id: str,
+        gate: str,
+        reason_code: str,
+        *,
+        attempts_spent: int,
+        budget: int,
+    ) -> None:
         """Write the escalation to the run's audit trail exactly once.
 
         Not ``record_escalation_audit``: that writer demands the full onboarding
@@ -318,7 +492,9 @@ class RunAdvanceService:
 
         ``gate`` is safe to write: it reached here only because ``resolve_gate``
         classified it as something other than ``human_only``, so it is one of the
-        policy's own declared gate names and never text taken off a page.
+        policy's own declared gate names and never text taken off a page. The two
+        counters are safe for the stronger reason that they never left this
+        process: one is read from the attempts table, the other from settings.
 
         A failed write must not end the sweep for the other runs — losing one
         escalation row is recoverable, and the next pass re-derives the same
@@ -334,8 +510,14 @@ class RunAdvanceService:
                 run_id=run_id,
                 event_type=ESCALATED_EVENT,
                 payload={
+                    # The run id rides in the payload as well as in the row's own
+                    # key: an event exported, forwarded, or read out of a joined
+                    # projection must still say which run exhausted what.
+                    "run_id": run_id,
                     "gate": gate,
                     "reason_code": reason_code,
+                    "attempts_spent": attempts_spent,
+                    "attempt_budget": budget,
                     # No provider was contacted and nothing was submitted: this
                     # event records a decision to stop, so the trail says so
                     # rather than leaving a reader to infer it.

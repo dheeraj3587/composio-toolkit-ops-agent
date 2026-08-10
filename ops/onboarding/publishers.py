@@ -570,7 +570,7 @@ class LedgerDeveloperAppBinding:
         request = record.get("request")
         recorded = request.get("credential_kind") if isinstance(request, Mapping) else None
         kind = (
-            cast(CredentialKind, recorded)
+            recorded
             if isinstance(recorded, str) and recorded in CREDENTIAL_FLOW_KINDS
             else self.default_credential_kind
         )

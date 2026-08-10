@@ -39,6 +39,8 @@ from api.models import (
     InvalidRequestResponse,
     LiveViewResponse,
     ManagedConnectionResponse,
+    ManagedKeyConnectionResponse,
+    ManagedKeySubmissionRequest,
     ModelCatalogResponse,
     PauseRequest,
     PauseResponse,
@@ -141,10 +143,28 @@ _KNOWN_VALIDATION_FIELDS = frozenset(
     }
 )
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-_MUTATION_GATED_PREFIXES = (
-    "/api/",
-    "/internal/browser-secret-broker/",
-)
+# Everything under this prefix is machine-to-machine credential traffic driven by
+# the browser worker, so the whole subtree stays behind the acceptance marker.
+_ACCEPTANCE_GATED_PREFIXES = ("/internal/browser-secret-broker/",)
+# The /api/ routes that exist solely to hand the deployment raw credential
+# material. Operator reads and the other operator-initiated writes are admitted
+# on an unaccepted release; only credential intake and background automation are
+# withheld (background sweeps gate themselves on the same marker in ops/runs).
+#
+# ``managed-key`` is here for the same reason as ``credentials`` and not because
+# of where the secret ends up: it takes custody of an owner's live API key in
+# this process, and an unaccepted release must not hold one even briefly. That
+# the key is forwarded to Composio rather than kept is irrelevant to this gate.
+_CREDENTIAL_INTAKE_SUFFIXES = frozenset({"credentials", "managed-key"})
+
+
+class DeploymentNotAcceptedError(Exception):
+    """A request carrying credential material arrived before release acceptance.
+
+    Raised from inside a handler rather than the middleware, because whether a
+    request submits credentials can depend on its body (``browser_login`` on run
+    creation and resume), which the middleware must not consume.
+    """
 
 
 def _environment_flag(name: str, *, default: bool = False) -> bool:
@@ -219,47 +239,23 @@ def _internal_api_auth_response(request: Request) -> JSONResponse | None:
     )
 
 
-def _deployment_acceptance_response(request: Request) -> JSONResponse | None:
-    """Fail closed on control-plane writes while a production release is pending.
-
-    This is a per-request admission decision. The deploy/restore contract keeps
-    acceptance monotonic for a running release and quiesces admission and services
-    before changing the marker for rollback, so an admitted mutation cannot race
-    a live marker revocation.
-    """
-
-    path = request.url.path
-    gated_write = request.method in _MUTATING_METHODS and path.startswith(_MUTATION_GATED_PREFIXES)
-    path_parts = path.split("/")
-    # Although this public endpoint is a GET, resolving it can mint a fresh
-    # view/control grant via POST /internal/browser/sessions/{id}/live-view.
-    # Treat that capability issuance as a mutation while leaving the screenshot
-    # and health/readiness GETs available to candidate probes.
-    gated_live_view_grant = bool(
-        request.method == "GET"
-        and len(path_parts) == 5
-        and path_parts[1:3] == ["api", "runs"]
-        and path_parts[3]
-        and path_parts[4] == "live-view"
-    )
-    if not gated_write and not gated_live_view_grant:
-        return None
+def _deployment_is_accepted(request: Request) -> bool:
+    """Whether this exact release has been accepted, per the run service."""
 
     service = getattr(request.app.state, "run_service", None)
     checker = getattr(service, "deployment_mutations_allowed", None)
     if callable(checker):
         try:
-            accepted = bool(checker())
+            return bool(checker())
         except Exception:
-            accepted = False
-    else:
-        # An injected test adapter may omit the optional deployment hook. That is
-        # safe only outside production automation mode; a production adapter that
-        # cannot prove acceptance must never receive a write.
-        accepted = not _environment_flag("OPS_STARTUP_AUTOMATION_ENABLED", default=False)
+            return False
+    # An injected test adapter may omit the optional deployment hook. That is
+    # safe only outside production automation mode; a production adapter that
+    # cannot prove acceptance must never receive credential material.
+    return not _environment_flag("OPS_STARTUP_AUTOMATION_ENABLED", default=False)
 
-    if accepted:
-        return None
+
+def _deployment_not_accepted_response() -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content={
@@ -268,6 +264,47 @@ def _deployment_acceptance_response(request: Request) -> JSONResponse | None:
         },
         headers={"Retry-After": "5"},
     )
+
+
+def _acceptance_gated_path(request: Request) -> bool:
+    """Whether the marker alone decides admission for this path and method.
+
+    Narrow on purpose. A release whose background maintenance is still inert is
+    not a release an operator should be locked out of: they must be able to start
+    a run, resume it, pause it, and watch its live view. What stays closed is
+    credential intake — the broker subtree, and the credential-submission route —
+    because an unaccepted deployment must not take custody of a secret.
+    """
+
+    path = request.url.path
+    if path.startswith(_ACCEPTANCE_GATED_PREFIXES):
+        return True
+    if request.method not in _MUTATING_METHODS:
+        return False
+    parts = path.split("/")
+    return bool(
+        len(parts) == 5
+        and parts[1:3] == ["api", "runs"]
+        and parts[3]
+        and parts[4] in _CREDENTIAL_INTAKE_SUFFIXES
+    )
+
+
+def _deployment_acceptance_response(request: Request) -> JSONResponse | None:
+    """Fail closed on credential intake while a production release is pending.
+
+    This is a per-request admission decision. The deploy/restore contract keeps
+    acceptance monotonic for a running release and quiesces admission and services
+    before changing the marker for rollback, so an admitted mutation cannot race
+    a live marker revocation. The read itself is memoized on the marker's on-disk
+    identity, so a hot path costs one ``lstat`` rather than an open-and-parse.
+    """
+
+    if not _acceptance_gated_path(request):
+        return None
+    if _deployment_is_accepted(request):
+        return None
+    return _deployment_not_accepted_response()
 
 
 def get_run_service(request: Request) -> RunService:
@@ -514,6 +551,14 @@ def create_app(
             content={"error": "credential_submission_rejected", "reason_code": exc.reason_code},
         )
 
+    @application.exception_handler(DeploymentNotAcceptedError)
+    async def deployment_not_accepted_handler(
+        request: Request,
+        exc: DeploymentNotAcceptedError,
+    ) -> JSONResponse:
+        del request, exc
+        return _deployment_not_accepted_response()
+
     @application.exception_handler(StarletteHTTPException)
     async def http_error_handler(
         request: Request,
@@ -570,6 +615,7 @@ def create_app(
         # only in the encrypted account vault, never in run state or logs.
         if payload.browser_login is not None:
             _require_owner_action(request)
+            _require_accepted_deployment(request)
         # ``payload.onboarding`` used to be refused here with
         # ``onboarding_driver_not_wired``, and the refusal was true when it was
         # written: no ``LoopSessionFactory`` existed outside the test fakes, so
@@ -683,6 +729,17 @@ def create_app(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="credential submission is restricted to loopback",
             )
+
+    def _require_accepted_deployment(request: Request) -> None:
+        """Refuse credential material carried in a body before release acceptance.
+
+        The path-based gate in the middleware cannot see these: ``browser_login``
+        and ``browser_verification`` arrive inside otherwise-ordinary operator
+        POSTs, which stay open on an unaccepted release.
+        """
+
+        if not _deployment_is_accepted(request):
+            raise DeploymentNotAcceptedError
 
     def _require_owner_action(request: Request) -> None:
         """Gate the routes that carry a RAW SECRET inbound, and only those.
@@ -827,6 +884,7 @@ def create_app(
             # resume. Reusable login pairs may remain only in the encrypted,
             # account-scoped vault; one-time verification values never do.
             _require_owner_action(request)
+            _require_accepted_deployment(request)
         return await run_service.resume(
             run_id,
             browser_login=browser_login,
@@ -849,6 +907,27 @@ def create_app(
 
         _require_agent_action(request)
         return await run_service.connect_managed(run_id)
+
+    @application.post(
+        "/api/runs/{run_id}/managed-key",
+        response_model=ManagedKeyConnectionResponse,
+        response_model_exclude_none=True,
+        responses=common_responses,
+    )
+    async def submit_managed_key(
+        run_id: RunId,
+        payload: ManagedKeySubmissionRequest,
+        request: Request,
+        run_service: ServiceDependency,
+    ) -> ManagedKeyConnectionResponse:
+        """Publish an owner-held key to Composio as an active connected account."""
+
+        # The owner-secret gate, not the agent-action gate that guards /connect.
+        # The distinction is what the request body carries, not which route kind
+        # it serves: /connect asks the deployment to mint a link, while this hands
+        # it a live credential, so it belongs with credential submission.
+        _require_owner_action(request)
+        return await run_service.submit_managed_key(run_id, payload)
 
     @application.post(
         "/api/runs/{run_id}/poll-connection",

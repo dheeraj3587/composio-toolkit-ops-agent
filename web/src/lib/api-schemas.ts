@@ -67,7 +67,7 @@ const runStatus = z.enum([
 export const browserProviderSchema = z.enum(["browser_use", "playwright"])
 export const accountModeSchema = z.enum(["existing_account", "create_account"])
 export const credentialCreationPolicySchema = z.enum(["reuse_only", "create_if_missing"])
-export const routeKindSchema = z.enum(["managed_auth", "playwright", "gated"])
+export const routeKindSchema = z.enum(["managed_auth", "managed_key", "playwright", "gated"])
 export const readinessTierSchema = z.enum([
   "managed_auth_ready",
   "browser_ready",
@@ -133,6 +133,10 @@ export const operationalResearchSchema = z.strictObject({
   authorization_url: nullableHttpUrl,
   token_url: nullableHttpUrl,
   credential_fields: z.array(boundedText(120)).max(50),
+  // Which of the names above mask their input on the operator's form. Defaulted
+  // for a research record persisted before the backend projected it; an empty
+  // list means "unknown", and the form masks everything rather than guess.
+  credential_secret_fields: z.array(boundedText(120)).max(50).default([]),
   // Bounded, non-secret prose describing how to create the credential. Omitted
   // from the response when empty, so it defaults to an empty list here. Bounds
   // mirror ops/core/models.py (20 steps, 500 characters each).
@@ -589,6 +593,17 @@ export const managedConnectionResponseSchema = z.strictObject({
   replayed: z.boolean().default(false),
 })
 
+// api/models.py::ManagedKeyConnectionResponse — the managed_key route's result.
+// Deliberately not a variant of the schema above: this path resolves to an
+// already-connected account, so it names a connected account id and never a
+// redirect, and neither field is optional in its own route.
+export const managedKeyConnectionResponseSchema = z.strictObject({
+  run: runSummarySchema,
+  connected_account_id: boundedText(200),
+  state: z.enum(["pending", "active", "terminal"]),
+  replayed: z.boolean().default(false),
+})
+
 export const runListResponseSchema = z.strictObject({
   items: z.array(runSummarySchema).max(100),
   total: z.number().int().nonnegative(),
@@ -772,7 +787,13 @@ export const snapshotHealthSchema = z.strictObject({
 export const browserServiceHealthViewSchema = z.strictObject({
   state: safeToken,
   reason_code: safeToken,
-  version: boundedText(40),
+  // NOT boundedText: api/models.py declares an unconstrained `str`, and every
+  // state that is not `ready` reports the empty string -- there is no version to
+  // report when the service is disabled, unconfigured or unreachable. A `.min(1)`
+  // here rejected the parse, and because this view is nested in the health
+  // response, the failure took the WHOLE health page down with a 502 in exactly
+  // the states an operator opens it to diagnose.
+  version: z.string().max(40),
   chromium_installed: z.boolean(),
   context_launch_ok: z.boolean(),
   capacity_total: z.number().int().nonnegative(),
@@ -1030,5 +1051,5 @@ export const appResearchResponseSchema = z.strictObject({
   signup_evidence_url: nullableHttpUrl,
   // How the app connects at all. Nullish-tolerant for the same reason as
   // signup_source: an older api that does not send it must still parse.
-  connect_route: z.enum(["managed_auth", "playwright", "gated"]).nullish(),
+  connect_route: z.enum(["managed_auth", "managed_key", "playwright", "gated"]).nullish(),
 })

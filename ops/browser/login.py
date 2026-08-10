@@ -132,6 +132,13 @@ _ACCOUNT_CHOICE_SELECTOR = (
     "button:has-text('Continue as'), button:has-text('Use another account'), "
     "[role='button']:has-text('Continue as'), a:has-text('Choose an account')"
 )
+# Entries in a chooser that are NAVIGATION rather than an identity: they open a
+# different form instead of selecting one of the offered accounts. They must
+# never be counted as a match, because "Use another account" contains no address
+# and would otherwise be the single visible control on a one-account chooser.
+_ACCOUNT_CHOICE_ESCAPE = re.compile(
+    r"(?i)use another account|choose an account|select an account|add account|sign in with a"
+)
 # Playwright's ``:has-text()`` is a SUBSTRING match, so ``button:has-text('Continue')``
 # in _SUBMIT_SELECTOR also matches "Continue with GitHub" and "Continue with Google".
 # Login pages routinely place those federated buttons ABOVE the email form, so
@@ -556,6 +563,59 @@ async def _click_email_continue(surface: Any) -> bool:
     return await _press_enter(surface, _EMAIL_SELECTOR)
 
 
+async def _click_matching_account(surface: Any, email: str, *, limit: int = 12) -> bool:
+    """Click the chooser entry that names ``email``, or click nothing.
+
+    This is not the agent choosing an account. An account chooser lists the
+    identities the browser profile already holds, and exactly one of them may be
+    the address this run was given to sign in with -- the same address the fill
+    path above would have typed into an email field on any page that offered
+    one. Clicking that entry is the same act, expressed as a click because the
+    provider replaced its form with a list.
+
+    So the rule is identity match, not selection: an entry is clicked only when
+    its visible label contains the run's own address and no other entry does.
+    Zero matches, two matches, or a chooser that shows display names without
+    addresses all return ``False``, which leaves the caller's
+    ``account_selection_required`` intact and sends the run to a person. That is
+    the fail-closed direction, because the wrong click here onboards the wrong
+    tenant.
+
+    The address is compared in-process against text already on the page and is
+    never returned, logged, or put in a reason code.
+    """
+
+    needle = email.strip().casefold()
+    if "@" not in needle:
+        return False
+    try:
+        locator = surface.locator(_ACCOUNT_CHOICE_SELECTOR)
+        total = min(int(await locator.count()), limit)
+    except Exception:
+        return False
+    matches: list[Any] = []
+    for index in range(total):
+        control = locator.nth(index)
+        try:
+            if not (await control.is_visible() and await control.is_enabled()):
+                continue
+        except Exception:
+            continue
+        label = await _control_label(control)
+        if _ACCOUNT_CHOICE_ESCAPE.search(label):
+            continue
+        if needle in label.casefold():
+            matches.append(control)
+    if len(matches) != 1:
+        return False
+    try:
+        await matches[0].click(timeout=5_000)
+    except Exception:
+        return False
+    await _settle(surface)
+    return True
+
+
 async def _settle(surface: Any) -> None:
     """Wait for the DOM to be ready — deliberately NOT ``networkidle``.
 
@@ -764,6 +824,21 @@ async def drive_login(
                 page, previous="password_required", patterns=patterns
             )
         return inspection
+
+    # An account chooser, resolved only when the run's OWN address is one of the
+    # entries. Everything else about this state is unchanged: no match leaves the
+    # inspection exactly as it was, so the caller still raises the
+    # ``account_selection`` gate and a person still decides.
+    if inspection.state == "account_selection_required" and email:
+        from ops.playwright.worker import navigation_allowed
+
+        if not navigation_allowed(getattr(page, "url", "") or "", tuple(patterns)):
+            return _refused("login_origin_unsafe")
+        if not await _click_matching_account(surface, email):
+            return inspection
+        return await inspect_after_login_submit(
+            page, previous="account_selection_required", patterns=patterns
+        )
 
     return inspection
 

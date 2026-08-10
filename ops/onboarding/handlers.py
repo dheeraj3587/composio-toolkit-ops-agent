@@ -75,7 +75,12 @@ from typing import TYPE_CHECKING, Final, Protocol, cast
 from ops.browser.metrics import OnboardingCorrelation
 from ops.core.inference import DecisionFailed
 from ops.onboarding.action_loop import LoopSession, run_action_loop
-from ops.onboarding.admission import AdmissionDecision, CredentialReferenceProbe, admit_from_vault
+from ops.onboarding.admission import (
+    AdmissionDecision,
+    CredentialReferenceProbe,
+    StandingSignupAuthority,
+    admit_from_vault,
+)
 from ops.onboarding.credentials import (
     CredentialLifecycleDeps,
     CredentialStep,
@@ -153,6 +158,7 @@ PROFILE_CORROBORATED: Final[OnboardingReasonCode] = "profile_corroborated"
 RESEARCH_ADAPTERS_UNAVAILABLE: Final[OnboardingReasonCode] = "research_adapters_unavailable"
 RESEARCH_ATTEMPT_FAILED: Final[OnboardingReasonCode] = "research_attempt_failed"
 SIGNUP_AUTHORIZATION_REQUIRED: Final[OnboardingReasonCode] = "signup_authorization_required"
+STANDING_SIGNUP_AUTHORIZATION: Final[OnboardingReasonCode] = "standing_signup_authorization"
 CREDENTIAL_STORED: Final[OnboardingReasonCode] = "credential_stored"
 PROFILE_UNAVAILABLE: Final[OnboardingReasonCode] = "capture_spec_unavailable"
 
@@ -221,10 +227,12 @@ class AdmissionDecisionStore(Protocol):
     """The durable admission decision: read it, and record the system's own.
 
     Structurally satisfied by :class:`ops.core.storage.OperationsStorage`. The
-    record verb is here because the *login* route is a decision this system makes
-    (Requirement 3.2) and the login phase handler refuses to drive a run with no
-    recorded decision; the signup route can only be written by the API acting on a
-    person, which the table's own CHECK enforces rather than this port.
+    record verb is here because two routes are decided on this side of the API:
+    *login*, which this system derives from the vault (Requirement 3.2), and a
+    *signup* the owner authorized in advance for this app. What stays impossible
+    is a signup this system decided on its own behalf — the table's CHECK admits
+    ``operator`` and ``standing_authorization`` and no other decider, so the port
+    does not have to police it.
     """
 
     def read_admission_decision(self, run_id: str) -> AdmissionDecision | None:
@@ -294,7 +302,7 @@ def _research_retry_seconds(attempts: int) -> int:
 
     if attempts < 0:
         raise ValueError("a research attempt count is not negative")
-    doubling = 2 ** min(attempts, _RESEARCH_RETRY_MAX_DOUBLINGS)
+    doubling: int = 2 ** min(attempts, _RESEARCH_RETRY_MAX_DOUBLINGS)
     return min(RESEARCH_RETRY_SECONDS * doubling, RESEARCH_RETRY_CEILING_SECONDS)
 
 
@@ -526,6 +534,12 @@ class VaultCheckPhaseHandler:
     # decision is attributed to it, so it is deployment configuration rather than
     # something a run could choose.
     owner_id: str
+    # The owner's standing, per-app authorization to create accounts, or None
+    # when this deployment configures none. Absent is the fail-closed state and
+    # the pre-2026-08-09 behavior: every run with nothing to sign in with stops
+    # and asks a person. Present, and covering this app, turns that stop into a
+    # recorded signup decision attributed to whoever gave the authorization.
+    standing: StandingSignupAuthority | None = None
 
     async def __call__(
         self,
@@ -539,10 +553,15 @@ class VaultCheckPhaseHandler:
         """Probe the vault for a usable login and report the route it implies.
 
         POST: references present ⟹ a ``login`` decision is durably recorded and
-              the step advances into ``route_selected_login``; references absent ⟹
-              nothing is recorded and the step advances into ``awaiting_admission``.
-              No credential value is read on either path — the port has no verb
-              that could return one.
+              the step advances into ``route_selected_login``; references absent
+              but the owner's standing authorization covers this app ⟹ a
+              ``signup`` decision attributed to the authorizing owner is durably
+              recorded and the step advances straight into
+              ``route_selected_signup``, skipping the waiting phase and its
+              prompt entirely; references absent with no authorization ⟹ nothing
+              is recorded and the step advances into ``awaiting_admission``. No
+              credential value is read on any path — the port has no verb that
+              could return one.
         """
 
         if phase != VAULT_CHECK_PHASE:
@@ -563,6 +582,7 @@ class VaultCheckPhaseHandler:
             app_name=profile.provider_name,
             account_ref=self.accounts.account_ref(run_id=run_id),
             owner_id=self.owner_id,
+            standing=self.standing,
         )
         if outcome.decision is not None:
             # The login route is a decision this system made, and the login phase
@@ -592,11 +612,25 @@ class AdmissionPhaseHandler:
     paused run needs a second human action to resume, so pausing here would turn
     one decision into two. A deferred run is re-queued and picks itself up the
     moment the decision row exists (Requirement 3.5).
+
+    A run only reaches here when no standing authorization covered it at the
+    vault probe. It re-checks anyway, because "no authorization covered it" can
+    stop being true while the run is parked: the authorization is deployment
+    configuration, and the deploy that grants it happens long after the probe
+    ran. Without the re-check, turning unattended signup on would release every
+    future run and none of the waiting ones.
     """
 
     decisions: AdmissionDecisionStore
     prompts: AdmissionPromptStore
     poll_seconds: int = ADMISSION_POLL_SECONDS
+    # The same standing authority the vault probe consults. Present here as well
+    # because a run can be PARKED in this phase when the authorization is
+    # granted: the probe ran before the deploy that granted it, so without this
+    # the owner would turn unattended signup on and every already-waiting run
+    # would keep waiting for a person forever. Re-checking here makes granting
+    # the authorization release them.
+    standing: StandingSignupAuthority | None = None
 
     async def __call__(
         self,
@@ -622,14 +656,28 @@ class AdmissionPhaseHandler:
 
         decision = self.decisions.read_admission_decision(run_id)
         if decision is None:
-            # Nobody has answered yet. The prompt is emitted through the durable
-            # counter, so the first arrival asks and every later one — a re-queued
-            # worker, a second worker, an operator refreshing the console — asks
-            # nothing further and costs the run no prompt.
-            emit_admission_prompt(
-                run_id=run_id, app_name=profile.provider_name, prompts=self.prompts
-            )
-            return PhaseStep.defer(deadline_after(self.poll_seconds), SIGNUP_AUTHORIZATION_REQUIRED)
+            standing_decision = self._standing_decision(run_id=run_id, profile=profile)
+            if standing_decision is not None:
+                # The write is conditional, so what comes back is the row that WON,
+                # which is not necessarily the one just offered: a person can answer
+                # between the read above and this write, and the store then reports a
+                # replay of their answer. Advancing to signup on that return value
+                # regardless of its route was the whole bug -- an operator who
+                # cancelled in that window still got an account created, under their
+                # own cancellation's reason code. Adopt whatever won and let the
+                # single dispatch below decide, digest check included.
+                decision, _replayed = self.decisions.record_admission_decision(standing_decision)
+            else:
+                # Nobody has answered yet. The prompt is emitted through the durable
+                # counter, so the first arrival asks and every later one — a re-queued
+                # worker, a second worker, an operator refreshing the console — asks
+                # nothing further and costs the run no prompt.
+                emit_admission_prompt(
+                    run_id=run_id, app_name=profile.provider_name, prompts=self.prompts
+                )
+                return PhaseStep.defer(
+                    deadline_after(self.poll_seconds), SIGNUP_AUTHORIZATION_REQUIRED
+                )
 
         if decision.profile_digest != profile.profile_digest:
             # An authorization is for the provider that was researched when it was
@@ -650,6 +698,34 @@ class AdmissionPhaseHandler:
         # decision here means the decision and the probe disagree about the same
         # vault. Raising names that; committing would be refused by the table.
         raise PhaseNotDrivable(phase, "the recorded admission decision routes to login")
+
+    def _standing_decision(
+        self, *, run_id: str, profile: ProviderProfile
+    ) -> AdmissionDecision | None:
+        """The signup decision the owner's standing authorization implies, if any.
+
+        Deliberately re-derived here rather than trusted from the vault probe: the
+        probe ran once, possibly before the deploy that granted the authorization,
+        and a run that is already waiting is exactly the run this exists for. The
+        decision is stamped with when the owner authorized the app — not with now
+        — so the durable row keeps answering "who agreed to this provider's terms,
+        and when" after the run is gone.
+        """
+
+        if self.standing is None:
+            return None
+        authorization = self.standing.signup_authorization(app_slug=profile.app_slug)
+        if authorization is None:
+            return None
+        return AdmissionDecision(
+            run_id=run_id,
+            profile_digest=profile.profile_digest,
+            route="signup",
+            reason_code=STANDING_SIGNUP_AUTHORIZATION,
+            decided_by="standing_authorization",
+            actor_owner_id=authorization.authorized_by,
+            decided_at=authorization.authorized_at,
+        )
 
 
 # --- the credential lifecycle ------------------------------------------------
@@ -971,6 +1047,7 @@ def onboarding_phase_handlers(
     credentials: CredentialLifecycleDeps | None = None,
     developer_app: DeveloperAppBinding | None = None,
     facts: ResearchFactRecorder | None = None,
+    standing: StandingSignupAuthority | None = None,
 ) -> dict[OnboardingPhase, PhaseHandler]:
     """The six handlers, ready to merge into ``OnboardingDeps.handlers``.
 
@@ -997,9 +1074,15 @@ def onboarding_phase_handlers(
     handlers: dict[OnboardingPhase, PhaseHandler] = {
         RESEARCH_PHASE: ResearchPhaseHandler(research=research, binding=providers, facts=facts),
         VAULT_CHECK_PHASE: VaultCheckPhaseHandler(
-            probe=probe, accounts=accounts, decisions=decisions, owner_id=owner_id
+            probe=probe,
+            accounts=accounts,
+            decisions=decisions,
+            owner_id=owner_id,
+            standing=standing,
         ),
-        ADMISSION_PHASE: AdmissionPhaseHandler(decisions=decisions, prompts=prompts),
+        ADMISSION_PHASE: AdmissionPhaseHandler(
+            decisions=decisions, prompts=prompts, standing=standing
+        ),
         # No ports at all: it reads the previous phase's committed outcome, so it
         # is registrable wherever the three above are.
         VAULT_STORAGE_PHASE: VaultStoragePhaseHandler(),

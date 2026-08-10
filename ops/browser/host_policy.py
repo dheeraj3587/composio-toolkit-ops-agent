@@ -42,7 +42,24 @@ from ops.core.models import OperationalResearch
 from ops.recipes.app_recipes import AppRecipe, get_app_recipe
 
 # Access routes for which a browser session may be launched at all.
+#
+# This is ``OperationalResearch.access_route`` vocabulary, NOT ``AppRecipe.
+# route_kind`` vocabulary, and the two never share a value -- a route kind such
+# as ``managed_key`` does not belong in this set and would silently never match.
+# A recipe reaches this gate through ``recipe_to_operational_research``, which is
+# where a new route kind is mapped onto the access route it deserves. Both gates
+# have to admit a kind before it can navigate: this one, and the ``route_kind``
+# check in :func:`browser_policy_from_recipe` below.
 BROWSER_ROUTES = frozenset({"self_serve", "hybrid"})
+
+# The recipe route kinds that may be driven by a browser at all. ``managed_key``
+# joins ``playwright`` because reaching the key is the same act for both: the
+# owner's console is behind a login, and the reviewed credential-management page
+# is a real destination. What differs is only where the key GOES afterwards
+# (Composio rather than this project's vault), and navigation authority does not
+# depend on that. ``managed_auth`` stays out because its flow is a redirect this
+# agent never drives, and ``gated`` stays out because it has no reviewed hosts.
+BROWSER_ROUTE_KINDS = frozenset({"playwright", "managed_key"})
 
 # Multi-label public suffixes seen across the reviewed catalog. Kept as an
 # explicit, auditable list rather than a bundled public-suffix database: an
@@ -62,6 +79,33 @@ _MULTI_LABEL_SUFFIXES: frozenset[str] = frozenset(
         "com.sg",
         "com.mx",
         "com.tr",
+    }
+)
+
+# Second-level labels that name a registry CATEGORY rather than a registrant,
+# recognized under any two-letter ccTLD. These are the words registries actually
+# use to partition a national zone; a company does not register "gov" or "ac" as
+# its own name. Deliberately excludes gTLD-ish words (biz, info) and anything
+# that is merely short -- see _is_public_suffix_pair for why length is the wrong
+# test.
+_REGISTRY_CATEGORY_LABELS: frozenset[str] = frozenset(
+    {
+        "ac",
+        "co",
+        "com",
+        "edu",
+        "gob",
+        "gov",
+        "govt",
+        "gr",
+        "lg",
+        "mil",
+        "ne",
+        "net",
+        "nom",
+        "or",
+        "org",
+        "sch",
     }
 )
 
@@ -91,6 +135,15 @@ def registrable_domain(hostname: str) -> str | None:
 
     Deliberately conservative: an unrecognized multi-label suffix yields a longer
     domain, which restricts navigation further instead of opening a public zone.
+
+    That claim used to be false for anything outside the twelve suffixes listed
+    above. ``www.vendor.com.pl`` returned ``com.pl`` — the public suffix itself —
+    so ``host_matches_patterns('evil-shop.com.pl', ('*.com.pl',))`` was True and
+    every caller that derives authority from this function (navigation
+    allow-lists, ``ops.onboarding.credentials`` injection, ``ops.access
+    .gate_policy``, verification sender matching) treated a whole public zone as
+    one vendor's. The explicit set stays as the authoritative fast path; the
+    structural rule below covers the rest of the ccTLD space.
     """
 
     host = (hostname or "").strip().rstrip(".").casefold()
@@ -99,9 +152,33 @@ def registrable_domain(hostname: str) -> str | None:
     labels = host.split(".")
     if len(labels) < 2 or any(not label for label in labels):
         return None
-    if len(labels) >= 3 and ".".join(labels[-2:]) in _MULTI_LABEL_SUFFIXES:
+    if len(labels) >= 3 and _is_public_suffix_pair(labels[-2], labels[-1]):
         return ".".join(labels[-3:])
     return ".".join(labels[-2:])
+
+
+def _is_public_suffix_pair(second_level: str, tld: str) -> bool:
+    """True when ``second_level.tld`` is a registry zone, not a registrable name.
+
+    Generalized past the twelve enumerated suffixes by the SECOND-level label
+    rather than by its length. Registries the world over reuse the same handful
+    of category words -- ``com.pl``, ``ne.jp``, ``or.kr``, ``gov.br``,
+    ``ac.uk`` -- so recognizing those words under any two-letter ccTLD covers the
+    space the explicit set was always going to miss.
+
+    A length rule was tried here first and is wrong in a way worth naming, because
+    it looks safe: "any second-level label of three characters or fewer under a
+    two-letter ccTLD is a zone". Short names under ``.io``, ``.co``, ``.ai`` and
+    ``.sh`` are ordinary vendor domains, so that rule split ``docs.fly.io`` off
+    from ``fly.io`` and made a vendor's own documentation host a different vendor
+    for every caller that derives authority from this function. Over-restriction
+    is not free: it revokes navigation and credential injection on hosts the run
+    legitimately owns.
+    """
+
+    if f"{second_level}.{tld}" in _MULTI_LABEL_SUFFIXES:
+        return True
+    return len(tld) == 2 and second_level in _REGISTRY_CATEGORY_LABELS
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,7 +267,7 @@ def get_browser_policy(app_slug: str) -> BrowserHostPolicy | None:
 def browser_policy_from_recipe(recipe: AppRecipe) -> BrowserHostPolicy | None:
     """Build navigation authority from an already-bound immutable recipe."""
 
-    if recipe.route_kind != "playwright":
+    if recipe.route_kind not in BROWSER_ROUTE_KINDS:
         return None
     browser = recipe.browser
     if browser is None:
@@ -520,6 +597,7 @@ def evaluate_navigation(url: str, allowed: BrowserAllowedHosts) -> BrowserHostDe
 
 __all__ = [
     "BROWSER_ROUTES",
+    "BROWSER_ROUTE_KINDS",
     "MAX_ALLOWED_HOST_PATTERNS",
     "NAVIGATION_TARGET_FIELDS",
     "BrowserAllowedHosts",

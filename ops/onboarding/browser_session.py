@@ -38,7 +38,7 @@ import asyncio
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol, cast
+from typing import Any, Final, Protocol, cast
 
 from ops.browser.candidates import ActionCandidate
 from ops.browser.decider import build_snapshot
@@ -62,11 +62,152 @@ LOGGER = logging.getLogger("composio_ops.onboarding_browser_session")
 # working.
 UNTITLED_PAGE = "(untitled)"
 
-# The observation status a mid-phase reading carries. The loop classifies the
-# page from its postconditions and its candidates, not from this field, so the
-# honest value is the neutral one: this reading asserts nothing about whether the
-# console is ready or the credential is visible.
-NAVIGATING = "navigating"
+# The observation status a mid-phase reading carries when nothing stronger can be
+# proven. It asserts nothing about whether the console is ready or the credential
+# is visible.
+NAVIGATING: Final = "navigating"
+
+# --- what a single-step reading can honestly prove ---------------------------
+# Every ``PHASE_POSTCONDITIONS`` predicate in ``ops.onboarding.action_loop`` reads
+# ``status``/``reason_code``/``credential_field_labels``, and this session used to
+# return ``NAVIGATING`` with none of them on every iteration. The result was not a
+# conservative loop, it was an unsatisfiable one: no phase driven through this
+# port could EVER report its postcondition met, so every one of them burned
+# ``MAX_NO_PROGRESS`` and returned ``loop_no_progress_budget_exhausted``. That is
+# the mechanism behind "the agent does nothing".
+#
+# So this classifies, using only what the trace loop uses for the same call:
+# the reviewed recipe's success predicate (``ops.playwright.predicates``), the
+# structural credential-bearing test, and code-authored control-name markers.
+# Page PROSE never proves anything here — the needles below are matched against
+# accessible names of interactive controls, which the page cannot rename into a
+# claim without also rendering that control.
+
+# An authenticated console has a way OUT of the account. A marketing page does
+# not. This is the one marker that survives every provider's layout.
+_SIGNED_IN_CONTROLS: Final[tuple[str, ...]] = (
+    "log out",
+    "logout",
+    "sign out",
+    "signout",
+    "log off",
+    "account settings",
+    "my account",
+)
+
+# Post-submit signup acknowledgements. Matched against the page's own visible
+# text because a "check your inbox" interstitial has no controls at all — the
+# only phase that reads this is ``signup``, whose real proof (the mailbox) is
+# checked separately by the verification phase that follows it.
+_SIGNUP_ACKNOWLEDGED: Final[tuple[str, ...]] = (
+    "verify your email",
+    "verify your account",
+    "confirm your email",
+    "check your inbox",
+    "check your email",
+    "verification email",
+    "confirmation email",
+)
+
+
+def _reviewed_success(inspection: PageInspection, recipe: Mapping[str, object] | None) -> bool:
+    """True when the caller-bound recipe's own success predicate holds here.
+
+    The SAME authority ``ops.playwright.worker`` uses at the equivalent point: a
+    predicate with no positive condition proves nothing (``predicate_satisfied``
+    returns False), so an app with an empty ``success`` block cannot be talked
+    into a credential surface by this path. Any failure to rebuild the recipe is
+    "not proven", never an exception — a malformed snapshot must not end a phase.
+    """
+
+    if recipe is None:
+        return False
+    try:
+        from ops.playwright.predicates import predicate_satisfied
+        from ops.recipes.app_recipes import AppRecipe, recipe_to_browser_trace
+
+        trace = recipe_to_browser_trace(AppRecipe.model_validate(dict(recipe)))
+    except Exception:  # noqa: BLE001 - an unusable snapshot proves nothing.
+        return False
+    if trace is None:
+        return False
+    return trace.success.has_positive_condition() and predicate_satisfied(trace.success, inspection)
+
+
+def _credential_labels(inspection: PageInspection) -> tuple[str, ...]:
+    """The already-sanitized names of the credential-shaped fields on this page.
+
+    Names only. ``ops.playwright.page_inspection`` rewrites a credential-describing
+    accessible name into a semantic placeholder at the source and redacts
+    token-shaped text, so nothing here can carry a secret value. Bounded to the 20
+    ``BrowserObservation`` accepts.
+    """
+
+    labels: list[str] = []
+    for element in inspection.elements:
+        if not element.secretish or not element.name:
+            continue
+        if element.name not in labels:
+            labels.append(element.name)
+        if len(labels) == 20:
+            break
+    return tuple(labels)
+
+
+def classify_observation(
+    inspection: PageInspection, *, recipe: Mapping[str, object] | None
+) -> BrowserObservation:
+    """One page reading, classified into the statuses the loop's postconditions read.
+
+    Ordered most-authoritative first, and every branch fails closed to
+    ``NAVIGATING`` — which is what this function returned unconditionally before,
+    so nothing it cannot prove is any weaker than it was.
+    """
+
+    gate = detect_human_gate(inspection)
+    if gate is not None:
+        return gate
+
+    title = inspection.title or UNTITLED_PAGE
+    labels = _credential_labels(inspection)
+    proven = _reviewed_success(inspection, recipe)
+    if proven or labels:
+        # Structurally credential-bearing, whether or not a reviewed predicate
+        # named it. This does NOT authorize capture: capture goes through
+        # ``arm_credential_surface``, which is the service's own proof and refuses
+        # without a recipe. It authorizes the LOOP to stop driving a page that is
+        # already showing the credential fields.
+        return BrowserObservation(
+            status="credential_page_ready",
+            current_url=inspection.url,
+            page_title=title,
+            credential_field_labels=labels,
+            non_secret_notes=(
+                "Verified the reviewed success predicate."
+                if proven
+                else "Credential-shaped fields are present.",
+            ),
+        )
+
+    names = tuple(name.casefold() for name in inspection.accessible_names())
+    if any(needle in name for needle in _SIGNED_IN_CONTROLS for name in names):
+        return BrowserObservation(
+            status="developer_console_ready",
+            current_url=inspection.url,
+            page_title=title,
+            non_secret_notes=("An account sign-out control is present.",),
+        )
+
+    text = inspection.visible_text.casefold()
+    if any(needle in text for needle in _SIGNUP_ACKNOWLEDGED):
+        return BrowserObservation(
+            status=NAVIGATING,
+            current_url=inspection.url,
+            page_title=title,
+            reason_code="signup_submitted",
+        )
+
+    return BrowserObservation(status=NAVIGATING, current_url=inspection.url, page_title=title)
 
 
 class RemoteObservationLike(Protocol):
@@ -230,7 +371,7 @@ class ServiceLoopSession:
         # rather than as "the page has no useful candidates". Without it the phase
         # would burn its no-progress budget staring at a challenge widget and then
         # report a bound as spent instead of naming the gate.
-        gate = detect_human_gate(
+        observation = classify_observation(
             PageInspection(
                 url=remote.url,
                 title=remote.title,
@@ -239,12 +380,8 @@ class ServiceLoopSession:
                 locators=(),
                 fingerprint=remote.fingerprint,
                 generation=remote.generation,
-            )
-        )
-        observation = gate or BrowserObservation(
-            status=NAVIGATING,
-            current_url=remote.url,
-            page_title=remote.title or UNTITLED_PAGE,
+            ),
+            recipe=self.recipe_snapshot,
         )
         return LoopObservation(
             observation=observation,

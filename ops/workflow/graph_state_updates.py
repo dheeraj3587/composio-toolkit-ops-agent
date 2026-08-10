@@ -81,6 +81,11 @@ def _observation_update(
             "type": observation.human_action_type,
             "message": observation.human_instruction,
             "live_view_available": state.get("browser_live_view_available", False),
+            # Same field, same reason, as the canonical runtime's pause payload:
+            # the observed gate URL is the only durable record of where the gate
+            # appeared, and ``ops.runs.advance`` needs it to confine a profile
+            # authority to the profile's own registrable domain.
+            "gate_url": observation.current_url,
         }
     return {
         "browser_observation": asdict(observation),

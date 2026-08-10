@@ -25,7 +25,12 @@ from ops.core.private_files import finalize_private_database, prepare_private_da
 from ops.core.redaction import redact_data, redact_text
 from ops.core.secret_store import parse_vault_reference
 from ops.core.state import RUN_STATUSES, AccessRoute, RunStatus
-from ops.onboarding.admission import AdmissionDecider, AdmissionDecision, AdmissionRoute
+from ops.onboarding.admission import (
+    SIGNUP_DECIDERS,
+    AdmissionDecider,
+    AdmissionDecision,
+    AdmissionRoute,
+)
 from ops.onboarding.effects import ONBOARDING_EFFECT_DISPOSITIONS, ONBOARDING_EFFECTS
 from ops.onboarding.phase import ONBOARDING_PHASES, ONBOARDING_REASON_CODES
 
@@ -189,6 +194,13 @@ CREATE TABLE IF NOT EXISTS onboarding_effect_reservations (
 # the type the deciding code is written against cannot drift apart.
 _ADMISSION_ROUTES: Final[tuple[AdmissionRoute, ...]] = get_args(AdmissionRoute)
 _ADMISSION_DECIDERS: Final[tuple[AdmissionDecider, ...]] = get_args(AdmissionDecider)
+# Sorted because ``SIGNUP_DECIDERS`` is a frozenset: without it the generated
+# statement would vary between processes, and a schema that differs by iteration
+# order is a schema nobody can diff.
+_SIGNUP_DECIDER_CHECK: Final = (
+    "CHECK (route <> 'signup' OR decided_by IN "
+    f"({_vocabulary_clause(tuple(sorted(SIGNUP_DECIDERS)))}))"
+)
 
 # A run needs two login references. The bound exists so that a *value* smuggled
 # past the reference grammar — a long blob under a plausible field name — cannot
@@ -204,9 +216,14 @@ MAX_CREDENTIAL_REFS_JSON_LENGTH = 1_000
 # already enforces, and the redundancy is deliberate (design LL-1.4): the
 # dataclass protects callers that go through it, the table protects the durable
 # record from anything that does not.
-#   * ``route <> 'signup' OR decided_by = 'operator'`` — no autonomous path can
-#     leave behind a stored authorization for account creation (Requirements 3.5,
-#     3.6).
+#   * ``route <> 'signup' OR decided_by IN (<the human deciders>)`` — no autonomous
+#     path can leave behind a stored authorization for account creation
+#     (Requirements 3.5, 3.6). The list is generated from
+#     ``ops.onboarding.admission.SIGNUP_DECIDERS`` rather than retyped, so the
+#     column and the dataclass check cannot drift apart. ``system`` is not in it
+#     and must never be: ``standing_authorization`` is a person's recorded
+#     decision made before the run, which is why it is admitted, and there is no
+#     third kind of authority that would be.
 #   * the ``credential_refs_json`` shape — the column holds ``vault://`` references
 #     or the empty list, never credential material (Requirement 19.8).
 _ADMISSION_DECISIONS_DDL = f"""
@@ -226,10 +243,50 @@ CREATE TABLE IF NOT EXISTS onboarding_admission_decisions (
         (credential_refs_json = '[]' OR credential_refs_json LIKE '%vault://%')
         AND length(credential_refs_json) <= {MAX_CREDENTIAL_REFS_JSON_LENGTH}
     ),
-    CHECK (route <> 'signup' OR decided_by = 'operator'),
+    {_SIGNUP_DECIDER_CHECK},
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
 """
+
+
+def _widen_admission_signup_deciders(connection: sqlite3.Connection) -> None:
+    """Let a pre-existing admission table store a standing-authorization signup.
+
+    Databases created before 2026-08-09 carry ``CHECK (route <> 'signup' OR
+    decided_by = 'operator')``, which would reject the unattended signup route as
+    an integrity error at the moment the decision is written — after research has
+    run and while the run believes it is authorized. SQLite cannot alter a CHECK
+    in place, so the table is rebuilt by the documented rename-copy-drop procedure.
+
+    Safe to run on every open. It is a no-op once the stored statement already
+    names the wider vocabulary, and the table has no index and nothing referencing
+    it, so the simple rename form is sufficient here — unlike the ``runs`` rebuild,
+    which thirteen tables point at.
+    """
+
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'onboarding_admission_decisions'"
+    ).fetchone()
+    if row is None or not row[0]:  # A fresh database; the DDL creates it correctly.
+        return
+    if "decided_by = 'operator'" not in str(row[0]):
+        return
+    names = ", ".join(
+        str(column[1])
+        for column in connection.execute(
+            "PRAGMA table_info(onboarding_admission_decisions)"
+        ).fetchall()
+    )
+    connection.execute(
+        "ALTER TABLE onboarding_admission_decisions RENAME TO onboarding_admission_decisions_legacy"
+    )
+    connection.executescript(_ADMISSION_DECISIONS_DDL)
+    connection.execute(
+        f"INSERT INTO onboarding_admission_decisions ({names}) "  # noqa: S608 - PRAGMA column list
+        f"SELECT {names} FROM onboarding_admission_decisions_legacy"
+    )
+    connection.execute("DROP TABLE onboarding_admission_decisions_legacy")
 
 
 # One row per navigation denial (Requirement 5.15). Append-only on purpose: a
@@ -1997,6 +2054,9 @@ class OperationsStorage:
             # Kept as their own scripts because their CHECK lists are generated
             # from the onboarding vocabularies rather than typed out.
             connection.executescript(_EFFECT_RESERVATIONS_DDL)
+            # Before the DDL, because the DDL is IF NOT EXISTS and would leave a
+            # pre-2026-08-09 table with its narrower signup CHECK in place.
+            _widen_admission_signup_deciders(connection)
             connection.executescript(_ADMISSION_DECISIONS_DDL)
             connection.executescript(_NAVIGATION_DENIALS_DDL)
             connection.executescript(_AUTONOMY_OUTCOMES_DDL)
