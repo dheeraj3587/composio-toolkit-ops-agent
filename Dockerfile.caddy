@@ -5,7 +5,7 @@
 # reviewed Caddy release with the fixed Go toolchain and explicitly selected
 # dependency versions. The official Go image is digest-pinned for reproducible
 # builder provenance and is not present in the runtime image.
-FROM golang:1.26.5-alpine3.24@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS caddy-builder
+FROM golang:1.26.6-alpine3.24@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83 AS caddy-builder
 
 WORKDIR /src
 COPY deploy/caddy-build/go.mod deploy/caddy-build/main.go ./
