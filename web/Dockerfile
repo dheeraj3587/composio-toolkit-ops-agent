@@ -2,7 +2,7 @@
 
 # Docker Hub official-image index digest for node:22.23.1-bookworm-slim,
 # reviewed 2026-07-29. All stages share one immutable runtime/toolchain base.
-FROM node:22.23.1-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS dependencies
+FROM node:26.8.2-bookworm-slim@sha256:cd9f682fa2885cd1056e830424764158570061c59736a1da836bc3d73df095ae AS dependencies
 
 ENV NEXT_TELEMETRY_DISABLED=1
 WORKDIR /app
@@ -12,7 +12,7 @@ COPY web/package.json web/package-lock.json web/.npmrc ./
 # application build remains an explicit command in the next stage.
 RUN npm ci --ignore-scripts --no-audit --no-fund
 
-FROM node:22.23.1-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS builder
+FROM node:26.8.2-bookworm-slim@sha256:cd9f682fa2885cd1056e830424764158570061c59736a1da836bc3d73df095ae AS builder
 
 ENV NEXT_TELEMETRY_DISABLED=1
 WORKDIR /app
@@ -21,7 +21,7 @@ COPY --from=dependencies /app/node_modules ./node_modules
 COPY web/ ./
 RUN npm run build
 
-FROM node:22.23.1-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS runner
+FROM node:26.8.2-bookworm-slim@sha256:cd9f682fa2885cd1056e830424764158570061c59736a1da836bc3d73df095ae AS runner
 
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
