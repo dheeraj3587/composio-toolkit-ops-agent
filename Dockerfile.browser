@@ -23,7 +23,7 @@
 # Docker Hub official-image index digest for python:3.11.15-slim-bookworm,
 # reviewed 2026-07-29. Chromium itself remains pinned by requirements-providers
 # and is installed during the build from that exact Playwright package.
-FROM python:3.11.15-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba
+FROM python:3.14.8-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
