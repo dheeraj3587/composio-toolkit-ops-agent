@@ -1,0 +1,75 @@
+name: Capture PR11 pytest gate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  capture:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    env:
+      ALLOW_LIVE_BROWSER: "false"
+      ALLOW_LIVE_VENDOR_EMAIL: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+      RUN_LIVE_TESTS: "0"
+    steps:
+      - name: Check out report branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/signup-foundation-ci-diagnostics
+          path: report
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Check out exact final PR11 merge commit
+        uses: actions/checkout@v4
+        with:
+          ref: 8f5277aeb910a534eab82d2e1ef0e0f3eef87a22
+          path: target
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: python -m pip install --requirement target/requirements-dev.txt
+      - run: python -m playwright install --with-deps chromium
+
+      - name: Capture pytest and remaining backend components
+        run: |
+          rm -rf report/pr11-pytest-diagnostics
+          mkdir -p report/pr11-pytest-diagnostics
+          cd target
+          set +e
+
+          timeout 720s pytest -vv --maxfail=1 \
+            > ../report/pr11-pytest-diagnostics/pytest.txt 2>&1
+          pytest_status=$?
+          mypy ops api streamlit_app.py \
+            > ../report/pr11-pytest-diagnostics/mypy.txt 2>&1
+          mypy_status=$?
+          python -m compileall -q ops api streamlit_app.py \
+            > ../report/pr11-pytest-diagnostics/compileall.txt 2>&1
+          compile_status=$?
+          pip-audit -r requirements-dev.txt \
+            > ../report/pr11-pytest-diagnostics/pip-audit.txt 2>&1
+          audit_status=$?
+
+          printf 'pytest=%s\nmypy=%s\ncompileall=%s\npip_audit=%s\n' \
+            "$pytest_status" "$mypy_status" "$compile_status" "$audit_status" \
+            > ../report/pr11-pytest-diagnostics/status.txt
+          set -e
+
+      - name: Commit pytest diagnostics
+        working-directory: report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pr11-pytest-diagnostics
+          git commit -m "chore: capture PR11 pytest diagnostics"
+          git push origin HEAD:agent/signup-foundation-ci-diagnostics

@@ -1,0 +1,13 @@
+name: Capture PR11 merge backend gate (paused)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  paused:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Long diagnostic already running; no new runs."

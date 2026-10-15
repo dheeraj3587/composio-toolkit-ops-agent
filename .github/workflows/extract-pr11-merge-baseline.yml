@@ -1,0 +1,101 @@
+name: Capture PR11 API validation error
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  capture:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      ALLOW_LIVE_BROWSER: "false"
+      ALLOW_LIVE_VENDOR_EMAIL: "false"
+      RUN_LIVE_TESTS: "0"
+    steps:
+      - name: Check out report branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/signup-foundation-ci-diagnostics
+          path: report
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Check out exact final PR11 merge commit
+        uses: actions/checkout@v4
+        with:
+          ref: 8f5277aeb910a534eab82d2e1ef0e0f3eef87a22
+          path: target
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: python -m pip install --requirement target/requirements-dev.txt
+
+      - name: Capture direct API service validation error
+        run: |
+          cd target
+          python - <<'PY' > ../report/pr11-api-validation.txt 2>&1
+          from __future__ import annotations
+
+          import asyncio
+          import tempfile
+          import traceback
+          from pathlib import Path
+
+          from pydantic import ValidationError
+
+          from api.models import CreateRunRequest
+          from api.service import LocalRunService
+          from ops.run_service import RunService as CoreRunService
+
+          payload = {
+              "app_name": "HubSpot",
+              "company": {
+                  "legal_name": "Example Company",
+                  "website": "https://example.test",
+                  "work_email_ref": "vault://company/work_email/test-operator",
+                  "use_case": "Evaluate documented integration access.",
+                  "callback_urls": ["https://example.test/oauth/callback"],
+              },
+              "requested_scope_policy": "maximum",
+              "dry_run": True,
+              "outreach_recipient_override": "controlled@example.test",
+          }
+
+          async def main() -> None:
+              with tempfile.TemporaryDirectory() as directory:
+                  db_path = Path(directory) / "private" / "ops.db"
+                  core = CoreRunService.from_paths(db_path=db_path)
+                  service = LocalRunService(db_path, core_service=core)
+                  await service.startup()
+                  try:
+                      request = CreateRunRequest.model_validate(payload)
+                      result = await service.create_run(request)
+                      print(result.model_dump(mode="json"))
+                  except ValidationError as exc:
+                      print("VALIDATION_ERROR")
+                      for item in exc.errors(include_url=False, include_input=False):
+                          print(item)
+                  except Exception:
+                      traceback.print_exc()
+                  finally:
+                      await service.shutdown()
+
+          asyncio.run(main())
+          PY
+
+      - name: Commit validation output
+        working-directory: report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pr11-api-validation.txt
+          git commit -m "chore: capture PR11 API validation error"
+          git push origin HEAD:agent/signup-foundation-ci-diagnostics
