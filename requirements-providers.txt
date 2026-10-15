@@ -6,7 +6,7 @@ playwright==1.61.0
 
 composio==0.18.0
 
-google-genai==2.12.1
+google-genai==2.16.0
 perplexityai==0.42.0
 # You.com SDK. Verified against PyPI on 2026-07-25: 2.5.0 is the current public
 # release (2026-07-23; 2.4.0 was 2026-07-17). The pin is the single source of
